@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sysi Overlay
+Comment=Start the transparent desktop overlay
+Exec=sysi
+Icon=io.sysi.Overlay
+Terminal=false
+StartupNotify=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+

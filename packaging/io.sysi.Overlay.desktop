@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Name=Sysi Overlay
+Comment=Transparent widgets, notes, timer, and desktop pet
+Exec=sysi
+Icon=io.sysi.Overlay
+Terminal=false
+Categories=Utility;System;
+StartupNotify=false
+Actions=Toggle;ToggleSettings;Quit;
+
+[Desktop Action Toggle]
+Name=Toggle Interaction
+Exec=sysi --toggle
+
+[Desktop Action ToggleSettings]
+Name=Show or Hide Settings
+Exec=sysi --toggle-settings
+
+[Desktop Action Quit]
+Name=Quit
+Exec=sysi --quit

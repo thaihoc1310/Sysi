@@ -1,0 +1,276 @@
+.overlay-root, window {
+  background-color: transparent;
+}
+
+* {
+  font-family: "Noto Sans", sans-serif;
+}
+
+.card {
+  background-color: transparent;
+  border: none;
+  padding: 4px;
+  box-shadow: none;
+  color: #f5f5f5;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.86);
+}
+
+.editing .card {
+  border: none;
+  box-shadow: none;
+}
+
+.adaptive-light .card {
+  background-color: transparent;
+  color: #111111;
+  text-shadow: 0 1px 3px rgba(255, 255, 255, 0.96);
+}
+
+.adaptive-dark .card {
+  color: #f6f6f6;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.9);
+}
+
+.card-title {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+}
+
+.card-kicker {
+  color: alpha(currentColor, 0.52);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+}
+
+separator {
+  background-color: alpha(currentColor, 0.13);
+  min-height: 1px;
+}
+
+.timer-value {
+  font-family: "Cantarell", "Inter", "Noto Sans", sans-serif;
+  font-size: 25px;
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+
+.timer-action {
+  font-family: "Cantarell", "Noto Sans", sans-serif;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+}
+
+.timer-card.timer-size-medium .timer-value {
+  font-size: 32px;
+}
+
+.timer-card.timer-size-medium .timer-action {
+  font-size: 13px;
+}
+
+.timer-card.timer-size-medium .timer-editor {
+  font-size: 22px;
+}
+
+.timer-card.timer-size-large .timer-value {
+  font-size: 40px;
+}
+
+.timer-card.timer-size-large .timer-action {
+  font-size: 15px;
+}
+
+.timer-card.timer-size-large .timer-editor {
+  font-size: 28px;
+}
+
+.timer-editor {
+  background-color: transparent;
+  border: none;
+  color: currentColor;
+  font-family: "Noto Sans Mono", monospace;
+  font-size: 18px;
+  font-weight: 600;
+  padding: 3px 5px;
+}
+
+.tiny-button {
+  background-image: none;
+  background-color: alpha(currentColor, 0.09);
+  border: none;
+  box-shadow: none;
+  color: currentColor;
+  font-size: 9px;
+  font-weight: 800;
+  min-height: 23px;
+  min-width: 23px;
+  padding: 1px 8px;
+}
+
+.tiny-button:hover {
+  background-color: alpha(currentColor, 0.18);
+}
+
+.alarm .card {
+  border: none;
+  box-shadow: none;
+}
+
+.alarm .timer-value {
+  color: currentColor;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.resize-handle {
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+textview, textview text {
+  background-color: transparent;
+  color: currentColor;
+}
+
+.note-editor, .pinned-editor {
+  background-color: transparent;
+  border: none;
+  padding: 7px;
+}
+
+.history-list {
+  background-color: transparent;
+  padding: 5px 2px;
+}
+
+.note-preview {
+  background-color: transparent;
+  color: currentColor;
+  border: none;
+  padding: 5px 7px;
+  font-size: 10px;
+  font-weight: bold;
+}
+
+.note-preview:hover {
+  color: currentColor;
+}
+
+.note-ghost {
+  background-color: transparent;
+  color: currentColor;
+  border: none;
+  padding: 7px 10px;
+  font-size: 10px;
+  font-weight: 800;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.92);
+}
+
+.picker-widget {
+  color: #f6f6f6;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.92);
+}
+
+.adaptive-light.picker-widget {
+  color: #111111;
+  text-shadow: 0 1px 3px rgba(255, 255, 255, 0.98);
+}
+
+.empty-slot {
+  background-color: transparent;
+  border: none;
+  padding: 1px;
+}
+
+.slot-plus {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: currentColor;
+  font-size: 17px;
+  font-weight: bold;
+  min-width: 26px;
+  min-height: 25px;
+  padding: 0;
+}
+
+.widget-choices {
+  background-color: transparent;
+}
+
+.picker-choice {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: currentColor;
+  font-size: 8px;
+  font-weight: bold;
+  min-height: 24px;
+  padding: 0 6px;
+}
+
+.picker-choice:hover {
+  color: currentColor;
+}
+
+.picker-toggle:checked {
+  color: currentColor;
+  background-color: alpha(currentColor, 0.16);
+}
+
+.pinned-note .card {
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.note-header {
+  background-color: rgba(222, 222, 222, 0.72);
+  border: none;
+  border-radius: 4px 4px 1px 1px;
+  min-height: 18px;
+  padding: 1px 4px;
+}
+
+.note-window-button {
+  background-color: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  color: #222222;
+  font-size: 10px;
+  font-weight: 800;
+  min-height: 13px;
+  min-width: 13px;
+  padding: 0;
+}
+
+.note-window-button:hover {
+  background-color: transparent;
+  color: #000000;
+}
+
+.note-hide {
+  color: #666666;
+}
+
+.pinned-note scrolledwindow,
+.pinned-note scrolledwindow viewport {
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.pinned-note scrollbar,
+.pinned-note scrollbar trough,
+.pinned-note scrollbar slider {
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  min-height: 0;
+  min-width: 0;
+}
