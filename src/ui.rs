@@ -9,6 +9,7 @@ use gtk::prelude::*;
 use std::{
     cell::{Cell, RefCell},
     f64::consts::{PI, TAU},
+    fs,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -415,15 +416,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     );
 
     let widget_picker = build_widget_picker(picker_color_mode);
-    let picker_position = state
-        .borrow()
-        .positions
-        .get("picker")
-        .copied()
-        .unwrap_or(Point {
-            x: primary_screen.x + 360,
-            y: primary_screen.y + 54,
-        });
+    let picker_position = Point {
+        x: primary_screen.x + 12,
+        y: primary_screen.y + 30,
+    };
     place_card(&root, &widget_picker.card, picker_position);
     register(
         &registry,
@@ -481,14 +477,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     *note_refresh.borrow_mut() = Some(refresh_closure.clone());
     refresh_closure();
 
-    let (system_enabled, timer_enabled, settings_enabled, color_mode) = {
+    let (system_enabled, timer_enabled, color_mode) = {
         let settings = &state.borrow().settings;
-        (
-            settings.system,
-            settings.timer,
-            settings.settings_button,
-            settings.color_mode,
-        )
+        (settings.system, settings.timer, settings.color_mode)
     };
     widget_picker.system.set_active(system_enabled);
     widget_picker.timer.set_active(timer_enabled);
@@ -569,9 +560,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     });
     widget_picker.new_note.connect_clicked({
         let root = root.clone();
-        let picker = widget_picker.card.clone();
         let revealer = widget_picker.revealer.clone();
         let history_revealer = widget_picker.history_revealer.clone();
+        let picker = widget_picker.card.clone();
         let state = state.clone();
         let refresh = refresh_closure.clone();
         let screens = screens.clone();
@@ -612,8 +603,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let interactive = interactive.clone();
         let window = window.clone();
         let registry = registry.clone();
-        let revealer = widget_picker.revealer.clone();
-        let history_revealer = widget_picker.history_revealer.clone();
+        let lock = widget_picker.lock.clone();
         let commit_timer_edit = timer_card.commit_edit.clone();
         Rc::new(move || {
             let enabled = !interactive.get();
@@ -624,10 +614,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             } else {
                 commit_timer_edit();
                 window.set_accept_focus(false);
-                revealer.set_reveal_child(false);
-                history_revealer.set_reveal_child(false);
                 window.style_context().remove_class("editing");
             }
+            lock.set_label(if enabled { "LOCK" } else { "UNLOCK" });
             set_edit_chrome_visibility(&registry, enabled);
             for item in registry.borrow().iter() {
                 item.widget.queue_draw();
@@ -636,42 +625,41 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         })
     };
 
-    let toggle_settings_action: Rc<dyn Fn()> = {
+    widget_picker.lock.connect_clicked({
+        let toggle_action = toggle_action.clone();
+        move |_| toggle_action()
+    });
+
+    let dispatch_panel_action: Rc<dyn Fn()> = {
         let picker = widget_picker.card.clone();
-        let revealer = widget_picker.revealer.clone();
         let history_revealer = widget_picker.history_revealer.clone();
-        let state = state.clone();
-        let window = window.clone();
-        let registry = registry.clone();
-        let interactive = interactive.clone();
-        Rc::new(move || {
-            let visible = !picker.is_visible();
-            picker.set_visible(visible);
-            if !visible {
-                revealer.set_reveal_child(false);
-                history_revealer.set_reveal_child(false);
+        let system = widget_picker.system.clone();
+        let timer = widget_picker.timer.clone();
+        let mode = widget_picker.mode.clone();
+        let lock = widget_picker.lock.clone();
+        let history = widget_picker.history.clone();
+        let new_note = widget_picker.new_note.clone();
+        let quit = widget_picker.quit.clone();
+        Rc::new(move || match take_panel_action().as_deref() {
+            Some("toggle-system") => system.set_active(!system.is_active()),
+            Some("toggle-timer") => timer.set_active(!timer.is_active()),
+            Some("next-color-mode") => mode.clicked(),
+            Some("toggle-lock") => lock.clicked(),
+            Some("new-note") => new_note.clicked(),
+            Some("toggle-history") => {
+                let opening = !history_revealer.reveals_child();
+                if opening {
+                    picker.show();
+                }
+                history.clicked();
+                if !opening {
+                    picker.hide();
+                }
             }
-            state.borrow_mut().settings.settings_button = visible;
-            let _ = state.borrow().save();
-            refresh_input_shape(&window, &registry, interactive.get());
+            Some("quit") => quit.clicked(),
+            _ => {}
         })
     };
-
-    widget_picker.plus.connect_clicked({
-        let revealer = widget_picker.revealer.clone();
-        let history_revealer = widget_picker.history_revealer.clone();
-        let window = window.clone();
-        let registry = registry.clone();
-        let interactive = interactive.clone();
-        move |_| {
-            let open = !revealer.reveals_child();
-            revealer.set_reveal_child(open);
-            if !open {
-                history_revealer.set_reveal_child(false);
-            }
-            refresh_shape_during_transition(&window, &registry, interactive.clone());
-        }
-    });
 
     window.connect_key_press_event({
         let toggle_action = toggle_action.clone();
@@ -695,6 +683,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     window.show_all();
     set_edit_chrome_visibility(&registry, true);
+    // The gear and its controls live in GNOME's real panel. This invisible
+    // widget remains only as the native history popover anchor.
+    widget_picker.plus.hide();
+    widget_picker.card.hide();
     widget_picker.revealer.set_reveal_child(false);
     widget_picker.history_revealer.set_reveal_child(false);
     if !system_enabled {
@@ -702,9 +694,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     }
     if !timer_enabled {
         timer_card.card.hide();
-    }
-    if !settings_enabled {
-        widget_picker.card.hide();
     }
     window.present();
     window.move_(0, 0);
@@ -726,12 +715,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     platform::spawn_global_hotkey(hotkey_tx);
     glib::MainContext::default().spawn_local({
         let toggle_action = toggle_action.clone();
-        let toggle_settings_action = toggle_settings_action.clone();
         async move {
             while let Ok(action) = hotkey_rx.recv().await {
                 match action {
                     platform::HotkeyAction::ToggleInteraction => toggle_action(),
-                    platform::HotkeyAction::ToggleSettings => toggle_settings_action(),
                 }
             }
         }
@@ -744,10 +731,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             glib::ControlFlow::Continue
         }
     });
-    glib::source::unix_signal_add_local(libc::SIGUSR2, {
-        let toggle_settings_action = toggle_settings_action.clone();
+    // The panel extension writes the one-shot action and then sends SIGWINCH.
+    // GLib dispatches it safely on GTK's main thread without a polling loop.
+    glib::source::unix_signal_add_local(libc::SIGWINCH, {
+        let dispatch_panel_action = dispatch_panel_action.clone();
         move || {
-            toggle_settings_action();
+            dispatch_panel_action();
             glib::ControlFlow::Continue
         }
     });
@@ -2160,6 +2149,7 @@ struct WidgetPicker {
     system: gtk::ToggleButton,
     timer: gtk::ToggleButton,
     mode: gtk::Button,
+    lock: gtk::Button,
     history: gtk::Button,
     history_revealer: gtk::Revealer,
     history_list: gtk::Box,
@@ -2184,7 +2174,7 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     slot.style_context().add_class("empty-slot");
     let plus = gtk::Button::with_label("⚙");
-    plus.set_tooltip_text(Some("Settings · Ctrl+Alt+G to hide"));
+    plus.set_tooltip_text(Some("Settings"));
     plus.set_can_focus(false);
     plus.style_context().add_class("slot-plus");
     slot.pack_start(&plus, false, false, 0);
@@ -2198,12 +2188,14 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let system = picker_toggle("SYSTEM");
     let timer = picker_toggle("TIMER");
     let mode = picker_button(initial_color_mode.label());
+    let lock = picker_button("LOCK");
     let history = picker_button("HISTORY");
     let new_note = picker_button("＋  NOTE");
     let quit = picker_button("QUIT");
     choices.pack_start(&system, false, false, 0);
     choices.pack_start(&timer, false, false, 0);
     choices.pack_start(&mode, false, false, 0);
+    choices.pack_start(&lock, false, false, 0);
     choices.pack_start(&new_note, false, false, 0);
     choices.pack_start(&history, false, false, 0);
     choices.pack_start(&quit, false, false, 0);
@@ -2220,14 +2212,15 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     content.pack_start(&history_revealer, false, false, 0);
 
     WidgetPicker {
-        drag,
         card,
+        drag,
         color_mode,
         plus,
         revealer,
         system,
         timer,
         mode,
+        lock,
         history,
         history_revealer,
         history_list,
@@ -2249,6 +2242,13 @@ fn picker_toggle(label: &str) -> gtk::ToggleButton {
     button.style_context().add_class("picker-choice");
     button.style_context().add_class("picker-toggle");
     button
+}
+
+fn take_panel_action() -> Option<String> {
+    let path = crate::state::cache_dir().join("panel-action");
+    let action = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(path);
+    Some(action.trim().to_owned())
 }
 
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -3552,7 +3552,8 @@ fn refresh_input_shape(
     let region = Region::create();
     for item in registry.borrow().iter() {
         let lock_timer = item.key == "timer";
-        if interactive || lock_timer || item.widget.style_context().has_class("alarm") {
+        let settings = item.key == "picker";
+        if interactive || settings || lock_timer || item.widget.style_context().has_class("alarm") {
             if !item.widget.is_visible() || !item.widget.is_mapped() {
                 continue;
             }
@@ -3623,13 +3624,21 @@ fn apply_widget_color_mode(
 }
 
 fn set_registered_color_mode(item: &RegisteredWidget, mode: ColorMode) {
-    item.color_mode.set(mode);
-    let context = item.widget.style_context();
+    set_event_box_color_mode(&item.widget, &item.color_mode, mode);
+}
+
+fn set_event_box_color_mode(
+    widget: &gtk::EventBox,
+    color_mode: &Rc<Cell<ColorMode>>,
+    mode: ColorMode,
+) {
+    color_mode.set(mode);
+    let context = widget.style_context();
     context.remove_class("mode-light");
     context.remove_class("mode-gray");
     context.remove_class("mode-dark");
     context.add_class(mode.css_class());
-    item.widget.queue_draw();
+    widget.queue_draw();
 }
 
 fn apply_timer_style(preview: &TimerStylePreview, style: TimerStyle) {

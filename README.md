@@ -20,13 +20,11 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 ## Controls
 
 - `Ctrl+Alt+O` — lock or unlock interaction.
-- `Ctrl+Alt+G` — show or hide the Settings button.
 - `Escape` — return to click-through lock mode.
 - `sysi --toggle` — toggle interaction from a terminal or a custom desktop shortcut.
-- `sysi --toggle-settings` — show or hide the Settings button.
 - `sysi --quit` — stop the running overlay.
 
-Sysi opens in Edit Mode. Drag a widget to move it or drag the small bottom-right arc to resize it. Notes show their title bar only in Edit Mode and use it as the move handle. A short click still activates buttons and note editing. The gear menu contains `SYSTEM`, `TIMER`, the current color mode, `NOTE`, `HISTORY`, and `QUIT`.
+Sysi opens in Edit Mode. Drag a widget to move it or drag the small bottom-right arc to resize it. Notes show their title bar only in Edit Mode and use it as the move handle. A short click still activates buttons and note editing. While Sysi is running, the gear in the GNOME panel expands to `SYSTEM`, `TIMER`, `LIGHT` / `GRAY` / `DARK`, `LOCK` / `UNLOCK`, `NOTE`, `HISTORY`, and `QUIT` directly in the panel.
 
 In either mode, hovering the timer overlays `START`, `PAUSE`, `RESUME`, or `DISMISS` over the time; click to perform that action. In Edit Mode, right-click the timer and choose `EDIT TIME` to enter `MM:SS`, `HH:MM:SS`, or a plain number of minutes. Four consecutive digits such as `1050` are automatically formatted and accepted as `10:50`.
 
@@ -44,10 +42,20 @@ The package is written to `dist/`.
 ## Install
 
 ```bash
-sudo apt install ./dist/sysi-overlay_0.1.17_amd64.deb
+sudo apt install ./dist/sysi-overlay_0.1.27_amd64.deb
 ```
 
 Sysi starts automatically on the next desktop login. It can also be launched immediately from the application menu.
+
+On Ubuntu GNOME, install the panel extension into your own extension directory, reload Shell, then enable it once:
+
+```bash
+/usr/bin/sysi --install-panel-extension
+# Press Alt+F2, type r, then press Enter (X11 only).
+gnome-extensions enable sysi-panel@thaihoc
+```
+
+Sysi refreshes this small per-user copy when it starts, so upgrades stay in sync. The panel gear is visible only while Sysi runs. It watches the PID file through a GNOME event monitor—there is no polling loop. Clicking it expands the controls directly in the GNOME panel. Its `LOCK` / `UNLOCK` button changes the desktop widgets between Edit and Lock mode; `Ctrl+Alt+O` still does the same without disabling the panel controls.
 
 ## Display support
 

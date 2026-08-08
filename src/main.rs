@@ -8,19 +8,39 @@ use gtk::prelude::*;
 use std::{
     cell::RefCell,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{self, Write},
     path::Path,
     process,
     rc::Rc,
 };
 
+const PANEL_EXTENSION_UUID: &str = "sysi-panel@thaihoc";
+const PANEL_EXTENSION_METADATA: &str =
+    include_str!("../packaging/gnome-shell-extension/metadata.json");
+const PANEL_EXTENSION_JS: &str = include_str!("../packaging/gnome-shell-extension/extension.js");
+
 fn main() {
+    if std::env::args().any(|arg| arg == "--install-panel-extension") {
+        if let Err(error) = install_panel_extension() {
+            eprintln!("Could not install the Sysi panel extension: {error}");
+            process::exit(1);
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == "--toggle") {
         signal_running(libc::SIGUSR1);
         return;
     }
-    if std::env::args().any(|arg| arg == "--toggle-settings") {
-        signal_running(libc::SIGUSR2);
+    if let Some(action) = option_value("--panel-action") {
+        if let Err(error) = write_panel_action(&action) {
+            eprintln!("Could not send the Sysi panel action: {error}");
+            process::exit(1);
+        }
+        signal_running(libc::SIGWINCH);
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--toggle-picker") {
+        signal_running(libc::SIGWINCH);
         return;
     }
     if std::env::args().any(|arg| arg == "--quit") {
@@ -32,6 +52,9 @@ fn main() {
         signal_running(libc::SIGUSR1);
         return;
     };
+    if let Err(error) = install_panel_extension() {
+        eprintln!("Could not refresh the Sysi panel extension: {error}");
+    }
     write_pid();
 
     let application = gtk::Application::new(
@@ -48,6 +71,47 @@ fn main() {
         let _ = fs::remove_file(state::cache_dir().join("pid"));
     });
     application.run();
+}
+
+fn install_panel_extension() -> io::Result<()> {
+    let data_dir = std::env::var_os("XDG_DATA_HOME")
+        .map(Into::into)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let extension_dir = data_dir
+        .join("gnome-shell/extensions")
+        .join(PANEL_EXTENSION_UUID);
+    fs::create_dir_all(&extension_dir)?;
+    write_if_changed(
+        &extension_dir.join("metadata.json"),
+        PANEL_EXTENSION_METADATA,
+    )?;
+    write_if_changed(&extension_dir.join("extension.js"), PANEL_EXTENSION_JS)
+}
+
+fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
+    if fs::read_to_string(path).ok().as_deref() == Some(contents) {
+        return Ok(());
+    }
+    fs::write(path, contents)
+}
+
+fn option_value(option: &str) -> Option<String> {
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        if arg == option {
+            return args.next().filter(|value| !value.is_empty());
+        }
+    }
+    None
+}
+
+fn write_panel_action(action: &str) -> io::Result<()> {
+    let dir = state::cache_dir();
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("panel-action"), action)
 }
 
 fn acquire_instance_lock() -> Option<File> {

@@ -5,7 +5,6 @@ use x11::xlib;
 #[derive(Clone, Copy, Debug)]
 pub enum HotkeyAction {
     ToggleInteraction,
-    ToggleSettings,
 }
 
 pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
@@ -21,7 +20,6 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
             }
             let root = xlib::XDefaultRootWindow(display);
             let toggle_keycode = xlib::XKeysymToKeycode(display, b'o' as u64);
-            let settings_keycode = xlib::XKeysymToKeycode(display, b'g' as u64);
             let base = xlib::ControlMask | xlib::Mod1Mask;
             for extra in [
                 0,
@@ -29,31 +27,26 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
                 xlib::Mod2Mask,
                 xlib::LockMask | xlib::Mod2Mask,
             ] {
-                for keycode in [toggle_keycode, settings_keycode] {
-                    xlib::XGrabKey(
-                        display,
-                        keycode as i32,
-                        base | extra,
-                        root,
-                        xlib::True,
-                        xlib::GrabModeAsync,
-                        xlib::GrabModeAsync,
-                    );
-                }
+                xlib::XGrabKey(
+                    display,
+                    toggle_keycode as i32,
+                    base | extra,
+                    root,
+                    xlib::True,
+                    xlib::GrabModeAsync,
+                    xlib::GrabModeAsync,
+                );
             }
             xlib::XSync(display, xlib::False);
             loop {
                 let mut event: xlib::XEvent = mem::zeroed();
                 xlib::XNextEvent(display, &mut event);
-                if event.get_type() == xlib::KeyPress {
-                    let action = if event.key.keycode == settings_keycode as u32 {
-                        HotkeyAction::ToggleSettings
-                    } else {
-                        HotkeyAction::ToggleInteraction
-                    };
-                    if sender.send_blocking(action).is_err() {
-                        break;
-                    }
+                if event.get_type() == xlib::KeyPress
+                    && sender
+                        .send_blocking(HotkeyAction::ToggleInteraction)
+                        .is_err()
+                {
+                    break;
                 }
             }
             xlib::XCloseDisplay(display);

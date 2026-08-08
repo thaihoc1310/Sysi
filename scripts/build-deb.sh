@@ -16,6 +16,10 @@ install -Dm644 "$project_dir/packaging/io.sysi.Overlay-autostart.desktop" \
   "$package_root/etc/xdg/autostart/io.sysi.Overlay.desktop"
 install -Dm644 "$project_dir/assets/sysi-icon.svg" \
   "$package_root/usr/share/icons/hicolor/scalable/apps/io.sysi.Overlay.svg"
+install -Dm644 "$project_dir/packaging/gnome-shell-extension/metadata.json" \
+  "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/metadata.json"
+install -Dm644 "$project_dir/packaging/gnome-shell-extension/extension.js" \
+  "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/extension.js"
 install -Dm644 "$project_dir/README.md" \
   "$package_root/usr/share/doc/sysi-overlay/README.md"
 install -Dm644 "$project_dir/LICENSE" \
@@ -30,6 +34,7 @@ Section: utils
 Priority: optional
 Architecture: $architecture
 Depends: libgtk-3-0t64 (>= 3.24) | libgtk-3-0 (>= 3.24), libx11-6
+Recommends: gnome-shell (>= 45)
 Installed-Size: $installed_kib
 Maintainer: Sysi contributors
 Description: Lightweight transparent desktop widgets for Ubuntu
