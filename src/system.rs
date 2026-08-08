@@ -178,9 +178,45 @@ fn read_process_stat(pid: u32) -> Option<(String, u64)> {
 }
 
 fn read_process_memory(pid: u32) -> Option<u64> {
-    let raw = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    raw.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        (fields.next()? == "VmRSS:").then(|| fields.next()?.parse().ok())?
-    })
+    // Match GNOME System Monitor's process-memory column: libgtop exposes
+    // `resident - shared`, both from /proc/<pid>/statm. Raw VmRSS charges all
+    // shared Chromium/Electron pages to every child process and looks far too
+    // high in a per-process list.
+    let raw = fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    parse_process_memory_statm(&raw, page_size_kib())
+}
+
+fn page_size_kib() -> u64 {
+    let bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(bytes).unwrap_or(4096).max(1) / 1024
+}
+
+fn parse_process_memory_statm(raw: &str, page_kib: u64) -> Option<u64> {
+    let mut fields = raw.split_whitespace();
+    let _virtual_pages = fields.next()?;
+    let resident_pages = fields.next()?.parse::<u64>().ok()?;
+    let shared_pages = fields.next()?.parse::<u64>().ok()?;
+    Some(
+        resident_pages
+            .saturating_sub(shared_pages)
+            .saturating_mul(page_kib.max(1)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_process_memory_statm;
+
+    #[test]
+    fn process_memory_matches_system_monitor_resident_minus_shared() {
+        assert_eq!(
+            parse_process_memory_statm("1000 200 50 0 0 0 0", 4),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn process_memory_never_underflows_when_kernel_reports_more_shared_pages() {
+        assert_eq!(parse_process_memory_statm("1000 20 50", 4), Some(0));
+    }
 }

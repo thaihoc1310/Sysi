@@ -125,11 +125,7 @@ separator {
   box-shadow: none;
 }
 
-.alarm .timer-value {
-  color: currentColor;
-  font-size: 14px;
-  font-weight: 800;
-}
+.timer-alarm-value { font-weight: 800; }
 
 .resize-handle {
   background-color: transparent;

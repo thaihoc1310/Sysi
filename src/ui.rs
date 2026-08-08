@@ -1289,6 +1289,7 @@ fn build_timer_card(
                 let _ = state.borrow().save();
             }
             card.style_context().remove_class("alarm");
+            label.style_context().remove_class("timer-alarm-value");
             interaction.set_above_child(true);
             stack.set_visible_child_name("time");
             if hovered.get() {
@@ -1456,6 +1457,7 @@ fn build_timer_card(
                 timer.remaining = Duration::from_secs(timer.duration_seconds as u64);
                 alarm.set(false);
                 card.style_context().remove_class("alarm");
+                label.style_context().remove_class("timer-alarm-value");
             } else if let Some(target) = timer.target.take() {
                 timer.remaining = target.saturating_duration_since(Instant::now());
             } else {
@@ -1782,6 +1784,7 @@ fn start_timer_updates(
                         timer.alarm = true;
                         alarm.set(true);
                         label.set_text("TIME'S UP!");
+                        label.style_context().add_class("timer-alarm-value");
                         card.style_context().add_class("alarm");
                     }
                 }
@@ -2195,9 +2198,9 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let system = picker_toggle("SYSTEM");
     let timer = picker_toggle("TIMER");
     let mode = picker_button(initial_color_mode.label());
-    let history = picker_button("▤  HISTORY");
+    let history = picker_button("HISTORY");
     let new_note = picker_button("＋  NOTE");
-    let quit = picker_button("×  QUIT");
+    let quit = picker_button("QUIT");
     choices.pack_start(&system, false, false, 0);
     choices.pack_start(&timer, false, false, 0);
     choices.pack_start(&mode, false, false, 0);
@@ -3665,8 +3668,12 @@ fn apply_timer_typography(provider: &gtk::CssProvider, style: TimerStyle, size: 
     let value = (value_base * scale).round().max(10.0);
     let action = (action_base * scale).round().max(7.0);
     let editor = (editor_base * scale).round().max(10.0);
+    // The alarm message has many more glyphs than a time value, but must
+    // still track resizing. The action scale keeps it inside every style's
+    // default footprint and grows proportionally with the widget.
+    let alarm = action;
     let css = format!(
-        ".timer-value {{ font-size: {value}px; }}\n.timer-action {{ font-size: {action}px; }}\n.timer-editor {{ font-size: {editor}px; }}"
+        ".timer-value {{ font-size: {value}px; }}\n.timer-alarm-value {{ font-size: {alarm}px; }}\n.timer-action {{ font-size: {action}px; }}\n.timer-editor {{ font-size: {editor}px; }}"
     );
     let _ = provider.load_from_data(css.as_bytes());
 }
