@@ -20,15 +20,25 @@
   box-shadow: none;
 }
 
-.adaptive-light .card {
+.mode-light .card,
+.mode-light.picker-widget {
   background-color: transparent;
-  color: #111111;
-  text-shadow: 0 1px 3px rgba(255, 255, 255, 0.96);
-}
-
-.adaptive-dark .card {
   color: #f6f6f6;
   text-shadow: 0 2px 4px rgba(0, 0, 0, 0.9);
+}
+
+.mode-gray .card,
+.mode-gray.picker-widget {
+  background-color: transparent;
+  color: #aaaaaa;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.72);
+}
+
+.mode-dark .card,
+.mode-dark.picker-widget {
+  background-color: transparent;
+  color: #111111;
+  text-shadow: none;
 }
 
 .card-title {
@@ -175,11 +185,6 @@ textview, textview text {
   text-shadow: 0 2px 4px rgba(0, 0, 0, 0.92);
 }
 
-.adaptive-light.picker-widget {
-  color: #111111;
-  text-shadow: 0 1px 3px rgba(255, 255, 255, 0.98);
-}
-
 .empty-slot {
   background-color: transparent;
   border: none;
@@ -236,6 +241,18 @@ textview, textview text {
   padding: 1px 4px;
 }
 
+.mode-light .note-header {
+  background-color: rgba(238, 238, 238, 0.76);
+}
+
+.mode-gray .note-header {
+  background-color: rgba(158, 158, 158, 0.76);
+}
+
+.mode-dark .note-header {
+  background-color: rgba(24, 24, 24, 0.82);
+}
+
 .note-window-button {
   background-color: transparent;
   border: none;
@@ -256,6 +273,14 @@ textview, textview text {
 
 .note-hide {
   color: #666666;
+}
+
+.mode-dark .note-window-button {
+  color: #f2f2f2;
+}
+
+.mode-dark .note-hide {
+  color: #b8b8b8;
 }
 
 .pinned-note scrolledwindow,

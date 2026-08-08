@@ -1,6 +1,6 @@
 [package]
 name = "sysi-overlay"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 description = "A tiny transparent desktop overlay for Ubuntu"
 license = "MIT"
@@ -10,6 +10,7 @@ name = "sysi"
 path = "src/main.rs"
 
 [dependencies]
+async-channel = "2.5"
 cairo-rs = "0.18"
 fs2 = "0.4"
 gdk = "0.18"

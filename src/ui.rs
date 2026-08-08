@@ -1,6 +1,6 @@
 use crate::{
     platform,
-    state::{AppState, Note, Point, Size},
+    state::{AppState, ColorMode, Note, Point, Size},
     system::SystemReader,
 };
 use cairo::{Context, FontSlant, FontWeight, RectangleInt, Region};
@@ -25,7 +25,7 @@ type SystemValues = Rc<Cell<(f64, f64, f64, f64, f64)>>;
 type BuiltSystemCard = (
     gtk::EventBox,
     gtk::EventBox,
-    Rc<Cell<bool>>,
+    Rc<Cell<ColorMode>>,
     gtk::DrawingArea,
     SystemValues,
     ResizeHandle,
@@ -34,7 +34,7 @@ type BuiltSystemCard = (
 #[derive(Clone)]
 struct ResizeHandle {
     hitbox: gtk::EventBox,
-    light_ink: Rc<Cell<bool>>,
+    color_mode: Rc<Cell<ColorMode>>,
 }
 
 #[derive(Clone, Copy)]
@@ -50,7 +50,8 @@ struct ResizeBounds {
 struct RegisteredWidget {
     key: String,
     widget: gtk::EventBox,
-    light_ink: Rc<Cell<bool>>,
+    color_mode: Rc<Cell<ColorMode>>,
+    edit_only: Option<gtk::EventBox>,
 }
 
 struct TimerRuntime {
@@ -186,8 +187,16 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     let registry: Rc<RefCell<Vec<RegisteredWidget>>> = Rc::new(RefCell::new(Vec::new()));
     let interactive = Rc::new(Cell::new(false));
+    let (system_color_mode, timer_color_mode, picker_color_mode) = {
+        let data = state.borrow();
+        (
+            saved_color_mode(&data, "system"),
+            saved_color_mode(&data, "timer"),
+            saved_color_mode(&data, "picker"),
+        )
+    };
 
-    let system_card = build_system_card();
+    let system_card = build_system_card(system_color_mode);
     apply_widget_size(
         &system_card.0,
         "system",
@@ -208,6 +217,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             .unwrap_or(Point { x: 34, y: 52 }),
     );
     register(&registry, "system", &system_card.0, system_card.2.clone());
+    attach_color_mode_menu(
+        &system_card.0,
+        "system".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+    );
     attach_drag(
         &system_card.1,
         &system_card.0,
@@ -236,7 +252,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         },
     );
 
-    let timer_card = build_timer_card(state.clone(), interactive.clone());
+    let timer_card = build_timer_card(state.clone(), interactive.clone(), timer_color_mode);
     let timer_default = Point {
         x: (primary_screen.x + primary_screen.width - TIMER_SIZE - 34).max(primary_screen.x + 8),
         y: primary_screen.y + 34,
@@ -261,7 +277,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         &registry,
         "timer",
         &timer_card.card,
-        timer_card.light_ink.clone(),
+        timer_card.color_mode.clone(),
+    );
+    attach_color_mode_menu(
+        &timer_card.card,
+        "timer".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
     );
     attach_drag(
         &timer_card.drag,
@@ -291,7 +314,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         },
     );
 
-    let widget_picker = build_widget_picker();
+    let widget_picker = build_widget_picker(picker_color_mode);
     let picker_position = state
         .borrow()
         .positions
@@ -306,7 +329,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         &registry,
         "picker",
         &widget_picker.card,
-        widget_picker.light_ink.clone(),
+        widget_picker.color_mode.clone(),
+    );
+    attach_color_mode_menu(
+        &widget_picker.card,
+        "picker".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
     );
     attach_drag(
         &widget_picker.drag,
@@ -343,30 +373,18 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     *note_refresh.borrow_mut() = Some(refresh_closure.clone());
     refresh_closure();
 
-    let alarm_flag = timer_card.alarm.clone();
-    let pet_widget = build_mascot(
-        &root,
-        primary_screen.x,
-        primary_screen.y,
-        primary_screen.width,
-        primary_screen.height,
-        state.clone(),
-        registry.clone(),
-        alarm_flag.clone(),
-    );
-
-    let (system_enabled, timer_enabled, pet_enabled, settings_enabled) = {
+    let (system_enabled, timer_enabled, settings_enabled, color_mode) = {
         let settings = &state.borrow().settings;
         (
             settings.system,
             settings.timer,
-            settings.mascot,
             settings.settings_button,
+            settings.color_mode,
         )
     };
     widget_picker.system.set_active(system_enabled);
     widget_picker.timer.set_active(timer_enabled);
-    widget_picker.pet.set_active(pet_enabled);
+    widget_picker.mode.set_label(color_mode.label());
 
     widget_picker.system.connect_toggled({
         let target = system_card.0.clone();
@@ -404,18 +422,19 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             refresh_input_shape(&window, &registry, interactive.get());
         }
     });
-    widget_picker.pet.connect_toggled({
-        let target = pet_widget.clone();
+    widget_picker.mode.connect_clicked({
         let state = state.clone();
-        let window = window.clone();
         let registry = registry.clone();
-        let interactive = interactive.clone();
         move |button| {
-            let enabled = button.is_active();
-            target.set_visible(enabled);
-            state.borrow_mut().settings.mascot = enabled;
+            let next = state.borrow().settings.color_mode.next();
+            {
+                let mut data = state.borrow_mut();
+                data.settings.color_mode = next;
+                data.widget_color_modes.clear();
+            }
             let _ = state.borrow().save();
-            refresh_input_shape(&window, &registry, interactive.get());
+            button.set_label(next.label());
+            apply_color_mode(&registry, next);
         }
     });
 
@@ -501,6 +520,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 history_revealer.set_reveal_child(false);
                 window.style_context().remove_class("editing");
             }
+            set_edit_chrome_visibility(&registry, enabled);
             for item in registry.borrow().iter() {
                 item.widget.queue_draw();
             }
@@ -566,6 +586,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     });
 
     window.show_all();
+    set_edit_chrome_visibility(&registry, false);
     widget_picker.revealer.set_reveal_child(false);
     widget_picker.history_revealer.set_reveal_child(false);
     if !system_enabled {
@@ -573,9 +594,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     }
     if !timer_enabled {
         timer_card.card.hide();
-    }
-    if !pet_enabled {
-        pet_widget.hide();
     }
     if !settings_enabled {
         widget_picker.card.hide();
@@ -591,24 +609,22 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let screens = screens.clone();
         move || {
             clamp_registered_widgets(&root, &registry, &screens, &state);
-            update_contrast(&registry);
             refresh_input_shape(&window, &registry, false);
         }
     });
 
-    let (hotkey_tx, hotkey_rx) = std::sync::mpsc::channel();
+    let (hotkey_tx, hotkey_rx) = async_channel::unbounded();
     platform::spawn_global_hotkey(hotkey_tx);
-    glib::timeout_add_local(Duration::from_millis(80), {
+    glib::MainContext::default().spawn_local({
         let toggle_action = toggle_action.clone();
         let toggle_settings_action = toggle_settings_action.clone();
-        move || {
-            while let Ok(action) = hotkey_rx.try_recv() {
+        async move {
+            while let Ok(action) = hotkey_rx.recv().await {
                 match action {
                     platform::HotkeyAction::ToggleInteraction => toggle_action(),
                     platform::HotkeyAction::ToggleSettings => toggle_settings_action(),
                 }
             }
-            glib::ControlFlow::Continue
         }
     });
 
@@ -627,19 +643,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }
     });
 
-    glib::timeout_add_local(Duration::from_secs(3), {
-        let registry = registry.clone();
-        move || {
-            update_contrast(&registry);
-            glib::ControlFlow::Continue
-        }
-    });
     start_system_updates(system_card.3, system_card.4);
     start_timer_updates(timer_card, state, window, registry, interactive);
 }
 
-fn build_system_card() -> BuiltSystemCard {
-    let (card, body, _, light, resize) = card_shell("", "");
+fn build_system_card(initial_color_mode: ColorMode) -> BuiltSystemCard {
+    let (card, body, _, color_mode, resize) = card_shell("", "", initial_color_mode);
     let values = Rc::new(Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)));
     let drag = gtk::EventBox::new();
     drag.set_visible_window(false);
@@ -654,13 +663,13 @@ fn build_system_card() -> BuiltSystemCard {
     body.pack_start(&drag, true, true, 0);
     canvas.connect_draw({
         let values = values.clone();
-        let light = light.clone();
+        let color_mode = color_mode.clone();
         move |area, ctx| {
-            draw_system(area, ctx, values.get(), light.get());
+            draw_system(area, ctx, values.get(), color_mode.get());
             glib::Propagation::Proceed
         }
     });
-    (card, drag, light, canvas, values, resize)
+    (card, drag, color_mode, canvas, values, resize)
 }
 
 fn start_system_updates(canvas: gtk::DrawingArea, values: SystemValues) {
@@ -692,7 +701,7 @@ fn draw_system(
     area: &gtk::DrawingArea,
     ctx: &Context,
     values: (f64, f64, f64, f64, f64),
-    light_ink: bool,
+    color_mode: ColorMode,
 ) {
     let (cpu, memory, _used, _total, _load) = values;
     let allocation = area.allocation();
@@ -707,20 +716,10 @@ fn draw_system(
         (f64::from(allocation.height()) - content_height) / 2.0,
     );
     ctx.scale(scale, scale);
-    let ink = if light_ink {
-        (0.08, 0.08, 0.08)
-    } else {
-        (0.96, 0.96, 0.96)
-    };
-    let muted = if light_ink {
-        (0.24, 0.24, 0.24)
-    } else {
-        (0.66, 0.66, 0.66)
-    };
-    let accent = if light_ink {
-        (0.14, 0.14, 0.14)
-    } else {
-        (0.88, 0.88, 0.88)
+    let (ink, muted, accent) = match color_mode {
+        ColorMode::Light => ((0.97, 0.97, 0.97), (0.72, 0.72, 0.72), (0.9, 0.9, 0.9)),
+        ColorMode::Gray => ((0.7, 0.7, 0.7), (0.5, 0.5, 0.5), (0.64, 0.64, 0.64)),
+        ColorMode::Dark => ((0.08, 0.08, 0.08), (0.24, 0.24, 0.24), (0.14, 0.14, 0.14)),
     };
     for (x, value, title) in [(52.0, cpu, "CPU"), (164.0, memory, "RAM")] {
         ctx.set_line_width(7.0);
@@ -756,7 +755,7 @@ fn draw_system(
 struct TimerCard {
     card: gtk::EventBox,
     drag: gtk::EventBox,
-    light_ink: Rc<Cell<bool>>,
+    color_mode: Rc<Cell<ColorMode>>,
     canvas: gtk::DrawingArea,
     stack: gtk::Stack,
     label: gtk::Label,
@@ -766,10 +765,15 @@ struct TimerCard {
     hovered: Rc<Cell<bool>>,
     commit_edit: Rc<dyn Fn()>,
     resize: ResizeHandle,
+    wake_updates: CallbackSlot,
 }
 
-fn build_timer_card(state: Rc<RefCell<AppState>>, interactive: Rc<Cell<bool>>) -> TimerCard {
-    let (card, body, drag, light_ink, resize) = card_shell("", "");
+fn build_timer_card(
+    state: Rc<RefCell<AppState>>,
+    interactive: Rc<Cell<bool>>,
+    initial_color_mode: ColorMode,
+) -> TimerCard {
+    let (card, body, drag, color_mode, resize) = card_shell("", "", initial_color_mode);
     card.style_context().add_class("timer-card");
     card.connect_size_allocate(|widget, allocation| {
         let context = widget.style_context();
@@ -793,6 +797,7 @@ fn build_timer_card(state: Rc<RefCell<AppState>>, interactive: Rc<Cell<bool>>) -
     }));
     let alarm = Rc::new(Cell::new(false));
     let hovered = Rc::new(Cell::new(false));
+    let wake_updates: CallbackSlot = Rc::new(RefCell::new(None));
 
     let overlay = gtk::Overlay::new();
     overlay.set_halign(gtk::Align::Fill);
@@ -841,9 +846,9 @@ fn build_timer_card(state: Rc<RefCell<AppState>>, interactive: Rc<Cell<bool>>) -
 
     canvas.connect_draw({
         let runtime = runtime.clone();
-        let light_ink = light_ink.clone();
+        let color_mode = color_mode.clone();
         move |area, ctx| {
-            draw_timer_ring(area, ctx, &runtime.borrow(), light_ink.get());
+            draw_timer_ring(area, ctx, &runtime.borrow(), color_mode.get());
             glib::Propagation::Proceed
         }
     });
@@ -1016,6 +1021,7 @@ fn build_timer_card(state: Rc<RefCell<AppState>>, interactive: Rc<Cell<bool>>) -
         let action = action.clone();
         let canvas = canvas.clone();
         let card = card.clone();
+        let wake_updates = wake_updates.clone();
         move |_, event| {
             if interactive.get() || event.button() != 1 {
                 return glib::Propagation::Proceed;
@@ -1039,7 +1045,11 @@ fn build_timer_card(state: Rc<RefCell<AppState>>, interactive: Rc<Cell<bool>>) -
             }
             label.set_text(&format_duration_ceil(timer.remaining));
             action.set_text(timer_action_text(&timer));
+            drop(timer);
             canvas.queue_draw();
+            if let Some(wake) = wake_updates.borrow().as_ref() {
+                wake();
+            }
             glib::Propagation::Stop
         }
     });
@@ -1047,7 +1057,7 @@ fn build_timer_card(state: Rc<RefCell<AppState>>, interactive: Rc<Cell<bool>>) -
     TimerCard {
         card,
         drag,
-        light_ink,
+        color_mode,
         canvas,
         stack,
         label,
@@ -1057,6 +1067,7 @@ fn build_timer_card(state: Rc<RefCell<AppState>>, interactive: Rc<Cell<bool>>) -
         hovered,
         commit_edit,
         resize,
+        wake_updates,
     }
 }
 
@@ -1101,12 +1112,21 @@ fn parse_timer_input(value: &str) -> Option<i64> {
     (seconds > 0).then_some(seconds)
 }
 
-fn draw_timer_ring(area: &gtk::DrawingArea, ctx: &Context, timer: &TimerRuntime, light_ink: bool) {
+fn draw_timer_ring(
+    area: &gtk::DrawingArea,
+    ctx: &Context,
+    timer: &TimerRuntime,
+    color_mode: ColorMode,
+) {
     let allocation = area.allocation();
     let cx = f64::from(allocation.width()) / 2.0;
     let cy = f64::from(allocation.height()) / 2.0;
     let radius = cx.min(cy) - 13.0;
-    let gray = if light_ink { 0.12 } else { 0.91 };
+    let gray = match color_mode {
+        ColorMode::Light => 0.91,
+        ColorMode::Gray => 0.6,
+        ColorMode::Dark => 0.12,
+    };
     let ratio =
         (timer.remaining.as_secs_f64() / timer.duration_seconds.max(1) as f64).clamp(0.0, 1.0);
     let start = -PI / 2.0;
@@ -1139,40 +1159,83 @@ fn start_timer_updates(
     registry: Rc<RefCell<Vec<RegisteredWidget>>>,
     interactive: Rc<Cell<bool>>,
 ) {
+    let source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let alarm_was_active = Rc::new(Cell::new(false));
-    glib::timeout_add_local(Duration::from_millis(80), move || {
-        let mut timer = timer_ui.runtime.borrow_mut();
-        timer.phase += 0.16;
-        if let Some(target) = timer.target {
-            timer.remaining = target.saturating_duration_since(Instant::now());
-            timer_ui
-                .label
-                .set_text(&format_duration_ceil(timer.remaining));
-            if timer.remaining.is_zero() {
-                timer.target = None;
-                timer.alarm = true;
-                timer_ui.alarm.set(true);
-                timer_ui.label.set_text("TIME'S UP!");
-                timer_ui.card.style_context().add_class("alarm");
+    let wake_updates: Rc<dyn Fn()> = Rc::new({
+        let source = source.clone();
+        let runtime = timer_ui.runtime.clone();
+        let label = timer_ui.label.clone();
+        let action = timer_ui.action.clone();
+        let stack = timer_ui.stack.clone();
+        let canvas = timer_ui.canvas.clone();
+        let card = timer_ui.card.clone();
+        let alarm = timer_ui.alarm.clone();
+        let hovered = timer_ui.hovered.clone();
+        let alarm_was_active = alarm_was_active.clone();
+        move || {
+            if source.borrow().is_some() {
+                return;
             }
-        }
-        if timer.target.is_some() || timer.alarm {
-            timer_ui.canvas.queue_draw();
-        }
-        if timer_ui.hovered.get() && !interactive.get() {
-            timer_ui.action.set_text(timer_action_text(&timer));
-            timer_ui.stack.set_visible_child_name("action");
-        }
-        if alarm_was_active.replace(timer.alarm) != timer.alarm {
+            let active = {
+                let timer = runtime.borrow();
+                timer.target.is_some() || timer.alarm
+            };
+            if !active {
+                return;
+            }
+
+            let source_for_tick = source.clone();
+            let runtime = runtime.clone();
+            let label = label.clone();
+            let action = action.clone();
+            let stack = stack.clone();
+            let canvas = canvas.clone();
+            let card = card.clone();
+            let alarm = alarm.clone();
+            let hovered = hovered.clone();
+            let alarm_was_active = alarm_was_active.clone();
             let window = window.clone();
             let registry = registry.clone();
-            let enabled = interactive.get();
-            glib::idle_add_local_once(move || {
-                refresh_input_shape(&window, &registry, enabled);
+            let interactive = interactive.clone();
+            let id = glib::timeout_add_local(Duration::from_millis(100), move || {
+                let mut timer = runtime.borrow_mut();
+                timer.phase += 0.2;
+                if let Some(target) = timer.target {
+                    timer.remaining = target.saturating_duration_since(Instant::now());
+                    label.set_text(&format_duration_ceil(timer.remaining));
+                    if timer.remaining.is_zero() {
+                        timer.target = None;
+                        timer.alarm = true;
+                        alarm.set(true);
+                        label.set_text("TIME'S UP!");
+                        card.style_context().add_class("alarm");
+                    }
+                }
+                let keep_running = timer.target.is_some() || timer.alarm;
+                if keep_running {
+                    canvas.queue_draw();
+                }
+                if hovered.get() && !interactive.get() {
+                    action.set_text(timer_action_text(&timer));
+                    stack.set_visible_child_name("action");
+                }
+                let alarm_active = timer.alarm;
+                drop(timer);
+
+                if alarm_was_active.replace(alarm_active) != alarm_active {
+                    refresh_input_shape(&window, &registry, interactive.get());
+                }
+                if keep_running {
+                    glib::ControlFlow::Continue
+                } else {
+                    source_for_tick.borrow_mut().take();
+                    glib::ControlFlow::Break
+                }
             });
+            *source.borrow_mut() = Some(id);
         }
-        glib::ControlFlow::Continue
     });
+    *timer_ui.wake_updates.borrow_mut() = Some(wake_updates);
 }
 
 fn rebuild_note_list(
@@ -1333,7 +1396,9 @@ fn rebuild_pinned_notes(
         .cloned()
         .collect();
     for note in pinned {
-        let (card, body, _drag, light, resize) = card_shell("", "");
+        let key = format!("note:{}", note.id);
+        let initial_color_mode = saved_color_mode(&state.borrow(), &key);
+        let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
         card.style_context().add_class("pinned-note");
 
         let header_drag = gtk::EventBox::new();
@@ -1373,7 +1438,6 @@ fn rebuild_pinned_notes(
         scroller.add(&editor);
         body.pack_start(&scroller, true, true, 0);
 
-        let key = format!("note:{}", note.id);
         apply_widget_size(
             &card,
             &key,
@@ -1384,7 +1448,21 @@ fn rebuild_pinned_notes(
             },
         );
         root.put(&card, note.position.x, note.position.y);
-        register(&registry, &key, &card, light);
+        register(&registry, &key, &card, color_mode);
+        if let Some(item) = registry
+            .borrow_mut()
+            .iter_mut()
+            .find(|item| item.key == key)
+        {
+            item.edit_only = Some(header_drag.clone());
+        }
+        attach_color_mode_menu(
+            &card,
+            key.clone(),
+            state.clone(),
+            registry.clone(),
+            interactive.clone(),
+        );
         attach_drag(
             &header_drag,
             &card,
@@ -1413,8 +1491,10 @@ fn rebuild_pinned_notes(
             },
         );
 
+        let pending_save: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         editor.buffer().expect("note buffer").connect_changed({
             let state = state.clone();
+            let pending_save = pending_save.clone();
             let id = note.id;
             move |buffer| {
                 let text = buffer
@@ -1424,7 +1504,16 @@ fn rebuild_pinned_notes(
                 if let Some(note) = state.borrow_mut().notes.iter_mut().find(|n| n.id == id) {
                     note.text = text;
                 }
-                let _ = state.borrow().save();
+                if let Some(source) = pending_save.borrow_mut().take() {
+                    source.remove();
+                }
+                let state = state.clone();
+                let pending_save_for_timeout = pending_save.clone();
+                let source = glib::timeout_add_local_once(Duration::from_millis(450), move || {
+                    let _ = state.borrow().save();
+                    pending_save_for_timeout.borrow_mut().take();
+                });
+                *pending_save.borrow_mut() = Some(source);
             }
         });
         unpin.connect_clicked({
@@ -1449,6 +1538,7 @@ fn rebuild_pinned_notes(
                 let mut data = state.borrow_mut();
                 data.notes.retain(|note| note.id != id);
                 data.sizes.remove(&format!("note:{id}"));
+                data.widget_color_modes.remove(&format!("note:{id}"));
                 drop(data);
                 let _ = state.borrow().save();
                 if let Some(callback) = refresh.borrow().as_ref() {
@@ -1457,18 +1547,19 @@ fn rebuild_pinned_notes(
             }
         });
         card.show_all();
+        header_drag.set_visible(interactive.get());
     }
 }
 
 struct WidgetPicker {
     card: gtk::EventBox,
     drag: gtk::EventBox,
-    light_ink: Rc<Cell<bool>>,
+    color_mode: Rc<Cell<ColorMode>>,
     plus: gtk::Button,
     revealer: gtk::Revealer,
     system: gtk::ToggleButton,
-    pet: gtk::ToggleButton,
     timer: gtk::ToggleButton,
+    mode: gtk::Button,
     history: gtk::Button,
     history_revealer: gtk::Revealer,
     history_list: gtk::Box,
@@ -1476,11 +1567,11 @@ struct WidgetPicker {
     quit: gtk::Button,
 }
 
-fn build_widget_picker() -> WidgetPicker {
+fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let card = gtk::EventBox::new();
     card.set_visible_window(false);
     card.style_context().add_class("picker-widget");
-    let light_ink = Rc::new(Cell::new(false));
+    let color_mode = Rc::new(Cell::new(initial_color_mode));
     let content = gtk::Box::new(gtk::Orientation::Vertical, 5);
     card.add(&content);
 
@@ -1505,14 +1596,14 @@ fn build_widget_picker() -> WidgetPicker {
     let choices = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     choices.style_context().add_class("widget-choices");
     let system = picker_toggle("CPU / RAM");
-    let pet = picker_toggle("PET");
     let timer = picker_toggle("TIMER");
+    let mode = picker_button(initial_color_mode.label());
     let history = picker_button("▤  HISTORY");
     let new_note = picker_button("＋  NOTE");
     let quit = picker_button("×  QUIT");
     choices.pack_start(&system, false, false, 0);
-    choices.pack_start(&pet, false, false, 0);
     choices.pack_start(&timer, false, false, 0);
+    choices.pack_start(&mode, false, false, 0);
     choices.pack_start(&new_note, false, false, 0);
     choices.pack_start(&history, false, false, 0);
     choices.pack_start(&quit, false, false, 0);
@@ -1531,12 +1622,12 @@ fn build_widget_picker() -> WidgetPicker {
     WidgetPicker {
         drag,
         card,
-        light_ink,
+        color_mode,
         plus,
         revealer,
         system,
-        pet,
         timer,
+        mode,
         history,
         history_revealer,
         history_list,
@@ -1560,7 +1651,7 @@ fn picker_toggle(label: &str) -> gtk::ToggleButton {
     button
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn build_mascot(
     root: &gtk::Fixed,
     walk_x: i32,
@@ -1583,7 +1674,12 @@ fn build_mascot(
     pet_widget.add(&area);
     let floor_y = (walk_y + walk_height - 126).max(walk_y);
     root.put(&pet_widget, walk_x + 70, floor_y);
-    register(&registry, "mascot", &pet_widget, Rc::new(Cell::new(false)));
+    register(
+        &registry,
+        "mascot",
+        &pet_widget,
+        Rc::new(Cell::new(ColorMode::Gray)),
+    );
     let runtime = Rc::new(RefCell::new(MascotRuntime {
         x: (walk_x + 150) as f64,
         target: (walk_x + 150) as f64,
@@ -2035,16 +2131,17 @@ fn draw_heart(ctx: &Context, x: f64, y: f64, alpha: f64) {
 fn card_shell(
     title: &str,
     kicker: &str,
+    initial_color_mode: ColorMode,
 ) -> (
     gtk::EventBox,
     gtk::Box,
     gtk::EventBox,
-    Rc<Cell<bool>>,
+    Rc<Cell<ColorMode>>,
     ResizeHandle,
 ) {
     let event = gtk::EventBox::new();
     event.set_visible_window(false);
-    let light = Rc::new(Cell::new(false));
+    let color_mode = Rc::new(Cell::new(initial_color_mode));
     let shell = gtk::Overlay::new();
     shell.set_hexpand(true);
     shell.set_vexpand(true);
@@ -2100,10 +2197,10 @@ fn card_shell(
         event,
         body,
         drag,
-        light.clone(),
+        color_mode.clone(),
         ResizeHandle {
             hitbox: resize_hitbox,
-            light_ink: light,
+            color_mode,
         },
     )
 }
@@ -2112,13 +2209,78 @@ fn register(
     registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
     key: &str,
     widget: &gtk::EventBox,
-    light_ink: Rc<Cell<bool>>,
+    color_mode: Rc<Cell<ColorMode>>,
 ) {
+    widget
+        .style_context()
+        .add_class(color_mode.get().css_class());
     registry.borrow_mut().push(RegisteredWidget {
         key: key.into(),
         widget: widget.clone(),
-        light_ink,
+        color_mode,
+        edit_only: None,
     });
+}
+
+fn saved_color_mode(state: &AppState, key: &str) -> ColorMode {
+    state
+        .widget_color_modes
+        .get(key)
+        .copied()
+        .unwrap_or(state.settings.color_mode)
+}
+
+fn set_edit_chrome_visibility(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, visible: bool) {
+    for item in registry.borrow().iter() {
+        if let Some(edit_only) = &item.edit_only {
+            edit_only.set_visible(visible);
+        }
+    }
+}
+
+fn attach_color_mode_menu(
+    widget: &gtk::EventBox,
+    key: String,
+    state: Rc<RefCell<AppState>>,
+    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
+    interactive: Rc<Cell<bool>>,
+) {
+    let menu = gtk::Menu::new();
+    for mode in [ColorMode::Light, ColorMode::Gray, ColorMode::Dark] {
+        let item = gtk::MenuItem::with_label(mode.label());
+        item.connect_activate({
+            let key = key.clone();
+            let state = state.clone();
+            let registry = registry.clone();
+            move |_| {
+                state
+                    .borrow_mut()
+                    .widget_color_modes
+                    .insert(key.clone(), mode);
+                let _ = state.borrow().save();
+                apply_widget_color_mode(&registry, &key, mode);
+            }
+        });
+        menu.append(&item);
+    }
+    menu.show_all();
+
+    let gesture = gtk::GestureMultiPress::new(widget);
+    gesture.set_button(3);
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    gesture.connect_pressed(move |gesture, _, _, _| {
+        if !interactive.get() {
+            gesture.set_state(gtk::EventSequenceState::Denied);
+            return;
+        }
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        menu.popup_easy(3, gtk::current_event_time());
+    });
+
+    // GTK detaches event controllers when their final strong reference is dropped.
+    unsafe {
+        widget.set_data("sysi-color-menu-gesture", gesture);
+    }
 }
 
 fn place_card(root: &gtk::Fixed, card: &gtk::EventBox, point: Point) {
@@ -2286,7 +2448,7 @@ fn attach_resize(
     });
     handle.hitbox.connect_draw({
         let interactive = interactive.clone();
-        let light_ink = handle.light_ink.clone();
+        let color_mode = handle.color_mode.clone();
         move |area, ctx| {
             if !interactive.get() {
                 return glib::Propagation::Proceed;
@@ -2294,7 +2456,11 @@ fn attach_resize(
             let allocation = area.allocation();
             let width = f64::from(allocation.width());
             let height = f64::from(allocation.height());
-            let gray = if light_ink.get() { 0.13 } else { 0.9 };
+            let gray = match color_mode.get() {
+                ColorMode::Light => 0.9,
+                ColorMode::Gray => 0.6,
+                ColorMode::Dark => 0.13,
+            };
             ctx.set_source_rgba(gray, gray, gray, 0.82);
             ctx.set_line_width(1.35);
             ctx.set_line_cap(cairo::LineCap::Round);
@@ -2635,29 +2801,30 @@ fn refresh_shape_during_transition(
     });
 }
 
-fn update_contrast(registry: &Rc<RefCell<Vec<RegisteredWidget>>>) {
+fn apply_color_mode(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, mode: ColorMode) {
     for item in registry.borrow().iter() {
-        let allocation = item.widget.allocation();
-        let scale = item.widget.scale_factor().max(1);
-        let light_ink = platform::sample_luminance(
-            (allocation.x() + allocation.width() / 2 - 8) * scale,
-            (allocation.y() + allocation.height() / 2 - 8) * scale,
-            16 * scale,
-            16 * scale,
-        )
-        .map(|value| value > 0.52)
-        .unwrap_or(false);
-        item.light_ink.set(light_ink);
-        let context = item.widget.style_context();
-        context.remove_class("adaptive-light");
-        context.remove_class("adaptive-dark");
-        context.add_class(if light_ink {
-            "adaptive-light"
-        } else {
-            "adaptive-dark"
-        });
-        item.widget.queue_draw();
+        set_registered_color_mode(item, mode);
     }
+}
+
+fn apply_widget_color_mode(
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+    key: &str,
+    mode: ColorMode,
+) {
+    if let Some(item) = registry.borrow().iter().find(|item| item.key == key) {
+        set_registered_color_mode(item, mode);
+    }
+}
+
+fn set_registered_color_mode(item: &RegisteredWidget, mode: ColorMode) {
+    item.color_mode.set(mode);
+    let context = item.widget.style_context();
+    context.remove_class("mode-light");
+    context.remove_class("mode-gray");
+    context.remove_class("mode-dark");
+    context.add_class(mode.css_class());
+    item.widget.queue_draw();
 }
 
 fn small_button(label: &str) -> gtk::Button {

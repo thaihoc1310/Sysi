@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Sysi Overlay
-Comment=Transparent widgets, notes, timer, and desktop pet
+Comment=Transparent system widgets, notes, and timer
 Exec=sysi
 Icon=io.sysi.Overlay
 Terminal=false

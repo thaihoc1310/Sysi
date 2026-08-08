@@ -1,6 +1,41 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorMode {
+    Light,
+    #[default]
+    Gray,
+    Dark,
+}
+
+impl ColorMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Light => Self::Gray,
+            Self::Gray => Self::Dark,
+            Self::Dark => Self::Light,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Light => "LIGHT",
+            Self::Gray => "GRAY",
+            Self::Dark => "DARK",
+        }
+    }
+
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Self::Light => "mode-light",
+            Self::Gray => "mode-gray",
+            Self::Dark => "mode-dark",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub struct Point {
     pub x: i32,
@@ -16,22 +51,22 @@ pub struct Size {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Settings {
     #[serde(default = "default_true")]
-    pub mascot: bool,
-    #[serde(default = "default_true")]
     pub system: bool,
     #[serde(default = "default_true")]
     pub timer: bool,
     #[serde(default = "default_true")]
     pub settings_button: bool,
+    #[serde(default)]
+    pub color_mode: ColorMode,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            mascot: true,
             system: true,
             timer: true,
             settings_button: true,
+            color_mode: ColorMode::default(),
         }
     }
 }
@@ -57,6 +92,8 @@ pub struct AppState {
     #[serde(default)]
     pub sizes: HashMap<String, Size>,
     #[serde(default)]
+    pub widget_color_modes: HashMap<String, ColorMode>,
+    #[serde(default)]
     pub notes: Vec<Note>,
     #[serde(default = "default_timer")]
     pub timer_seconds: i64,
@@ -74,6 +111,7 @@ impl Default for AppState {
             settings: Settings::default(),
             positions,
             sizes: HashMap::new(),
+            widget_color_modes: HashMap::new(),
             notes: Vec::new(),
             timer_seconds: default_timer(),
             next_note_id: 1,
@@ -126,5 +164,33 @@ impl AppState {
         let raw = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         fs::write(&temp, raw)?;
         fs::rename(temp, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppState, ColorMode};
+
+    #[test]
+    fn old_settings_default_to_gray_mode() {
+        let state: AppState = serde_json::from_str(
+            r#"{"settings":{"mascot":true,"system":true,"timer":true,"settings_button":true}}"#,
+        )
+        .expect("legacy state should remain readable");
+        assert_eq!(state.settings.color_mode, ColorMode::Gray);
+    }
+
+    #[test]
+    fn color_mode_cycles_through_all_three_modes() {
+        assert_eq!(ColorMode::Light.next(), ColorMode::Gray);
+        assert_eq!(ColorMode::Gray.next(), ColorMode::Dark);
+        assert_eq!(ColorMode::Dark.next(), ColorMode::Light);
+    }
+
+    #[test]
+    fn old_state_defaults_to_no_widget_color_overrides() {
+        let state: AppState = serde_json::from_str(r#"{"settings":{"color_mode":"dark"}}"#)
+            .expect("state without per-widget colors should remain readable");
+        assert!(state.widget_color_modes.is_empty());
     }
 }
