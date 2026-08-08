@@ -73,28 +73,24 @@ separator {
   letter-spacing: 1.2px;
 }
 
-.timer-card.timer-size-medium .timer-value {
-  font-size: 32px;
+.timer-card.timer-style-digital .timer-value {
+  font-family: "Noto Sans Mono", "DejaVu Sans Mono", monospace;
+  font-weight: 700;
+  letter-spacing: 0.3px;
 }
 
-.timer-card.timer-size-medium .timer-action {
-  font-size: 13px;
+.timer-card.timer-style-digital .timer-action {
+  letter-spacing: 2.1px;
 }
 
-.timer-card.timer-size-medium .timer-editor {
-  font-size: 22px;
+.timer-card.timer-style-ticks .timer-value {
+  font-weight: 700;
+  letter-spacing: 1.4px;
 }
 
-.timer-card.timer-size-large .timer-value {
-  font-size: 40px;
-}
-
-.timer-card.timer-size-large .timer-action {
-  font-size: 15px;
-}
-
-.timer-card.timer-size-large .timer-editor {
-  font-size: 28px;
+.timer-card.timer-style-arc .timer-value {
+  font-weight: 500;
+  letter-spacing: 1.7px;
 }
 
 .timer-editor {

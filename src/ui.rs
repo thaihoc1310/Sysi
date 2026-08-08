@@ -1,7 +1,7 @@
 use crate::{
     platform,
-    state::{AppState, ColorMode, Note, Point, Size},
-    system::SystemReader,
+    state::{AppState, ColorMode, Note, Point, Size, SystemDetails, TimerStyle},
+    system::{SystemReader, SystemSnapshot},
 };
 use cairo::{Context, FontSlant, FontWeight, RectangleInt, Region};
 use gdk::prelude::*;
@@ -15,21 +15,32 @@ use std::{
 
 const SYSTEM_WIDTH: i32 = 196;
 const SYSTEM_HEIGHT: i32 = 76;
-const TIMER_SIZE: i32 = 132;
+const SYSTEM_SINGLE_WIDTH: i32 = 76;
+const TIMER_SIZE: i32 = 116;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
 const RESIZE_HIT_SIZE: i32 = 18;
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
-type SystemValues = Rc<Cell<(f64, f64, f64, f64, f64)>>;
-type BuiltSystemCard = (
-    gtk::EventBox,
-    gtk::EventBox,
-    Rc<Cell<ColorMode>>,
-    gtk::DrawingArea,
-    SystemValues,
-    ResizeHandle,
-);
+type SystemValues = Rc<RefCell<SystemSnapshot>>;
+
+struct SystemCard {
+    card: gtk::EventBox,
+    drag: gtk::EventBox,
+    color_mode: Rc<Cell<ColorMode>>,
+    canvas: gtk::DrawingArea,
+    values: SystemValues,
+    details: Rc<Cell<SystemDetails>>,
+    resize: ResizeHandle,
+}
+
+#[derive(Clone)]
+struct SystemDetailsPreview {
+    card: gtk::EventBox,
+    canvas: gtk::DrawingArea,
+    values: SystemValues,
+    details: Rc<Cell<SystemDetails>>,
+}
 
 #[derive(Clone)]
 struct ResizeHandle {
@@ -44,6 +55,7 @@ struct ResizeBounds {
     max_width: i32,
     max_height: i32,
     aspect_ratio: Option<f64>,
+    preserve_current_aspect: bool,
 }
 
 #[derive(Clone)]
@@ -110,7 +122,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     window.set_accept_focus(false);
     window.set_focus_on_map(false);
     window.stick();
-    window.set_type_hint(gdk::WindowTypeHint::Dock);
+    // Dock windows cannot receive keyboard focus. Utility keeps this overlay out
+    // of GNOME's panel layer while remaining a focusable edit surface.
+    window.set_type_hint(gdk::WindowTypeHint::Utility);
 
     if let Some(screen) = gtk::prelude::WidgetExt::screen(&window) {
         if let Some(visual) = screen.rgba_visual() {
@@ -166,6 +180,71 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             data.layout_version = 3;
             let _ = data.save();
         }
+        if data.layout_version < 4 {
+            let old_size = data.sizes.get("timer").copied();
+            let compact_size = match data.timer_style {
+                TimerStyle::Digital
+                    if old_size
+                        == Some(Size {
+                            width: 108,
+                            height: 48,
+                        }) =>
+                {
+                    Some(TimerStyle::Digital.default_size())
+                }
+                TimerStyle::Ring | TimerStyle::Ticks | TimerStyle::Arc
+                    if old_size
+                        == Some(Size {
+                            width: 132,
+                            height: 132,
+                        }) =>
+                {
+                    Some(data.timer_style.default_size())
+                }
+                _ => None,
+            };
+            if let Some(size) = compact_size {
+                data.sizes.insert("timer".into(), size);
+            }
+            data.layout_version = 4;
+            let _ = data.save();
+        }
+        if data.layout_version < 5 {
+            if data.timer_style == TimerStyle::Digital
+                && data.sizes.get("timer").copied()
+                    == Some(Size {
+                        width: 96,
+                        height: 40,
+                    })
+            {
+                data.sizes
+                    .insert("timer".into(), TimerStyle::Digital.default_size());
+            }
+            data.layout_version = 5;
+            let _ = data.save();
+        }
+        if data.layout_version < 6 {
+            let details = data.settings.system_details;
+            if system_meter_count(details) == 1
+                && !details.processes
+                && !details.cores
+                && data.sizes.get("system").copied()
+                    == Some(Size {
+                        width: SYSTEM_WIDTH,
+                        height: SYSTEM_HEIGHT,
+                    })
+            {
+                data.sizes.insert(
+                    "system".into(),
+                    Size {
+                        width: SYSTEM_SINGLE_WIDTH,
+                        height: SYSTEM_HEIGHT,
+                    },
+                );
+            }
+            data.layout_version = 6;
+            let _ = data.save();
+        }
     }
     window.set_default_size(screen_width, screen_height);
     window.move_(0, 0);
@@ -187,29 +266,29 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     });
 
     let registry: Rc<RefCell<Vec<RegisteredWidget>>> = Rc::new(RefCell::new(Vec::new()));
-    let interactive = Rc::new(Cell::new(false));
-    let (system_color_mode, timer_color_mode, picker_color_mode) = {
+    let interactive = Rc::new(Cell::new(true));
+    window.set_accept_focus(true);
+    window.style_context().add_class("editing");
+    let (system_color_mode, timer_color_mode, picker_color_mode, system_details) = {
         let data = state.borrow();
         (
             saved_color_mode(&data, "system"),
             saved_color_mode(&data, "timer"),
             saved_color_mode(&data, "picker"),
+            data.settings.system_details,
         )
     };
 
-    let system_card = build_system_card(system_color_mode);
+    let system_card = build_system_card(system_color_mode, system_details);
     apply_widget_size(
-        &system_card.0,
+        &system_card.card,
         "system",
         &state,
-        Size {
-            width: SYSTEM_WIDTH,
-            height: SYSTEM_HEIGHT,
-        },
+        system_content_size(system_details, 0),
     );
     place_card(
         &root,
-        &system_card.0,
+        &system_card.card,
         state
             .borrow()
             .positions
@@ -217,17 +296,29 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             .copied()
             .unwrap_or(Point { x: 34, y: 52 }),
     );
-    register(&registry, "system", &system_card.0, system_card.2.clone());
+    register(
+        &registry,
+        "system",
+        &system_card.card,
+        system_card.color_mode.clone(),
+    );
     attach_color_mode_menu(
-        &system_card.0,
+        &system_card.card,
         "system".into(),
         state.clone(),
         registry.clone(),
         interactive.clone(),
+        None,
+        Some(SystemDetailsPreview {
+            card: system_card.card.clone(),
+            canvas: system_card.canvas.clone(),
+            values: system_card.values.clone(),
+            details: system_card.details.clone(),
+        }),
     );
     attach_drag(
-        &system_card.1,
-        &system_card.0,
+        &system_card.drag,
+        &system_card.card,
         &root,
         "system".into(),
         state.clone(),
@@ -236,8 +327,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         window.clone(),
     );
     attach_resize(
-        &system_card.5,
-        &system_card.0,
+        &system_card.resize,
+        &system_card.card,
         &root,
         "system".into(),
         state.clone(),
@@ -245,17 +336,20 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         window.clone(),
         ResizeBounds {
-            min_width: 160,
+            min_width: 72,
             min_height: 64,
             max_width: 520,
-            max_height: 210,
-            aspect_ratio: Some(f64::from(SYSTEM_WIDTH) / f64::from(SYSTEM_HEIGHT)),
+            max_height: 640,
+            aspect_ratio: None,
+            preserve_current_aspect: false,
         },
     );
 
     let timer_card = build_timer_card(state.clone(), interactive.clone(), timer_color_mode);
+    let timer_default_size = timer_card.style.get().default_size();
     let timer_default = Point {
-        x: (primary_screen.x + primary_screen.width - TIMER_SIZE - 34).max(primary_screen.x + 8),
+        x: (primary_screen.x + primary_screen.width - timer_default_size.width - 34)
+            .max(primary_screen.x + 8),
         y: primary_screen.y + 34,
     };
     let timer_position = state
@@ -264,15 +358,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         .get("timer")
         .copied()
         .unwrap_or(timer_default);
-    apply_widget_size(
-        &timer_card.card,
-        "timer",
-        &state,
-        Size {
-            width: TIMER_SIZE,
-            height: TIMER_SIZE,
-        },
-    );
+    apply_widget_size(&timer_card.card, "timer", &state, timer_default_size);
     place_card(&root, &timer_card.card, timer_position);
     register(
         &registry,
@@ -286,6 +372,18 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
+        Some(TimerStylePreview {
+            style: timer_card.style.clone(),
+            size: timer_card.style_size.clone(),
+            card: timer_card.card.clone(),
+            canvas: timer_card.canvas.clone(),
+            window: window.clone(),
+            registry: registry.clone(),
+            interactive: interactive.clone(),
+            typography: timer_card.typography.clone(),
+            open_edit: timer_card.open_edit.clone(),
+        }),
+        None,
     );
     attach_drag(
         &timer_card.drag,
@@ -307,11 +405,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         window.clone(),
         ResizeBounds {
-            min_width: 92,
-            min_height: 92,
+            min_width: 72,
+            min_height: 36,
             max_width: 320,
             max_height: 320,
             aspect_ratio: Some(1.0),
+            preserve_current_aspect: true,
         },
     );
 
@@ -338,6 +437,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
+        None,
+        None,
     );
     attach_drag(
         &widget_picker.drag,
@@ -369,6 +470,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 window.clone(),
             );
             refresh_input_shape(&window, &registry, interactive.get());
+            glib::idle_add_local_once({
+                let window = window.clone();
+                let registry = registry.clone();
+                let interactive = interactive.clone();
+                move || refresh_input_shape(&window, &registry, interactive.get())
+            });
         })
     };
     *note_refresh.borrow_mut() = Some(refresh_closure.clone());
@@ -388,7 +495,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     widget_picker.mode.set_label(color_mode.label());
 
     widget_picker.system.connect_toggled({
-        let target = system_card.0.clone();
+        let target = system_card.card.clone();
         let state = state.clone();
         let window = window.clone();
         let registry = registry.clone();
@@ -587,11 +694,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     });
 
     window.show_all();
-    set_edit_chrome_visibility(&registry, false);
+    set_edit_chrome_visibility(&registry, true);
     widget_picker.revealer.set_reveal_child(false);
     widget_picker.history_revealer.set_reveal_child(false);
     if !system_enabled {
-        system_card.0.hide();
+        system_card.card.hide();
     }
     if !timer_enabled {
         timer_card.card.hide();
@@ -608,9 +715,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let state = state.clone();
         let root = root.clone();
         let screens = screens.clone();
+        let interactive = interactive.clone();
         move || {
             clamp_registered_widgets(&root, &registry, &screens, &state);
-            refresh_input_shape(&window, &registry, false);
+            refresh_input_shape(&window, &registry, interactive.get());
         }
     });
 
@@ -644,13 +752,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }
     });
 
-    start_system_updates(system_card.3, system_card.4);
+    start_system_updates(system_card);
     start_timer_updates(timer_card, state, window, registry, interactive);
 }
 
-fn build_system_card(initial_color_mode: ColorMode) -> BuiltSystemCard {
+fn build_system_card(initial_color_mode: ColorMode, initial_details: SystemDetails) -> SystemCard {
     let (card, body, _, color_mode, resize) = card_shell("", "", initial_color_mode);
-    let values = Rc::new(Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)));
+    let values = Rc::new(RefCell::new(SystemSnapshot::default()));
+    let details = Rc::new(Cell::new(initial_details));
     let drag = gtk::EventBox::new();
     drag.set_visible_window(false);
     drag.set_above_child(true);
@@ -665,29 +774,41 @@ fn build_system_card(initial_color_mode: ColorMode) -> BuiltSystemCard {
     canvas.connect_draw({
         let values = values.clone();
         let color_mode = color_mode.clone();
+        let details = details.clone();
         move |area, ctx| {
-            draw_system(area, ctx, values.get(), color_mode.get());
+            draw_system(area, ctx, &values.borrow(), color_mode.get(), details.get());
             glib::Propagation::Proceed
         }
     });
-    (card, drag, color_mode, canvas, values, resize)
+    SystemCard {
+        card,
+        drag,
+        color_mode,
+        canvas,
+        values,
+        details,
+        resize,
+    }
 }
 
-fn start_system_updates(canvas: gtk::DrawingArea, values: SystemValues) {
+fn start_system_updates(system: SystemCard) {
     let reader = Rc::new(RefCell::new(SystemReader::default()));
     let update: Rc<dyn Fn()> = Rc::new({
         let reader = reader.clone();
-        let canvas = canvas.clone();
-        let values = values.clone();
+        let canvas = system.canvas.clone();
+        let values = system.values.clone();
+        let details = system.details.clone();
+        let card = system.card.clone();
         move || {
-            let snapshot = reader.borrow_mut().read();
-            values.set((
-                snapshot.cpu_percent,
-                snapshot.memory_percent,
-                snapshot.memory_used_gib,
-                snapshot.memory_total_gib,
-                snapshot.load_one,
-            ));
+            let options = details.get();
+            let snapshot = reader.borrow_mut().read(options.processes, options.cores);
+            let desired = system_content_size(options, snapshot.cores.len());
+            let current = card.allocation();
+            if current.width() == desired.width && current.height() < desired.height {
+                card.set_size_request(desired.width, desired.height);
+                card.queue_resize();
+            }
+            *values.borrow_mut() = snapshot;
             canvas.queue_draw();
         }
     });
@@ -701,62 +822,296 @@ fn start_system_updates(canvas: gtk::DrawingArea, values: SystemValues) {
 fn draw_system(
     area: &gtk::DrawingArea,
     ctx: &Context,
-    values: (f64, f64, f64, f64, f64),
+    values: &SystemSnapshot,
     color_mode: ColorMode,
+    details: SystemDetails,
 ) {
-    let (cpu, memory, _used, _total, _load) = values;
     let allocation = area.allocation();
-    let scale = (f64::from(allocation.width()) / 188.0)
-        .min(f64::from(allocation.height()) / 72.0)
-        .max(0.1);
-    let content_width = 188.0 * scale;
-    let content_height = 72.0 * scale;
-    let _ = ctx.save();
-    ctx.translate(
-        (f64::from(allocation.width()) - content_width) / 2.0,
-        (f64::from(allocation.height()) - content_height) / 2.0,
-    );
-    ctx.scale(scale, scale);
+    let width = f64::from(allocation.width().max(1));
+    let meter_count = system_meter_count(details);
+    let meter_width = if meter_count == 1 {
+        f64::from(SYSTEM_SINGLE_WIDTH)
+    } else {
+        188.0
+    };
+    let scale = (width / meter_width).clamp(0.1, 1.0);
+    let content_width = meter_width * scale;
     let (ink, muted, accent) = match color_mode {
         ColorMode::Light => ((0.97, 0.97, 0.97), (0.72, 0.72, 0.72), (0.9, 0.9, 0.9)),
         ColorMode::Gray => ((0.7, 0.7, 0.7), (0.5, 0.5, 0.5), (0.64, 0.64, 0.64)),
         ColorMode::Dark => ((0.08, 0.08, 0.08), (0.24, 0.24, 0.24), (0.14, 0.14, 0.14)),
     };
-    for (x, value, title) in [(47.0, cpu, "CPU"), (141.0, memory, "RAM")] {
-        ctx.set_line_width(6.5);
-        ctx.set_line_cap(cairo::LineCap::Round);
-        ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
-        ctx.new_sub_path();
-        ctx.arc(x, 35.0, 28.0, -PI * 0.75, PI * 0.75);
-        let _ = ctx.stroke();
-        ctx.set_source_rgba(accent.0, accent.1, accent.2, 0.96);
-        ctx.new_sub_path();
-        ctx.arc(
-            x,
-            35.0,
-            28.0,
-            -PI * 0.75,
-            -PI * 0.75 + PI * 1.5 * (value / 100.0).clamp(0.0, 1.0),
+    let meters = match (details.cpu, details.ram) {
+        (true, true) => [
+            Some((47.0, values.cpu_percent, "CPU")),
+            Some((141.0, values.memory_percent, "RAM")),
+        ],
+        (true, false) => [Some((38.0, values.cpu_percent, "CPU")), None],
+        (false, true) => [Some((38.0, values.memory_percent, "RAM")), None],
+        (false, false) => [None, None],
+    };
+    if meters[0].is_some() {
+        let _ = ctx.save();
+        ctx.translate((width - content_width) / 2.0, 0.0);
+        ctx.scale(scale, scale);
+        for (x, value, title) in meters.into_iter().flatten() {
+            ctx.set_line_width(6.5);
+            ctx.set_line_cap(cairo::LineCap::Round);
+            ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
+            ctx.new_sub_path();
+            ctx.arc(x, 35.0, 28.0, -PI * 0.75, PI * 0.75);
+            let _ = ctx.stroke();
+            ctx.set_source_rgba(accent.0, accent.1, accent.2, 0.96);
+            ctx.new_sub_path();
+            ctx.arc(
+                x,
+                35.0,
+                28.0,
+                -PI * 0.75,
+                -PI * 0.75 + PI * 1.5 * (value / 100.0).clamp(0.0, 1.0),
+            );
+            let _ = ctx.stroke();
+            center_text(
+                ctx,
+                x,
+                37.0,
+                &format!("{value:.0}%"),
+                18.0,
+                FontWeight::Bold,
+                ink,
+            );
+            center_text(ctx, x, 56.0, title, 8.5, FontWeight::Bold, muted);
+        }
+        let _ = ctx.restore();
+    }
+    let mut cursor_y = if details.cpu || details.ram {
+        76.0 * scale
+    } else {
+        2.0
+    };
+    if details.processes {
+        draw_system_processes(ctx, values, width, cursor_y, ink, muted);
+        cursor_y += 108.0;
+    }
+    if details.cores {
+        draw_system_cores(ctx, &values.cores, width, cursor_y, ink, muted, accent);
+    }
+}
+
+fn system_content_size(details: SystemDetails, core_count: usize) -> Size {
+    let mut height = if details.cpu || details.ram {
+        SYSTEM_HEIGHT
+    } else {
+        10
+    };
+    if details.processes {
+        height += 108;
+    }
+    if details.cores {
+        height += 16 + (core_count.max(16).div_ceil(4) as i32 * 17);
+    }
+    Size {
+        width: if details.processes || details.cores {
+            318
+        } else if system_meter_count(details) == 1 {
+            SYSTEM_SINGLE_WIDTH
+        } else {
+            SYSTEM_WIDTH
+        },
+        height,
+    }
+}
+
+fn system_meter_count(details: SystemDetails) -> usize {
+    usize::from(details.cpu) + usize::from(details.ram)
+}
+
+fn draw_system_processes(
+    ctx: &Context,
+    values: &SystemSnapshot,
+    width: f64,
+    top: f64,
+    ink: (f64, f64, f64),
+    muted: (f64, f64, f64),
+) {
+    draw_left_text(
+        ctx,
+        5.0,
+        top + 11.0,
+        "PROCESS",
+        8.0,
+        FontWeight::Bold,
+        muted,
+    );
+    draw_right_text(
+        ctx,
+        width - 96.0,
+        top + 11.0,
+        "CPU",
+        8.0,
+        FontWeight::Bold,
+        muted,
+    );
+    draw_right_text(
+        ctx,
+        width - 57.0,
+        top + 11.0,
+        "ID",
+        8.0,
+        FontWeight::Bold,
+        muted,
+    );
+    draw_right_text(
+        ctx,
+        width - 5.0,
+        top + 11.0,
+        "MEM",
+        8.0,
+        FontWeight::Bold,
+        muted,
+    );
+    ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.18);
+    ctx.set_line_width(1.0);
+    ctx.move_to(4.0, top + 15.0);
+    ctx.line_to(width - 4.0, top + 15.0);
+    let _ = ctx.stroke();
+    for (row, process) in values.processes.iter().take(5).enumerate() {
+        let baseline = top + 29.0 + row as f64 * 17.0;
+        let label = truncate_text(&process.name, 23);
+        draw_left_text(ctx, 5.0, baseline, &label, 9.5, FontWeight::Normal, ink);
+        draw_right_text(
+            ctx,
+            width - 96.0,
+            baseline,
+            &format!("{:.1}%", process.cpu_percent),
+            9.5,
+            FontWeight::Normal,
+            ink,
         );
-        let _ = ctx.stroke();
-        center_text(
+        draw_right_text(
+            ctx,
+            width - 57.0,
+            baseline,
+            &process.pid.to_string(),
+            9.5,
+            FontWeight::Normal,
+            ink,
+        );
+        draw_right_text(
+            ctx,
+            width - 5.0,
+            baseline,
+            &format_memory(process.memory_kib),
+            9.5,
+            FontWeight::Normal,
+            ink,
+        );
+    }
+}
+
+fn draw_system_cores(
+    ctx: &Context,
+    cores: &[f64],
+    width: f64,
+    top: f64,
+    ink: (f64, f64, f64),
+    muted: (f64, f64, f64),
+    accent: (f64, f64, f64),
+) {
+    let column_width = (width - 10.0) / 4.0;
+    for (index, value) in cores.iter().enumerate() {
+        let column = index % 4;
+        let row = index / 4;
+        let x = 5.0 + column as f64 * column_width;
+        let y = top + 11.0 + row as f64 * 17.0;
+        draw_left_text(
             ctx,
             x,
-            37.0,
+            y,
+            &format!("C{:02}", index + 1),
+            8.0,
+            FontWeight::Bold,
+            muted,
+        );
+        ctx.set_line_width(2.3);
+        ctx.set_line_cap(cairo::LineCap::Round);
+        ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
+        ctx.move_to(x + 23.0, y - 3.0);
+        ctx.line_to(x + 48.0, y - 3.0);
+        let _ = ctx.stroke();
+        ctx.set_source_rgb(accent.0, accent.1, accent.2);
+        ctx.move_to(x + 23.0, y - 3.0);
+        ctx.line_to(x + 23.0 + 25.0 * (value / 100.0).clamp(0.0, 1.0), y - 3.0);
+        let _ = ctx.stroke();
+        draw_right_text(
+            ctx,
+            x + column_width - 2.0,
+            y,
             &format!("{value:.0}%"),
-            18.0,
+            8.0,
             FontWeight::Bold,
             ink,
         );
-        center_text(ctx, x, 56.0, title, 8.5, FontWeight::Bold, muted);
     }
-    let _ = ctx.restore();
+}
+
+fn draw_left_text(
+    ctx: &Context,
+    x: f64,
+    baseline: f64,
+    text: &str,
+    size: f64,
+    weight: FontWeight,
+    color: (f64, f64, f64),
+) {
+    ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
+    ctx.set_font_size(size);
+    ctx.set_source_rgb(color.0, color.1, color.2);
+    ctx.move_to(x, baseline);
+    let _ = ctx.show_text(text);
+}
+
+fn draw_right_text(
+    ctx: &Context,
+    right: f64,
+    baseline: f64,
+    text: &str,
+    size: f64,
+    weight: FontWeight,
+    color: (f64, f64, f64),
+) {
+    ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
+    ctx.set_font_size(size);
+    let width = ctx
+        .text_extents(text)
+        .map(|metrics| metrics.x_advance())
+        .unwrap_or(0.0);
+    draw_left_text(ctx, right - width, baseline, text, size, weight, color);
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let mut result: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        result.push('…');
+    }
+    result
+}
+
+fn format_memory(kib: u64) -> String {
+    if kib >= 1024 * 1024 {
+        format!("{:.1}G", kib as f64 / 1_048_576.0)
+    } else {
+        format!("{:.0}M", kib as f64 / 1024.0)
+    }
 }
 
 struct TimerCard {
     card: gtk::EventBox,
     drag: gtk::EventBox,
     color_mode: Rc<Cell<ColorMode>>,
+    style: Rc<Cell<TimerStyle>>,
+    style_size: Rc<Cell<Size>>,
+    typography: gtk::CssProvider,
     canvas: gtk::DrawingArea,
     stack: gtk::Stack,
     label: gtk::Label,
@@ -764,29 +1119,35 @@ struct TimerCard {
     runtime: Rc<RefCell<TimerRuntime>>,
     alarm: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
+    open_edit: Rc<dyn Fn()>,
     commit_edit: Rc<dyn Fn()>,
     resize: ResizeHandle,
     wake_updates: CallbackSlot,
 }
 
+#[derive(Clone)]
+struct TimerStylePreview {
+    style: Rc<Cell<TimerStyle>>,
+    size: Rc<Cell<Size>>,
+    card: gtk::EventBox,
+    canvas: gtk::DrawingArea,
+    window: gtk::ApplicationWindow,
+    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
+    interactive: Rc<Cell<bool>>,
+    typography: gtk::CssProvider,
+    open_edit: Rc<dyn Fn()>,
+}
+
 fn build_timer_card(
     state: Rc<RefCell<AppState>>,
-    interactive: Rc<Cell<bool>>,
+    _interactive: Rc<Cell<bool>>,
     initial_color_mode: ColorMode,
 ) -> TimerCard {
     let (card, body, drag, color_mode, resize) = card_shell("", "", initial_color_mode);
     card.style_context().add_class("timer-card");
-    card.connect_size_allocate(|widget, allocation| {
-        let context = widget.style_context();
-        context.remove_class("timer-size-medium");
-        context.remove_class("timer-size-large");
-        let diameter = allocation.width().min(allocation.height());
-        if diameter >= 245 {
-            context.add_class("timer-size-large");
-        } else if diameter >= 180 {
-            context.add_class("timer-size-medium");
-        }
-    });
+    let style = Rc::new(Cell::new(state.borrow().timer_style));
+    let style_size = Rc::new(Cell::new(style.get().default_size()));
+    card.style_context().add_class(style.get().css_class());
     let duration = state.borrow().timer_seconds.clamp(1, 24 * 3600);
     let runtime = Rc::new(RefCell::new(TimerRuntime {
         duration_seconds: duration,
@@ -825,36 +1186,77 @@ fn build_timer_card(
     );
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::None);
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
     stack.set_halign(gtk::Align::Center);
     stack.set_valign(gtk::Align::Center);
 
     let label = gtk::Label::new(Some(&format_duration(duration)));
+    label.set_selectable(false);
     label.style_context().add_class("timer-value");
     let action = gtk::Label::new(Some("START"));
+    action.set_selectable(false);
     action.style_context().add_class("timer-action");
+    action.set_halign(gtk::Align::Center);
+    action.set_valign(gtk::Align::Center);
+    action.set_opacity(1.0);
+    action.hide();
     let editor = gtk::Entry::new();
-    editor.set_width_chars(8);
+    editor.set_width_chars(5);
+    editor.set_can_focus(true);
     editor.set_max_length(8);
     editor.set_alignment(0.5);
     editor.style_context().add_class("timer-editor");
     stack.add_named(&label, "time");
-    stack.add_named(&action, "action");
     stack.add_named(&editor, "editor");
     stack.set_visible_child_name("time");
-    interaction.add(&stack);
+    let text_overlay = gtk::Overlay::new();
+    text_overlay.set_halign(gtk::Align::Center);
+    text_overlay.set_valign(gtk::Align::Center);
+    text_overlay.add(&stack);
+    text_overlay.add_overlay(&action);
+    text_overlay.set_overlay_pass_through(&action, true);
+    interaction.add(&text_overlay);
     overlay.add_overlay(&interaction);
     body.pack_start(&overlay, true, true, 0);
+
+    let typography = gtk::CssProvider::new();
+    for widget in [
+        &label.clone().upcast::<gtk::Widget>(),
+        &action.clone().upcast(),
+        &editor.clone().upcast(),
+    ] {
+        widget
+            .style_context()
+            .add_provider(&typography, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+    }
+    apply_timer_typography(&typography, style.get(), style_size.get());
+    card.connect_size_allocate({
+        let style_size = style_size.clone();
+        let style = style.clone();
+        let typography = typography.clone();
+        move |_, allocation| {
+            let size = Size {
+                width: allocation.width().max(1),
+                height: allocation.height().max(1),
+            };
+            style_size.set(size);
+            apply_timer_typography(&typography, style.get(), size);
+        }
+    });
 
     canvas.connect_draw({
         let runtime = runtime.clone();
         let color_mode = color_mode.clone();
+        let style = style.clone();
         move |area, ctx| {
-            draw_timer_ring(area, ctx, &runtime.borrow(), color_mode.get());
+            draw_timer_style(area, ctx, &runtime.borrow(), color_mode.get(), style.get());
             glib::Propagation::Proceed
         }
     });
 
     let editing = Rc::new(Cell::new(false));
+    let click_start = Rc::new(Cell::new(None::<(f64, f64)>));
     let commit_edit: Rc<dyn Fn()> = Rc::new({
         let runtime = runtime.clone();
         let state = state.clone();
@@ -866,6 +1268,8 @@ fn build_timer_card(
         let editing = editing.clone();
         let interaction = interaction.clone();
         let card = card.clone();
+        let action = action.clone();
+        let hovered = hovered.clone();
         move || {
             if !editing.replace(false) {
                 return;
@@ -887,6 +1291,41 @@ fn build_timer_card(
             card.style_context().remove_class("alarm");
             interaction.set_above_child(true);
             stack.set_visible_child_name("time");
+            if hovered.get() {
+                action.set_text(timer_action_text(&runtime.borrow()));
+                label.set_opacity(0.28);
+                action.show();
+            } else {
+                label.set_opacity(1.0);
+                action.hide();
+            }
+            canvas.queue_draw();
+        }
+    });
+    let cancel_edit: Rc<dyn Fn()> = Rc::new({
+        let runtime = runtime.clone();
+        let label = label.clone();
+        let stack = stack.clone();
+        let canvas = canvas.clone();
+        let editing = editing.clone();
+        let interaction = interaction.clone();
+        let action = action.clone();
+        let hovered = hovered.clone();
+        move || {
+            if !editing.replace(false) {
+                return;
+            }
+            label.set_text(&format_duration_ceil(runtime.borrow().remaining));
+            interaction.set_above_child(true);
+            stack.set_visible_child_name("time");
+            if hovered.get() {
+                label.set_opacity(0.28);
+                action.set_text(timer_action_text(&runtime.borrow()));
+                action.show();
+            } else {
+                label.set_opacity(1.0);
+                action.hide();
+            }
             canvas.queue_draw();
         }
     });
@@ -917,21 +1356,17 @@ fn build_timer_card(
         }
     });
     editor.connect_focus_out_event({
-        let commit_edit = commit_edit.clone();
+        let cancel_edit = cancel_edit.clone();
         move |_, _| {
-            commit_edit();
+            cancel_edit();
             glib::Propagation::Proceed
         }
     });
     editor.connect_key_press_event({
-        let editing = editing.clone();
-        let stack = stack.clone();
-        let interaction = interaction.clone();
+        let cancel_edit = cancel_edit.clone();
         move |_, event| {
             if event.keyval() == gdk::keys::constants::Escape {
-                editing.set(false);
-                interaction.set_above_child(true);
-                stack.set_visible_child_name("time");
+                cancel_edit();
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -939,83 +1374,61 @@ fn build_timer_card(
     });
 
     interaction.connect_enter_notify_event({
-        let interactive = interactive.clone();
         let hovered = hovered.clone();
         let runtime = runtime.clone();
+        let label = label.clone();
         let action = action.clone();
-        let stack = stack.clone();
         let editing = editing.clone();
         move |_, _| {
             hovered.set(true);
-            if !interactive.get() && !editing.get() {
+            if !editing.get() {
                 action.set_text(timer_action_text(&runtime.borrow()));
-                stack.set_visible_child_name("action");
+                label.set_opacity(0.28);
+                action.show();
             }
             glib::Propagation::Proceed
         }
     });
     interaction.connect_leave_notify_event({
         let hovered = hovered.clone();
-        let stack = stack.clone();
+        let label = label.clone();
+        let action = action.clone();
         let editing = editing.clone();
         move |_, _| {
             hovered.set(false);
             if !editing.get() {
-                stack.set_visible_child_name("time");
+                label.set_opacity(1.0);
+                action.hide();
             }
             glib::Propagation::Proceed
         }
     });
     interaction.connect_motion_notify_event({
-        let interactive = interactive.clone();
         let hovered = hovered.clone();
         let runtime = runtime.clone();
+        let label = label.clone();
         let action = action.clone();
-        let stack = stack.clone();
         let editing = editing.clone();
         move |_, _| {
             hovered.set(true);
-            if !interactive.get() && !editing.get() {
+            if !editing.get() {
                 action.set_text(timer_action_text(&runtime.borrow()));
-                stack.set_visible_child_name("action");
+                label.set_opacity(0.28);
+                action.show();
             }
             glib::Propagation::Proceed
         }
     });
     interaction.connect_button_press_event({
-        let interactive = interactive.clone();
-        let runtime = runtime.clone();
-        let editor = editor.clone();
-        let stack = stack.clone();
-        let editing = editing.clone();
-        let interaction = interaction.clone();
-        move |widget, event| {
-            if interactive.get()
-                && event.button() == 1
-                && event.event_type() == gdk::EventType::DoubleButtonPress
-            {
-                let (x, y) = event.position();
-                let allocation = widget.allocation();
-                let center_x = f64::from(allocation.width()) / 2.0;
-                let center_y = f64::from(allocation.height()) / 2.0;
-                let radius = f64::from(allocation.width().min(allocation.height())) * 0.36;
-                let dx = x - center_x;
-                let dy = y - center_y;
-                if dx * dx + dy * dy <= radius * radius {
-                    editing.set(true);
-                    editor.set_text(&format_duration(runtime.borrow().duration_seconds));
-                    stack.set_visible_child_name("editor");
-                    interaction.set_above_child(false);
-                    editor.grab_focus();
-                    editor.select_region(0, -1);
-                    return glib::Propagation::Stop;
-                }
+        let click_start = click_start.clone();
+        move |_, event| {
+            if event.button() == 1 && event.event_type() == gdk::EventType::ButtonPress {
+                click_start.set(Some(event.position()));
             }
             glib::Propagation::Proceed
         }
     });
     interaction.connect_button_release_event({
-        let interactive = interactive.clone();
         let runtime = runtime.clone();
         let alarm = alarm.clone();
         let label = label.clone();
@@ -1023,8 +1436,16 @@ fn build_timer_card(
         let canvas = canvas.clone();
         let card = card.clone();
         let wake_updates = wake_updates.clone();
+        let click_start = click_start.clone();
         move |_, event| {
-            if interactive.get() || event.button() != 1 {
+            if event.button() != 1 {
+                return glib::Propagation::Proceed;
+            }
+            let Some((start_x, start_y)) = click_start.replace(None) else {
+                return glib::Propagation::Proceed;
+            };
+            let (end_x, end_y) = event.position();
+            if (end_x - start_x).abs() + (end_y - start_y).abs() > 5.0 {
                 return glib::Propagation::Proceed;
             }
             let mut timer = runtime.borrow_mut();
@@ -1055,10 +1476,45 @@ fn build_timer_card(
         }
     });
 
+    let open_edit: Rc<dyn Fn()> = Rc::new({
+        let runtime = runtime.clone();
+        let label = label.clone();
+        let action = action.clone();
+        let editor = editor.clone();
+        let stack = stack.clone();
+        let editing = editing.clone();
+        let interaction = interaction.clone();
+        let canvas = canvas.clone();
+        move || {
+            if editing.replace(true) {
+                return;
+            }
+            let mut timer = runtime.borrow_mut();
+            if let Some(target) = timer.target.take() {
+                timer.remaining = target.saturating_duration_since(Instant::now());
+                timer.started = true;
+            }
+            label.set_text(&format_duration_ceil(timer.remaining));
+            action.set_text(timer_action_text(&timer));
+            drop(timer);
+            editor.set_text(&format_duration(runtime.borrow().duration_seconds));
+            label.set_opacity(1.0);
+            action.hide();
+            stack.set_visible_child_name("editor");
+            interaction.set_above_child(false);
+            editor.grab_focus();
+            editor.select_region(0, -1);
+            canvas.queue_draw();
+        }
+    });
+
     TimerCard {
         card,
         drag,
         color_mode,
+        style,
+        style_size,
+        typography,
         canvas,
         stack,
         label,
@@ -1066,6 +1522,7 @@ fn build_timer_card(
         runtime,
         alarm,
         hovered,
+        open_edit,
         commit_edit,
         resize,
         wake_updates,
@@ -1113,23 +1570,49 @@ fn parse_timer_input(value: &str) -> Option<i64> {
     (seconds > 0).then_some(seconds)
 }
 
+fn draw_timer_style(
+    area: &gtk::DrawingArea,
+    ctx: &Context,
+    timer: &TimerRuntime,
+    color_mode: ColorMode,
+    style: TimerStyle,
+) {
+    match style {
+        TimerStyle::Ring => draw_timer_ring(area, ctx, timer, color_mode),
+        TimerStyle::Digital => draw_timer_digital_alarm(area, ctx, timer, color_mode),
+        TimerStyle::Ticks => draw_timer_ticks(area, ctx, timer, color_mode),
+        TimerStyle::Arc => draw_timer_arc(area, ctx, timer, color_mode),
+    }
+}
+
+fn timer_gray(color_mode: ColorMode) -> f64 {
+    match color_mode {
+        ColorMode::Light => 0.91,
+        ColorMode::Gray => 0.6,
+        ColorMode::Dark => 0.12,
+    }
+}
+
+fn timer_ratio(timer: &TimerRuntime) -> f64 {
+    (timer.remaining.as_secs_f64() / timer.duration_seconds.max(1) as f64).clamp(0.0, 1.0)
+}
+
+fn timer_center(area: &gtk::DrawingArea, inset: f64) -> (f64, f64, f64) {
+    let allocation = area.allocation();
+    let cx = f64::from(allocation.width()) / 2.0;
+    let cy = f64::from(allocation.height()) / 2.0;
+    (cx, cy, (cx.min(cy) - inset).max(1.0))
+}
+
 fn draw_timer_ring(
     area: &gtk::DrawingArea,
     ctx: &Context,
     timer: &TimerRuntime,
     color_mode: ColorMode,
 ) {
-    let allocation = area.allocation();
-    let cx = f64::from(allocation.width()) / 2.0;
-    let cy = f64::from(allocation.height()) / 2.0;
-    let radius = cx.min(cy) - 9.0;
-    let gray = match color_mode {
-        ColorMode::Light => 0.91,
-        ColorMode::Gray => 0.6,
-        ColorMode::Dark => 0.12,
-    };
-    let ratio =
-        (timer.remaining.as_secs_f64() / timer.duration_seconds.max(1) as f64).clamp(0.0, 1.0);
+    let (cx, cy, radius) = timer_center(area, 9.0);
+    let gray = timer_gray(color_mode);
+    let ratio = timer_ratio(timer);
     let start = -PI / 2.0;
 
     ctx.set_line_width(8.0);
@@ -1151,6 +1634,96 @@ fn draw_timer_ring(
         ctx.arc(cx, cy, radius, start, start + TAU * ratio);
         let _ = ctx.stroke();
     }
+}
+
+fn draw_timer_digital_alarm(
+    area: &gtk::DrawingArea,
+    ctx: &Context,
+    timer: &TimerRuntime,
+    color_mode: ColorMode,
+) {
+    if !timer.alarm {
+        return;
+    }
+    let (cx, cy, radius) = timer_center(area, 11.0);
+    let pulse = 0.25 + 0.6 * (timer.phase.sin() * 0.5 + 0.5);
+    let gray = timer_gray(color_mode);
+    ctx.set_source_rgba(gray, gray, gray, pulse);
+    ctx.set_line_width(2.0);
+    ctx.set_line_cap(cairo::LineCap::Round);
+    for direction in [-1.0, 1.0] {
+        let x = cx + direction * radius * 0.82;
+        ctx.move_to(x, cy - radius * 0.18);
+        ctx.line_to(x + direction * 5.0, cy);
+        ctx.line_to(x, cy + radius * 0.18);
+    }
+    let _ = ctx.stroke();
+}
+
+fn draw_timer_ticks(
+    area: &gtk::DrawingArea,
+    ctx: &Context,
+    timer: &TimerRuntime,
+    color_mode: ColorMode,
+) {
+    let (cx, cy, radius) = timer_center(area, 8.0);
+    let gray = timer_gray(color_mode);
+    let ratio = timer_ratio(timer);
+    let active_ticks = (ratio * 24.0).ceil() as usize;
+    let pulse = 0.38 + 0.52 * (timer.phase.sin() * 0.5 + 0.5);
+    ctx.set_line_width(2.3);
+    ctx.set_line_cap(cairo::LineCap::Round);
+    for index in 0..24 {
+        let angle = -PI / 2.0 + TAU * index as f64 / 24.0;
+        let (sin, cos) = angle.sin_cos();
+        let inner = radius - if index % 6 == 0 { 7.0 } else { 4.5 };
+        let alpha = if timer.alarm {
+            pulse
+        } else if index < active_ticks {
+            0.9
+        } else {
+            0.2
+        };
+        ctx.set_source_rgba(gray, gray, gray, alpha);
+        ctx.move_to(cx + cos * inner, cy + sin * inner);
+        ctx.line_to(cx + cos * radius, cy + sin * radius);
+        let _ = ctx.stroke();
+    }
+}
+
+fn draw_timer_arc(
+    area: &gtk::DrawingArea,
+    ctx: &Context,
+    timer: &TimerRuntime,
+    color_mode: ColorMode,
+) {
+    let (cx, cy, radius) = timer_center(area, 8.0);
+    let gray = timer_gray(color_mode);
+    let ratio = timer_ratio(timer);
+    let start = -PI * 0.84;
+    let sweep = TAU * 0.74;
+    ctx.set_line_width(3.2);
+    ctx.set_line_cap(cairo::LineCap::Round);
+    ctx.set_source_rgba(gray, gray, gray, 0.2);
+    ctx.new_sub_path();
+    ctx.arc(cx, cy, radius, start, start + sweep);
+    let _ = ctx.stroke();
+
+    let alpha = if timer.alarm {
+        0.38 + 0.52 * (timer.phase.sin() * 0.5 + 0.5)
+    } else {
+        0.92
+    };
+    ctx.set_source_rgba(gray, gray, gray, alpha);
+    ctx.new_sub_path();
+    ctx.arc(
+        cx,
+        cy,
+        radius,
+        start,
+        start + if timer.alarm { sweep } else { sweep * ratio },
+    );
+    let _ = ctx.stroke();
 }
 
 fn start_timer_updates(
@@ -1216,9 +1789,9 @@ fn start_timer_updates(
                 if keep_running {
                     canvas.queue_draw();
                 }
-                if hovered.get() && !interactive.get() {
+                if hovered.get() && stack.visible_child_name().as_deref() != Some("editor") {
                     action.set_text(timer_action_text(&timer));
-                    stack.set_visible_child_name("action");
+                    action.show();
                 }
                 let alarm_active = timer.alarm;
                 drop(timer);
@@ -1422,6 +1995,16 @@ fn rebuild_pinned_notes(
         body.pack_start(&header_drag, false, false, 0);
 
         let editor = gtk::TextView::new();
+        editor.set_editable(true);
+        editor.set_can_focus(true);
+        editor.set_cursor_visible(true);
+        editor.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+        editor.connect_button_press_event(|editor, event| {
+            if event.button() == 1 {
+                editor.grab_focus();
+            }
+            glib::Propagation::Proceed
+        });
         editor.set_wrap_mode(gtk::WrapMode::Word);
         editor.set_size_request(1, 1);
         editor.set_hexpand(true);
@@ -1429,6 +2012,16 @@ fn rebuild_pinned_notes(
         editor.style_context().add_class("pinned-editor");
         editor.buffer().expect("note buffer").set_text(&note.text);
         let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+        scroller.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+        scroller.connect_button_press_event({
+            let editor = editor.clone();
+            move |_, event| {
+                if event.button() == 1 {
+                    editor.grab_focus();
+                }
+                glib::Propagation::Proceed
+            }
+        });
         scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
         scroller.set_shadow_type(gtk::ShadowType::None);
         scroller.set_overlay_scrolling(false);
@@ -1463,6 +2056,8 @@ fn rebuild_pinned_notes(
             state.clone(),
             registry.clone(),
             interactive.clone(),
+            None,
+            None,
         );
         attach_drag(
             &header_drag,
@@ -1489,6 +2084,7 @@ fn rebuild_pinned_notes(
                 max_width: 540,
                 max_height: 440,
                 aspect_ratio: None,
+                preserve_current_aspect: false,
             },
         );
 
@@ -1596,7 +2192,7 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     revealer.set_transition_duration(190);
     let choices = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     choices.style_context().add_class("widget-choices");
-    let system = picker_toggle("CPU / RAM");
+    let system = picker_toggle("SYSTEM");
     let timer = picker_toggle("TIMER");
     let mode = picker_button(initial_color_mode.label());
     let history = picker_button("▤  HISTORY");
@@ -2245,6 +2841,8 @@ fn attach_color_mode_menu(
     state: Rc<RefCell<AppState>>,
     registry: Rc<RefCell<Vec<RegisteredWidget>>>,
     interactive: Rc<Cell<bool>>,
+    timer_style: Option<TimerStylePreview>,
+    system_details: Option<SystemDetailsPreview>,
 ) {
     let menu = gtk::Menu::new();
     for mode in [ColorMode::Light, ColorMode::Gray, ColorMode::Dark] {
@@ -2263,6 +2861,103 @@ fn attach_color_mode_menu(
             }
         });
         menu.append(&item);
+    }
+
+    if let Some(timer_style) = timer_style {
+        let parent = gtk::MenuItem::with_label("STYLE");
+        let submenu = gtk::Menu::new();
+        for style in TimerStyle::ALL {
+            let item = gtk::MenuItem::with_label(style.label());
+            item.connect_select({
+                let timer_style = timer_style.clone();
+                move |_| apply_timer_style(&timer_style, style)
+            });
+            item.connect_activate({
+                let timer_style = timer_style.clone();
+                let state = state.clone();
+                move |_| {
+                    apply_timer_style(&timer_style, style);
+                    let mut data = state.borrow_mut();
+                    data.timer_style = style;
+                    data.sizes.insert("timer".into(), timer_style.size.get());
+                    let _ = data.save();
+                }
+            });
+            submenu.append(&item);
+        }
+        parent.set_submenu(Some(&submenu));
+        menu.append(&parent);
+        menu.connect_selection_done({
+            let timer_style = timer_style.clone();
+            let state = state.clone();
+            move |_| apply_timer_style(&timer_style, state.borrow().timer_style)
+        });
+
+        let edit_time = gtk::MenuItem::with_label("EDIT TIME");
+        edit_time.connect_activate({
+            let open_edit = timer_style.open_edit.clone();
+            move |_| {
+                glib::timeout_add_local_once(Duration::from_millis(80), {
+                    let open_edit = open_edit.clone();
+                    move || open_edit()
+                });
+            }
+        });
+        menu.append(&edit_time);
+    }
+    if let Some(system_details) = system_details {
+        menu.append(&gtk::SeparatorMenuItem::new());
+        let cpu = gtk::CheckMenuItem::with_label("CPU");
+        cpu.set_active(system_details.details.get().cpu);
+        cpu.connect_toggled({
+            let preview = system_details.clone();
+            let state = state.clone();
+            move |item| {
+                let mut details = preview.details.get();
+                details.cpu = item.is_active();
+                apply_system_details(&preview, &state, details);
+            }
+        });
+        menu.append(&cpu);
+
+        let ram = gtk::CheckMenuItem::with_label("RAM");
+        ram.set_active(system_details.details.get().ram);
+        ram.connect_toggled({
+            let preview = system_details.clone();
+            let state = state.clone();
+            move |item| {
+                let mut details = preview.details.get();
+                details.ram = item.is_active();
+                apply_system_details(&preview, &state, details);
+            }
+        });
+        menu.append(&ram);
+
+        let processes = gtk::CheckMenuItem::with_label("TOP PROCESSES");
+        processes.set_active(system_details.details.get().processes);
+        processes.connect_toggled({
+            let preview = system_details.clone();
+            let state = state.clone();
+            move |item| {
+                let mut details = preview.details.get();
+                details.processes = item.is_active();
+                apply_system_details(&preview, &state, details);
+            }
+        });
+        menu.append(&processes);
+
+        let cores = gtk::CheckMenuItem::with_label("CPU CORES");
+        cores.set_active(system_details.details.get().cores);
+        cores.connect_toggled({
+            let preview = system_details.clone();
+            let state = state.clone();
+            move |item| {
+                let mut details = preview.details.get();
+                details.cores = item.is_active();
+                apply_system_details(&preview, &state, details);
+            }
+        });
+        menu.append(&cores);
     }
     menu.show_all();
 
@@ -2284,6 +2979,22 @@ fn attach_color_mode_menu(
     }
 }
 
+fn apply_system_details(
+    preview: &SystemDetailsPreview,
+    state: &Rc<RefCell<AppState>>,
+    details: SystemDetails,
+) {
+    preview.details.set(details);
+    let size = system_content_size(details, preview.values.borrow().cores.len());
+    preview.card.set_size_request(size.width, size.height);
+    preview.card.queue_resize();
+    preview.canvas.queue_draw();
+    let mut data = state.borrow_mut();
+    data.settings.system_details = details;
+    data.sizes.insert("system".into(), size);
+    let _ = data.save();
+}
+
 fn place_card(root: &gtk::Fixed, card: &gtk::EventBox, point: Point) {
     root.put(card, point.x.max(0), point.y.max(0));
 }
@@ -2299,7 +3010,6 @@ fn logical_screen_rects(scale: i32, fallback_width: i32, fallback_height: i32) -
         return vec![root_bounds];
     };
     let mut raw_screens = Vec::new();
-    let mut raw_workareas = Vec::new();
     for index in 0..display.n_monitors() {
         if let Some(monitor) = display.monitor(index) {
             let geometry = monitor.geometry();
@@ -2309,24 +3019,12 @@ fn logical_screen_rects(scale: i32, fallback_width: i32, fallback_height: i32) -
                 width: geometry.width(),
                 height: geometry.height(),
             });
-            let workarea = monitor.workarea();
-            raw_workareas.push(ScreenRect {
-                x: workarea.x(),
-                y: workarea.y(),
-                width: workarea.width(),
-                height: workarea.height(),
-            });
         }
     }
     let divisor = monitor_coordinate_divisor(&raw_screens, scale, root_bounds);
     let screens: Vec<_> = raw_screens
         .into_iter()
-        .zip(raw_workareas)
-        .filter_map(|(screen, workarea)| {
-            let screen = normalize_monitor_rect(screen, divisor, root_bounds)?;
-            let workarea = normalize_monitor_rect(workarea, divisor, root_bounds);
-            Some(apply_top_panel_inset(screen, workarea))
-        })
+        .filter_map(|screen| normalize_monitor_rect(screen, divisor, root_bounds))
         .collect();
     if screens.is_empty() {
         vec![root_bounds]
@@ -2355,13 +3053,6 @@ fn logical_primary_screen(
         width: primary_geometry.width(),
         height: primary_geometry.height(),
     };
-    let primary_workarea = monitor.workarea();
-    let primary_workarea = ScreenRect {
-        x: primary_workarea.x(),
-        y: primary_workarea.y(),
-        width: primary_workarea.width(),
-        height: primary_workarea.height(),
-    };
     let raw_screens: Vec<_> = (0..display.n_monitors())
         .filter_map(|index| display.monitor(index))
         .map(|monitor| {
@@ -2375,9 +3066,7 @@ fn logical_primary_screen(
         })
         .collect();
     let divisor = monitor_coordinate_divisor(&raw_screens, scale, root_bounds);
-    let primary = normalize_monitor_rect(primary, divisor, root_bounds)?;
-    let workarea = normalize_monitor_rect(primary_workarea, divisor, root_bounds);
-    Some(apply_top_panel_inset(primary, workarea))
+    normalize_monitor_rect(primary, divisor, root_bounds)
 }
 
 fn monitor_coordinate_divisor(
@@ -2433,19 +3122,6 @@ fn normalize_monitor_rect(
         width: right - left,
         height: bottom - top,
     })
-}
-
-fn apply_top_panel_inset(screen: ScreenRect, workarea: Option<ScreenRect>) -> ScreenRect {
-    let bottom = screen.y + screen.height;
-    let top = workarea
-        .map(|workarea| workarea.y.clamp(screen.y, bottom))
-        .unwrap_or(screen.y);
-    ScreenRect {
-        x: screen.x,
-        y: top,
-        width: screen.width,
-        height: bottom - top,
-    }
 }
 
 fn clamp_to_screens(point: Point, width: i32, height: i32, screens: &[ScreenRect]) -> Point {
@@ -2657,7 +3333,12 @@ fn attach_resize(
                 .min(available_height)
                 .max(bounds.min_height);
 
-            let next = if let Some(ratio) = bounds.aspect_ratio {
+            let aspect_ratio = if bounds.preserve_current_aspect {
+                Some(f64::from(start_width) / f64::from(start_height.max(1)))
+            } else {
+                bounds.aspect_ratio
+            };
+            let next = if let Some(ratio) = aspect_ratio {
                 let width_factor = (f64::from(start_width) + delta_x) / f64::from(start_width);
                 let height_factor = (f64::from(start_height) + delta_y) / f64::from(start_height);
                 let desired_factor = if delta_x.abs() >= delta_y.abs() {
@@ -2736,6 +3417,9 @@ fn attach_drag(
     let gesture = gtk::GestureDrag::new(handle);
     gesture.set_button(1);
     gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    // GestureDrag's local deltas are rounded around HiDPI scale boundaries.
+    // Follow the root pointer instead, so moving the Fixed child never feeds
+    // back into the next drag delta.
     let start = Rc::new(Cell::new(None::<(i32, i32, f64, f64)>));
     gesture.connect_drag_begin({
         let start = start.clone();
@@ -2945,6 +3629,59 @@ fn set_registered_color_mode(item: &RegisteredWidget, mode: ColorMode) {
     item.widget.queue_draw();
 }
 
+fn apply_timer_style(preview: &TimerStylePreview, style: TimerStyle) {
+    let previous = preview.style.get();
+    if previous != style {
+        let size = timer_style_size(preview.size.get(), previous, style);
+        preview.size.set(size);
+        preview.card.set_size_request(size.width, size.height);
+        preview.card.queue_resize();
+    }
+    preview.style.set(style);
+    let context = preview.card.style_context();
+    for style in TimerStyle::ALL {
+        context.remove_class(style.css_class());
+    }
+    context.add_class(style.css_class());
+    apply_timer_typography(&preview.typography, style, preview.size.get());
+    preview.canvas.queue_draw();
+    glib::idle_add_local_once({
+        let window = preview.window.clone();
+        let registry = preview.registry.clone();
+        let interactive = preview.interactive.clone();
+        move || refresh_input_shape(&window, &registry, interactive.get())
+    });
+}
+
+fn apply_timer_typography(provider: &gtk::CssProvider, style: TimerStyle, size: Size) {
+    let reference = style.default_size();
+    let scale = (f64::from(size.width.max(1)) / f64::from(reference.width))
+        .min(f64::from(size.height.max(1)) / f64::from(reference.height))
+        .clamp(0.45, 3.2);
+    let (value_base, action_base, editor_base) = match style {
+        TimerStyle::Digital => (25.0, 9.0, 17.0),
+        TimerStyle::Ring | TimerStyle::Ticks | TimerStyle::Arc => (25.0, 11.0, 18.0),
+    };
+    let value = (value_base * scale).round().max(10.0);
+    let action = (action_base * scale).round().max(7.0);
+    let editor = (editor_base * scale).round().max(10.0);
+    let css = format!(
+        ".timer-value {{ font-size: {value}px; }}\n.timer-action {{ font-size: {action}px; }}\n.timer-editor {{ font-size: {editor}px; }}"
+    );
+    let _ = provider.load_from_data(css.as_bytes());
+}
+
+fn timer_style_size(size: Size, from: TimerStyle, to: TimerStyle) -> Size {
+    let from_default = from.default_size();
+    let to_default = to.default_size();
+    let factor = (f64::from(size.width.max(1)) / f64::from(from_default.width))
+        .min(f64::from(size.height.max(1)) / f64::from(from_default.height));
+    Size {
+        width: (f64::from(to_default.width) * factor).round().max(1.0) as i32,
+        height: (f64::from(to_default.height) * factor).round().max(1.0) as i32,
+    }
+}
+
 fn small_button(label: &str) -> gtk::Button {
     let button = gtk::Button::with_label(label);
     button.style_context().add_class("tiny-button");
@@ -3028,10 +3765,10 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        apply_top_panel_inset, clamp_to_screens, monitor_coordinate_divisor,
-        normalize_monitor_rect, parse_timer_input, ScreenRect,
+        clamp_to_screens, monitor_coordinate_divisor, normalize_monitor_rect, parse_timer_input,
+        system_content_size, timer_style_size, ScreenRect,
     };
-    use crate::state::Point;
+    use crate::state::{Point, Size, SystemDetails, TimerStyle};
 
     #[test]
     fn parses_supported_timer_formats() {
@@ -3067,25 +3804,39 @@ mod timer_input_tests {
     }
 
     #[test]
-    fn top_panel_is_reserved_without_shrinking_the_bottom_edge() {
-        let screen = ScreenRect {
-            x: 0,
-            y: 0,
-            width: 1280,
-            height: 720,
-        };
-        let workarea = ScreenRect {
-            x: 0,
-            y: 29,
-            width: 1280,
-            height: 691,
-        };
-        let safe_screen = apply_top_panel_inset(screen, Some(workarea));
-        assert_eq!(safe_screen.y, 29);
-        assert_eq!(safe_screen.height, 691);
+    fn digital_timer_style_uses_a_compact_rectangular_container() {
+        let ring = TimerStyle::Ring.default_size();
+        let digital = timer_style_size(ring, TimerStyle::Ring, TimerStyle::Digital);
         assert_eq!(
-            clamp_to_screens(Point { x: 300, y: 900 }, 196, 76, &[safe_screen]),
-            Point { x: 300, y: 644 }
+            digital,
+            Size {
+                width: 84,
+                height: 36
+            }
+        );
+        assert_eq!(
+            timer_style_size(digital, TimerStyle::Digital, TimerStyle::Ring),
+            ring
+        );
+    }
+
+    #[test]
+    fn a_single_system_meter_uses_a_tight_square_container() {
+        let size = system_content_size(
+            SystemDetails {
+                cpu: true,
+                ram: false,
+                processes: false,
+                cores: false,
+            },
+            0,
+        );
+        assert_eq!(
+            size,
+            Size {
+                width: 76,
+                height: 76
+            }
         );
     }
 }

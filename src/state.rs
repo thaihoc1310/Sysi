@@ -37,12 +37,57 @@ impl ColorMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TimerStyle {
+    #[default]
+    Ring,
+    Digital,
+    Ticks,
+    Arc,
+}
+
+impl TimerStyle {
+    pub const ALL: [Self; 4] = [Self::Ring, Self::Digital, Self::Ticks, Self::Arc];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ring => "RING",
+            Self::Digital => "DIGITAL",
+            Self::Ticks => "TICKS",
+            Self::Arc => "ARC",
+        }
+    }
+
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Self::Ring => "timer-style-ring",
+            Self::Digital => "timer-style-digital",
+            Self::Ticks => "timer-style-ticks",
+            Self::Arc => "timer-style-arc",
+        }
+    }
+
+    pub fn default_size(self) -> Size {
+        match self {
+            Self::Ring | Self::Ticks | Self::Arc => Size {
+                width: 116,
+                height: 116,
+            },
+            Self::Digital => Size {
+                width: 84,
+                height: 36,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Size {
     pub width: i32,
     pub height: i32,
@@ -58,6 +103,8 @@ pub struct Settings {
     pub settings_button: bool,
     #[serde(default)]
     pub color_mode: ColorMode,
+    #[serde(default)]
+    pub system_details: SystemDetails,
 }
 
 impl Default for Settings {
@@ -67,6 +114,30 @@ impl Default for Settings {
             timer: true,
             settings_button: true,
             color_mode: ColorMode::default(),
+            system_details: SystemDetails::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct SystemDetails {
+    #[serde(default = "default_true")]
+    pub cpu: bool,
+    #[serde(default = "default_true")]
+    pub ram: bool,
+    #[serde(default)]
+    pub processes: bool,
+    #[serde(default)]
+    pub cores: bool,
+}
+
+impl Default for SystemDetails {
+    fn default() -> Self {
+        Self {
+            cpu: true,
+            ram: true,
+            processes: false,
+            cores: false,
         }
     }
 }
@@ -97,6 +168,8 @@ pub struct AppState {
     pub notes: Vec<Note>,
     #[serde(default = "default_timer")]
     pub timer_seconds: i64,
+    #[serde(default)]
+    pub timer_style: TimerStyle,
     #[serde(default = "default_next_id")]
     pub next_note_id: u64,
 }
@@ -114,6 +187,7 @@ impl Default for AppState {
             widget_color_modes: HashMap::new(),
             notes: Vec::new(),
             timer_seconds: default_timer(),
+            timer_style: TimerStyle::default(),
             next_note_id: 1,
         }
     }
@@ -169,7 +243,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, ColorMode};
+    use super::{AppState, ColorMode, TimerStyle};
 
     #[test]
     fn old_settings_default_to_gray_mode() {
@@ -192,5 +266,12 @@ mod tests {
         let state: AppState = serde_json::from_str(r#"{"settings":{"color_mode":"dark"}}"#)
             .expect("state without per-widget colors should remain readable");
         assert!(state.widget_color_modes.is_empty());
+    }
+
+    #[test]
+    fn old_state_defaults_to_ring_timer_style() {
+        let state: AppState = serde_json::from_str(r#"{"timer_seconds":120}"#)
+            .expect("state without a timer style should remain readable");
+        assert_eq!(state.timer_style, TimerStyle::Ring);
     }
 }
