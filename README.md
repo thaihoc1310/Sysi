@@ -11,6 +11,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 - Create multiple independent notes from the `NOTE` action.
 - Click-through lock mode. Mouse events pass through everywhere except the timer circle, which keeps its hover and click control.
 - Manual `LIGHT`, `GRAY`, and `DARK` foreground modes with no screen sampling. In Edit Mode, right-click any widget to give it its own mode; using the Settings mode button resets every widget to the selected mode.
+- HiDPI-aware placement: widgets stop below Ubuntu's top panel and stay inside the real bottom edge of the display.
 - Native HiDPI and multi-monitor placement, including 200% scaling.
 - Persistent notes, positions, widget sizes, timer duration, and visibility settings.
 - Automatic startup through XDG Autostart.
@@ -42,7 +43,7 @@ The package is written to `dist/`.
 ## Install
 
 ```bash
-sudo apt install ./dist/sysi-overlay_0.1.3_amd64.deb
+sudo apt install ./dist/sysi-overlay_0.1.4_amd64.deb
 ```
 
 Sysi starts automatically on the next desktop login. It can also be launched immediately from the application menu.

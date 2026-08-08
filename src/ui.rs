@@ -13,8 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SYSTEM_WIDTH: i32 = 224;
-const SYSTEM_HEIGHT: i32 = 90;
+const SYSTEM_WIDTH: i32 = 196;
+const SYSTEM_HEIGHT: i32 = 76;
 const TIMER_SIZE: i32 = 132;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
@@ -90,7 +90,7 @@ struct MascotSheets {
     mischief: gdk_pixbuf::Pixbuf,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScreenRect {
     x: i32,
     y: i32,
@@ -110,7 +110,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     window.set_accept_focus(false);
     window.set_focus_on_map(false);
     window.stick();
-    window.set_type_hint(gdk::WindowTypeHint::Utility);
+    window.set_type_hint(gdk::WindowTypeHint::Dock);
 
     if let Some(screen) = gtk::prelude::WidgetExt::screen(&window) {
         if let Some(visual) = screen.rgba_visual() {
@@ -120,11 +120,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     let screen = gdk::Screen::default().expect("Sysi requires a graphical display");
     let root_window = screen.root_window().expect("display root window");
-    let scale = window.scale_factor().max(1);
+    let scale = root_window.scale_factor().max(1);
     let screen_width = root_window.width() / scale;
     let screen_height = root_window.height() / scale;
     let screens = logical_screen_rects(scale, screen_width, screen_height);
-    let primary_screen = logical_primary_screen(scale).unwrap_or(screens[0]);
+    let primary_screen =
+        logical_primary_screen(scale, screen_width, screen_height).unwrap_or(screens[0]);
     {
         let mut data = state.borrow_mut();
         if data.layout_version < 3 {
@@ -705,11 +706,11 @@ fn draw_system(
 ) {
     let (cpu, memory, _used, _total, _load) = values;
     let allocation = area.allocation();
-    let scale = (f64::from(allocation.width()) / 216.0)
-        .min(f64::from(allocation.height()) / 82.0)
+    let scale = (f64::from(allocation.width()) / 188.0)
+        .min(f64::from(allocation.height()) / 72.0)
         .max(0.1);
-    let content_width = 216.0 * scale;
-    let content_height = 82.0 * scale;
+    let content_width = 188.0 * scale;
+    let content_height = 72.0 * scale;
     let _ = ctx.save();
     ctx.translate(
         (f64::from(allocation.width()) - content_width) / 2.0,
@@ -721,19 +722,19 @@ fn draw_system(
         ColorMode::Gray => ((0.7, 0.7, 0.7), (0.5, 0.5, 0.5), (0.64, 0.64, 0.64)),
         ColorMode::Dark => ((0.08, 0.08, 0.08), (0.24, 0.24, 0.24), (0.14, 0.14, 0.14)),
     };
-    for (x, value, title) in [(52.0, cpu, "CPU"), (164.0, memory, "RAM")] {
-        ctx.set_line_width(7.0);
+    for (x, value, title) in [(47.0, cpu, "CPU"), (141.0, memory, "RAM")] {
+        ctx.set_line_width(6.5);
         ctx.set_line_cap(cairo::LineCap::Round);
         ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
         ctx.new_sub_path();
-        ctx.arc(x, 42.0, 30.0, -PI * 0.75, PI * 0.75);
+        ctx.arc(x, 35.0, 28.0, -PI * 0.75, PI * 0.75);
         let _ = ctx.stroke();
         ctx.set_source_rgba(accent.0, accent.1, accent.2, 0.96);
         ctx.new_sub_path();
         ctx.arc(
             x,
-            42.0,
-            30.0,
+            35.0,
+            28.0,
             -PI * 0.75,
             -PI * 0.75 + PI * 1.5 * (value / 100.0).clamp(0.0, 1.0),
         );
@@ -741,13 +742,13 @@ fn draw_system(
         center_text(
             ctx,
             x,
-            40.0,
+            37.0,
             &format!("{value:.0}%"),
             18.0,
             FontWeight::Bold,
             ink,
         );
-        center_text(ctx, x, 60.0, title, 8.5, FontWeight::Bold, muted);
+        center_text(ctx, x, 56.0, title, 8.5, FontWeight::Bold, muted);
     }
     let _ = ctx.restore();
 }
@@ -1121,7 +1122,7 @@ fn draw_timer_ring(
     let allocation = area.allocation();
     let cx = f64::from(allocation.width()) / 2.0;
     let cy = f64::from(allocation.height()) / 2.0;
-    let radius = cx.min(cy) - 13.0;
+    let radius = cx.min(cy) - 9.0;
     let gray = match color_mode {
         ColorMode::Light => 0.91,
         ColorMode::Gray => 0.6,
@@ -2287,47 +2288,164 @@ fn place_card(root: &gtk::Fixed, card: &gtk::EventBox, point: Point) {
     root.put(card, point.x.max(0), point.y.max(0));
 }
 
-fn logical_screen_rects(_scale: i32, fallback_width: i32, fallback_height: i32) -> Vec<ScreenRect> {
-    let Some(display) = gdk::Display::default() else {
-        return vec![ScreenRect {
-            x: 0,
-            y: 0,
-            width: fallback_width,
-            height: fallback_height,
-        }];
+fn logical_screen_rects(scale: i32, fallback_width: i32, fallback_height: i32) -> Vec<ScreenRect> {
+    let root_bounds = ScreenRect {
+        x: 0,
+        y: 0,
+        width: fallback_width.max(1),
+        height: fallback_height.max(1),
     };
-    let mut screens = Vec::new();
+    let Some(display) = gdk::Display::default() else {
+        return vec![root_bounds];
+    };
+    let mut raw_screens = Vec::new();
+    let mut raw_workareas = Vec::new();
     for index in 0..display.n_monitors() {
         if let Some(monitor) = display.monitor(index) {
-            let geometry = monitor.workarea();
-            screens.push(ScreenRect {
+            let geometry = monitor.geometry();
+            raw_screens.push(ScreenRect {
                 x: geometry.x(),
                 y: geometry.y(),
                 width: geometry.width(),
                 height: geometry.height(),
             });
+            let workarea = monitor.workarea();
+            raw_workareas.push(ScreenRect {
+                x: workarea.x(),
+                y: workarea.y(),
+                width: workarea.width(),
+                height: workarea.height(),
+            });
         }
     }
+    let divisor = monitor_coordinate_divisor(&raw_screens, scale, root_bounds);
+    let screens: Vec<_> = raw_screens
+        .into_iter()
+        .zip(raw_workareas)
+        .filter_map(|(screen, workarea)| {
+            let screen = normalize_monitor_rect(screen, divisor, root_bounds)?;
+            let workarea = normalize_monitor_rect(workarea, divisor, root_bounds);
+            Some(apply_top_panel_inset(screen, workarea))
+        })
+        .collect();
     if screens.is_empty() {
-        screens.push(ScreenRect {
-            x: 0,
-            y: 0,
-            width: fallback_width,
-            height: fallback_height,
-        });
+        vec![root_bounds]
+    } else {
+        screens
     }
-    screens
 }
 
-fn logical_primary_screen(_scale: i32) -> Option<ScreenRect> {
-    let monitor = gdk::Display::default()?.primary_monitor()?;
-    let geometry = monitor.workarea();
-    Some(ScreenRect {
-        x: geometry.x(),
-        y: geometry.y(),
-        width: geometry.width(),
-        height: geometry.height(),
+fn logical_primary_screen(
+    scale: i32,
+    fallback_width: i32,
+    fallback_height: i32,
+) -> Option<ScreenRect> {
+    let root_bounds = ScreenRect {
+        x: 0,
+        y: 0,
+        width: fallback_width.max(1),
+        height: fallback_height.max(1),
+    };
+    let display = gdk::Display::default()?;
+    let monitor = display.primary_monitor()?;
+    let primary_geometry = monitor.geometry();
+    let primary = ScreenRect {
+        x: primary_geometry.x(),
+        y: primary_geometry.y(),
+        width: primary_geometry.width(),
+        height: primary_geometry.height(),
+    };
+    let primary_workarea = monitor.workarea();
+    let primary_workarea = ScreenRect {
+        x: primary_workarea.x(),
+        y: primary_workarea.y(),
+        width: primary_workarea.width(),
+        height: primary_workarea.height(),
+    };
+    let raw_screens: Vec<_> = (0..display.n_monitors())
+        .filter_map(|index| display.monitor(index))
+        .map(|monitor| {
+            let geometry = monitor.geometry();
+            ScreenRect {
+                x: geometry.x(),
+                y: geometry.y(),
+                width: geometry.width(),
+                height: geometry.height(),
+            }
+        })
+        .collect();
+    let divisor = monitor_coordinate_divisor(&raw_screens, scale, root_bounds);
+    let primary = normalize_monitor_rect(primary, divisor, root_bounds)?;
+    let workarea = normalize_monitor_rect(primary_workarea, divisor, root_bounds);
+    Some(apply_top_panel_inset(primary, workarea))
+}
+
+fn monitor_coordinate_divisor(
+    raw_screens: &[ScreenRect],
+    scale: i32,
+    root_bounds: ScreenRect,
+) -> i32 {
+    if scale <= 1 || raw_screens.is_empty() {
+        return 1;
+    }
+    let min_x = raw_screens.iter().map(|screen| screen.x).min().unwrap_or(0);
+    let min_y = raw_screens.iter().map(|screen| screen.y).min().unwrap_or(0);
+    let max_x = raw_screens
+        .iter()
+        .map(|screen| screen.x.saturating_add(screen.width))
+        .max()
+        .unwrap_or(root_bounds.width);
+    let max_y = raw_screens
+        .iter()
+        .map(|screen| screen.y.saturating_add(screen.height))
+        .max()
+        .unwrap_or(root_bounds.height);
+    if max_x.saturating_sub(min_x) > root_bounds.width
+        || max_y.saturating_sub(min_y) > root_bounds.height
+    {
+        scale
+    } else {
+        1
+    }
+}
+
+fn normalize_monitor_rect(
+    screen: ScreenRect,
+    divisor: i32,
+    root_bounds: ScreenRect,
+) -> Option<ScreenRect> {
+    let divisor = divisor.max(1);
+    let x = (f64::from(screen.x) / f64::from(divisor)).round() as i32;
+    let y = (f64::from(screen.y) / f64::from(divisor)).round() as i32;
+    let width = (f64::from(screen.width) / f64::from(divisor)).round() as i32;
+    let height = (f64::from(screen.height) / f64::from(divisor)).round() as i32;
+    let left = x.clamp(root_bounds.x, root_bounds.x + root_bounds.width);
+    let top = y.clamp(root_bounds.y, root_bounds.y + root_bounds.height);
+    let right = x
+        .saturating_add(width)
+        .clamp(root_bounds.x, root_bounds.x + root_bounds.width);
+    let bottom = y
+        .saturating_add(height)
+        .clamp(root_bounds.y, root_bounds.y + root_bounds.height);
+    (right > left && bottom > top).then_some(ScreenRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
     })
+}
+
+fn apply_top_panel_inset(screen: ScreenRect, workarea: Option<ScreenRect>) -> ScreenRect {
+    let bottom = screen.y + screen.height;
+    let top = workarea
+        .map(|workarea| workarea.y.clamp(screen.y, bottom))
+        .unwrap_or(screen.y);
+    ScreenRect {
+        x: screen.x,
+        y: top,
+        width: screen.width,
+        height: bottom - top,
+    }
 }
 
 fn clamp_to_screens(point: Point, width: i32, height: i32, screens: &[ScreenRect]) -> Point {
@@ -2909,7 +3027,11 @@ fn install_css(screen: &gdk::Screen) {
 
 #[cfg(test)]
 mod timer_input_tests {
-    use super::parse_timer_input;
+    use super::{
+        apply_top_panel_inset, clamp_to_screens, monitor_coordinate_divisor,
+        normalize_monitor_rect, parse_timer_input, ScreenRect,
+    };
+    use crate::state::Point;
 
     #[test]
     fn parses_supported_timer_formats() {
@@ -2923,5 +3045,47 @@ mod timer_input_tests {
         assert_eq!(parse_timer_input("0"), None);
         assert_eq!(parse_timer_input("10:99"), None);
         assert_eq!(parse_timer_input("hello"), None);
+    }
+
+    #[test]
+    fn physical_monitor_geometry_is_normalized_for_hidpi_overlay() {
+        let root = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        };
+        let physical = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        let divisor = monitor_coordinate_divisor(&[physical], 2, root);
+        assert_eq!(divisor, 2);
+        assert_eq!(normalize_monitor_rect(physical, divisor, root), Some(root));
+    }
+
+    #[test]
+    fn top_panel_is_reserved_without_shrinking_the_bottom_edge() {
+        let screen = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        };
+        let workarea = ScreenRect {
+            x: 0,
+            y: 29,
+            width: 1280,
+            height: 691,
+        };
+        let safe_screen = apply_top_panel_inset(screen, Some(workarea));
+        assert_eq!(safe_screen.y, 29);
+        assert_eq!(safe_screen.height, 691);
+        assert_eq!(
+            clamp_to_screens(Point { x: 300, y: 900 }, 196, 76, &[safe_screen]),
+            Point { x: 300, y: 644 }
+        );
     }
 }

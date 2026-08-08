@@ -36,7 +36,7 @@ impl ColorMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
