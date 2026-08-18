@@ -38,7 +38,7 @@
 .mode-dark.picker-widget {
   background-color: transparent;
   color: #111111;
-  text-shadow: none;
+  text-shadow: 0 1px 3px rgba(255, 255, 255, 0.34);
 }
 
 .card-title {

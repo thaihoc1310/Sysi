@@ -25,6 +25,12 @@ const RESIZE_HIT_SIZE: i32 = 18;
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 type SystemValues = Rc<RefCell<SystemSnapshot>>;
 
+#[derive(Clone, Copy)]
+struct TextShadow {
+    color: (f64, f64, f64),
+    alpha: f64,
+}
+
 struct SystemCard {
     card: gtk::EventBox,
     drag: gtk::EventBox,
@@ -830,6 +836,7 @@ fn draw_system(
         ColorMode::Gray => ((0.7, 0.7, 0.7), (0.5, 0.5, 0.5), (0.64, 0.64, 0.64)),
         ColorMode::Dark => ((0.08, 0.08, 0.08), (0.24, 0.24, 0.24), (0.14, 0.14, 0.14)),
     };
+    let shadow = system_text_shadow(color_mode);
     let meters = match (details.cpu, details.ram) {
         (true, true) => [
             Some((47.0, values.cpu_percent, "CPU")),
@@ -860,7 +867,7 @@ fn draw_system(
                 -PI * 0.75 + PI * 1.5 * (value / 100.0).clamp(0.0, 1.0),
             );
             let _ = ctx.stroke();
-            center_text(
+            center_text_with_shadow(
                 ctx,
                 x,
                 37.0,
@@ -868,8 +875,9 @@ fn draw_system(
                 18.0,
                 FontWeight::Bold,
                 ink,
+                shadow,
             );
-            center_text(ctx, x, 56.0, title, 8.5, FontWeight::Bold, muted);
+            center_text_with_shadow(ctx, x, 56.0, title, 8.5, FontWeight::Bold, muted, shadow);
         }
         let _ = ctx.restore();
     }
@@ -879,11 +887,20 @@ fn draw_system(
         2.0
     };
     if details.processes {
-        draw_system_processes(ctx, values, width, cursor_y, ink, muted);
+        draw_system_processes(ctx, values, width, cursor_y, ink, muted, shadow);
         cursor_y += 108.0;
     }
     if details.cores {
-        draw_system_cores(ctx, &values.cores, width, cursor_y, ink, muted, accent);
+        draw_system_cores(
+            ctx,
+            &values.cores,
+            width,
+            cursor_y,
+            ink,
+            muted,
+            accent,
+            shadow,
+        );
     }
 }
 
@@ -922,8 +939,9 @@ fn draw_system_processes(
     top: f64,
     ink: (f64, f64, f64),
     muted: (f64, f64, f64),
+    shadow: TextShadow,
 ) {
-    draw_left_text(
+    draw_left_text_with_shadow(
         ctx,
         5.0,
         top + 11.0,
@@ -931,8 +949,9 @@ fn draw_system_processes(
         8.0,
         FontWeight::Bold,
         muted,
+        shadow,
     );
-    draw_right_text(
+    draw_right_text_with_shadow(
         ctx,
         width - 96.0,
         top + 11.0,
@@ -940,8 +959,9 @@ fn draw_system_processes(
         8.0,
         FontWeight::Bold,
         muted,
+        shadow,
     );
-    draw_right_text(
+    draw_right_text_with_shadow(
         ctx,
         width - 57.0,
         top + 11.0,
@@ -949,8 +969,9 @@ fn draw_system_processes(
         8.0,
         FontWeight::Bold,
         muted,
+        shadow,
     );
-    draw_right_text(
+    draw_right_text_with_shadow(
         ctx,
         width - 5.0,
         top + 11.0,
@@ -958,6 +979,7 @@ fn draw_system_processes(
         8.0,
         FontWeight::Bold,
         muted,
+        shadow,
     );
     ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.18);
     ctx.set_line_width(1.0);
@@ -967,8 +989,17 @@ fn draw_system_processes(
     for (row, process) in values.processes.iter().take(5).enumerate() {
         let baseline = top + 29.0 + row as f64 * 17.0;
         let label = truncate_text(&process.name, 23);
-        draw_left_text(ctx, 5.0, baseline, &label, 9.5, FontWeight::Normal, ink);
-        draw_right_text(
+        draw_left_text_with_shadow(
+            ctx,
+            5.0,
+            baseline,
+            &label,
+            9.5,
+            FontWeight::Normal,
+            ink,
+            shadow,
+        );
+        draw_right_text_with_shadow(
             ctx,
             width - 96.0,
             baseline,
@@ -976,8 +1007,9 @@ fn draw_system_processes(
             9.5,
             FontWeight::Normal,
             ink,
+            shadow,
         );
-        draw_right_text(
+        draw_right_text_with_shadow(
             ctx,
             width - 57.0,
             baseline,
@@ -985,8 +1017,9 @@ fn draw_system_processes(
             9.5,
             FontWeight::Normal,
             ink,
+            shadow,
         );
-        draw_right_text(
+        draw_right_text_with_shadow(
             ctx,
             width - 5.0,
             baseline,
@@ -994,10 +1027,12 @@ fn draw_system_processes(
             9.5,
             FontWeight::Normal,
             ink,
+            shadow,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_system_cores(
     ctx: &Context,
     cores: &[f64],
@@ -1006,6 +1041,7 @@ fn draw_system_cores(
     ink: (f64, f64, f64),
     muted: (f64, f64, f64),
     accent: (f64, f64, f64),
+    shadow: TextShadow,
 ) {
     let column_width = (width - 10.0) / 4.0;
     for (index, value) in cores.iter().enumerate() {
@@ -1013,7 +1049,7 @@ fn draw_system_cores(
         let row = index / 4;
         let x = 5.0 + column as f64 * column_width;
         let y = top + 11.0 + row as f64 * 17.0;
-        draw_left_text(
+        draw_left_text_with_shadow(
             ctx,
             x,
             y,
@@ -1021,6 +1057,7 @@ fn draw_system_cores(
             8.0,
             FontWeight::Bold,
             muted,
+            shadow,
         );
         ctx.set_line_width(2.3);
         ctx.set_line_cap(cairo::LineCap::Round);
@@ -1032,7 +1069,7 @@ fn draw_system_cores(
         ctx.move_to(x + 23.0, y - 3.0);
         ctx.line_to(x + 23.0 + 25.0 * (value / 100.0).clamp(0.0, 1.0), y - 3.0);
         let _ = ctx.stroke();
-        draw_right_text(
+        draw_right_text_with_shadow(
             ctx,
             x + column_width - 2.0,
             y,
@@ -1040,11 +1077,30 @@ fn draw_system_cores(
             8.0,
             FontWeight::Bold,
             ink,
+            shadow,
         );
     }
 }
 
-fn draw_left_text(
+fn system_text_shadow(color_mode: ColorMode) -> TextShadow {
+    match color_mode {
+        ColorMode::Light => TextShadow {
+            color: (0.0, 0.0, 0.0),
+            alpha: 0.72,
+        },
+        ColorMode::Gray => TextShadow {
+            color: (0.0, 0.0, 0.0),
+            alpha: 0.52,
+        },
+        ColorMode::Dark => TextShadow {
+            color: (1.0, 1.0, 1.0),
+            alpha: 0.34,
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_left_text_with_shadow(
     ctx: &Context,
     x: f64,
     baseline: f64,
@@ -1052,15 +1108,22 @@ fn draw_left_text(
     size: f64,
     weight: FontWeight,
     color: (f64, f64, f64),
+    shadow: impl Into<Option<TextShadow>>,
 ) {
     ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
     ctx.set_font_size(size);
+    if let Some(shadow) = shadow.into() {
+        ctx.set_source_rgba(shadow.color.0, shadow.color.1, shadow.color.2, shadow.alpha);
+        ctx.move_to(x + 0.8, baseline + 0.8);
+        let _ = ctx.show_text(text);
+    }
     ctx.set_source_rgb(color.0, color.1, color.2);
     ctx.move_to(x, baseline);
     let _ = ctx.show_text(text);
 }
 
-fn draw_right_text(
+#[allow(clippy::too_many_arguments)]
+fn draw_right_text_with_shadow(
     ctx: &Context,
     right: f64,
     baseline: f64,
@@ -1068,6 +1131,7 @@ fn draw_right_text(
     size: f64,
     weight: FontWeight,
     color: (f64, f64, f64),
+    shadow: impl Into<Option<TextShadow>>,
 ) {
     ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
     ctx.set_font_size(size);
@@ -1075,7 +1139,16 @@ fn draw_right_text(
         .text_extents(text)
         .map(|metrics| metrics.x_advance())
         .unwrap_or(0.0);
-    draw_left_text(ctx, right - width, baseline, text, size, weight, color);
+    draw_left_text_with_shadow(
+        ctx,
+        right - width,
+        baseline,
+        text,
+        size,
+        weight,
+        color,
+        shadow,
+    );
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -3740,12 +3813,33 @@ fn center_text(
     weight: FontWeight,
     color: (f64, f64, f64),
 ) {
+    center_text_with_shadow(ctx, x, y, text, size, weight, color, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn center_text_with_shadow(
+    ctx: &Context,
+    x: f64,
+    y: f64,
+    text: &str,
+    size: f64,
+    weight: FontWeight,
+    color: (f64, f64, f64),
+    shadow: impl Into<Option<TextShadow>>,
+) {
     ctx.select_font_face("Sans", FontSlant::Normal, weight);
     ctx.set_font_size(size);
+    let mut origin = x;
     if let Ok(extents) = ctx.text_extents(text) {
-        ctx.move_to(x - (extents.width() / 2.0 + extents.x_bearing()), y);
+        origin -= extents.width() / 2.0 + extents.x_bearing();
+    }
+    if let Some(shadow) = shadow.into() {
+        ctx.set_source_rgba(shadow.color.0, shadow.color.1, shadow.color.2, shadow.alpha);
+        ctx.move_to(origin + 0.8, y + 0.8);
+        let _ = ctx.show_text(text);
     }
     ctx.set_source_rgb(color.0, color.1, color.2);
+    ctx.move_to(origin, y);
     let _ = ctx.show_text(text);
 }
 
