@@ -282,12 +282,48 @@ textview, textview text {
   box-shadow: none;
 }
 
-.pinned-note scrollbar,
-.pinned-note scrollbar trough,
-.pinned-note scrollbar slider {
+.pinned-note scrollbar {
   background-color: transparent;
   border: none;
   box-shadow: none;
-  min-height: 0;
-  min-width: 0;
+}
+
+.pinned-note scrollbar trough {
+  background-color: transparent;
+  border: none;
+  border-radius: 4px;
+  transition: 160ms ease-out;
+}
+
+.pinned-note scrollbar slider {
+  background-color: alpha(currentColor, 0.0);
+  border: none;
+  border-radius: 4px;
+  min-width: 7px;
+  min-height: 26px;
+  margin: 1px;
+  transition: 160ms ease-out;
+}
+
+.pinned-note.note-hover scrollbar trough {
+  background-color: alpha(currentColor, 0.10);
+}
+
+.pinned-note.note-hover scrollbar slider,
+.pinned-note scrollbar slider:hover {
+  background-color: alpha(currentColor, 0.40);
+}
+
+.pinned-note.note-hover scrollbar slider:hover {
+  background-color: alpha(currentColor, 0.56);
+}
+
+.pinned-note.note-hover scrollbar slider:active {
+  background-color: alpha(currentColor, 0.68);
+}
+
+/* The timer renders without the overlay text halo; placed after the
+   .mode-* .card rules so it wins at equal specificity. */
+.timer-card .card {
+  text-shadow: none;
 }

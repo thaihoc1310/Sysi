@@ -25,12 +25,6 @@ const RESIZE_HIT_SIZE: i32 = 18;
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 type SystemValues = Rc<RefCell<SystemSnapshot>>;
 
-#[derive(Clone, Copy)]
-struct TextShadow {
-    color: (f64, f64, f64),
-    alpha: f64,
-}
-
 struct SystemCard {
     card: gtk::EventBox,
     drag: gtk::EventBox,
@@ -71,6 +65,7 @@ struct RegisteredWidget {
     widget: gtk::EventBox,
     color_mode: Rc<Cell<ColorMode>>,
     edit_only: Option<gtk::EventBox>,
+    editor: Option<gtk::TextView>,
 }
 
 struct TimerRuntime {
@@ -572,18 +567,49 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let state = state.clone();
         let refresh = refresh_closure.clone();
         let screens = screens.clone();
+        let registry = registry.clone();
+        let window = window.clone();
         move |_| {
+            // Open the note near the pointer (the action comes from the GNOME
+            // panel, so this lands just under the menu) instead of a fixed
+            // corner; fall back to the picker anchor without a pointer.
             let allocation = picker.allocation();
-            let position = clamp_to_screens(
-                Point {
+            let desired = pointer_position()
+                .map(|(x, y)| Point {
+                    x: x as i32 - NOTE_WIDTH / 2,
+                    y: y as i32 + 24,
+                })
+                .unwrap_or(Point {
                     x: allocation.x() + 205,
                     y: allocation.y() + 40,
-                },
-                NOTE_WIDTH,
-                NOTE_HEIGHT,
-                &screens,
-            );
+                });
+            let mut position = clamp_to_screens(desired, NOTE_WIDTH, NOTE_HEIGHT, &screens);
             let mut data = state.borrow_mut();
+            // Cascade so back-to-back notes don't stack invisibly on top of
+            // each other.
+            for _ in 0..12 {
+                let occupied = data.notes.iter().any(|note| {
+                    note.pinned
+                        && (note.position.x - position.x).abs() < 12
+                        && (note.position.y - position.y).abs() < 12
+                });
+                if !occupied {
+                    break;
+                }
+                let next = clamp_to_screens(
+                    Point {
+                        x: position.x + 26,
+                        y: position.y + 26,
+                    },
+                    NOTE_WIDTH,
+                    NOTE_HEIGHT,
+                    &screens,
+                );
+                if next == position {
+                    break;
+                }
+                position = next;
+            }
             let id = data.next_note_id;
             data.next_note_id += 1;
             data.notes.push(Note {
@@ -597,6 +623,24 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             revealer.set_reveal_child(false);
             history_revealer.set_reveal_child(false);
             refresh();
+            // Focus the fresh editor once the rebuilt card is mapped, so the
+            // user can start typing immediately, like a native notes app.
+            glib::idle_add_local_once({
+                let registry = registry.clone();
+                let window = window.clone();
+                let key = format!("note:{id}");
+                move || {
+                    let registry = registry.borrow();
+                    if let Some(editor) = registry
+                        .iter()
+                        .find(|item| item.key == key)
+                        .and_then(|item| item.editor.clone())
+                    {
+                        window.present();
+                        editor.grab_focus();
+                    }
+                }
+            });
             let _ = &root;
         }
     });
@@ -646,12 +690,20 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let history = widget_picker.history.clone();
         let new_note = widget_picker.new_note.clone();
         let quit = widget_picker.quit.clone();
+        let interactive = interactive.clone();
         Rc::new(move || match take_panel_action().as_deref() {
             Some("toggle-system") => system.set_active(!system.is_active()),
             Some("toggle-timer") => timer.set_active(!timer.is_active()),
             Some("next-color-mode") => mode.clicked(),
             Some("toggle-lock") => lock.clicked(),
-            Some("new-note") => new_note.clicked(),
+            Some("new-note") => {
+                // A note created while locked would be read-only; unlock so
+                // the user can type into it right away.
+                if !interactive.get() {
+                    lock.clicked();
+                }
+                new_note.clicked();
+            }
             Some("toggle-history") => {
                 let opening = !history_revealer.reveals_child();
                 if opening {
@@ -746,7 +798,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             glib::ControlFlow::Continue
         }
     });
+    // A panel action left pending by the launcher (the previous instance
+    // was down and the click restarted us) is applied once the UI is up.
+    dispatch_panel_action();
 
+    track_note_hover(registry.clone());
     start_system_updates(system_card);
     start_timer_updates(timer_card, state, window, registry, interactive);
 }
@@ -836,7 +892,6 @@ fn draw_system(
         ColorMode::Gray => ((0.7, 0.7, 0.7), (0.5, 0.5, 0.5), (0.64, 0.64, 0.64)),
         ColorMode::Dark => ((0.08, 0.08, 0.08), (0.24, 0.24, 0.24), (0.14, 0.14, 0.14)),
     };
-    let shadow = system_text_shadow(color_mode);
     let meters = match (details.cpu, details.ram) {
         (true, true) => [
             Some((47.0, values.cpu_percent, "CPU")),
@@ -867,7 +922,7 @@ fn draw_system(
                 -PI * 0.75 + PI * 1.5 * (value / 100.0).clamp(0.0, 1.0),
             );
             let _ = ctx.stroke();
-            center_text_with_shadow(
+            center_text(
                 ctx,
                 x,
                 37.0,
@@ -875,9 +930,8 @@ fn draw_system(
                 18.0,
                 FontWeight::Bold,
                 ink,
-                shadow,
             );
-            center_text_with_shadow(ctx, x, 56.0, title, 8.5, FontWeight::Bold, muted, shadow);
+            center_text(ctx, x, 56.0, title, 8.5, FontWeight::Bold, muted);
         }
         let _ = ctx.restore();
     }
@@ -887,7 +941,7 @@ fn draw_system(
         2.0
     };
     if details.processes {
-        draw_system_processes(ctx, values, width, cursor_y, ink, muted, shadow);
+        draw_system_processes(ctx, values, width, cursor_y, ink, muted);
         cursor_y += 108.0;
     }
     if details.cores {
@@ -899,7 +953,6 @@ fn draw_system(
             ink,
             muted,
             accent,
-            shadow,
         );
     }
 }
@@ -939,9 +992,8 @@ fn draw_system_processes(
     top: f64,
     ink: (f64, f64, f64),
     muted: (f64, f64, f64),
-    shadow: TextShadow,
 ) {
-    draw_left_text_with_shadow(
+    draw_left_text(
         ctx,
         5.0,
         top + 11.0,
@@ -949,9 +1001,8 @@ fn draw_system_processes(
         8.0,
         FontWeight::Bold,
         muted,
-        shadow,
     );
-    draw_right_text_with_shadow(
+    draw_right_text(
         ctx,
         width - 96.0,
         top + 11.0,
@@ -959,9 +1010,8 @@ fn draw_system_processes(
         8.0,
         FontWeight::Bold,
         muted,
-        shadow,
     );
-    draw_right_text_with_shadow(
+    draw_right_text(
         ctx,
         width - 57.0,
         top + 11.0,
@@ -969,9 +1019,8 @@ fn draw_system_processes(
         8.0,
         FontWeight::Bold,
         muted,
-        shadow,
     );
-    draw_right_text_with_shadow(
+    draw_right_text(
         ctx,
         width - 5.0,
         top + 11.0,
@@ -979,7 +1028,6 @@ fn draw_system_processes(
         8.0,
         FontWeight::Bold,
         muted,
-        shadow,
     );
     ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.18);
     ctx.set_line_width(1.0);
@@ -989,7 +1037,7 @@ fn draw_system_processes(
     for (row, process) in values.processes.iter().take(5).enumerate() {
         let baseline = top + 29.0 + row as f64 * 17.0;
         let label = truncate_text(&process.name, 23);
-        draw_left_text_with_shadow(
+        draw_left_text(
             ctx,
             5.0,
             baseline,
@@ -997,9 +1045,8 @@ fn draw_system_processes(
             9.5,
             FontWeight::Normal,
             ink,
-            shadow,
         );
-        draw_right_text_with_shadow(
+        draw_right_text(
             ctx,
             width - 96.0,
             baseline,
@@ -1007,9 +1054,8 @@ fn draw_system_processes(
             9.5,
             FontWeight::Normal,
             ink,
-            shadow,
         );
-        draw_right_text_with_shadow(
+        draw_right_text(
             ctx,
             width - 57.0,
             baseline,
@@ -1017,9 +1063,8 @@ fn draw_system_processes(
             9.5,
             FontWeight::Normal,
             ink,
-            shadow,
         );
-        draw_right_text_with_shadow(
+        draw_right_text(
             ctx,
             width - 5.0,
             baseline,
@@ -1027,7 +1072,6 @@ fn draw_system_processes(
             9.5,
             FontWeight::Normal,
             ink,
-            shadow,
         );
     }
 }
@@ -1041,7 +1085,6 @@ fn draw_system_cores(
     ink: (f64, f64, f64),
     muted: (f64, f64, f64),
     accent: (f64, f64, f64),
-    shadow: TextShadow,
 ) {
     let column_width = (width - 10.0) / 4.0;
     for (index, value) in cores.iter().enumerate() {
@@ -1049,7 +1092,7 @@ fn draw_system_cores(
         let row = index / 4;
         let x = 5.0 + column as f64 * column_width;
         let y = top + 11.0 + row as f64 * 17.0;
-        draw_left_text_with_shadow(
+        draw_left_text(
             ctx,
             x,
             y,
@@ -1057,7 +1100,6 @@ fn draw_system_cores(
             8.0,
             FontWeight::Bold,
             muted,
-            shadow,
         );
         ctx.set_line_width(2.3);
         ctx.set_line_cap(cairo::LineCap::Round);
@@ -1069,7 +1111,7 @@ fn draw_system_cores(
         ctx.move_to(x + 23.0, y - 3.0);
         ctx.line_to(x + 23.0 + 25.0 * (value / 100.0).clamp(0.0, 1.0), y - 3.0);
         let _ = ctx.stroke();
-        draw_right_text_with_shadow(
+        draw_right_text(
             ctx,
             x + column_width - 2.0,
             y,
@@ -1077,30 +1119,11 @@ fn draw_system_cores(
             8.0,
             FontWeight::Bold,
             ink,
-            shadow,
         );
     }
 }
 
-fn system_text_shadow(color_mode: ColorMode) -> TextShadow {
-    match color_mode {
-        ColorMode::Light => TextShadow {
-            color: (0.0, 0.0, 0.0),
-            alpha: 0.72,
-        },
-        ColorMode::Gray => TextShadow {
-            color: (0.0, 0.0, 0.0),
-            alpha: 0.52,
-        },
-        ColorMode::Dark => TextShadow {
-            color: (1.0, 1.0, 1.0),
-            alpha: 0.34,
-        },
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_left_text_with_shadow(
+fn draw_left_text(
     ctx: &Context,
     x: f64,
     baseline: f64,
@@ -1108,22 +1131,15 @@ fn draw_left_text_with_shadow(
     size: f64,
     weight: FontWeight,
     color: (f64, f64, f64),
-    shadow: impl Into<Option<TextShadow>>,
 ) {
     ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
     ctx.set_font_size(size);
-    if let Some(shadow) = shadow.into() {
-        ctx.set_source_rgba(shadow.color.0, shadow.color.1, shadow.color.2, shadow.alpha);
-        ctx.move_to(x + 0.8, baseline + 0.8);
-        let _ = ctx.show_text(text);
-    }
     ctx.set_source_rgb(color.0, color.1, color.2);
     ctx.move_to(x, baseline);
     let _ = ctx.show_text(text);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_right_text_with_shadow(
+fn draw_right_text(
     ctx: &Context,
     right: f64,
     baseline: f64,
@@ -1131,7 +1147,6 @@ fn draw_right_text_with_shadow(
     size: f64,
     weight: FontWeight,
     color: (f64, f64, f64),
-    shadow: impl Into<Option<TextShadow>>,
 ) {
     ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
     ctx.set_font_size(size);
@@ -1139,7 +1154,7 @@ fn draw_right_text_with_shadow(
         .text_extents(text)
         .map(|metrics| metrics.x_advance())
         .unwrap_or(0.0);
-    draw_left_text_with_shadow(
+    draw_left_text(
         ctx,
         right - width,
         baseline,
@@ -1147,7 +1162,6 @@ fn draw_right_text_with_shadow(
         size,
         weight,
         color,
-        shadow,
     );
 }
 
@@ -1888,8 +1902,14 @@ fn rebuild_note_list(
     }
     let notes = state.borrow().notes.clone();
     for note in notes.iter().rev().take(8) {
-        let preview = note.text.lines().next().unwrap_or("");
-        let preview = if preview.trim().is_empty() {
+        // First non-empty line, so a note starting with a blank line still
+        // shows its content instead of "Untitled note".
+        let preview = note
+            .text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        let preview = if preview.is_empty() {
             "Untitled note".into()
         } else {
             truncate_chars(preview, 27)
@@ -1949,6 +1969,15 @@ fn draggable_note_preview(
             let Some((sx, sy)) = start.get() else {
                 return glib::Propagation::Proceed;
             };
+            // A lost release (broken grab) would leave the ghost stranded on
+            // the overlay; drop the drag as soon as the button is no longer down.
+            if !event.state().contains(gdk::ModifierType::BUTTON1_MASK) {
+                start.set(None);
+                if let Some(floating) = ghost.borrow_mut().take() {
+                    root.remove(&floating);
+                }
+                return glib::Propagation::Proceed;
+            }
             let (x, y) = event.root();
             if ghost.borrow().is_none() && ((x - sx).abs() > 5.0 || (y - sy).abs() > 5.0) {
                 let floating = gtk::Label::new(Some(&text));
@@ -1973,9 +2002,10 @@ fn draggable_note_preview(
             let (x, y) = event.root();
             let desired = if let Some(floating) = floating {
                 root.remove(&floating);
+                // Pin the note exactly where the ghost preview was dropped.
                 Point {
-                    x: (x as i32 - 115).max(0),
-                    y: (y as i32 - 55).max(0),
+                    x: (x as i32 - 72).max(0),
+                    y: (y as i32 - 18).max(0),
                 }
             } else {
                 Point {
@@ -2039,6 +2069,9 @@ fn rebuild_pinned_notes(
         let initial_color_mode = saved_color_mode(&state.borrow(), &key);
         let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
         card.style_context().add_class("pinned-note");
+        // Own a GdkWindow so the hover tracker can test pointer containment and
+        // fade the note scrollbar in without GTK3's per-window :hover routing.
+        card.set_visible_window(true);
 
         let header_drag = gtk::EventBox::new();
         header_drag.set_visible_window(true);
@@ -2060,7 +2093,7 @@ fn rebuild_pinned_notes(
         body.pack_start(&header_drag, false, false, 0);
 
         let editor = gtk::TextView::new();
-        editor.set_editable(true);
+        editor.set_editable(interactive.get());
         editor.set_can_focus(true);
         editor.set_cursor_visible(true);
         editor.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
@@ -2070,7 +2103,9 @@ fn rebuild_pinned_notes(
             }
             glib::Propagation::Proceed
         });
-        editor.set_wrap_mode(gtk::WrapMode::Word);
+        // WordChar (not Word) so an overlong token breaks instead of forcing
+        // the layout wider than the card.
+        editor.set_wrap_mode(gtk::WrapMode::WordChar);
         editor.set_size_request(1, 1);
         editor.set_hexpand(true);
         editor.set_vexpand(true);
@@ -2087,12 +2122,24 @@ fn rebuild_pinned_notes(
                 glib::Propagation::Proceed
             }
         });
-        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
+        // Horizontal must NOT be Never: GTK3 propagates the child's minimum
+        // width through a Never-policy scrolled window, and a TextView's
+        // minimum width is its current text layout width — GtkFixed then
+        // allocates that minimum, so the note could never shrink below its
+        // text and even grew while typing. External keeps the text wrapping
+        // to the card (WordChar guarantees no horizontal overflow) without
+        // ever propagating the text width. Automatic (vertical) keeps the
+        // note at its fixed height and reveals a scrollbar on overflow.
+        scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
         scroller.set_shadow_type(gtk::ShadowType::None);
         scroller.set_overlay_scrolling(false);
         scroller.set_size_request(1, 1);
         scroller.set_hexpand(true);
         scroller.set_vexpand(true);
+        // Keep both axes bounded to the card's requested size: the note must
+        // not grow with its content (horizontally or vertically) past the size
+        // the user set, so long text wraps and scrolls instead.
+        scroller.set_propagate_natural_width(false);
         scroller.set_propagate_natural_height(false);
         scroller.add(&editor);
         body.pack_start(&scroller, true, true, 0);
@@ -2114,6 +2161,7 @@ fn rebuild_pinned_notes(
             .find(|item| item.key == key)
         {
             item.edit_only = Some(header_drag.clone());
+            item.editor = Some(editor.clone());
         }
         attach_color_mode_menu(
             &card,
@@ -2144,7 +2192,7 @@ fn rebuild_pinned_notes(
             interactive.clone(),
             window.clone(),
             ResizeBounds {
-                min_width: 150,
+                min_width: 75,
                 min_height: 92,
                 max_width: 540,
                 max_height: 440,
@@ -2211,6 +2259,44 @@ fn rebuild_pinned_notes(
         card.show_all();
         header_drag.set_visible(interactive.get());
     }
+}
+
+fn track_note_hover(registry: Rc<RefCell<Vec<RegisteredWidget>>>) {
+    // GTK3 delivers enter/leave to the window under the pointer, so hovering
+    // the editor (which owns its own window) never sets :hover on the note
+    // card. Poll the pointer position cheaply and toggle a class that fades
+    // the note scrollbar in instead of relying on CSS :hover propagation.
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        let Some(device) = gdk::Display::default()
+            .and_then(|display| display.default_seat())
+            .and_then(|seat| seat.pointer())
+        else {
+            return glib::ControlFlow::Continue;
+        };
+        let (_, pointer_x, pointer_y) = device.position();
+        let notes: Vec<gtk::EventBox> = registry
+            .borrow()
+            .iter()
+            .filter(|item| item.key.starts_with("note:"))
+            .map(|item| item.widget.clone())
+            .collect();
+        for card in notes {
+            let hovered = card.window().is_some_and(|window| {
+                let (_, origin_x, origin_y) = window.origin();
+                pointer_x >= origin_x
+                    && pointer_x < origin_x + window.width()
+                    && pointer_y >= origin_y
+                    && pointer_y < origin_y + window.height()
+            });
+            let context = card.style_context();
+            if hovered {
+                context.add_class("note-hover");
+            } else {
+                context.remove_class("note-hover");
+            }
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 struct WidgetPicker {
@@ -2892,6 +2978,7 @@ fn register(
         widget: widget.clone(),
         color_mode,
         edit_only: None,
+        editor: None,
     });
 }
 
@@ -2907,6 +2994,11 @@ fn set_edit_chrome_visibility(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, vis
     for item in registry.borrow().iter() {
         if let Some(edit_only) = &item.edit_only {
             edit_only.set_visible(visible);
+        }
+        // Notes stay scrollable in lock mode (their rectangle stays in the
+        // input shape), so their editor turns read-only instead of editable.
+        if let Some(editor) = &item.editor {
+            editor.set_editable(visible);
         }
     }
 }
@@ -3377,6 +3469,12 @@ fn attach_resize(
             else {
                 return glib::Propagation::Proceed;
             };
+            // If the release happened outside the overlay (broken grab), the
+            // press state goes stale and hovering would keep resizing.
+            if !event.state().contains(gdk::ModifierType::BUTTON1_MASK) {
+                start.set(None);
+                return glib::Propagation::Proceed;
+            }
             let (pointer_x, pointer_y) = event.root();
             let delta_x = pointer_x - pointer_start_x;
             let delta_y = pointer_y - pointer_start_y;
@@ -3626,7 +3724,15 @@ fn refresh_input_shape(
     for item in registry.borrow().iter() {
         let lock_timer = item.key == "timer";
         let settings = item.key == "picker";
-        if interactive || settings || lock_timer || item.widget.style_context().has_class("alarm") {
+        // Notes keep receiving input in lock mode so their content can still
+        // be scrolled; editing is disabled separately via the read-only editor.
+        let lock_note = item.key.starts_with("note:");
+        if interactive
+            || settings
+            || lock_timer
+            || lock_note
+            || item.widget.style_context().has_class("alarm")
+        {
             if !item.widget.is_visible() || !item.widget.is_mapped() {
                 continue;
             }
@@ -3813,30 +3919,11 @@ fn center_text(
     weight: FontWeight,
     color: (f64, f64, f64),
 ) {
-    center_text_with_shadow(ctx, x, y, text, size, weight, color, None);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn center_text_with_shadow(
-    ctx: &Context,
-    x: f64,
-    y: f64,
-    text: &str,
-    size: f64,
-    weight: FontWeight,
-    color: (f64, f64, f64),
-    shadow: impl Into<Option<TextShadow>>,
-) {
     ctx.select_font_face("Sans", FontSlant::Normal, weight);
     ctx.set_font_size(size);
     let mut origin = x;
     if let Ok(extents) = ctx.text_extents(text) {
         origin -= extents.width() / 2.0 + extents.x_bearing();
-    }
-    if let Some(shadow) = shadow.into() {
-        ctx.set_source_rgba(shadow.color.0, shadow.color.1, shadow.color.2, shadow.alpha);
-        ctx.move_to(origin + 0.8, y + 0.8);
-        let _ = ctx.show_text(text);
     }
     ctx.set_source_rgb(color.0, color.1, color.2);
     ctx.move_to(origin, y);

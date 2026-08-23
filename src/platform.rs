@@ -7,6 +7,21 @@ pub enum HotkeyAction {
     ToggleInteraction,
 }
 
+// Xlib's default error handlers call exit(), which would silently kill the
+// whole app (stale pid file, dead tray) on any X error — e.g. a conflicting
+// grab or the display connection dropping. Ignore recoverable errors and end
+// the thread quietly when the connection itself is lost.
+unsafe extern "C" fn ignore_x_error(
+    _display: *mut xlib::Display,
+    _error: *mut xlib::XErrorEvent,
+) -> i32 {
+    0
+}
+
+unsafe extern "C" fn ignore_x_io_error(_display: *mut xlib::Display) -> i32 {
+    0
+}
+
 pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
     if std::env::var("XDG_SESSION_TYPE").unwrap_or_default() != "x11" {
         return false;
@@ -14,6 +29,8 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
     thread::Builder::new()
         .name("sysi-hotkey".into())
         .spawn(move || unsafe {
+            xlib::XSetErrorHandler(Some(ignore_x_error));
+            xlib::XSetIOErrorHandler(Some(ignore_x_io_error));
             let display = xlib::XOpenDisplay(ptr::null());
             if display.is_null() {
                 return;
@@ -40,7 +57,11 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
             xlib::XSync(display, xlib::False);
             loop {
                 let mut event: xlib::XEvent = mem::zeroed();
-                xlib::XNextEvent(display, &mut event);
+                if xlib::XNextEvent(display, &mut event) == 0 {
+                    // The display connection is gone (display reset, session
+                    // teardown). Stop polling instead of exiting the app.
+                    break;
+                }
                 if event.get_type() == xlib::KeyPress
                     && sender
                         .send_blocking(HotkeyAction::ToggleInteraction)

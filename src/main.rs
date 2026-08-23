@@ -9,7 +9,7 @@ use std::{
     cell::RefCell,
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process,
     rc::Rc,
 };
@@ -28,7 +28,7 @@ fn main() {
         return;
     }
     if std::env::args().any(|arg| arg == "--toggle") {
-        signal_running(libc::SIGUSR1);
+        signal_or_restart(libc::SIGUSR1);
         return;
     }
     if let Some(action) = option_value("--panel-action") {
@@ -36,20 +36,29 @@ fn main() {
             eprintln!("Could not send the Sysi panel action: {error}");
             process::exit(1);
         }
-        signal_running(libc::SIGWINCH);
+        match signal_running(libc::SIGWINCH) {
+            Ok(()) => {}
+            // The instance is gone (stale pid). "quit" has nothing to quit;
+            // every other action starts a fresh instance that applies the
+            // pending action once the UI is up.
+            Err(_) if action == "quit" => {}
+            Err(_) => spawn_instance(),
+        }
         return;
     }
     if std::env::args().any(|arg| arg == "--toggle-picker") {
-        signal_running(libc::SIGWINCH);
+        signal_or_restart(libc::SIGWINCH);
         return;
     }
     if std::env::args().any(|arg| arg == "--quit") {
-        signal_running(libc::SIGTERM);
+        if signal_running(libc::SIGTERM).is_ok() {
+            let _ = fs::remove_file(state::cache_dir().join("pid"));
+        }
         return;
     }
 
     let Some(_instance_lock) = acquire_instance_lock() else {
-        signal_running(libc::SIGUSR1);
+        let _ = signal_running(libc::SIGUSR1);
         return;
     };
     if let Err(error) = install_panel_extension() {
@@ -61,6 +70,18 @@ fn main() {
         Some("io.sysi.Overlay"),
         gtk::gio::ApplicationFlags::NON_UNIQUE,
     );
+    // The panel's quit action and `sysi --quit` deliver SIGTERM. GLib's
+    // default handling terminates the process without running shutdown
+    // handlers, which would leave a stale pid file behind: the panel icon
+    // keeps showing and every later click silently misses. Route it through
+    // a clean GTK quit instead.
+    glib::source::unix_signal_add_local(libc::SIGTERM, {
+        let application = application.clone();
+        move || {
+            application.quit();
+            glib::ControlFlow::Continue
+        }
+    });
     let state = Rc::new(RefCell::new(state::AppState::load()));
     application.connect_activate({
         let state = state.clone();
@@ -137,17 +158,53 @@ fn write_pid() {
     }
 }
 
-fn signal_running(signal: i32) {
+fn signal_running(signal: i32) -> io::Result<()> {
     let path = state::cache_dir().join("pid");
     let Some(pid) = read_pid(&path) else {
-        eprintln!("Sysi is not running yet.");
-        process::exit(1);
+        return Err(not_running());
     };
+    // A recycled pid would receive the signal for free; only signal an
+    // actual sysi process, and drop a stale pid file so the panel icon
+    // stops trusting it.
+    if !is_sysi_process(pid) {
+        let _ = fs::remove_file(&path);
+        return Err(not_running());
+    }
     let result = unsafe { libc::kill(pid, signal) };
     if result != 0 {
-        eprintln!("Could not contact Sysi process {pid}.");
-        process::exit(1);
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            let _ = fs::remove_file(&path);
+            return Err(not_running());
+        }
+        return Err(error);
     }
+    Ok(())
+}
+
+fn not_running() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, "Sysi is not running")
+}
+
+fn is_sysi_process(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim() == "sysi")
+        .unwrap_or(false)
+}
+
+fn signal_or_restart(signal: i32) {
+    if signal_running(signal).is_err() {
+        spawn_instance();
+    }
+}
+
+fn spawn_instance() {
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sysi"));
+    let _ = std::process::Command::new(executable)
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn();
 }
 
 fn read_pid(path: &Path) -> Option<i32> {
