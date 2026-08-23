@@ -102,6 +102,8 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub settings_button: bool,
     #[serde(default)]
+    pub history_open: bool,
+    #[serde(default)]
     pub color_mode: ColorMode,
     #[serde(default)]
     pub system_details: SystemDetails,
@@ -113,6 +115,7 @@ impl Default for Settings {
             system: true,
             timer: true,
             settings_button: true,
+            history_open: false,
             color_mode: ColorMode::default(),
             system_details: SystemDetails::default(),
         }
@@ -266,6 +269,13 @@ mod tests {
         let state: AppState = serde_json::from_str(r#"{"settings":{"color_mode":"dark"}}"#)
             .expect("state without per-widget colors should remain readable");
         assert!(state.widget_color_modes.is_empty());
+    }
+
+    #[test]
+    fn old_state_defaults_to_a_closed_history_window() {
+        let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
+            .expect("state without a history flag should remain readable");
+        assert!(!state.settings.history_open);
     }
 
     #[test]

@@ -9,12 +9,14 @@ use std::{
     cell::RefCell,
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    mem,
     path::{Path, PathBuf},
-    process,
+    process, ptr,
     rc::Rc,
 };
 
 const PANEL_EXTENSION_UUID: &str = "sysi-panel@thaihoc";
+
 const PANEL_EXTENSION_METADATA: &str =
     include_str!("../packaging/gnome-shell-extension/metadata.json");
 const PANEL_EXTENSION_JS: &str = include_str!("../packaging/gnome-shell-extension/extension.js");
@@ -65,6 +67,19 @@ fn main() {
         eprintln!("Could not refresh the Sysi panel extension: {error}");
     }
     write_pid();
+
+    // SIGUSR1's default action terminates the process, so a toggle sent
+    // while this instance is still starting (handlers are registered in
+    // build()) would kill it and leave a stale pid file. Block the signals
+    // until build() unblocks them; any pending one then dispatches exactly
+    // once through the freshly installed handlers.
+    unsafe {
+        let mut set: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::sigaddset(&mut set, libc::SIGWINCH);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut());
+    }
 
     let application = gtk::Application::new(
         Some("io.sysi.Overlay"),

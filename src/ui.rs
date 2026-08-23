@@ -20,6 +20,13 @@ const SYSTEM_SINGLE_WIDTH: i32 = 76;
 const TIMER_SIZE: i32 = 116;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
+const HISTORY_WIDTH: i32 = 236;
+const HISTORY_HEIGHT: i32 = 252;
+// One rendered row (.note-preview padding + the inherited note font) plus the
+// list spacing, and the header + list padding above it. Used to scale how many
+// rows the window renders to how tall the user dragged it.
+const HISTORY_ROW_HEIGHT: i32 = 30;
+const HISTORY_CHROME_HEIGHT: i32 = 32;
 const RESIZE_HIT_SIZE: i32 = 18;
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
@@ -75,33 +82,6 @@ struct TimerRuntime {
     started: bool,
     alarm: bool,
     phase: f64,
-}
-
-struct MascotRuntime {
-    x: f64,
-    target: f64,
-    target_top: i32,
-    phase: f64,
-    pause: u16,
-    message: String,
-    seed: u64,
-    reaction: u16,
-    sequence: PetSequence,
-    sequence_tick: u16,
-    target_key: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PetSequence {
-    Roam,
-    Climb,
-    Throw,
-}
-
-struct MascotSheets {
-    basic: gdk_pixbuf::Pixbuf,
-    climb: gdk_pixbuf::Pixbuf,
-    mischief: gdk_pixbuf::Pixbuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +228,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let _ = data.save();
         }
     }
+    // The overlay covers the X root window, which always spans every
+    // monitor; monitor-derived bounds would double-count Xinerama screens.
     window.set_default_size(screen_width, screen_height);
     window.move_(0, 0);
 
@@ -447,17 +429,113 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         window.clone(),
     );
+    let history = build_history_window(saved_color_mode(&state.borrow(), "history"));
+    let history_position = state
+        .borrow()
+        .positions
+        .get("history")
+        .copied()
+        .unwrap_or(Point {
+            x: primary_screen.x + 28,
+            y: primary_screen.y + 186,
+        });
+    apply_widget_size(
+        &history.card,
+        "history",
+        &state,
+        Size {
+            width: HISTORY_WIDTH,
+            height: HISTORY_HEIGHT,
+        },
+    );
+    place_card(&root, &history.card, history_position);
+    register(
+        &registry,
+        "history",
+        &history.card,
+        history.color_mode.clone(),
+    );
+    if let Some(item) = registry
+        .borrow_mut()
+        .iter_mut()
+        .find(|item| item.key == "history")
+    {
+        item.edit_only = Some(history.header.clone());
+    }
+    attach_color_mode_menu(
+        &history.card,
+        "history".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        None,
+        None,
+    );
+    attach_drag(
+        &history.header,
+        &history.card,
+        &root,
+        "history".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+    );
+    attach_resize(
+        &history.resize,
+        &history.card,
+        &root,
+        "history".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+        ResizeBounds {
+            min_width: 132,
+            min_height: 92,
+            max_width: 620,
+            max_height: 760,
+            aspect_ratio: None,
+            preserve_current_aspect: false,
+        },
+    );
+
     let note_refresh: CallbackSlot = Rc::new(RefCell::new(None));
+    // How many rows the list renders, derived from the window height so
+    // dragging the grip down shows more entries and dragging it up shows
+    // fewer. Kept in a cell so every rebuild path agrees on the current one.
+    let history_limit = Rc::new(Cell::new(history_row_budget(
+        state
+            .borrow()
+            .sizes
+            .get("history")
+            .map(|size| size.height)
+            .filter(|height| *height > 0)
+            .unwrap_or(HISTORY_HEIGHT),
+    )));
+    // Search mode is tracked explicitly: show_all() (on unlock, or when the
+    // window is reopened) would otherwise reveal both header bars at once.
+    let searching = Rc::new(Cell::new(false));
+
     let refresh_closure: Rc<dyn Fn()> = {
         let root = root.clone();
         let state = state.clone();
         let registry = registry.clone();
-        let list_box = widget_picker.history_list.clone();
+        let list = history.list.clone();
         let note_refresh = note_refresh.clone();
         let interactive = interactive.clone();
         let window = window.clone();
+        let search = history.bar.search.clone();
+        let history_limit = history_limit.clone();
         Rc::new(move || {
-            rebuild_note_list(&list_box, &root, state.clone(), note_refresh.clone());
+            rebuild_note_list(
+                &list,
+                &root,
+                state.clone(),
+                note_refresh.clone(),
+                &search.text(),
+                history_limit.get(),
+            );
             rebuild_pinned_notes(
                 &root,
                 state.clone(),
@@ -477,6 +555,147 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     };
     *note_refresh.borrow_mut() = Some(refresh_closure.clone());
     refresh_closure();
+
+    // Typing in the search box rebuilds only the history rows — pinned notes
+    // and the input shape are untouched — and the rebuild is debounced so a
+    // fast typing burst stays smooth.
+    let refresh_history: Rc<dyn Fn()> = {
+        let list = history.list.clone();
+        let root = root.clone();
+        let state = state.clone();
+        let note_refresh = note_refresh.clone();
+        let search = history.bar.search.clone();
+        let history_limit = history_limit.clone();
+        Rc::new(move || {
+            rebuild_note_list(
+                &list,
+                &root,
+                state.clone(),
+                note_refresh.clone(),
+                &search.text(),
+                history_limit.get(),
+            );
+        })
+    };
+    let pending_search: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    history.bar.search.connect_changed({
+        let refresh_history = refresh_history.clone();
+        let pending_search = pending_search.clone();
+        move |_| {
+            if let Some(source) = pending_search.borrow_mut().take() {
+                source.remove();
+            }
+            let refresh_history = refresh_history.clone();
+            let pending_for_timer = pending_search.clone();
+            let source = glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                pending_for_timer.borrow_mut().take();
+                refresh_history();
+            });
+            *pending_search.borrow_mut() = Some(source);
+        }
+    });
+
+    // Resizing changes how many rows fit, so re-render when the row budget
+    // actually changes — never on every allocation, which would loop.
+    history.card.connect_size_allocate({
+        let history_limit = history_limit.clone();
+        let refresh_history = refresh_history.clone();
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        move |_, allocation| {
+            let next = history_row_budget(allocation.height());
+            if next == history_limit.get() {
+                return;
+            }
+            history_limit.set(next);
+            // Adding rows from inside size-allocate re-enters GTK's layout;
+            // defer to the next idle instead.
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            let refresh_history = refresh_history.clone();
+            let pending_for_idle = pending.clone();
+            let source = glib::idle_add_local_once(move || {
+                pending_for_idle.borrow_mut().take();
+                refresh_history();
+            });
+            *pending.borrow_mut() = Some(source);
+        }
+    });
+
+    // The search icon turns the header into the search field, plus the "\u{00d7}"
+    // that puts the plain title bar back.
+    history.bar.open_search.connect_clicked({
+        let bar = history.bar.clone();
+        let window = window.clone();
+        let searching = searching.clone();
+        move |_| {
+            searching.set(true);
+            bar.set_search_mode(true);
+            present_overlay(&window);
+            bar.search.grab_focus();
+        }
+    });
+    let close_history_search: Rc<dyn Fn()> = {
+        let bar = history.bar.clone();
+        let searching = searching.clone();
+        Rc::new(move || {
+            searching.set(false);
+            bar.set_search_mode(false);
+            // Clearing fires `changed`, which reruns the (now empty) query and
+            // restores the full list.
+            bar.search.set_text("");
+        })
+    };
+    history.bar.close_search.connect_clicked({
+        let close_history_search = close_history_search.clone();
+        move |_| close_history_search()
+    });
+
+    let toggle_history: Rc<dyn Fn()> = {
+        let card = history.card.clone();
+        let header = history.header.clone();
+        let bar = history.bar.clone();
+        let searching = searching.clone();
+        let state = state.clone();
+        let window = window.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let root = root.clone();
+        let screens = screens.clone();
+        Rc::new(move || {
+            let open = !card.is_visible();
+            if open {
+                card.show_all();
+                // show_all() reveals both slot occupants and the header
+                // itself; restore the search mode and the lock-mode rule.
+                bar.set_search_mode(searching.get());
+                header.set_visible(interactive.get());
+            } else {
+                card.hide();
+            }
+            state.borrow_mut().settings.history_open = open;
+            let _ = state.borrow().save();
+            refresh_input_shape(&window, &registry, interactive.get());
+            glib::idle_add_local_once({
+                let window = window.clone();
+                let registry = registry.clone();
+                let interactive = interactive.clone();
+                let root = root.clone();
+                let screens = screens.clone();
+                let state = state.clone();
+                move || {
+                    if open {
+                        clamp_registered_widgets(&root, &registry, &screens, &state);
+                    }
+                    refresh_input_shape(&window, &registry, interactive.get());
+                }
+            });
+        })
+    };
+    history.hide.connect_clicked({
+        let toggle_history = toggle_history.clone();
+        move |_| toggle_history()
+    });
 
     let (system_enabled, timer_enabled, color_mode) = {
         let settings = &state.borrow().settings;
@@ -538,31 +757,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }
     });
 
-    widget_picker.history.connect_clicked({
-        let revealer = widget_picker.history_revealer.clone();
-        let window = window.clone();
-        let registry = registry.clone();
-        let interactive = interactive.clone();
-        let root = root.clone();
-        let screens = screens.clone();
-        let state = state.clone();
-        move |_| {
-            revealer.set_reveal_child(!revealer.reveals_child());
-            refresh_shape_during_transition(&window, &registry, interactive.clone());
-            let root = root.clone();
-            let registry = registry.clone();
-            let screens = screens.clone();
-            let state = state.clone();
-            glib::timeout_add_local(Duration::from_millis(230), move || {
-                clamp_registered_widgets(&root, &registry, &screens, &state);
-                glib::ControlFlow::Break
-            });
-        }
-    });
     widget_picker.new_note.connect_clicked({
         let root = root.clone();
         let revealer = widget_picker.revealer.clone();
-        let history_revealer = widget_picker.history_revealer.clone();
         let picker = widget_picker.card.clone();
         let state = state.clone();
         let refresh = refresh_closure.clone();
@@ -621,7 +818,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let _ = data.save();
             drop(data);
             revealer.set_reveal_child(false);
-            history_revealer.set_reveal_child(false);
             refresh();
             // Focus the fresh editor once the rebuilt card is mapped, so the
             // user can start typing immediately, like a native notes app.
@@ -636,7 +832,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         .find(|item| item.key == key)
                         .and_then(|item| item.editor.clone())
                     {
-                        window.present();
+                        present_overlay(&window);
                         editor.grab_focus();
                     }
                 }
@@ -681,15 +877,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     });
 
     let dispatch_panel_action: Rc<dyn Fn()> = {
-        let picker = widget_picker.card.clone();
-        let history_revealer = widget_picker.history_revealer.clone();
         let system = widget_picker.system.clone();
         let timer = widget_picker.timer.clone();
         let mode = widget_picker.mode.clone();
         let lock = widget_picker.lock.clone();
-        let history = widget_picker.history.clone();
         let new_note = widget_picker.new_note.clone();
         let quit = widget_picker.quit.clone();
+        let toggle_history = toggle_history.clone();
         let interactive = interactive.clone();
         Rc::new(move || match take_panel_action().as_deref() {
             Some("toggle-system") => system.set_active(!system.is_active()),
@@ -704,16 +898,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 }
                 new_note.clicked();
             }
-            Some("toggle-history") => {
-                let opening = !history_revealer.reveals_child();
-                if opening {
-                    picker.show();
-                }
-                history.clicked();
-                if !opening {
-                    picker.hide();
-                }
-            }
+            Some("toggle-history") => toggle_history(),
             Some("quit") => quit.clicked(),
             _ => {}
         })
@@ -722,10 +907,22 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     window.connect_key_press_event({
         let toggle_action = toggle_action.clone();
         let interactive = interactive.clone();
+        let searching = searching.clone();
+        let history_card = history.card.clone();
+        let close_history_search = close_history_search.clone();
         move |_, event| {
-            if event.keyval() == gdk::keys::constants::Escape && interactive.get() {
-                toggle_action();
-                return glib::Propagation::Stop;
+            if event.keyval() == gdk::keys::constants::Escape {
+                // The overlay sees key events before the focused widget, so
+                // Escape while searching must close the search box rather than
+                // lock the whole overlay out from under the user.
+                if searching.get() && history_card.is_visible() {
+                    close_history_search();
+                    return glib::Propagation::Stop;
+                }
+                if interactive.get() {
+                    toggle_action();
+                    return glib::Propagation::Stop;
+                }
             }
             glib::Propagation::Proceed
         }
@@ -739,6 +936,18 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }
     });
 
+    // Connected before the first map so it also runs for it: a remap hands
+    // the overlay a fresh, unshaped X window, and the cached shape would
+    // otherwise decide there was nothing to push.
+    window.connect_map({
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        move |window| {
+            invalidate_input_shape_cache();
+            refresh_input_shape(window, &registry, interactive.get());
+        }
+    });
+
     window.show_all();
     set_edit_chrome_visibility(&registry, true);
     // The gear and its controls live in GNOME's real panel. This invisible
@@ -746,7 +955,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     widget_picker.plus.hide();
     widget_picker.card.hide();
     widget_picker.revealer.set_reveal_child(false);
-    widget_picker.history_revealer.set_reveal_child(false);
+    // show_all() above revealed both slot occupants; the window starts on the
+    // plain title bar, and stays hidden until the panel or a saved session
+    // opens it.
+    history.bar.set_search_mode(false);
+    if !state.borrow().settings.history_open {
+        history.card.hide();
+    }
     if !system_enabled {
         system_card.card.hide();
     }
@@ -766,6 +981,39 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         move || {
             clamp_registered_widgets(&root, &registry, &screens, &state);
             refresh_input_shape(&window, &registry, interactive.get());
+        }
+    });
+
+    // The input shape decides whether a click lands on Sysi or falls through
+    // to the app underneath, and every widget rectangle in it comes from a
+    // GTK allocation. Any re-layout — a rebuilt note that is not allocated
+    // yet when its own refresh runs, a card resized by the details menu, a
+    // timer that changed style — moved those rectangles without updating the
+    // shape, so the widget rendered but swallowed no clicks until some
+    // unrelated action refreshed it. Re-derive it from the layout itself:
+    // GtkFixed re-allocates on every move and size change, and the refresh is
+    // a no-op unless the rectangles actually moved.
+    root.connect_size_allocate({
+        let window = window.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let queued = Rc::new(Cell::new(false));
+        move |_, _| {
+            // Coalesce a burst of allocations into one refresh, and never
+            // reshape from inside size-allocate itself.
+            if queued.replace(true) {
+                return;
+            }
+            glib::idle_add_local_once({
+                let window = window.clone();
+                let registry = registry.clone();
+                let interactive = interactive.clone();
+                let queued = queued.clone();
+                move || {
+                    queued.set(false);
+                    refresh_input_shape(&window, &registry, interactive.get());
+                }
+            });
         }
     });
 
@@ -798,12 +1046,43 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             glib::ControlFlow::Continue
         }
     });
+
     // A panel action left pending by the launcher (the previous instance
     // was down and the click restarted us) is applied once the UI is up.
     dispatch_panel_action();
 
-    track_note_hover(registry.clone());
-    start_system_updates(system_card);
+    // Re-clamp widgets and re-cover the screen when monitors are added,
+    // removed, or rescaled.
+    screen.connect_monitors_changed({
+        let window = window.clone();
+        let root = root.clone();
+        let registry = registry.clone();
+        let state = state.clone();
+        move |screen| {
+            let root_window = screen.root_window().expect("display root window");
+            let scale = root_window.scale_factor().max(1);
+            let width = root_window.width() / scale;
+            let height = root_window.height() / scale;
+            let screens = logical_screen_rects(scale, width, height);
+            window.set_default_size(width, height);
+            window.move_(0, 0);
+            clamp_registered_widgets(&root, &registry, &screens, &state);
+        }
+    });
+
+    // The signals blocked at startup are safe to deliver now: both handlers
+    // are registered above, so a pending toggle dispatches instead of
+    // terminating the process (SIGUSR1's default action is death).
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::sigaddset(&mut set, libc::SIGWINCH);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+
+    track_widget_hover(registry.clone(), history.scroller.clone());
+    start_system_updates(system_card, state.clone());
     start_timer_updates(timer_card, state, window, registry, interactive);
 }
 
@@ -842,7 +1121,7 @@ fn build_system_card(initial_color_mode: ColorMode, initial_details: SystemDetai
     }
 }
 
-fn start_system_updates(system: SystemCard) {
+fn start_system_updates(system: SystemCard, state: Rc<RefCell<AppState>>) {
     let reader = Rc::new(RefCell::new(SystemReader::default()));
     let update: Rc<dyn Fn()> = Rc::new({
         let reader = reader.clone();
@@ -850,12 +1129,19 @@ fn start_system_updates(system: SystemCard) {
         let values = system.values.clone();
         let details = system.details.clone();
         let card = system.card.clone();
+        let state = state.clone();
         move || {
             let options = details.get();
             let snapshot = reader.borrow_mut().read(options.processes, options.cores);
             let desired = system_content_size(options, snapshot.cores.len());
             let current = card.allocation();
-            if current.width() == desired.width && current.height() < desired.height {
+            // Only auto-grow the default layout (new core rows); a size the
+            // user set with the resize handle must not be overridden.
+            let custom = state.borrow().sizes.get("system").copied();
+            if custom.is_none()
+                && current.width() == desired.width
+                && current.height() < desired.height
+            {
                 card.set_size_request(desired.width, desired.height);
                 card.queue_resize();
             }
@@ -945,15 +1231,7 @@ fn draw_system(
         cursor_y += 108.0;
     }
     if details.cores {
-        draw_system_cores(
-            ctx,
-            &values.cores,
-            width,
-            cursor_y,
-            ink,
-            muted,
-            accent,
-        );
+        draw_system_cores(ctx, &values.cores, width, cursor_y, ink, muted, accent);
     }
 }
 
@@ -967,7 +1245,7 @@ fn system_content_size(details: SystemDetails, core_count: usize) -> Size {
         height += 108;
     }
     if details.cores {
-        height += 16 + (core_count.max(16).div_ceil(4) as i32 * 17);
+        height += 16 + (core_count.max(1).div_ceil(4) as i32 * 17);
     }
     Size {
         width: if details.processes || details.cores {
@@ -1037,15 +1315,7 @@ fn draw_system_processes(
     for (row, process) in values.processes.iter().take(5).enumerate() {
         let baseline = top + 29.0 + row as f64 * 17.0;
         let label = truncate_text(&process.name, 23);
-        draw_left_text(
-            ctx,
-            5.0,
-            baseline,
-            &label,
-            9.5,
-            FontWeight::Normal,
-            ink,
-        );
+        draw_left_text(ctx, 5.0, baseline, &label, 9.5, FontWeight::Normal, ink);
         draw_right_text(
             ctx,
             width - 96.0,
@@ -1154,15 +1424,7 @@ fn draw_right_text(
         .text_extents(text)
         .map(|metrics| metrics.x_advance())
         .unwrap_or(0.0);
-    draw_left_text(
-        ctx,
-        right - width,
-        baseline,
-        text,
-        size,
-        weight,
-        color,
-    );
+    draw_left_text(ctx, right - width, baseline, text, size, weight, color);
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -1896,32 +2158,64 @@ fn rebuild_note_list(
     root: &gtk::Fixed,
     state: Rc<RefCell<AppState>>,
     refresh: CallbackSlot,
+    query: &str,
+    limit: usize,
 ) {
     for child in list.children() {
         list.remove(&child);
     }
-    let notes = state.borrow().notes.clone();
-    for note in notes.iter().rev().take(8) {
+    let query = query.trim().to_lowercase();
+    // Borrow the notes instead of cloning every one; only matches become
+    // widgets, and only as many as the window is tall enough to scroll
+    // through, so a huge history stays cheap per keystroke.
+    let notes = state.borrow();
+    let mut shown = 0_usize;
+    for note in notes
+        .notes
+        .iter()
+        .rev()
+        .filter(|note| query.is_empty() || note.text.to_lowercase().contains(&query))
+        .take(limit)
+    {
         // First non-empty line, so a note starting with a blank line still
-        // shows its content instead of "Untitled note".
-        let preview = note
+        // shows its content instead of "Untitled note". The headline is not
+        // truncated here: the row label ellipsizes, so widening the window
+        // reveals more of it and narrowing it reveals less.
+        let headline = note
             .text
             .lines()
             .find(|line| !line.trim().is_empty())
-            .unwrap_or("");
-        let preview = if preview.is_empty() {
-            "Untitled note".into()
+            .unwrap_or("")
+            .trim();
+        let headline = if headline.is_empty() {
+            "Untitled note"
         } else {
-            truncate_chars(preview, 27)
+            headline
         };
         let row = draggable_note_preview(
-            &format!("{}  {preview}", if note.pinned { "◆" } else { "◇" }),
+            &format!(
+                "{}  {headline}",
+                if note.pinned { "\u{25cf}" } else { "\u{25cb}" }
+            ),
             note.id,
             root,
             state.clone(),
             refresh.clone(),
         );
         list.pack_start(&row, false, false, 0);
+        shown += 1;
+    }
+    drop(notes);
+    if shown == 0 {
+        let empty = gtk::Label::new(Some(if query.is_empty() {
+            "No notes yet"
+        } else {
+            "No matches"
+        }));
+        empty.set_xalign(0.0);
+        empty.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        empty.style_context().add_class("history-empty");
+        list.pack_start(&empty, false, false, 0);
     }
 
     list.show_all();
@@ -1980,7 +2274,7 @@ fn draggable_note_preview(
             }
             let (x, y) = event.root();
             if ghost.borrow().is_none() && ((x - sx).abs() > 5.0 || (y - sy).abs() > 5.0) {
-                let floating = gtk::Label::new(Some(&text));
+                let floating = gtk::Label::new(Some(&truncate_chars(&text, 34)));
                 floating.style_context().add_class("note-ghost");
                 root.put(&floating, x as i32 - 72, y as i32 - 18);
                 floating.show();
@@ -1999,6 +2293,7 @@ fn draggable_note_preview(
         move |_, event| {
             start.set(None);
             let floating = ghost.borrow_mut().take();
+            let dragged = floating.is_some();
             let (x, y) = event.root();
             let desired = if let Some(floating) = floating {
                 root.remove(&floating);
@@ -2022,8 +2317,13 @@ fn draggable_note_preview(
             let point = clamp_to_screens(desired, NOTE_WIDTH, NOTE_HEIGHT, &screens);
             let mut data = state.borrow_mut();
             if let Some(note) = data.notes.iter_mut().find(|note| note.id == note_id) {
+                // Only an explicit drag repositions. A plain click on a row
+                // whose note is already on the desktop used to teleport that
+                // note to the pointer, which read as the note jumping away.
+                if dragged || !note.pinned {
+                    note.position = point;
+                }
                 note.pinned = true;
-                note.position = point;
             }
             let _ = data.save();
             drop(data);
@@ -2261,11 +2561,12 @@ fn rebuild_pinned_notes(
     }
 }
 
-fn track_note_hover(registry: Rc<RefCell<Vec<RegisteredWidget>>>) {
+fn track_widget_hover(registry: Rc<RefCell<Vec<RegisteredWidget>>>, history: gtk::ScrolledWindow) {
     // GTK3 delivers enter/leave to the window under the pointer, so hovering
     // the editor (which owns its own window) never sets :hover on the note
-    // card. Poll the pointer position cheaply and toggle a class that fades
-    // the note scrollbar in instead of relying on CSS :hover propagation.
+    // card. Poll the pointer position cheaply — one timer serves both the
+    // pinned notes and the history list — and toggle classes that fade the
+    // scrollbar thumbs in instead of relying on CSS :hover propagation.
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let Some(device) = gdk::Display::default()
             .and_then(|display| display.default_seat())
@@ -2295,8 +2596,57 @@ fn track_note_hover(registry: Rc<RefCell<Vec<RegisteredWidget>>>) {
                 context.remove_class("note-hover");
             }
         }
+        let context = history.style_context();
+        let hovered = history.window().is_some_and(|window| {
+            let (_, origin_x, origin_y) = window.origin();
+            pointer_x >= origin_x
+                && pointer_x < origin_x + window.width()
+                && pointer_y >= origin_y
+                && pointer_y < origin_y + window.height()
+        });
+        if hovered {
+            context.add_class("history-hover");
+        } else {
+            context.remove_class("history-hover");
+        }
         glib::ControlFlow::Continue
     });
+}
+
+// The history list is its own note-shaped overlay window: a draggable header
+// that flips between a title bar and a search field, a scrolling column of
+// note headlines, and a resize grip. Widening it reveals more of each
+// headline; heightening it renders and shows more rows.
+struct HistoryWindow {
+    card: gtk::EventBox,
+    header: gtk::EventBox,
+    bar: HistoryHeader,
+    hide: gtk::Button,
+    list: gtk::Box,
+    scroller: gtk::ScrolledWindow,
+    color_mode: Rc<Cell<ColorMode>>,
+    resize: ResizeHandle,
+}
+
+// The two modes share one row: the hide button never moves, the title and the
+// entry occupy the same slot, and the magnifier and the "clear" cross share
+// the trailing slot. Only the occupant of each slot changes, so the caret
+// lands exactly where the title text was.
+#[derive(Clone)]
+struct HistoryHeader {
+    title: gtk::Label,
+    search: gtk::Entry,
+    open_search: gtk::Button,
+    close_search: gtk::Button,
+}
+
+impl HistoryHeader {
+    fn set_search_mode(&self, searching: bool) {
+        self.title.set_visible(!searching);
+        self.open_search.set_visible(!searching);
+        self.search.set_visible(searching);
+        self.close_search.set_visible(searching);
+    }
 }
 
 struct WidgetPicker {
@@ -2309,9 +2659,6 @@ struct WidgetPicker {
     timer: gtk::ToggleButton,
     mode: gtk::Button,
     lock: gtk::Button,
-    history: gtk::Button,
-    history_revealer: gtk::Revealer,
-    history_list: gtk::Box,
     new_note: gtk::Button,
     quit: gtk::Button,
 }
@@ -2348,7 +2695,6 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let timer = picker_toggle("TIMER");
     let mode = picker_button(initial_color_mode.label());
     let lock = picker_button("LOCK");
-    let history = picker_button("HISTORY");
     let new_note = picker_button("＋  NOTE");
     let quit = picker_button("QUIT");
     choices.pack_start(&system, false, false, 0);
@@ -2356,19 +2702,9 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     choices.pack_start(&mode, false, false, 0);
     choices.pack_start(&lock, false, false, 0);
     choices.pack_start(&new_note, false, false, 0);
-    choices.pack_start(&history, false, false, 0);
     choices.pack_start(&quit, false, false, 0);
     revealer.add(&choices);
     top.pack_start(&revealer, false, false, 0);
-
-    let history_revealer = gtk::Revealer::new();
-    history_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
-    history_revealer.set_transition_duration(210);
-    let history_list = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    history_list.set_size_request(224, -1);
-    history_list.style_context().add_class("history-list");
-    history_revealer.add(&history_list);
-    content.pack_start(&history_revealer, false, false, 0);
 
     WidgetPicker {
         card,
@@ -2380,11 +2716,103 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
         timer,
         mode,
         lock,
-        history,
-        history_revealer,
-        history_list,
         new_note,
         quit,
+    }
+}
+
+fn history_row_budget(card_height: i32) -> usize {
+    let list_height = (card_height - HISTORY_CHROME_HEIGHT).max(HISTORY_ROW_HEIGHT);
+    let visible = (list_height / HISTORY_ROW_HEIGHT) as usize;
+    // Render a screenful plus some headroom: the extra rows are what the
+    // scrollbar scrolls through, and the total shrinks with the window so a
+    // small history window stays cheap to rebuild per keystroke.
+    (visible + 10).clamp(14, 240)
+}
+
+fn build_history_window(initial_color_mode: ColorMode) -> HistoryWindow {
+    let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
+    // Share the pinned-note look (transparent card, faded scrollbar thumb) so
+    // the history window reads as one of the notes.
+    card.style_context().add_class("pinned-note");
+    card.style_context().add_class("history-window");
+    // Own a GdkWindow so the hover tracker can test pointer containment.
+    card.set_visible_window(true);
+
+    let header = gtk::EventBox::new();
+    header.set_visible_window(true);
+    header.set_hexpand(true);
+    header.style_context().add_class("note-header");
+    header.style_context().add_class("history-header");
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    bar.set_hexpand(true);
+    let hide = small_button("\u{2212}");
+    hide.style_context().add_class("note-window-button");
+    hide.style_context().add_class("note-hide");
+    hide.set_tooltip_text(Some("Hide History"));
+    let title = gtk::Label::new(Some("HISTORY"));
+    title.set_xalign(0.0);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.style_context().add_class("history-title");
+    let search = gtk::Entry::new();
+    search.set_placeholder_text(Some("SEARCH NOTES\u{2026}"));
+    search.set_has_frame(false);
+    // GtkEntry's default width-chars is a hard minimum that GtkFixed would
+    // honour, pinning the window open at ~150px; one char lets it shrink with
+    // the card while still expanding to fill the header.
+    search.set_width_chars(1);
+    search.set_max_width_chars(1);
+    search.set_hexpand(true);
+    search.style_context().add_class("history-search");
+    let open_search = icon_button("edit-find-symbolic", "Search notes");
+    let close_search = small_button("\u{00d7}");
+    close_search.style_context().add_class("note-window-button");
+    close_search.style_context().add_class("note-close");
+    close_search.set_tooltip_text(Some("Close search"));
+    bar.pack_start(&hide, false, false, 0);
+    bar.pack_start(&title, true, true, 0);
+    bar.pack_start(&search, true, true, 0);
+    // Packed end-first, so the cross sits at the very edge and the magnifier
+    // takes the same spot when it is the visible one.
+    bar.pack_end(&close_search, false, false, 0);
+    bar.pack_end(&open_search, false, false, 0);
+    header.add(&bar);
+    body.pack_start(&header, false, false, 0);
+
+    let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    // External (not Never) horizontally: a Never-policy scrolled window
+    // propagates its child's minimum width, so the widest row would stop the
+    // window from ever being dragged narrower again.
+    scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
+    // The indicator floats over the rows, so rows use the full width and the
+    // thumb fades in while the pointer is over the list.
+    scroller.set_overlay_scrolling(true);
+    scroller.set_shadow_type(gtk::ShadowType::None);
+    scroller.set_propagate_natural_width(false);
+    scroller.set_propagate_natural_height(false);
+    scroller.set_size_request(1, 1);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.style_context().add_class("history-scroller");
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    list.style_context().add_class("history-list");
+    scroller.add(&list);
+    body.pack_start(&scroller, true, true, 0);
+
+    HistoryWindow {
+        card,
+        header,
+        bar: HistoryHeader {
+            title,
+            search,
+            open_search,
+            close_search,
+        },
+        hide,
+        list,
+        scroller,
+        color_mode,
+        resize,
     }
 }
 
@@ -2408,483 +2836,6 @@ fn take_panel_action() -> Option<String> {
     let action = fs::read_to_string(&path).ok()?;
     let _ = fs::remove_file(path);
     Some(action.trim().to_owned())
-}
-
-#[allow(dead_code, clippy::too_many_arguments)]
-fn build_mascot(
-    root: &gtk::Fixed,
-    walk_x: i32,
-    walk_y: i32,
-    walk_width: i32,
-    walk_height: i32,
-    state: Rc<RefCell<AppState>>,
-    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
-    alarm: Rc<Cell<bool>>,
-) -> gtk::EventBox {
-    let pet_widget = gtk::EventBox::new();
-    pet_widget.set_visible_window(false);
-    pet_widget.add_events(
-        gdk::EventMask::BUTTON_PRESS_MASK
-            | gdk::EventMask::BUTTON1_MOTION_MASK
-            | gdk::EventMask::BUTTON_RELEASE_MASK,
-    );
-    let area = gtk::DrawingArea::new();
-    area.set_size_request(168, 108);
-    pet_widget.add(&area);
-    let floor_y = (walk_y + walk_height - 126).max(walk_y);
-    root.put(&pet_widget, walk_x + 70, floor_y);
-    register(
-        &registry,
-        "mascot",
-        &pet_widget,
-        Rc::new(Cell::new(ColorMode::Gray)),
-    );
-    let runtime = Rc::new(RefCell::new(MascotRuntime {
-        x: (walk_x + 150) as f64,
-        target: (walk_x + 150) as f64,
-        target_top: floor_y,
-        phase: 0.0,
-        pause: 20,
-        message: "Hello there!".into(),
-        seed: 0x5A17_D00D,
-        reaction: 0,
-        sequence: PetSequence::Roam,
-        sequence_tick: 0,
-        target_key: None,
-    }));
-    let held = Rc::new(Cell::new(false));
-    let sheets = Rc::new(load_mascot_sheets());
-    pet_widget.connect_button_press_event({
-        let runtime = runtime.clone();
-        let held = held.clone();
-        move |_, event| {
-            if event.button() == 1 {
-                let mut pet = runtime.borrow_mut();
-                held.set(true);
-                pet.sequence = PetSequence::Roam;
-                pet.sequence_tick = 0;
-                pet.reaction = 42;
-                pet.pause = 42;
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        }
-    });
-    pet_widget.connect_motion_notify_event({
-        let held = held.clone();
-        let runtime = runtime.clone();
-        let root = root.clone();
-        let pet_widget = pet_widget.clone();
-        move |_, event| {
-            if !held.get() {
-                return glib::Propagation::Proceed;
-            }
-            let (x, y) = event.root();
-            let next_x = (x as i32 - 84).clamp(walk_x, (walk_x + walk_width - 168).max(walk_x));
-            let next_y = (y as i32 - 48).clamp(walk_y, (walk_y + walk_height - 108).max(walk_y));
-            runtime.borrow_mut().x = (next_x + 80) as f64;
-            root.move_(&pet_widget, next_x, next_y);
-            root.queue_draw_area(next_x, next_y, 168, 108);
-            glib::Propagation::Stop
-        }
-    });
-    pet_widget.connect_button_release_event({
-        let held = held.clone();
-        let runtime = runtime.clone();
-        move |_, _| {
-            held.set(false);
-            let mut pet = runtime.borrow_mut();
-            pet.target = pet.x;
-            pet.reaction = 48;
-            pet.pause = 28;
-            glib::Propagation::Stop
-        }
-    });
-    area.connect_draw({
-        let runtime = runtime.clone();
-        let alarm = alarm.clone();
-        let held = held.clone();
-        let sheets = sheets.clone();
-        move |_, ctx| {
-            draw_sprite_mascot(ctx, &runtime.borrow(), alarm.get(), held.get(), &sheets);
-            glib::Propagation::Proceed
-        }
-    });
-
-    glib::timeout_add_local(Duration::from_millis(66), {
-        let area = area.clone();
-        let pet_widget = pet_widget.clone();
-        let root = root.clone();
-        let held = held.clone();
-        let state = state.clone();
-        move || {
-            if !pet_widget.is_visible() {
-                return glib::ControlFlow::Continue;
-            }
-            let mut pet = runtime.borrow_mut();
-            pet.phase += if alarm.get() { 0.58 } else { 0.17 };
-            pet.reaction = pet.reaction.saturating_sub(1);
-            let mut thrown_key = None;
-            if held.get() {
-                pet.sequence_tick = pet.sequence_tick.wrapping_add(1);
-            } else if alarm.get() {
-                pet.pause = 20;
-            } else if pet.sequence != PetSequence::Roam {
-                pet.sequence_tick += 1;
-                if pet.sequence_tick >= 64 {
-                    if pet.sequence == PetSequence::Throw {
-                        thrown_key = pet.target_key.clone();
-                    }
-                    pet.sequence = PetSequence::Roam;
-                    pet.sequence_tick = 0;
-                    pet.target_key = None;
-                    pet.pause = 22;
-                }
-            } else if pet.pause > 0 {
-                pet.pause -= 1;
-            } else {
-                let distance = pet.target - pet.x;
-                if distance.abs() > 8.0 {
-                    pet.x += distance.signum() * 2.4;
-                } else if pet.target_key.is_some() {
-                    pet.sequence = if pet.seed.is_multiple_of(5) {
-                        PetSequence::Throw
-                    } else {
-                        PetSequence::Climb
-                    };
-                    pet.sequence_tick = 0;
-                } else {
-                    pet.seed = pet.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    let items: Vec<RegisteredWidget> = registry
-                        .borrow()
-                        .iter()
-                        .filter(|item| {
-                            item.key != "mascot"
-                                && item.key != "settings"
-                                && item.key != "picker"
-                                && item.widget.is_visible()
-                        })
-                        .cloned()
-                        .collect();
-                    if !items.is_empty() && (pet.seed & 3) != 0 {
-                        let item = &items[(pet.seed as usize) % items.len()];
-                        let allocation = item.widget.allocation();
-                        pet.target = (allocation.x() + allocation.width() / 2)
-                            .clamp(walk_x + 55, walk_x + walk_width - 55)
-                            as f64;
-                        pet.target_top = allocation.y();
-                        pet.target_key = Some(item.key.clone());
-                    } else {
-                        pet.target = (walk_x + 55) as f64
-                            + (pet.seed % (walk_width.saturating_sub(110).max(1) as u64)) as f64;
-                        pet.target_top = floor_y;
-                    }
-                }
-            }
-            let old = pet_widget.allocation();
-            let next_x = (pet.x as i32 - 80).clamp(walk_x, (walk_x + walk_width - 168).max(walk_x));
-            let next_y = if pet.sequence == PetSequence::Climb {
-                let top = (pet.target_top - 78).clamp(walk_y, floor_y);
-                let progress = f64::from(pet.sequence_tick.min(40)) / 40.0;
-                (f64::from(floor_y) + f64::from(top - floor_y) * progress) as i32
-            } else {
-                floor_y
-            };
-            root.queue_draw_area(old.x() - 3, old.y() - 3, old.width() + 6, old.height() + 6);
-            if !held.get() {
-                root.move_(&pet_widget, next_x, next_y);
-                root.queue_draw_area(next_x - 3, next_y - 3, old.width() + 6, old.height() + 6);
-            }
-            drop(pet);
-            if let Some(key) = thrown_key {
-                nudge_thrown_widget(&key, &root, &registry, &state);
-            }
-            area.queue_draw();
-            glib::ControlFlow::Continue
-        }
-    });
-
-    pet_widget
-}
-
-fn load_mascot_sheets() -> MascotSheets {
-    MascotSheets {
-        basic: load_pixbuf(include_bytes!("../assets/mascot-basic.png")),
-        climb: load_pixbuf(include_bytes!("../assets/mascot-climb.png")),
-        mischief: load_pixbuf(include_bytes!("../assets/mascot-mischief.png")),
-    }
-}
-
-fn load_pixbuf(bytes: &'static [u8]) -> gdk_pixbuf::Pixbuf {
-    let loader = gdk_pixbuf::PixbufLoader::new();
-    loader.write(bytes).expect("embedded mascot sprite data");
-    loader.close().expect("complete mascot sprite data");
-    loader.pixbuf().expect("decoded mascot sprite sheet")
-}
-
-fn draw_sprite_mascot(
-    ctx: &Context,
-    pet: &MascotRuntime,
-    alarm: bool,
-    held: bool,
-    sheets: &MascotSheets,
-) {
-    let (sheet, frame) = if held {
-        (&sheets.mischief, 1 + ((pet.phase * 2.2) as usize % 7))
-    } else if alarm {
-        (&sheets.mischief, 2 + ((pet.phase * 2.6) as usize % 6))
-    } else {
-        match pet.sequence {
-            PetSequence::Climb => (&sheets.climb, (pet.sequence_tick as usize / 4).min(15)),
-            PetSequence::Throw => (
-                &sheets.mischief,
-                8 + (pet.sequence_tick as usize / 8).min(7),
-            ),
-            PetSequence::Roam if pet.pause == 0 && (pet.target - pet.x).abs() > 8.0 => {
-                (&sheets.basic, 4 + ((pet.phase * 2.0) as usize % 4))
-            }
-            PetSequence::Roam => (&sheets.basic, (pet.phase as usize / 2) % 4),
-        }
-    };
-    draw_sprite_frame(ctx, sheet, frame, pet.target < pet.x);
-}
-
-fn draw_sprite_frame(ctx: &Context, sheet: &gdk_pixbuf::Pixbuf, frame: usize, mirror: bool) {
-    let cell = sheet.width() / 4;
-    let display_size = 96.0;
-    let _ = ctx.save();
-    ctx.translate(36.0, 3.0);
-    if mirror {
-        ctx.translate(display_size, 0.0);
-        ctx.scale(-1.0, 1.0);
-    }
-    ctx.scale(
-        display_size / f64::from(cell),
-        display_size / f64::from(cell),
-    );
-    ctx.rectangle(0.0, 0.0, f64::from(cell), f64::from(cell));
-    ctx.clip();
-    let column = (frame % 4) as i32;
-    let row = (frame / 4) as i32;
-    ctx.set_source_pixbuf(sheet, f64::from(-column * cell), f64::from(-row * cell));
-    let _ = ctx.paint();
-    let _ = ctx.restore();
-}
-
-fn nudge_thrown_widget(
-    key: &str,
-    root: &gtk::Fixed,
-    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
-    state: &Rc<RefCell<AppState>>,
-) {
-    let Some(item) = registry
-        .borrow()
-        .iter()
-        .find(|item| item.key == key)
-        .cloned()
-    else {
-        return;
-    };
-    let allocation = item.widget.allocation();
-    let root_allocation = root.allocation();
-    let screens = logical_screen_rects(
-        item.widget.scale_factor(),
-        root_allocation.width(),
-        root_allocation.height(),
-    );
-    let point = clamp_to_screens(
-        Point {
-            x: allocation.x() + 56,
-            y: allocation.y() - 18,
-        },
-        allocation.width(),
-        allocation.height(),
-        &screens,
-    );
-    root.queue_draw_area(
-        allocation.x() - 3,
-        allocation.y() - 3,
-        allocation.width() + 6,
-        allocation.height() + 6,
-    );
-    root.move_(&item.widget, point.x, point.y);
-    let mut data = state.borrow_mut();
-    if let Some(id) = key
-        .strip_prefix("note:")
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        if let Some(note) = data.notes.iter_mut().find(|note| note.id == id) {
-            note.position = point;
-        }
-    } else {
-        data.positions.insert(key.into(), point);
-    }
-    let _ = data.save();
-}
-
-#[allow(dead_code)]
-fn draw_legacy_mascot(ctx: &Context, pet: &MascotRuntime, alarm: bool) {
-    let bounce = if alarm {
-        (pet.phase.sin().abs() * 12.0) + 4.0
-    } else if pet.reaction > 0 {
-        pet.phase.sin().abs() * 7.0
-    } else {
-        pet.phase.sin().abs() * 2.5
-    };
-    let _ = ctx.save();
-    ctx.translate(110.0, 113.0 - bounce);
-
-    let _ = ctx.save();
-    ctx.set_source_rgba(0.03, 0.04, 0.06, 0.20);
-    ctx.scale(1.0, 0.35);
-    ctx.new_sub_path();
-    ctx.arc(0.0, 34.0, 42.0, 0.0, TAU);
-    let _ = ctx.fill();
-    let _ = ctx.restore();
-
-    let direction = if pet.target >= pet.x { 1.0 } else { -1.0 };
-    ctx.scale(direction, 1.0);
-    ctx.set_line_width(8.0);
-    ctx.set_line_cap(cairo::LineCap::Round);
-    ctx.set_source_rgb(0.47, 0.85, 1.0);
-    let tail_wag = (pet.phase * 1.7).sin() * 9.0;
-    ctx.move_to(-28.0, 6.0);
-    ctx.curve_to(
-        -58.0,
-        -2.0 + tail_wag,
-        -49.0,
-        -31.0,
-        -37.0,
-        -23.0 + tail_wag,
-    );
-    let _ = ctx.stroke();
-
-    ctx.set_source_rgb(0.98, 0.89, 0.75);
-    rounded_rect(ctx, -35.0, -17.0, 70.0, 50.0, 22.0);
-    let _ = ctx.fill_preserve();
-    ctx.set_source_rgb(0.13, 0.14, 0.17);
-    ctx.set_line_width(2.8);
-    let _ = ctx.stroke();
-    ctx.set_source_rgb(1.0, 0.92, 0.80);
-    ctx.arc(16.0, -25.0, 31.0, 0.0, TAU);
-    let _ = ctx.fill_preserve();
-    ctx.set_source_rgb(0.13, 0.14, 0.17);
-    ctx.set_line_width(2.8);
-    let _ = ctx.stroke();
-    ctx.set_source_rgb(1.0, 0.92, 0.80);
-    ctx.move_to(-7.0, -45.0);
-    ctx.line_to(1.0, -75.0);
-    ctx.line_to(17.0, -51.0);
-    ctx.close_path();
-    let _ = ctx.fill_preserve();
-    ctx.set_source_rgb(0.13, 0.14, 0.17);
-    ctx.set_line_width(2.8);
-    let _ = ctx.stroke();
-    ctx.set_source_rgb(1.0, 0.92, 0.80);
-    ctx.move_to(27.0, -51.0);
-    ctx.line_to(46.0, -70.0);
-    ctx.line_to(44.0, -36.0);
-    ctx.close_path();
-    let _ = ctx.fill_preserve();
-    ctx.set_source_rgb(0.13, 0.14, 0.17);
-    let _ = ctx.stroke();
-
-    ctx.set_source_rgb(1.0, 0.55, 0.62);
-    ctx.move_to(0.0, -56.0);
-    ctx.line_to(3.0, -68.0);
-    ctx.line_to(10.0, -55.0);
-    ctx.close_path();
-    let _ = ctx.fill();
-    ctx.move_to(34.0, -54.0);
-    ctx.line_to(43.0, -64.0);
-    ctx.line_to(42.0, -48.0);
-    ctx.close_path();
-    let _ = ctx.fill();
-
-    ctx.set_source_rgb(0.12, 0.14, 0.18);
-    if pet.phase.rem_euclid(10.0) > 9.25 {
-        ctx.set_line_width(2.4);
-        for eye_x in [7.0, 27.0] {
-            ctx.move_to(eye_x - 3.5, -27.0);
-            ctx.curve_to(eye_x - 1.0, -24.5, eye_x + 1.0, -24.5, eye_x + 3.5, -27.0);
-            let _ = ctx.stroke();
-        }
-    } else {
-        for eye_x in [7.0, 27.0] {
-            ctx.arc(eye_x, -27.0, 3.7, 0.0, TAU);
-            let _ = ctx.fill();
-        }
-    }
-    ctx.set_source_rgb(1.0, 0.45, 0.56);
-    for cheek_x in [-1.0, 36.0] {
-        ctx.arc(cheek_x, -17.0, 4.0, 0.0, TAU);
-        let _ = ctx.fill();
-    }
-    ctx.set_source_rgb(0.13, 0.14, 0.17);
-    ctx.set_line_width(2.0);
-    ctx.move_to(15.0, -17.0);
-    ctx.curve_to(18.0, -13.0, 22.0, -13.0, 25.0, -17.0);
-    let _ = ctx.stroke();
-
-    ctx.set_line_width(8.0);
-    ctx.set_source_rgb(0.98, 0.89, 0.75);
-    let step = pet.phase.sin() * 7.0;
-    ctx.move_to(-17.0, 27.0);
-    ctx.line_to(-19.0 + step, 39.0);
-    ctx.move_to(18.0, 27.0);
-    ctx.line_to(19.0 - step, 39.0);
-    let _ = ctx.stroke();
-    let _ = ctx.restore();
-
-    if pet.reaction > 0 {
-        let lift = (42 - pet.reaction) as f64 * 0.65;
-        for (x, delay) in [(69.0, 0.0), (151.0, 8.0), (179.0, 17.0)] {
-            let local = (lift - delay).max(0.0);
-            if local > 0.0 {
-                draw_heart(ctx, x, 82.0 - local, (1.0 - local / 42.0).max(0.15));
-            }
-        }
-    }
-
-    if pet.pause > 0 || alarm {
-        ctx.set_source_rgba(0.05, 0.07, 0.10, 0.88);
-        rounded_rect(ctx, 44.0, 5.0, 148.0, 32.0, 12.0);
-        let _ = ctx.fill();
-        center_text(
-            ctx,
-            118.0,
-            25.0,
-            &pet.message,
-            10.5,
-            FontWeight::Bold,
-            (0.96, 0.98, 1.0),
-        );
-    }
-    if alarm {
-        ctx.set_source_rgb(1.0, 0.42, 0.50);
-        for x in [48.0, 176.0] {
-            ctx.move_to(x, 52.0);
-            ctx.line_to(x + 8.0, 41.0);
-            ctx.line_to(x + 6.0, 56.0);
-            let _ = ctx.stroke();
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn draw_heart(ctx: &Context, x: f64, y: f64, alpha: f64) {
-    let _ = ctx.save();
-    ctx.translate(x, y);
-    ctx.scale(0.65, 0.65);
-    ctx.set_source_rgba(1.0, 0.34, 0.48, alpha);
-    ctx.move_to(0.0, 5.0);
-    ctx.curve_to(-18.0, -7.0, -16.0, -20.0, -6.0, -20.0);
-    ctx.curve_to(0.0, -20.0, 4.0, -15.0, 5.0, -11.0);
-    ctx.curve_to(8.0, -18.0, 22.0, -20.0, 24.0, -8.0);
-    ctx.curve_to(25.0, 0.0, 15.0, 8.0, 2.0, 18.0);
-    ctx.close_path();
-    let _ = ctx.fill();
-    let _ = ctx.restore();
 }
 
 fn card_shell(
@@ -3159,23 +3110,30 @@ fn apply_system_details(
     preview.canvas.queue_draw();
     let mut data = state.borrow_mut();
     data.settings.system_details = details;
-    data.sizes.insert("system".into(), size);
+    // Drop any stored size instead of pinning this one. Turning CPU CORES on
+    // computes the height from the cores read so far — none, because the
+    // reader was not collecting them — so it would lock the card to a single
+    // row and, because a stored size means "the user resized this", the
+    // periodic update would never grow it and the core grid stayed clipped.
+    // Handing the card back to the layout lets that auto-grow run; a real
+    // resize-handle drag still stores a size and still wins.
+    data.sizes.remove("system");
     let _ = data.save();
 }
 
 fn place_card(root: &gtk::Fixed, card: &gtk::EventBox, point: Point) {
-    root.put(card, point.x.max(0), point.y.max(0));
+    root.put(card, point.x, point.y);
 }
 
 fn logical_screen_rects(scale: i32, fallback_width: i32, fallback_height: i32) -> Vec<ScreenRect> {
-    let root_bounds = ScreenRect {
+    let fallback = ScreenRect {
         x: 0,
         y: 0,
         width: fallback_width.max(1),
         height: fallback_height.max(1),
     };
     let Some(display) = gdk::Display::default() else {
-        return vec![root_bounds];
+        return vec![fallback];
     };
     let mut raw_screens = Vec::new();
     for index in 0..display.n_monitors() {
@@ -3189,15 +3147,52 @@ fn logical_screen_rects(scale: i32, fallback_width: i32, fallback_height: i32) -
             });
         }
     }
-    let divisor = monitor_coordinate_divisor(&raw_screens, scale, root_bounds);
+    if raw_screens.is_empty() {
+        return vec![fallback];
+    }
+    let divisor = monitor_coordinate_divisor(&raw_screens, scale, fallback);
+    let root_bounds = monitor_root_bounds(&raw_screens, divisor, fallback);
     let screens: Vec<_> = raw_screens
         .into_iter()
         .filter_map(|screen| normalize_monitor_rect(screen, divisor, root_bounds))
         .collect();
     if screens.is_empty() {
-        vec![root_bounds]
+        vec![fallback]
     } else {
         screens
+    }
+}
+
+// The overlay window must cover every monitor, including Xinerama screens
+// with negative origins; the X root window's (0, 0) corner is not the
+// bounding box's corner once a screen sits left of the primary.
+fn monitor_root_bounds(
+    raw_screens: &[ScreenRect],
+    divisor: i32,
+    fallback: ScreenRect,
+) -> ScreenRect {
+    let divisor = divisor.max(1);
+    let min_x = raw_screens.iter().map(|screen| screen.x).min().unwrap_or(0);
+    let min_y = raw_screens.iter().map(|screen| screen.y).min().unwrap_or(0);
+    let max_x = raw_screens
+        .iter()
+        .map(|screen| screen.x.saturating_add(screen.width))
+        .max()
+        .unwrap_or(fallback.width);
+    let max_y = raw_screens
+        .iter()
+        .map(|screen| screen.y.saturating_add(screen.height))
+        .max()
+        .unwrap_or(fallback.height);
+    ScreenRect {
+        x: (f64::from(min_x) / f64::from(divisor)).round() as i32,
+        y: (f64::from(min_y) / f64::from(divisor)).round() as i32,
+        width: (f64::from(max_x.saturating_sub(min_x)) / f64::from(divisor))
+            .round()
+            .max(1.0) as i32,
+        height: (f64::from(max_y.saturating_sub(min_y)) / f64::from(divisor))
+            .round()
+            .max(1.0) as i32,
     }
 }
 
@@ -3206,7 +3201,7 @@ fn logical_primary_screen(
     fallback_width: i32,
     fallback_height: i32,
 ) -> Option<ScreenRect> {
-    let root_bounds = ScreenRect {
+    let fallback = ScreenRect {
         x: 0,
         y: 0,
         width: fallback_width.max(1),
@@ -3233,7 +3228,11 @@ fn logical_primary_screen(
             }
         })
         .collect();
-    let divisor = monitor_coordinate_divisor(&raw_screens, scale, root_bounds);
+    if raw_screens.is_empty() {
+        return Some(fallback);
+    }
+    let divisor = monitor_coordinate_divisor(&raw_screens, scale, fallback);
+    let root_bounds = monitor_root_bounds(&raw_screens, divisor, fallback);
     normalize_monitor_rect(primary, divisor, root_bounds)
 }
 
@@ -3319,9 +3318,6 @@ fn clamp_registered_widgets(
 ) {
     let mut data = state.borrow_mut();
     for item in registry.borrow().iter() {
-        if item.key == "mascot" || item.key == "settings" {
-            continue;
-        }
         let allocation = item.widget.allocation();
         if allocation.width() <= 1 || allocation.height() <= 1 {
             continue;
@@ -3711,6 +3707,45 @@ fn pointer_position() -> Option<(f64, f64)> {
     let (_, x, y) = pointer.position_double();
     Some((x, y))
 }
+fn present_overlay(window: &gtk::ApplicationWindow) {
+    // present() with GDK_CURRENT_TIME makes GNOME's WM log "Buggy client sent
+    // a _NET_ACTIVE_WINDOW message with a timestamp of 0" and lets the overlay
+    // steal focus from the app the user is typing in. Use the X server's last
+    // user-interaction timestamp when one is available.
+    let timestamp = gdk::Display::default()
+        .and_then(|display| {
+            display
+                .downcast_ref::<gdkx11::X11Display>()
+                .map(|display| display.user_time())
+        })
+        .unwrap_or(0);
+    if timestamp != 0 {
+        window.present_with_time(timestamp);
+    } else {
+        window.present();
+    }
+}
+
+// One widget's contribution to the overlay's input shape. Compared against
+// the previous refresh so an unchanged shape costs no X round-trip, which is
+// what makes it safe to recompute on every re-layout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShapePart {
+    Rect(i32, i32, i32, i32),
+    Circle(i32, i32, i32, i32),
+}
+
+thread_local! {
+    static LAST_INPUT_SHAPE: RefCell<Option<Vec<ShapePart>>> = const { RefCell::new(None) };
+}
+
+// The cache tracks what was last pushed to *this* GdkWindow. A remap gives the
+// overlay a fresh, unshaped X window, so the cache has to be dropped or the
+// next refresh would decide there was nothing to do and leave every widget
+// click-through.
+fn invalidate_input_shape_cache() {
+    LAST_INPUT_SHAPE.with(|last| *last.borrow_mut() = None);
+}
 
 fn refresh_input_shape(
     window: &gtk::ApplicationWindow,
@@ -3718,15 +3753,19 @@ fn refresh_input_shape(
     interactive: bool,
 ) {
     let Some(gdk_window) = window.window() else {
+        // No X window to shape yet; forget the cache so the refresh that runs
+        // once it exists actually pushes a region.
+        invalidate_input_shape_cache();
         return;
     };
-    let region = Region::create();
+    let mut parts: Vec<ShapePart> = Vec::new();
     for item in registry.borrow().iter() {
         let lock_timer = item.key == "timer";
         let settings = item.key == "picker";
-        // Notes keep receiving input in lock mode so their content can still
-        // be scrolled; editing is disabled separately via the read-only editor.
-        let lock_note = item.key.starts_with("note:");
+        // Notes and the history list keep receiving input in lock mode so
+        // their content can still be scrolled; editing is disabled separately
+        // via the read-only editor, and their headers hide as edit chrome.
+        let lock_note = item.key.starts_with("note:") || item.key == "history";
         if interactive
             || settings
             || lock_timer
@@ -3738,52 +3777,46 @@ fn refresh_input_shape(
             }
             let allocation = item.widget.allocation();
             if allocation.width() > 1 && allocation.height() > 1 {
-                if !interactive && lock_timer {
-                    union_circle_region(&region, &allocation);
+                let part = if !interactive && lock_timer {
+                    ShapePart::Circle
                 } else {
-                    let _ = region.union_rectangle(&RectangleInt::new(
-                        allocation.x(),
-                        allocation.y(),
-                        allocation.width(),
-                        allocation.height(),
-                    ));
-                }
+                    ShapePart::Rect
+                };
+                parts.push(part(
+                    allocation.x(),
+                    allocation.y(),
+                    allocation.width(),
+                    allocation.height(),
+                ));
+            }
+        }
+    }
+    if LAST_INPUT_SHAPE.with(|last| last.borrow().as_deref() == Some(parts.as_slice())) {
+        return;
+    }
+    let region = Region::create();
+    for part in &parts {
+        match *part {
+            ShapePart::Rect(x, y, width, height) => {
+                let _ = region.union_rectangle(&RectangleInt::new(x, y, width, height));
+            }
+            ShapePart::Circle(x, y, width, height) => {
+                union_circle_region(&region, x, y, width, height);
             }
         }
     }
     gdk_window.input_shape_combine_region(&region, 0, 0);
+    LAST_INPUT_SHAPE.with(|last| *last.borrow_mut() = Some(parts));
 }
 
-fn union_circle_region(region: &Region, allocation: &gtk::Allocation) {
-    let radius = (allocation.width().min(allocation.height()) / 2 - 10).clamp(1, 62);
-    let cx = allocation.x() + allocation.width() / 2;
-    let cy = allocation.y() + allocation.height() / 2;
+fn union_circle_region(region: &Region, x: i32, y: i32, width: i32, height: i32) {
+    let radius = (width.min(height) / 2 - 10).clamp(1, 62);
+    let cx = x + width / 2;
+    let cy = y + height / 2;
     for dy in (-radius..=radius).step_by(2) {
         let half = ((radius * radius - dy * dy) as f64).sqrt() as i32;
         let _ = region.union_rectangle(&RectangleInt::new(cx - half, cy + dy, half * 2 + 1, 2));
     }
-}
-
-fn refresh_shape_during_transition(
-    window: &gtk::ApplicationWindow,
-    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
-    interactive: Rc<Cell<bool>>,
-) {
-    let ticks = Rc::new(Cell::new(0_u8));
-    glib::timeout_add_local(Duration::from_millis(28), {
-        let window = window.clone();
-        let registry = registry.clone();
-        move || {
-            refresh_input_shape(&window, &registry, interactive.get());
-            let next = ticks.get() + 1;
-            ticks.set(next);
-            if next < 11 {
-                glib::ControlFlow::Continue
-            } else {
-                glib::ControlFlow::Break
-            }
-        }
-    });
 }
 
 fn apply_color_mode(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, mode: ColorMode) {
@@ -3884,6 +3917,21 @@ fn small_button(label: &str) -> gtk::Button {
     button
 }
 
+fn icon_button(icon_name: &str, tooltip: &str) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.set_can_focus(false);
+    button.set_tooltip_text(Some(tooltip));
+    button.style_context().add_class("tiny-button");
+    button.style_context().add_class("note-window-button");
+    // A symbolic icon recolours to the button's CSS colour, so it follows the
+    // header text in every colour mode; a text glyph would depend on the
+    // system font having it.
+    let icon = gtk::Image::from_icon_name(Some(icon_name), gtk::IconSize::Menu);
+    icon.set_pixel_size(11);
+    button.add(&icon);
+    button
+}
+
 fn format_duration(seconds: i64) -> String {
     let seconds = seconds.max(0);
     let hours = seconds / 3600;
@@ -3930,22 +3978,6 @@ fn center_text(
     let _ = ctx.show_text(text);
 }
 
-fn rounded_rect(ctx: &Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
-    let radius = radius.min(width / 2.0).min(height / 2.0);
-    ctx.new_sub_path();
-    ctx.arc(x + width - radius, y + radius, radius, -PI / 2.0, 0.0);
-    ctx.arc(
-        x + width - radius,
-        y + height - radius,
-        radius,
-        0.0,
-        PI / 2.0,
-    );
-    ctx.arc(x + radius, y + height - radius, radius, PI / 2.0, PI);
-    ctx.arc(x + radius, y + radius, radius, PI, PI * 1.5);
-    ctx.close_path();
-}
-
 fn install_css(screen: &gdk::Screen) {
     let css = include_str!("style.css");
     let provider = gtk::CssProvider::new();
@@ -3962,10 +3994,26 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        clamp_to_screens, monitor_coordinate_divisor, normalize_monitor_rect, parse_timer_input,
-        system_content_size, timer_style_size, ScreenRect,
+        history_row_budget, monitor_coordinate_divisor, monitor_root_bounds,
+        normalize_monitor_rect, parse_timer_input, system_content_size, timer_style_size,
+        ScreenRect, HISTORY_HEIGHT,
     };
-    use crate::state::{Point, Size, SystemDetails, TimerStyle};
+    use crate::state::{Size, SystemDetails, TimerStyle};
+
+    #[test]
+    fn a_taller_history_window_renders_more_rows_than_a_shorter_one() {
+        let short = history_row_budget(120);
+        let tall = history_row_budget(600);
+        assert!(
+            tall > short,
+            "dragging the history window taller must render more rows: {short} -> {tall}"
+        );
+        // Even a window dragged to its minimum keeps a scrollable buffer, and
+        // a huge one stays bounded so each keystroke rebuild stays cheap.
+        assert_eq!(history_row_budget(0), 14);
+        assert!(history_row_budget(100_000) <= 240);
+        assert!(history_row_budget(HISTORY_HEIGHT) >= 14);
+    }
 
     #[test]
     fn parses_supported_timer_formats() {
@@ -3998,6 +4046,39 @@ mod timer_input_tests {
         let divisor = monitor_coordinate_divisor(&[physical], 2, root);
         assert_eq!(divisor, 2);
         assert_eq!(normalize_monitor_rect(physical, divisor, root), Some(root));
+    }
+    #[test]
+    fn monitors_left_of_the_primary_keep_negative_coordinates() {
+        let fallback = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let raw = [
+            ScreenRect {
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            ScreenRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        ];
+        let bounds = monitor_root_bounds(&raw, 1, fallback);
+        assert_eq!(
+            bounds,
+            ScreenRect {
+                x: -1920,
+                y: 0,
+                width: 3840,
+                height: 1080,
+            }
+        );
     }
 
     #[test]

@@ -146,16 +146,19 @@ textview, textview text {
 
 .history-list {
   background-color: transparent;
-  padding: 5px 2px;
+  padding: 3px 2px;
+}
+
+.history-empty {
+  color: alpha(currentColor, 0.5);
+  padding: 5px 8px;
 }
 
 .note-preview {
   background-color: transparent;
   color: currentColor;
   border: none;
-  padding: 5px 7px;
-  font-size: 10px;
-  font-weight: bold;
+  padding: 3px 7px;
 }
 
 .note-preview:hover {
@@ -166,9 +169,7 @@ textview, textview text {
   background-color: transparent;
   color: currentColor;
   border: none;
-  padding: 7px 10px;
-  font-size: 10px;
-  font-weight: 800;
+  padding: 5px 9px;
   text-shadow: 0 2px 4px rgba(0, 0, 0, 0.92);
 }
 
@@ -305,10 +306,6 @@ textview, textview text {
   transition: 160ms ease-out;
 }
 
-.pinned-note.note-hover scrollbar trough {
-  background-color: alpha(currentColor, 0.10);
-}
-
 .pinned-note.note-hover scrollbar slider,
 .pinned-note scrollbar slider:hover {
   background-color: alpha(currentColor, 0.40);
@@ -319,6 +316,96 @@ textview, textview text {
 }
 
 .pinned-note.note-hover scrollbar slider:active {
+  background-color: alpha(currentColor, 0.68);
+}
+
+/* The history window wears the note chrome: a light header bar that flips
+   between a title and a search field, and a scrollbar whose track never
+   paints — only the thumb fades in while the pointer is over the list. */
+.history-header {
+  border-radius: 4px 4px 1px 1px;
+  min-height: 20px;
+  padding-right: 6px;
+}
+
+.history-title {
+  color: #222222;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 1.3px;
+  text-shadow: none;
+}
+
+.mode-dark .history-title {
+  color: #f2f2f2;
+}
+
+/* The search field is the header bar itself, not a box inside it: no
+   background of its own, so flipping into search mode only swaps the title
+   text for a caret. */
+.history-search {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  color: #222222;
+  caret-color: #222222;
+  text-shadow: none;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 1.3px;
+  min-height: 16px;
+  /* No inset: the entry occupies the title's slot, so the caret has to land
+     exactly where the title text started. */
+  padding: 0;
+}
+
+.history-search:focus {
+  background-color: transparent;
+}
+
+.history-search placeholder {
+  color: alpha(currentColor, 0.5);
+}
+
+.mode-dark .history-search {
+  color: #f2f2f2;
+  caret-color: #f2f2f2;
+}
+
+.history-scroller scrollbar {
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.history-scroller scrollbar trough {
+  background-color: transparent;
+  border: none;
+  border-radius: 4px;
+}
+
+.history-scroller scrollbar slider {
+  background-color: alpha(currentColor, 0.0);
+  border: none;
+  border-radius: 4px;
+  min-width: 7px;
+  min-height: 26px;
+  margin: 1px;
+  transition: 160ms ease-out;
+}
+
+.history-scroller.history-hover scrollbar slider,
+.history-scroller scrollbar slider:hover {
+  background-color: alpha(currentColor, 0.40);
+}
+
+.history-scroller.history-hover scrollbar slider:hover {
+  background-color: alpha(currentColor, 0.56);
+}
+
+.history-scroller.history-hover scrollbar slider:active {
   background-color: alpha(currentColor, 0.68);
 }
 
