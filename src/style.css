@@ -144,10 +144,12 @@ textview, textview text {
   padding: 7px;
 }
 
-/* Inline images make a text row very tall. Keep the insertion caret hairline-
- * thin instead of letting its width grow proportionally with the image row. */
-.pinned-editor {
-  -GtkWidget-cursor-aspect-ratio: 0.012;
+/* GTK sizes the insertion caret as row_height * aspect_ratio + 1, so a row
+ * holding an inline image turns the caret into a wide bar: at the 0.04 default
+ * a 240px-tall image gives an 11px-wide caret. Zero pins it at one pixel, the
+ * width every other text editor draws, whatever the row height. */
+.note-editor, .pinned-editor {
+  -GtkWidget-cursor-aspect-ratio: 0;
 }
 
 .history-list {
