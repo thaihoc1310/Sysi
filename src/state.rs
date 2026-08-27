@@ -145,6 +145,19 @@ impl Default for SystemDetails {
     }
 }
 
+// A pasted image lives as a file next to the notes, and the note text keeps a
+// U+FFFC object-replacement character where it sits. The images list runs in
+// the same order as those placeholders, so text and images stay interleaved
+// through a save/load round trip.
+pub const IMAGE_PLACEHOLDER: char = '\u{fffc}';
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NoteImage {
+    pub file: String,
+    pub width: i32,
+    pub height: i32,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Note {
     pub id: u64,
@@ -153,6 +166,8 @@ pub struct Note {
     pub pinned: bool,
     #[serde(default)]
     pub position: Point,
+    #[serde(default)]
+    pub images: Vec<NoteImage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -175,6 +190,8 @@ pub struct AppState {
     pub timer_style: TimerStyle,
     #[serde(default = "default_next_id")]
     pub next_note_id: u64,
+    #[serde(default = "default_next_id")]
+    pub next_image_id: u64,
 }
 
 impl Default for AppState {
@@ -192,6 +209,7 @@ impl Default for AppState {
             timer_seconds: default_timer(),
             timer_style: TimerStyle::default(),
             next_note_id: 1,
+            next_image_id: 1,
         }
     }
 }
@@ -214,6 +232,17 @@ pub fn config_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("sysi")
+}
+
+// Pasted images are user data, not a cache: losing them would gut the note
+// that shows them, so they go under XDG_DATA_HOME rather than the cache dir.
+pub fn images_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("sysi")
+        .join("images")
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -241,6 +270,31 @@ impl AppState {
         let raw = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         fs::write(&temp, raw)?;
         fs::rename(temp, path)
+    }
+
+    // Delete image files no note points at any more. Deleting a note that
+    // showed an image, or backspacing over the placeholder, would otherwise
+    // leave the file behind for good.
+    pub fn prune_orphan_images(&self) {
+        let referenced = self.referenced_image_files();
+        let Ok(entries) = fs::read_dir(images_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !referenced.contains(name) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    pub fn referenced_image_files(&self) -> std::collections::HashSet<String> {
+        self.notes
+            .iter()
+            .flat_map(|note| note.images.iter())
+            .map(|image| image.file.clone())
+            .collect()
     }
 }
 
@@ -276,6 +330,27 @@ mod tests {
         let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
             .expect("state without a history flag should remain readable");
         assert!(!state.settings.history_open);
+    }
+
+    #[test]
+    fn old_notes_load_without_images() {
+        let state: AppState = serde_json::from_str(
+            r#"{"notes":[{"id":1,"text":"hello","pinned":true}],"next_note_id":2}"#,
+        )
+        .expect("notes saved before image support should remain readable");
+        assert!(state.notes[0].images.is_empty());
+        assert_eq!(state.next_image_id, 1);
+    }
+
+    #[test]
+    fn orphan_image_files_are_the_ones_no_note_references() {
+        let state: AppState = serde_json::from_str(
+            r#"{"notes":[{"id":1,"text":"a\ufffcb","images":[{"file":"7.png","width":80,"height":60}]}]}"#,
+        )
+        .expect("a note with an image should be readable");
+        let referenced = state.referenced_image_files();
+        assert!(referenced.contains("7.png"));
+        assert!(!referenced.contains("8.png"));
     }
 
     #[test]
