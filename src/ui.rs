@@ -2401,10 +2401,9 @@ fn draggable_note_preview(
 const NOTE_IMAGE_DEFAULT_MAX: i32 = 240;
 const NOTE_IMAGE_MIN: i32 = 40;
 const NOTE_IMAGE_MAX: i32 = 1400;
-// The invisible strip at the right/bottom edge that behaves like resize
-// chrome. It is deliberately small enough that ordinary image clicks still
-// place the caret, but large enough to acquire without pixel hunting.
-const NOTE_IMAGE_EDGE_HIT: i32 = 7;
+// A hover-only corner handle, matching the note card resize affordance.
+const NOTE_IMAGE_HANDLE_HIT: i32 = 18;
+const NOTE_IMAGE_BORDER_RADIUS: f64 = 6.0;
 const NOTE_UNDO_LIMIT: usize = 100;
 // Slack under a pasted image so its frame is not flush with the note edge.
 const NOTE_IMAGE_ROOM: i32 = 10;
@@ -2417,13 +2416,6 @@ struct FocusedImage {
     height: i32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImageResizeAxis {
-    Right,
-    Bottom,
-    Corner,
-}
-
 #[derive(Clone, Debug)]
 struct ImageResize {
     offset: i32,
@@ -2431,7 +2423,6 @@ struct ImageResize {
     start_y: f64,
     start_width: i32,
     aspect: f64,
-    axis: ImageResizeAxis,
     before: NoteSnapshot,
 }
 
@@ -2607,18 +2598,16 @@ fn resized_image_size(
     dx: f64,
     dy: f64,
     max_width: i32,
-    axis: ImageResizeAxis,
 ) -> (i32, i32) {
     let aspect = if aspect.is_finite() && aspect > 0.0 {
         aspect
     } else {
         1.0
     };
-    let delta = match axis {
-        ImageResizeAxis::Right => dx,
-        ImageResizeAxis::Bottom => dy * aspect,
-        ImageResizeAxis::Corner if dx.abs() >= dy.abs() => dx,
-        ImageResizeAxis::Corner => dy * aspect,
+    let delta = if dx.abs() >= dy.abs() {
+        dx
+    } else {
+        dy * aspect
     };
     let max_width = max_width.clamp(NOTE_IMAGE_MIN, NOTE_IMAGE_MAX);
     let width = ((f64::from(start_width) + delta).round() as i32).clamp(NOTE_IMAGE_MIN, max_width);
@@ -2682,8 +2671,61 @@ fn scaled_image(file: &str, width: i32, height: i32, originals: &ImageOriginals)
     } else {
         original.scale_simple(width, height, InterpType::Bilinear)?
     };
+    // The corners are rounded on the copy that goes into the note, not on the
+    // stored original: a square corner would poke out past the focus outline,
+    // which is drawn after the text and cannot erase what is under it.
+    let pixbuf = round_pixbuf_corners(&pixbuf, NOTE_IMAGE_BORDER_RADIUS).unwrap_or(pixbuf);
     tag_image_source(&pixbuf, file);
     Some(pixbuf)
+}
+
+// Cut the corners out of the alpha channel directly rather than through a
+// cairo clip: gdk_pixbuf_get_from_surface needs an initialised GDK, so a clip
+// would make this untestable and display-bound for no gain.
+fn round_pixbuf_corners(pixbuf: &Pixbuf, radius: f64) -> Option<Pixbuf> {
+    let target = if pixbuf.has_alpha() {
+        pixbuf.copy()?
+    } else {
+        pixbuf.add_alpha(false, 0, 0, 0).ok()?
+    };
+    let width = target.width();
+    let height = target.height();
+    let radius = radius
+        .min(f64::from(width) / 2.0)
+        .min(f64::from(height) / 2.0);
+    let channels = target.n_channels() as usize;
+    if radius <= 0.0 || channels < 4 {
+        return Some(target);
+    }
+    let stride = target.rowstride() as usize;
+    let limit = (radius.ceil() as i32).min(width).min(height);
+    // SAFETY: `target` was just created here, so no other reference to its
+    // pixel buffer exists while the alpha channel is rewritten.
+    let pixels = unsafe { target.pixels() };
+    for corner_y in 0..limit {
+        for corner_x in 0..limit {
+            // How much of this pixel the rounded corner still covers. The
+            // half-pixel ramp keeps the curve from looking like a staircase.
+            let dx = (radius - (f64::from(corner_x) + 0.5)).max(0.0);
+            let dy = (radius - (f64::from(corner_y) + 0.5)).max(0.0);
+            let coverage = (radius - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+            if coverage >= 1.0 {
+                continue;
+            }
+            for (x, y) in [
+                (corner_x, corner_y),
+                (width - 1 - corner_x, corner_y),
+                (corner_x, height - 1 - corner_y),
+                (width - 1 - corner_x, height - 1 - corner_y),
+            ] {
+                let index = y as usize * stride + x as usize * channels + 3;
+                if let Some(alpha) = pixels.get_mut(index) {
+                    *alpha = (f64::from(*alpha) * coverage).round() as u8;
+                }
+            }
+        }
+    }
+    Some(target)
 }
 
 fn store_note_image(pixbuf: &Pixbuf, state: &Rc<RefCell<AppState>>) -> Option<String> {
@@ -2884,33 +2926,56 @@ fn image_at_pointer(editor: &gtk::TextView, x: f64, y: f64) -> Option<FocusedIma
     None
 }
 
-fn image_resize_zone(
-    editor: &gtk::TextView,
-    x: f64,
-    y: f64,
-) -> Option<(FocusedImage, ImageResizeAxis)> {
+fn image_resize_zone(editor: &gtk::TextView, x: f64, y: f64) -> Option<FocusedImage> {
     let image = image_at_pointer(editor, x, y)?;
     let (rect_x, rect_y, width, height) = image_rect(editor, image.offset)?;
-    let edge = f64::from(NOTE_IMAGE_EDGE_HIT);
-    let near_right = x >= rect_x + width - edge && x <= rect_x + width;
-    let near_bottom = y >= rect_y + height - edge && y <= rect_y + height;
-    let inside_x = x >= rect_x && x <= rect_x + width;
-    let inside_y = y >= rect_y && y <= rect_y + height;
-    let axis = match (near_right && inside_y, near_bottom && inside_x) {
-        (true, true) => ImageResizeAxis::Corner,
-        (true, false) => ImageResizeAxis::Right,
-        (false, true) => ImageResizeAxis::Bottom,
-        (false, false) => return None,
-    };
-    Some((image, axis))
+    let handle = f64::from(NOTE_IMAGE_HANDLE_HIT);
+    (x >= rect_x + width - handle
+        && x <= rect_x + width
+        && y >= rect_y + height - handle
+        && y <= rect_y + height)
+        .then_some(image)
 }
 
-fn image_resize_cursor(axis: ImageResizeAxis) -> gdk::CursorType {
-    match axis {
-        ImageResizeAxis::Right => gdk::CursorType::RightSide,
-        ImageResizeAxis::Bottom => gdk::CursorType::BottomSide,
-        ImageResizeAxis::Corner => gdk::CursorType::BottomRightCorner,
+// The image body is not text, so it must not keep the caret cursor; only the
+// little corner arc advertises a resize.
+fn image_pointer_cursor(editor: &gtk::TextView, x: f64, y: f64) -> gdk::CursorType {
+    if editor.is_editable() {
+        if image_resize_zone(editor, x, y).is_some() {
+            return gdk::CursorType::BottomRightCorner;
+        }
+        if image_at_pointer(editor, x, y).is_some() {
+            return gdk::CursorType::Arrow;
+        }
     }
+    gdk::CursorType::Xterm
+}
+
+// GtkTextView owns the I-beam on its text window — a child of the widget
+// window — and re-asserts it there, so a cursor set on the widget itself is
+// never the one the pointer shows. Set it on the window the pointer is over.
+fn set_editor_cursor(editor: &gtk::TextView, cursor: gdk::CursorType) {
+    let Some(window) = TextViewExt::window(editor, gtk::TextWindowType::Text) else {
+        return;
+    };
+    let cursor = gdk::Cursor::for_display(&window.display(), cursor);
+    window.set_cursor(cursor.as_ref());
+}
+
+fn rounded_rectangle(ctx: &Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
+    let radius = radius.min(width / 2.0).min(height / 2.0).max(0.0);
+    ctx.new_sub_path();
+    ctx.arc(x + width - radius, y + radius, radius, -PI / 2.0, 0.0);
+    ctx.arc(
+        x + width - radius,
+        y + height - radius,
+        radius,
+        0.0,
+        PI / 2.0,
+    );
+    ctx.arc(x + radius, y + height - radius, radius, PI / 2.0, PI);
+    ctx.arc(x + radius, y + radius, radius, PI, PI * 1.5);
+    ctx.close_path();
 }
 
 fn replace_note_image(
@@ -2937,6 +3002,34 @@ fn replace_note_image(
     buffer.insert_pixbuf(&mut at, &scaled);
     buffer.place_cursor(&buffer.iter_at_offset(offset + 1));
     Some(())
+}
+
+fn copy_focused_image(
+    editor: &gtk::TextView,
+    focus: &ImageFocus,
+    originals: &ImageOriginals,
+) -> bool {
+    let Some(image) = *focus.borrow() else {
+        return false;
+    };
+    let Some(buffer) = editor.buffer() else {
+        return false;
+    };
+    // An explicit text selection wins; Ctrl+C must keep behaving like a normal
+    // editor even if an old image focus outline is still present.
+    if buffer.has_selection() {
+        return false;
+    }
+    let Some(displayed) = buffer.iter_at_offset(image.offset).pixbuf() else {
+        return false;
+    };
+    let pixbuf = image_source(&displayed)
+        .and_then(|file| original_image(&file, originals))
+        .unwrap_or(displayed);
+    editor
+        .clipboard(&gdk::SELECTION_CLIPBOARD)
+        .set_image(&pixbuf);
+    true
 }
 
 fn paste_note_image(
@@ -3094,6 +3187,7 @@ fn attach_note_images(
     let target = Rc::new(target);
     let originals: ImageOriginals = Rc::new(RefCell::new(HashMap::new()));
     let focus: ImageFocus = Rc::new(RefCell::new(None));
+    let hover: ImageFocus = Rc::new(RefCell::new(None));
     let resize: ImageResizeState = Rc::new(RefCell::new(None));
     let undo: NoteUndoState = Rc::new(RefCell::new(NoteUndo::default()));
 
@@ -3166,6 +3260,14 @@ fn attach_note_images(
                 return glib::Propagation::Proceed;
             }
             let key = event.keyval();
+            let c = key == gdk::keys::constants::c || key == gdk::keys::constants::C;
+            if c {
+                return if copy_focused_image(editor, &focus, &originals) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                };
+            }
             let z = key == gdk::keys::constants::z || key == gdk::keys::constants::Z;
             let y = key == gdk::keys::constants::y || key == gdk::keys::constants::Y;
             if !z && !y {
@@ -3194,7 +3296,7 @@ fn attach_note_images(
             }
             let (x, y) = event.position();
             if editor.is_editable() {
-                if let Some((image, axis)) = image_resize_zone(editor, x, y) {
+                if let Some(image) = image_resize_zone(editor, x, y) {
                     let Some(buffer) = editor.buffer() else {
                         return glib::Propagation::Proceed;
                     };
@@ -3206,7 +3308,6 @@ fn attach_note_images(
                         start_y: y,
                         start_width: image.width,
                         aspect: f64::from(image.width) / f64::from(image.height.max(1)),
-                        axis,
                         before: note_snapshot(&buffer, &target, &state),
                     });
                     return glib::Propagation::Stop;
@@ -3238,6 +3339,7 @@ fn attach_note_images(
 
     editor.connect_motion_notify_event({
         let focus = focus.clone();
+        let hover = hover.clone();
         let resize = resize.clone();
         let originals = originals.clone();
         let target = target.clone();
@@ -3245,18 +3347,17 @@ fn attach_note_images(
         move |editor, event| {
             let (x, y) = event.position();
             let Some(drag) = resize.borrow().clone() else {
-                // The resize chrome is invisible until the pointer reaches an
-                // image edge; the cursor itself is the affordance.
-                if let Some(window) = WidgetExt::window(editor) {
-                    let cursor = editor
-                        .is_editable()
-                        .then(|| image_resize_zone(editor, x, y))
-                        .flatten()
-                        .and_then(|(_, axis)| {
-                            gdk::Cursor::for_display(&window.display(), image_resize_cursor(axis))
-                        });
-                    window.set_cursor(cursor.as_ref());
+                let hovered = editor
+                    .is_editable()
+                    .then(|| image_at_pointer(editor, x, y))
+                    .flatten();
+                let hover_changed =
+                    hovered.map(|image| image.offset) != hover.borrow().map(|image| image.offset);
+                *hover.borrow_mut() = hovered;
+                if hover_changed {
+                    editor.queue_draw();
                 }
+                set_editor_cursor(editor, image_pointer_cursor(editor, x, y));
                 return glib::Propagation::Proceed;
             };
             // Never wider than the grown note can show: an image dragged past
@@ -3276,6 +3377,7 @@ fn attach_note_images(
                 ),
                 layout_y,
             );
+            set_editor_cursor(editor, gdk::CursorType::BottomRightCorner);
             let max_width = resize_width_limit(room, drag.aspect);
             let (width, height) = resized_image_size(
                 drag.start_width,
@@ -3283,7 +3385,6 @@ fn attach_note_images(
                 x - drag.start_x,
                 y - drag.start_y,
                 max_width,
-                drag.axis,
             );
             if focus.borrow().map(|image| image.width) == Some(width) {
                 return glib::Propagation::Stop;
@@ -3304,18 +3405,20 @@ fn attach_note_images(
 
     editor.connect_button_release_event({
         let resize = resize.clone();
+        let hover = hover.clone();
         let undo = undo.clone();
         let target = target.clone();
         let state = state.clone();
-        move |editor, _| {
+        move |editor, event| {
             if let Some(drag) = resize.borrow_mut().take() {
                 if let Some(buffer) = editor.buffer() {
                     let after = note_snapshot(&buffer, &target, &state);
                     record_note_undo(&undo, drag.before, &after);
                 }
-                if let Some(window) = WidgetExt::window(editor) {
-                    window.set_cursor(None);
-                }
+                let (x, y) = event.position();
+                *hover.borrow_mut() = image_at_pointer(editor, x, y);
+                set_editor_cursor(editor, image_pointer_cursor(editor, x, y));
+                editor.queue_draw();
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -3324,20 +3427,23 @@ fn attach_note_images(
 
     editor.connect_leave_notify_event({
         let resize = resize.clone();
+        let hover = hover.clone();
         move |editor, _| {
             if resize.borrow().is_none() {
-                if let Some(window) = WidgetExt::window(editor) {
-                    window.set_cursor(None);
+                if hover.borrow_mut().take().is_some() {
+                    editor.queue_draw();
                 }
+                set_editor_cursor(editor, gdk::CursorType::Xterm);
             }
             glib::Propagation::Proceed
         }
     });
 
-    // Focus is a quiet one-pixel outline. Resize has no permanent handle: the
-    // right/bottom edge advertises itself only by changing the pointer.
+    // Focus gets a rounded gray outline. Hover reveals the same little corner
+    // arc used by note cards; only that arc is draggable.
     editor.connect_local("draw", true, {
         let focus = focus.clone();
+        let hover = hover.clone();
         move |values| {
             let editor = values
                 .first()
@@ -3351,10 +3457,28 @@ fn attach_note_images(
                     .map(|image| image.offset)
                     .and_then(|offset| image_rect(&editor, offset))
                 {
-                    let color = editor.style_context().color(gtk::StateFlags::NORMAL);
-                    ctx.set_line_width(1.0);
-                    ctx.set_source_rgba(color.red(), color.green(), color.blue(), 0.85);
-                    ctx.rectangle(x - 0.5, y - 0.5, width + 1.0, height + 1.0);
+                    ctx.set_line_width(1.25);
+                    ctx.set_source_rgba(0.55, 0.55, 0.55, 0.9);
+                    rounded_rectangle(
+                        &ctx,
+                        x - 0.5,
+                        y - 0.5,
+                        width + 1.0,
+                        height + 1.0,
+                        NOTE_IMAGE_BORDER_RADIUS + 0.5,
+                    );
+                    let _ = ctx.stroke();
+                }
+                if let Some((x, y, width, height)) = hover
+                    .borrow()
+                    .map(|image| image.offset)
+                    .and_then(|offset| image_rect(&editor, offset))
+                {
+                    ctx.set_source_rgba(0.55, 0.55, 0.55, 0.95);
+                    ctx.set_line_width(1.6);
+                    ctx.set_line_cap(cairo::LineCap::Round);
+                    ctx.new_sub_path();
+                    ctx.arc(x + width - 8.5, y + height - 8.5, 6.5, 0.0, PI / 2.0);
                     let _ = ctx.stroke();
                 }
             }
@@ -5174,12 +5298,13 @@ mod timer_input_tests {
         cascade_point, fit_within_bounds, history_row_budget, image_room, image_room_after_y,
         monitor_coordinate_divisor, monitor_root_bounds, normalize_monitor_rect, note_headline,
         note_image_cap, note_size_for_image, parse_timer_input, record_note_undo, reopen_point,
-        resize_width_limit, resized_image_size, system_content_size, timer_style_size,
-        ImageResizeAxis, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT,
-        HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
-        NOTE_MAX_HEIGHT, NOTE_WIDTH,
+        resize_width_limit, resized_image_size, round_pixbuf_corners, system_content_size,
+        timer_style_size, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT,
+        HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
+        NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT, NOTE_WIDTH,
     };
     use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
+    use gdk_pixbuf::{Colorspace, Pixbuf};
     use std::{cell::RefCell, rc::Rc};
 
     const SCREEN: ScreenRect = ScreenRect {
@@ -5419,37 +5544,55 @@ mod timer_input_tests {
     }
 
     #[test]
-    fn dragging_an_image_edge_keeps_the_aspect_and_stays_within_bounds() {
+    fn dragging_the_image_corner_keeps_the_aspect_and_stays_within_bounds() {
         let aspect = 240.0 / 135.0;
         let room = NOTE_IMAGE_MAX;
-        let (width, height) =
-            resized_image_size(240, aspect, 60.0, 0.0, room, ImageResizeAxis::Right);
+        let (width, height) = resized_image_size(240, aspect, 60.0, 0.0, room);
         assert_eq!(width, 300);
         assert_eq!(height, 169);
         // Dragging down enlarges just as readily as dragging right.
-        let (tall_width, _) =
-            resized_image_size(240, aspect, 0.0, 60.0, room, ImageResizeAxis::Bottom);
+        let (tall_width, _) = resized_image_size(240, aspect, 0.0, 60.0, room);
         assert!(tall_width > 240);
         // The image can never be dragged away to nothing or past the cap.
         assert_eq!(
-            resized_image_size(240, aspect, -5000.0, 0.0, room, ImageResizeAxis::Right,).0,
+            resized_image_size(240, aspect, -5000.0, 0.0, room).0,
             NOTE_IMAGE_MIN
         );
         assert_eq!(
-            resized_image_size(240, aspect, 9000.0, 0.0, room, ImageResizeAxis::Right,).0,
+            resized_image_size(240, aspect, 9000.0, 0.0, room).0,
             NOTE_IMAGE_MAX
         );
         // It also cannot be dragged wider than the note can show, which is what
         // keeps the resize edge reachable.
-        assert_eq!(
-            resized_image_size(240, aspect, 9000.0, 0.0, 300, ImageResizeAxis::Corner,).0,
-            300
-        );
+        assert_eq!(resized_image_size(240, aspect, 9000.0, 0.0, 300).0, 300);
         // A degenerate aspect ratio must not produce a zero or NaN size.
-        assert_eq!(
-            resized_image_size(120, 0.0, 10.0, 0.0, room, ImageResizeAxis::Right,),
-            (130, 130)
-        );
+        assert_eq!(resized_image_size(120, 0.0, 10.0, 0.0, room), (130, 130));
+    }
+
+    #[test]
+    fn a_note_image_loses_its_sharp_corners_on_every_side() {
+        // The focus outline is drawn after the text and cannot erase what is
+        // under it, so the corners have to be gone from the image itself.
+        let pixbuf = Pixbuf::new(Colorspace::Rgb, true, 8, 60, 40).expect("test pixbuf");
+        pixbuf.fill(0xff_00_00_ff);
+        let rounded = round_pixbuf_corners(&pixbuf, NOTE_IMAGE_BORDER_RADIUS)
+            .expect("rounding a pixbuf must succeed");
+        assert_eq!((rounded.width(), rounded.height()), (60, 40));
+
+        let bytes = rounded.read_pixel_bytes();
+        let stride = rounded.rowstride() as usize;
+        let channels = rounded.n_channels() as usize;
+        let alpha =
+            |x: i32, y: i32| -> u8 { bytes[y as usize * stride + x as usize * channels + 3] };
+        for (x, y) in [(0, 0), (59, 0), (0, 39), (59, 39)] {
+            assert_eq!(alpha(x, y), 0, "corner {x},{y} must be cut away");
+        }
+        // Only the corners: the edges and the middle stay fully opaque.
+        assert_eq!(alpha(30, 0), 255);
+        assert_eq!(alpha(30, 39), 255);
+        assert_eq!(alpha(0, 20), 255);
+        assert_eq!(alpha(59, 20), 255);
+        assert_eq!(alpha(30, 20), 255);
     }
 
     #[test]
