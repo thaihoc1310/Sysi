@@ -662,9 +662,26 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let interactive = interactive.clone();
         let root = root.clone();
         let screens = screens.clone();
+        let picker = widget_picker.card.clone();
         Rc::new(move || {
             let open = !card.is_visible();
             if open {
+                // Always come back near the click, so a window left
+                // half off-screen is reachable again by its header.
+                reopen_widget(
+                    &card,
+                    "history",
+                    &root,
+                    &state,
+                    &screens,
+                    primary_screen,
+                    Size {
+                        width: HISTORY_WIDTH,
+                        height: HISTORY_HEIGHT,
+                    },
+                    Some(&picker),
+                    &registry,
+                );
                 card.show_all();
                 // show_all() reveals both slot occupants and the header
                 // itself; restore the search mode and the lock-mode rule.
@@ -711,9 +728,26 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let window = window.clone();
         let registry = registry.clone();
         let interactive = interactive.clone();
+        let root = root.clone();
+        let screens = screens.clone();
+        let picker = widget_picker.card.clone();
         move |button| {
             let enabled = button.is_active();
             if enabled {
+                reopen_widget(
+                    &target,
+                    "system",
+                    &root,
+                    &state,
+                    &screens,
+                    primary_screen,
+                    Size {
+                        width: SYSTEM_WIDTH,
+                        height: SYSTEM_HEIGHT,
+                    },
+                    Some(&picker),
+                    &registry,
+                );
                 target.show_all();
             } else {
                 target.hide();
@@ -729,9 +763,26 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let window = window.clone();
         let registry = registry.clone();
         let interactive = interactive.clone();
+        let root = root.clone();
+        let screens = screens.clone();
+        let picker = widget_picker.card.clone();
         move |button| {
             let enabled = button.is_active();
             if enabled {
+                reopen_widget(
+                    &target,
+                    "timer",
+                    &root,
+                    &state,
+                    &screens,
+                    primary_screen,
+                    Size {
+                        width: TIMER_SIZE,
+                        height: TIMER_SIZE,
+                    },
+                    Some(&picker),
+                    &registry,
+                );
                 target.show_all();
             } else {
                 target.hide();
@@ -3310,6 +3361,133 @@ fn clamp_to_screens(point: Point, width: i32, height: i32, screens: &[ScreenRect
         .unwrap_or(point)
 }
 
+// Where a widget lands when it is switched back on. A widget hidden while it
+// sat half off-screen — or one that grew past the screen edge while hidden —
+// came back with its drag header out of reach, leaving nothing to grab it by.
+// Reopening it under the pointer (the panel entry or picker button that was
+// just clicked) keeps it where the user is already looking and always fully on
+// a monitor; with no pointer it centres on the primary screen.
+fn reopen_point(
+    pointer: Option<(f64, f64)>,
+    size: Size,
+    screens: &[ScreenRect],
+    primary: ScreenRect,
+    avoid: Option<ScreenRect>,
+) -> Point {
+    let mut desired = pointer
+        .map(|(x, y)| Point {
+            x: x as i32 - size.width / 2,
+            y: y as i32 + 24,
+        })
+        .unwrap_or(Point {
+            x: primary.x + (primary.width - size.width).max(0) / 2,
+            y: primary.y + (primary.height - size.height).max(0) / 2,
+        });
+    // The click that reopens a widget usually happens on the picker bar, which
+    // draws over whatever lands underneath it — that is how the history header
+    // became invisible and undraggable. Drop below the bar when the landing
+    // rectangle would slide under it.
+    if let Some(bar) = avoid {
+        let overlaps = desired.x < bar.x + bar.width
+            && desired.x + size.width > bar.x
+            && desired.y < bar.y + bar.height
+            && desired.y + size.height > bar.y;
+        if overlaps {
+            desired.y = bar.y + bar.height + 10;
+        }
+    }
+    clamp_to_screens(desired, size.width, size.height, screens)
+}
+
+// Two widgets reopened from the same click would land on the same spot, one
+// drawn straight over the other. Step off the occupied rectangles the way a
+// new note cascades, keeping every candidate on a monitor.
+fn cascade_point(
+    point: Point,
+    size: Size,
+    occupied: &[ScreenRect],
+    screens: &[ScreenRect],
+) -> Point {
+    let mut result = point;
+    for _ in 0..12 {
+        let clash = occupied.iter().any(|taken| {
+            result.x < taken.x + taken.width
+                && result.x + size.width > taken.x
+                && result.y < taken.y + taken.height
+                && result.y + size.height > taken.y
+        });
+        if !clash {
+            break;
+        }
+        let next = clamp_to_screens(
+            Point {
+                x: result.x + 26,
+                y: result.y + 26,
+            },
+            size.width,
+            size.height,
+            screens,
+        );
+        if next == result {
+            break;
+        }
+        result = next;
+    }
+    result
+}
+
+// The card's own size request, which every resize and style change keeps
+// current, so a hidden card — whose allocation is stale or never happened —
+// still reopens with its real footprint accounted for.
+fn card_size(card: &gtk::EventBox, fallback: Size) -> Size {
+    let (width, height) = card.size_request();
+    Size {
+        width: if width > 1 { width } else { fallback.width },
+        height: if height > 1 { height } else { fallback.height },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reopen_widget(
+    card: &gtk::EventBox,
+    key: &str,
+    root: &gtk::Fixed,
+    state: &Rc<RefCell<AppState>>,
+    screens: &[ScreenRect],
+    primary: ScreenRect,
+    fallback: Size,
+    avoid: Option<&gtk::EventBox>,
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+) {
+    let size = card_size(card, fallback);
+    let point = reopen_point(
+        pointer_position(),
+        size,
+        screens,
+        primary,
+        avoid.and_then(widget_rect),
+    );
+    let occupied: Vec<ScreenRect> = registry
+        .borrow()
+        .iter()
+        .filter(|item| item.key != key && item.widget.is_visible())
+        .filter_map(|item| widget_rect(&item.widget))
+        .collect();
+    let point = cascade_point(point, size, &occupied, screens);
+    root.move_(card, point.x, point.y);
+    state.borrow_mut().positions.insert(key.to_owned(), point);
+}
+
+fn widget_rect(widget: &gtk::EventBox) -> Option<ScreenRect> {
+    let allocation = widget.allocation();
+    (allocation.width() > 1 && allocation.height() > 1).then_some(ScreenRect {
+        x: allocation.x(),
+        y: allocation.y(),
+        width: allocation.width(),
+        height: allocation.height(),
+    })
+}
+
 fn clamp_registered_widgets(
     root: &gtk::Fixed,
     registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
@@ -3994,11 +4172,84 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        history_row_budget, monitor_coordinate_divisor, monitor_root_bounds,
-        normalize_monitor_rect, parse_timer_input, system_content_size, timer_style_size,
-        ScreenRect, HISTORY_HEIGHT,
+        cascade_point, history_row_budget, monitor_coordinate_divisor, monitor_root_bounds,
+        normalize_monitor_rect, parse_timer_input, reopen_point, system_content_size,
+        timer_style_size, ScreenRect, HISTORY_HEIGHT, HISTORY_WIDTH,
     };
-    use crate::state::{Size, SystemDetails, TimerStyle};
+    use crate::state::{Point, Size, SystemDetails, TimerStyle};
+
+    const SCREEN: ScreenRect = ScreenRect {
+        x: 0,
+        y: 0,
+        width: 1280,
+        height: 800,
+    };
+    const HISTORY: Size = Size {
+        width: HISTORY_WIDTH,
+        height: HISTORY_HEIGHT,
+    };
+
+    #[test]
+    fn a_reopened_window_lands_near_the_click_and_fully_on_screen() {
+        let point = reopen_point(Some((900.0, 300.0)), HISTORY, &[SCREEN], SCREEN, None);
+        assert_eq!(point, Point { x: 782, y: 324 });
+        // A click at the far edge still yields a window whose header — its only
+        // drag handle — is on screen.
+        let edge = reopen_point(Some((1279.0, 795.0)), HISTORY, &[SCREEN], SCREEN, None);
+        assert!(edge.x >= SCREEN.x && edge.x + HISTORY.width <= SCREEN.width);
+        assert!(edge.y >= SCREEN.y && edge.y + HISTORY.height <= SCREEN.height);
+    }
+
+    #[test]
+    fn a_reopened_window_without_a_pointer_centres_on_the_primary_screen() {
+        let point = reopen_point(None, HISTORY, &[SCREEN], SCREEN, None);
+        assert_eq!(
+            point,
+            Point {
+                x: (SCREEN.width - HISTORY.width) / 2,
+                y: (SCREEN.height - HISTORY.height) / 2,
+            }
+        );
+    }
+
+    #[test]
+    fn two_widgets_reopened_from_one_click_do_not_stack_on_each_other() {
+        let taken = ScreenRect {
+            x: 600,
+            y: 300,
+            width: 200,
+            height: 120,
+        };
+        let stacked = Point { x: 600, y: 300 };
+        let point = cascade_point(stacked, HISTORY, &[taken], &[SCREEN]);
+        assert_ne!(point, stacked);
+        assert!(
+            point.x >= taken.x + taken.width || point.y >= taken.y + taken.height,
+            "the second widget must step clear of the first: {point:?}"
+        );
+        // Nothing in the way leaves the landing spot exactly where it was.
+        assert_eq!(cascade_point(stacked, HISTORY, &[], &[SCREEN]), stacked);
+    }
+
+    #[test]
+    fn a_reopened_window_never_lands_under_the_picker_bar() {
+        let bar = ScreenRect {
+            x: 12,
+            y: 30,
+            width: 940,
+            height: 40,
+        };
+        // Clicking "history" on the bar itself: the window drops clear of the
+        // bar instead of sliding under it, where its header is unreachable.
+        let point = reopen_point(Some((850.0, 48.0)), HISTORY, &[SCREEN], SCREEN, Some(bar));
+        assert!(
+            point.y >= bar.y + bar.height,
+            "reopened window must clear the picker bar: {point:?}"
+        );
+        // A click well below the bar is left alone.
+        let clear = reopen_point(Some((850.0, 400.0)), HISTORY, &[SCREEN], SCREEN, Some(bar));
+        assert_eq!(clear.y, 424);
+    }
 
     #[test]
     fn a_taller_history_window_renders_more_rows_than_a_shorter_one() {
