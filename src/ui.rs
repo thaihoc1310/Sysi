@@ -2403,6 +2403,11 @@ const NOTE_IMAGE_MIN: i32 = 40;
 const NOTE_IMAGE_MAX: i32 = 1400;
 // A hover-only corner handle, matching the note card resize affordance.
 const NOTE_IMAGE_HANDLE_HIT: i32 = 18;
+// A note whose editor has not been allocated yet reports a 1x1 text area, which
+// would make its chrome look like the entire card and balloon the note on the
+// first paste. Bound the measurement to what a note plausibly spends on its
+// header, padding and scrollbar.
+const NOTE_IMAGE_CHROME_MAX: i32 = 90;
 const NOTE_IMAGE_BORDER_RADIUS: f64 = 6.0;
 const NOTE_UNDO_LIMIT: usize = 100;
 // Slack under a pasted image so its frame is not flush with the note edge.
@@ -2463,13 +2468,15 @@ fn note_image_chrome(editor: &gtk::TextView, card: &gtk::EventBox) -> Size {
     let editor_allocation = editor.allocation();
     let padding = editor.style_context().padding(gtk::StateFlags::NORMAL);
     Size {
-        width: (allocation.width() - editor_allocation.width()).max(0)
+        width: ((allocation.width() - editor_allocation.width()).max(0)
             + i32::from(padding.left)
             + i32::from(padding.right)
-            + NOTE_IMAGE_ROOM,
-        height: (allocation.height() - editor_allocation.height()).max(0)
+            + NOTE_IMAGE_ROOM)
+            .min(NOTE_IMAGE_CHROME_MAX),
+        height: ((allocation.height() - editor_allocation.height()).max(0)
             + i32::from(padding.top)
-            + i32::from(padding.bottom),
+            + i32::from(padding.bottom))
+        .min(NOTE_IMAGE_CHROME_MAX),
     }
 }
 
@@ -3094,6 +3101,9 @@ fn paste_note_image(
     // height alone clips a paste made after a few lines of text.
     let extent = image_layout_extent(editor, offset, Size { width, height });
     grow_note_for_image(editor, target, state, extent);
+    // Saved to disk already, so keeping the full-resolution paste in memory
+    // buys nothing until the image is actually resized.
+    originals.borrow_mut().remove(&file);
     true
 }
 
@@ -3217,6 +3227,26 @@ fn attach_note_images(
         }
     });
 
+    // The focused image is held as a buffer offset, so any edit before it
+    // shifts the image out from under that offset: the outline would trace
+    // whatever now sits there and Ctrl+C would copy it. A live resize edits the
+    // buffer itself and keeps its focus; every other edit drops it.
+    if let Some(buffer) = editor.buffer() {
+        buffer.connect_changed({
+            let focus = focus.clone();
+            let resize = resize.clone();
+            let editor = editor.clone();
+            move |_| {
+                if resize.borrow().is_some() {
+                    return;
+                }
+                if focus.borrow_mut().take().is_some() {
+                    editor.queue_draw();
+                }
+            }
+        });
+    }
+
     // GtkTextBuffer tells us where a logical user edit starts and ends. Keep a
     // full mixed text/image snapshot at that boundary so one Ctrl+Z reverses
     // one edit (including a paste or deleting an inline image).
@@ -3256,7 +3286,10 @@ fn attach_note_images(
         let originals = originals.clone();
         let focus = focus.clone();
         move |editor, event| {
-            if !editor.is_editable() || !event.state().contains(gdk::ModifierType::CONTROL_MASK) {
+            if !editor.is_editable() {
+                return glib::Propagation::Proceed;
+            }
+            if !event.state().contains(gdk::ModifierType::CONTROL_MASK) {
                 return glib::Propagation::Proceed;
             }
             let key = event.keyval();
@@ -3406,6 +3439,7 @@ fn attach_note_images(
     editor.connect_button_release_event({
         let resize = resize.clone();
         let hover = hover.clone();
+        let originals = originals.clone();
         let undo = undo.clone();
         let target = target.clone();
         let state = state.clone();
@@ -3415,6 +3449,11 @@ fn attach_note_images(
                     let after = note_snapshot(&buffer, &target, &state);
                     record_note_undo(&undo, drag.before, &after);
                 }
+                // The cache exists so one drag rescales from full-resolution
+                // bytes instead of from its own output. Holding a 4K
+                // screenshot in memory after the drag has nothing left to
+                // serve, and the file is one cheap load away.
+                originals.borrow_mut().clear();
                 let (x, y) = event.position();
                 *hover.borrow_mut() = image_at_pointer(editor, x, y);
                 set_editor_cursor(editor, image_pointer_cursor(editor, x, y));
@@ -3452,6 +3491,10 @@ fn attach_note_images(
                 .get(1)
                 .and_then(|value| value.get::<cairo::Context>().ok());
             if let (Some(editor), Some(ctx)) = (editor, ctx) {
+                // Lock mode is read-only, so it shows no resize affordance.
+                if !editor.is_editable() {
+                    return Some(false.to_value());
+                }
                 if let Some((x, y, width, height)) = focus
                     .borrow()
                     .map(|image| image.offset)
@@ -3505,6 +3548,14 @@ fn rebuild_pinned_notes(
         .collect();
     for widget in old {
         root.remove(&widget);
+        // Removing a card only drops the container's reference to it. Its own
+        // handlers hold the card (through the image target they need to grow
+        // and resize it), so the card, its editor and every pixbuf in that
+        // editor's buffer would outlive the rebuild. Destroying it disposes
+        // the object, which disconnects those handlers and breaks the cycle.
+        // SAFETY: the card has just been unparented and nothing reads it
+        // again; the loop owns the only remaining reference.
+        unsafe { widget.destroy() };
     }
     registry
         .borrow_mut()
