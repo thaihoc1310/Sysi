@@ -151,7 +151,7 @@ impl Default for SystemDetails {
 // through a save/load round trip.
 pub const IMAGE_PLACEHOLDER: char = '\u{fffc}';
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NoteImage {
     pub file: String,
     pub width: i32,

@@ -144,6 +144,12 @@ textview, textview text {
   padding: 7px;
 }
 
+/* Inline images make a text row very tall. Keep the insertion caret hairline-
+ * thin instead of letting its width grow proportionally with the image row. */
+.pinned-editor {
+  -GtkWidget-cursor-aspect-ratio: 0.012;
+}
+
 .history-list {
   background-color: transparent;
   padding: 3px 2px;

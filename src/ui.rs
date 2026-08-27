@@ -2401,9 +2401,12 @@ fn draggable_note_preview(
 const NOTE_IMAGE_DEFAULT_MAX: i32 = 240;
 const NOTE_IMAGE_MIN: i32 = 40;
 const NOTE_IMAGE_MAX: i32 = 1400;
-const NOTE_IMAGE_GRIP: i32 = 14;
-// Slack under a pasted image so its frame and grip are not flush with the edge
-// of the note.
+// The invisible strip at the right/bottom edge that behaves like resize
+// chrome. It is deliberately small enough that ordinary image clicks still
+// place the caret, but large enough to acquire without pixel hunting.
+const NOTE_IMAGE_EDGE_HIT: i32 = 7;
+const NOTE_UNDO_LIMIT: usize = 100;
+// Slack under a pasted image so its frame is not flush with the note edge.
 const NOTE_IMAGE_ROOM: i32 = 10;
 const NOTE_IMAGE_DATA_KEY: &str = "sysi-image-file";
 
@@ -2414,21 +2417,47 @@ struct FocusedImage {
     height: i32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageResizeAxis {
+    Right,
+    Bottom,
+    Corner,
+}
+
+#[derive(Clone, Debug)]
 struct ImageResize {
     offset: i32,
     start_x: f64,
     start_y: f64,
     start_width: i32,
     aspect: f64,
+    axis: ImageResizeAxis,
+    before: NoteSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NoteSnapshot {
+    text: String,
+    images: Vec<NoteImage>,
+    cursor: i32,
+    size: Size,
+}
+
+#[derive(Default)]
+struct NoteUndo {
+    undo: Vec<NoteSnapshot>,
+    redo: Vec<NoteSnapshot>,
+    pending: Option<NoteSnapshot>,
+    applying: bool,
 }
 
 type ImageFocus = Rc<RefCell<Option<FocusedImage>>>;
 type ImageResizeState = Rc<RefCell<Option<ImageResize>>>;
 type ImageOriginals = Rc<RefCell<HashMap<String, Pixbuf>>>;
+type NoteUndoState = Rc<RefCell<NoteUndo>>;
 
 // How wide a pasted image may be drawn: it has to fit the note it lands in —
-// an image wider than the note is clipped, taking its resize grip out of reach
+// an image wider than the note is clipped, taking its resize edge out of reach
 // with it — but a big note should not get a wall-sized paste either.
 fn note_image_cap(available_width: i32) -> i32 {
     available_width.clamp(NOTE_IMAGE_MIN, NOTE_IMAGE_DEFAULT_MAX)
@@ -2455,7 +2484,7 @@ fn note_image_chrome(editor: &gtk::TextView, card: &gtk::EventBox) -> Size {
 
 // How far a note may grow to fit a pasted image: never past what a resize drag
 // allows, and never past the edge of the monitor it sits on, so growing the
-// note cannot push its own resize grip off-screen.
+// note cannot push its own resize handle off-screen.
 fn note_growth_limit(card: &gtk::EventBox) -> Size {
     let allocation = card.allocation();
     let root = card
@@ -2488,7 +2517,7 @@ fn note_growth_limit(card: &gtk::EventBox) -> Size {
 }
 
 // The size a note needs so a freshly pasted image is fully visible inside it,
-// grip included. A note is only ever grown here, never shrunk.
+// image edge included. A note is only ever grown here, never shrunk.
 fn note_size_for_image(current: Size, chrome: Size, image: Size, limit: Size) -> Size {
     Size {
         width: (image.width + chrome.width).clamp(current.width, limit.width.max(current.width)),
@@ -2497,7 +2526,7 @@ fn note_size_for_image(current: Size, chrome: Size, image: Size, limit: Size) ->
     }
 }
 
-// Grow the note so the image inside it stays fully visible, grip included, and
+// Grow the note so the image inside it stays fully visible, edge included, and
 // remember the new size the way a resize drag does.
 fn grow_note_for_image(
     editor: &gtk::TextView,
@@ -2528,23 +2557,48 @@ fn grow_note_for_image(
     });
 }
 
-// Scale so both sides fit inside `max`, and never enlarge: a 60px icon pasted
-// into a note should stay a 60px icon.
-fn fit_within(width: i32, height: i32, max: i32) -> (i32, i32) {
+fn fit_within_bounds(width: i32, height: i32, max_width: i32, max_height: i32) -> (i32, i32) {
     let width = width.max(1);
     let height = height.max(1);
-    let max = max.max(NOTE_IMAGE_MIN);
-    if width <= max && height <= max {
+    let max_width = max_width.max(1);
+    let max_height = max_height.max(1);
+    if width <= max_width && height <= max_height {
         return (width, height);
     }
-    let scale = f64::from(max) / f64::from(width.max(height));
+    let scale =
+        (f64::from(max_width) / f64::from(width)).min(f64::from(max_height) / f64::from(height));
     (
         ((f64::from(width) * scale).round() as i32).max(1),
         ((f64::from(height) * scale).round() as i32).max(1),
     )
 }
 
-// The size a grip drag lands on. The larger of the two deltas drives it, so
+fn image_room(limit: Size, chrome: Size) -> Size {
+    Size {
+        width: (limit.width - chrome.width).max(1),
+        height: (limit.height - chrome.height - NOTE_IMAGE_ROOM).max(1),
+    }
+}
+
+fn image_room_after_y(room: Size, layout_y: i32) -> Size {
+    Size {
+        width: room.width,
+        height: (room.height - layout_y.max(0)).max(1),
+    }
+}
+
+fn resize_width_limit(room: Size, aspect: f64) -> i32 {
+    let aspect = if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        1.0
+    };
+    room.width
+        .min((f64::from(room.height) * aspect).floor() as i32)
+        .clamp(NOTE_IMAGE_MIN, NOTE_IMAGE_MAX)
+}
+
+// The size an edge drag lands on. The larger of the two deltas drives a corner,
 // dragging down enlarges as readily as dragging right, and the aspect ratio of
 // the pasted image is never distorted.
 fn resized_image_size(
@@ -2553,16 +2607,18 @@ fn resized_image_size(
     dx: f64,
     dy: f64,
     max_width: i32,
+    axis: ImageResizeAxis,
 ) -> (i32, i32) {
     let aspect = if aspect.is_finite() && aspect > 0.0 {
         aspect
     } else {
         1.0
     };
-    let delta = if dx.abs() >= dy.abs() {
-        dx
-    } else {
-        dy * aspect
+    let delta = match axis {
+        ImageResizeAxis::Right => dx,
+        ImageResizeAxis::Bottom => dy * aspect,
+        ImageResizeAxis::Corner if dx.abs() >= dy.abs() => dx,
+        ImageResizeAxis::Corner => dy * aspect,
     };
     let max_width = max_width.clamp(NOTE_IMAGE_MIN, NOTE_IMAGE_MAX);
     let width = ((f64::from(start_width) + delta).round() as i32).clamp(NOTE_IMAGE_MIN, max_width);
@@ -2688,10 +2744,58 @@ fn note_buffer_images(
     images
 }
 
-fn fill_note_buffer(buffer: &gtk::TextBuffer, note: &Note, originals: &ImageOriginals) {
+fn note_snapshot(
+    buffer: &gtk::TextBuffer,
+    target: &NoteImageTarget,
+    state: &Rc<RefCell<AppState>>,
+) -> NoteSnapshot {
+    let text = note_buffer_text(buffer);
+    let images = note_buffer_images(buffer, &text, state);
+    let cursor = buffer
+        .get_insert()
+        .map(|mark| buffer.iter_at_mark(&mark).offset())
+        .unwrap_or_else(|| buffer.char_count());
+    let allocation = target.card.allocation();
+    let size = state
+        .borrow()
+        .sizes
+        .get(&target.key)
+        .copied()
+        .unwrap_or(Size {
+            width: allocation.width(),
+            height: allocation.height(),
+        });
+    NoteSnapshot {
+        text,
+        images,
+        cursor,
+        size,
+    }
+}
+
+fn record_note_undo(history: &NoteUndoState, before: NoteSnapshot, after: &NoteSnapshot) {
+    // Moving the caret is navigation, not an edit. The saved cursor still
+    // matters when the snapshot is restored, but does not create an undo step.
+    if before.text == after.text && before.images == after.images && before.size == after.size {
+        return;
+    }
+    let mut history = history.borrow_mut();
+    history.undo.push(before);
+    if history.undo.len() > NOTE_UNDO_LIMIT {
+        history.undo.remove(0);
+    }
+    history.redo.clear();
+}
+
+fn fill_note_content(
+    buffer: &gtk::TextBuffer,
+    text: &str,
+    images: &[NoteImage],
+    originals: &ImageOriginals,
+) {
     buffer.set_text("");
-    let mut images = note.images.iter();
-    for (index, chunk) in note.text.split(IMAGE_PLACEHOLDER).enumerate() {
+    let mut images = images.iter();
+    for (index, chunk) in text.split(IMAGE_PLACEHOLDER).enumerate() {
         if index > 0 {
             // Every chunk after the first is preceded by one placeholder. An
             // image whose file went missing simply drops out of the note.
@@ -2706,6 +2810,10 @@ fn fill_note_buffer(buffer: &gtk::TextBuffer, note: &Note, originals: &ImageOrig
         let mut end = buffer.end_iter();
         buffer.insert(&mut end, chunk);
     }
+}
+
+fn fill_note_buffer(buffer: &gtk::TextBuffer, note: &Note, originals: &ImageOriginals) {
+    fill_note_content(buffer, &note.text, &note.images, originals);
 }
 
 // Where the image at `offset` is drawn, in widget coordinates — the same space
@@ -2729,37 +2837,80 @@ fn image_rect(editor: &gtk::TextView, offset: i32) -> Option<(f64, f64, f64, f64
     ))
 }
 
+// The image's bottom in the complete text layout, not merely in the currently
+// scrolled viewport. This accounts for text and earlier images above a newly
+// pasted image when deciding how far the note should grow.
+fn image_layout_extent(editor: &gtk::TextView, offset: i32, fallback: Size) -> Size {
+    let Some(buffer) = editor.buffer() else {
+        return fallback;
+    };
+    let iter = buffer.iter_at_offset(offset);
+    if iter.pixbuf().is_none() {
+        return fallback;
+    }
+    let location = editor.iter_location(&iter);
+    Size {
+        width: fallback.width,
+        height: (location.y() + location.height()).max(fallback.height),
+    }
+}
+
 fn image_at_pointer(editor: &gtk::TextView, x: f64, y: f64) -> Option<FocusedImage> {
     let (buffer_x, buffer_y) =
         editor.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
     let iter = editor.iter_at_location(buffer_x, buffer_y)?;
-    let pixbuf = iter.pixbuf()?;
-    // iter_at_location snaps to the nearest position, so a click just past the
-    // image would otherwise count as a hit on it.
-    let location = editor.iter_location(&iter);
-    let inside = buffer_x >= location.x()
-        && buffer_x <= location.x() + location.width()
-        && buffer_y >= location.y()
-        && buffer_y <= location.y() + location.height();
-    inside.then_some(FocusedImage {
-        offset: iter.offset(),
-        width: pixbuf.width(),
-        height: pixbuf.height(),
-    })
+    let buffer = editor.buffer()?;
+    // On the trailing half of an inline object GTK may return the insertion
+    // position *after* it. Probe that previous offset as well, otherwise the
+    // right-edge resize strip is impossible to acquire.
+    for offset in [iter.offset(), iter.offset() - 1] {
+        if offset < 0 {
+            continue;
+        }
+        let Some(pixbuf) = buffer.iter_at_offset(offset).pixbuf() else {
+            continue;
+        };
+        let Some((rect_x, rect_y, width, height)) = image_rect(editor, offset) else {
+            continue;
+        };
+        if x >= rect_x && x <= rect_x + width && y >= rect_y && y <= rect_y + height {
+            return Some(FocusedImage {
+                offset,
+                width: pixbuf.width(),
+                height: pixbuf.height(),
+            });
+        }
+    }
+    None
 }
 
-fn on_image_grip(editor: &gtk::TextView, focus: &ImageFocus, x: f64, y: f64) -> bool {
-    let Some(offset) = focus.borrow().map(|image| image.offset) else {
-        return false;
+fn image_resize_zone(
+    editor: &gtk::TextView,
+    x: f64,
+    y: f64,
+) -> Option<(FocusedImage, ImageResizeAxis)> {
+    let image = image_at_pointer(editor, x, y)?;
+    let (rect_x, rect_y, width, height) = image_rect(editor, image.offset)?;
+    let edge = f64::from(NOTE_IMAGE_EDGE_HIT);
+    let near_right = x >= rect_x + width - edge && x <= rect_x + width;
+    let near_bottom = y >= rect_y + height - edge && y <= rect_y + height;
+    let inside_x = x >= rect_x && x <= rect_x + width;
+    let inside_y = y >= rect_y && y <= rect_y + height;
+    let axis = match (near_right && inside_y, near_bottom && inside_x) {
+        (true, true) => ImageResizeAxis::Corner,
+        (true, false) => ImageResizeAxis::Right,
+        (false, true) => ImageResizeAxis::Bottom,
+        (false, false) => return None,
     };
-    let Some((rect_x, rect_y, width, height)) = image_rect(editor, offset) else {
-        return false;
-    };
-    let grip = f64::from(NOTE_IMAGE_GRIP);
-    x >= rect_x + width - grip
-        && x <= rect_x + width
-        && y >= rect_y + height - grip
-        && y <= rect_y + height
+    Some((image, axis))
+}
+
+fn image_resize_cursor(axis: ImageResizeAxis) -> gdk::CursorType {
+    match axis {
+        ImageResizeAxis::Right => gdk::CursorType::RightSide,
+        ImageResizeAxis::Bottom => gdk::CursorType::BottomSide,
+        ImageResizeAxis::Corner => gdk::CursorType::BottomRightCorner,
+    }
 }
 
 fn replace_note_image(
@@ -2804,30 +2955,52 @@ fn paste_note_image(
     let Some(pixbuf) = clipboard.wait_for_image() else {
         return false;
     };
+    let Some(buffer) = editor.buffer() else {
+        return false;
+    };
+    let Some(insert) = buffer.get_insert() else {
+        return false;
+    };
+    // Text and earlier images above the insertion point already consume some
+    // of the note's vertical growth budget.
+    let insertion_y = editor.iter_location(&buffer.iter_at_mark(&insert)).y();
     let Some(file) = store_note_image(&pixbuf, state) else {
         return false;
     };
     originals.borrow_mut().insert(file.clone(), pixbuf.clone());
-    let cap = note_image_cap(
-        note_growth_limit(&target.card).width - note_image_chrome(editor, &target.card).width,
+    let room = image_room_after_y(
+        image_room(
+            note_growth_limit(&target.card),
+            note_image_chrome(editor, &target.card),
+        ),
+        insertion_y,
     );
-    let (width, height) = fit_within(pixbuf.width(), pixbuf.height(), cap);
+    let (width, height) = fit_within_bounds(
+        pixbuf.width(),
+        pixbuf.height(),
+        note_image_cap(room.width),
+        NOTE_IMAGE_DEFAULT_MAX.min(room.height),
+    );
     let Some(scaled) = scaled_image(&file, width, height, originals) else {
-        return false;
-    };
-    let Some(buffer) = editor.buffer() else {
+        originals.borrow_mut().remove(&file);
+        let _ = fs::remove_file(crate::state::images_dir().join(&file));
         return false;
     };
     // Pasting over a selection replaces it, the way a text paste does.
     buffer.delete_selection(true, true);
     let Some(insert) = buffer.get_insert() else {
+        originals.borrow_mut().remove(&file);
+        let _ = fs::remove_file(crate::state::images_dir().join(&file));
         return false;
     };
     let mut at = buffer.iter_at_mark(&insert);
+    let offset = at.offset();
     buffer.insert_pixbuf(&mut at, &scaled);
-    // A note left at its default size would clip the bottom of the image, and
-    // the resize grip with it.
-    grow_note_for_image(editor, target, state, Size { width, height });
+    buffer.place_cursor(&buffer.iter_at_offset(offset + 1));
+    // Include any text/images already above this one. Growing for the pixbuf's
+    // height alone clips a paste made after a few lines of text.
+    let extent = image_layout_extent(editor, offset, Size { width, height });
+    grow_note_for_image(editor, target, state, extent);
     true
 }
 
@@ -2841,8 +3014,77 @@ struct NoteImageTarget {
     interactive: Rc<Cell<bool>>,
 }
 
-// Click an image to focus it, then drag the grip in its bottom-right corner to
-// resize it. Focus also parks the cursor right after the image, so Backspace
+fn apply_note_snapshot(
+    editor: &gtk::TextView,
+    target: &NoteImageTarget,
+    state: &Rc<RefCell<AppState>>,
+    originals: &ImageOriginals,
+    snapshot: &NoteSnapshot,
+) {
+    let Some(buffer) = editor.buffer() else {
+        return;
+    };
+    target
+        .card
+        .set_size_request(snapshot.size.width, snapshot.size.height);
+    target.card.queue_resize();
+    state
+        .borrow_mut()
+        .sizes
+        .insert(target.key.clone(), snapshot.size);
+    fill_note_content(&buffer, &snapshot.text, &snapshot.images, originals);
+    let cursor = snapshot.cursor.clamp(0, buffer.char_count());
+    buffer.place_cursor(&buffer.iter_at_offset(cursor));
+    // Buffer change handlers have synchronously copied the restored content
+    // into AppState by this point; persist both content and note geometry now.
+    let _ = state.borrow().save();
+    editor.queue_draw();
+    let window = target.window.clone();
+    let registry = target.registry.clone();
+    let interactive = target.interactive.clone();
+    glib::idle_add_local_once(move || {
+        refresh_input_shape(&window, &registry, interactive.get());
+    });
+}
+
+fn undo_note_edit(
+    editor: &gtk::TextView,
+    target: &NoteImageTarget,
+    state: &Rc<RefCell<AppState>>,
+    originals: &ImageOriginals,
+    history: &NoteUndoState,
+    redo: bool,
+) -> bool {
+    let Some(buffer) = editor.buffer() else {
+        return false;
+    };
+    let current = note_snapshot(&buffer, target, state);
+    let restore = {
+        let mut history = history.borrow_mut();
+        let restore = if redo {
+            history.redo.pop()
+        } else {
+            history.undo.pop()
+        };
+        let Some(restore) = restore else {
+            return false;
+        };
+        if redo {
+            history.undo.push(current);
+        } else {
+            history.redo.push(current);
+        }
+        history.applying = true;
+        history.pending = None;
+        restore
+    };
+    apply_note_snapshot(editor, target, state, originals, &restore);
+    history.borrow_mut().applying = false;
+    true
+}
+
+// Hover the right/bottom image edge to resize it directly. Clicking the image
+// still focuses it and parks the cursor immediately after it, so Backspace
 // deletes it and typing continues after it.
 fn attach_note_images(
     editor: &gtk::TextView,
@@ -2853,11 +3095,13 @@ fn attach_note_images(
     let originals: ImageOriginals = Rc::new(RefCell::new(HashMap::new()));
     let focus: ImageFocus = Rc::new(RefCell::new(None));
     let resize: ImageResizeState = Rc::new(RefCell::new(None));
+    let undo: NoteUndoState = Rc::new(RefCell::new(NoteUndo::default()));
 
     editor.add_events(
         gdk::EventMask::BUTTON_PRESS_MASK
             | gdk::EventMask::BUTTON_RELEASE_MASK
-            | gdk::EventMask::POINTER_MOTION_MASK,
+            | gdk::EventMask::POINTER_MOTION_MASK
+            | gdk::EventMask::LEAVE_NOTIFY_MASK,
     );
 
     editor.connect_paste_clipboard({
@@ -2865,7 +3109,13 @@ fn attach_note_images(
         let originals = originals.clone();
         let target = target.clone();
         move |editor| {
-            if paste_note_image(editor, &target, &state, &originals) {
+            let Some(buffer) = editor.buffer() else {
+                return;
+            };
+            buffer.begin_user_action();
+            let pasted = paste_note_image(editor, &target, &state, &originals);
+            buffer.end_user_action();
+            if pasted {
                 // The default handler would paste the clipboard's text form of
                 // the same image next to it — a file URL, or an HTML img tag.
                 glib::signal_stop_emission_by_name(editor, "paste-clipboard");
@@ -2873,28 +3123,96 @@ fn attach_note_images(
         }
     });
 
+    // GtkTextBuffer tells us where a logical user edit starts and ends. Keep a
+    // full mixed text/image snapshot at that boundary so one Ctrl+Z reverses
+    // one edit (including a paste or deleting an inline image).
+    if let Some(buffer) = editor.buffer() {
+        buffer.connect_begin_user_action({
+            let undo = undo.clone();
+            let target = target.clone();
+            let state = state.clone();
+            move |buffer| {
+                let mut history = undo.borrow_mut();
+                if !history.applying && history.pending.is_none() {
+                    history.pending = Some(note_snapshot(buffer, &target, &state));
+                }
+            }
+        });
+        buffer.connect_end_user_action({
+            let undo = undo.clone();
+            let target = target.clone();
+            let state = state.clone();
+            move |buffer| {
+                if undo.borrow().applying {
+                    return;
+                }
+                let before = undo.borrow_mut().pending.take();
+                if let Some(before) = before {
+                    let after = note_snapshot(buffer, &target, &state);
+                    record_note_undo(&undo, before, &after);
+                }
+            }
+        });
+    }
+
+    editor.connect_key_press_event({
+        let undo = undo.clone();
+        let target = target.clone();
+        let state = state.clone();
+        let originals = originals.clone();
+        let focus = focus.clone();
+        move |editor, event| {
+            if !editor.is_editable() || !event.state().contains(gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            let key = event.keyval();
+            let z = key == gdk::keys::constants::z || key == gdk::keys::constants::Z;
+            let y = key == gdk::keys::constants::y || key == gdk::keys::constants::Y;
+            if !z && !y {
+                return glib::Propagation::Proceed;
+            }
+            let redo = y || event.state().contains(gdk::ModifierType::SHIFT_MASK);
+            if undo_note_edit(editor, &target, &state, &originals, &undo, redo) {
+                *focus.borrow_mut() = None;
+                editor.queue_draw();
+                glib::Propagation::Stop
+            } else {
+                // Consume an empty undo/redo too; otherwise GTK emits a bell.
+                glib::Propagation::Stop
+            }
+        }
+    });
+
     editor.connect_button_press_event({
         let focus = focus.clone();
         let resize = resize.clone();
+        let target = target.clone();
+        let state = state.clone();
         move |editor, event| {
             if event.button() != 1 {
                 return glib::Propagation::Proceed;
             }
             let (x, y) = event.position();
-            let focused_grip = editor.is_editable() && on_image_grip(editor, &focus, x, y);
-            if focused_grip {
-                if let Some(image) = *focus.borrow() {
+            if editor.is_editable() {
+                if let Some((image, axis)) = image_resize_zone(editor, x, y) {
+                    let Some(buffer) = editor.buffer() else {
+                        return glib::Propagation::Proceed;
+                    };
+                    *focus.borrow_mut() = Some(image);
+                    editor.queue_draw();
                     *resize.borrow_mut() = Some(ImageResize {
                         offset: image.offset,
                         start_x: x,
                         start_y: y,
                         start_width: image.width,
                         aspect: f64::from(image.width) / f64::from(image.height.max(1)),
+                        axis,
+                        before: note_snapshot(&buffer, &target, &state),
                     });
                     return glib::Propagation::Stop;
                 }
             }
-            // Lock mode is read-only: no frame, no grip, nothing to resize.
+            // Lock mode is read-only: no frame and no edge resize affordance.
             let hit = editor
                 .is_editable()
                 .then(|| image_at_pointer(editor, x, y))
@@ -2926,32 +3244,46 @@ fn attach_note_images(
         let state = state.clone();
         move |editor, event| {
             let (x, y) = event.position();
-            let Some(drag) = *resize.borrow() else {
-                // Hovering the grip advertises the resize the way the card
-                // corner grips do.
+            let Some(drag) = resize.borrow().clone() else {
+                // The resize chrome is invisible until the pointer reaches an
+                // image edge; the cursor itself is the affordance.
                 if let Some(window) = WidgetExt::window(editor) {
-                    let cursor = if editor.is_editable() && on_image_grip(editor, &focus, x, y) {
-                        gdk::Cursor::for_display(
-                            &window.display(),
-                            gdk::CursorType::BottomRightCorner,
-                        )
-                    } else {
-                        None
-                    };
+                    let cursor = editor
+                        .is_editable()
+                        .then(|| image_resize_zone(editor, x, y))
+                        .flatten()
+                        .and_then(|(_, axis)| {
+                            gdk::Cursor::for_display(&window.display(), image_resize_cursor(axis))
+                        });
                     window.set_cursor(cursor.as_ref());
                 }
                 return glib::Propagation::Proceed;
             };
             // Never wider than the grown note can show: an image dragged past
-            // the note edge takes its own grip out of reach.
-            let max_width = note_growth_limit(&target.card).width
-                - note_image_chrome(editor, &target.card).width;
+            // the note edge takes its own resize edge out of reach.
+            let layout_y = editor
+                .buffer()
+                .map(|buffer| {
+                    editor
+                        .iter_location(&buffer.iter_at_offset(drag.offset))
+                        .y()
+                })
+                .unwrap_or(0);
+            let room = image_room_after_y(
+                image_room(
+                    note_growth_limit(&target.card),
+                    note_image_chrome(editor, &target.card),
+                ),
+                layout_y,
+            );
+            let max_width = resize_width_limit(room, drag.aspect);
             let (width, height) = resized_image_size(
                 drag.start_width,
                 drag.aspect,
                 x - drag.start_x,
                 y - drag.start_y,
                 max_width,
+                drag.axis,
             );
             if focus.borrow().map(|image| image.width) == Some(width) {
                 return glib::Propagation::Stop;
@@ -2962,7 +3294,8 @@ fn attach_note_images(
                     width,
                     height,
                 });
-                grow_note_for_image(editor, &target, &state, Size { width, height });
+                let extent = image_layout_extent(editor, drag.offset, Size { width, height });
+                grow_note_for_image(editor, &target, &state, extent);
                 editor.queue_draw();
             }
             glib::Propagation::Stop
@@ -2971,8 +3304,15 @@ fn attach_note_images(
 
     editor.connect_button_release_event({
         let resize = resize.clone();
+        let undo = undo.clone();
+        let target = target.clone();
+        let state = state.clone();
         move |editor, _| {
-            if resize.borrow_mut().take().is_some() {
+            if let Some(drag) = resize.borrow_mut().take() {
+                if let Some(buffer) = editor.buffer() {
+                    let after = note_snapshot(&buffer, &target, &state);
+                    record_note_undo(&undo, drag.before, &after);
+                }
                 if let Some(window) = WidgetExt::window(editor) {
                     window.set_cursor(None);
                 }
@@ -2982,7 +3322,20 @@ fn attach_note_images(
         }
     });
 
-    // Drawn after the text, so the frame and grip sit on top of the image.
+    editor.connect_leave_notify_event({
+        let resize = resize.clone();
+        move |editor, _| {
+            if resize.borrow().is_none() {
+                if let Some(window) = WidgetExt::window(editor) {
+                    window.set_cursor(None);
+                }
+            }
+            glib::Propagation::Proceed
+        }
+    });
+
+    // Focus is a quiet one-pixel outline. Resize has no permanent handle: the
+    // right/bottom edge advertises itself only by changing the pointer.
     editor.connect_local("draw", true, {
         let focus = focus.clone();
         move |values| {
@@ -2999,13 +3352,10 @@ fn attach_note_images(
                     .and_then(|offset| image_rect(&editor, offset))
                 {
                     let color = editor.style_context().color(gtk::StateFlags::NORMAL);
-                    let grip = f64::from(NOTE_IMAGE_GRIP);
                     ctx.set_line_width(1.0);
                     ctx.set_source_rgba(color.red(), color.green(), color.blue(), 0.85);
                     ctx.rectangle(x - 0.5, y - 0.5, width + 1.0, height + 1.0);
                     let _ = ctx.stroke();
-                    ctx.rectangle(x + width - grip, y + height - grip, grip, grip);
-                    let _ = ctx.fill();
                 }
             }
             Some(false.to_value())
@@ -4821,14 +5171,16 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        cascade_point, fit_within, history_row_budget, monitor_coordinate_divisor,
-        monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
-        note_size_for_image, parse_timer_input, reopen_point, resized_image_size,
-        system_content_size, timer_style_size, ScreenRect, HISTORY_HEIGHT, HISTORY_WIDTH,
-        NOTE_HEIGHT, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT,
-        NOTE_WIDTH,
+        cascade_point, fit_within_bounds, history_row_budget, image_room, image_room_after_y,
+        monitor_coordinate_divisor, monitor_root_bounds, normalize_monitor_rect, note_headline,
+        note_image_cap, note_size_for_image, parse_timer_input, record_note_undo, reopen_point,
+        resize_width_limit, resized_image_size, system_content_size, timer_style_size,
+        ImageResizeAxis, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT,
+        HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
+        NOTE_MAX_HEIGHT, NOTE_WIDTH,
     };
-    use crate::state::{Point, Size, SystemDetails, TimerStyle};
+    use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
+    use std::{cell::RefCell, rc::Rc};
 
     const SCREEN: ScreenRect = ScreenRect {
         x: 0,
@@ -4921,22 +5273,104 @@ mod timer_input_tests {
     #[test]
     fn a_pasted_screenshot_is_scaled_down_but_a_small_icon_is_left_alone() {
         // A 1920x1080 screenshot fits the note without distorting its shape.
-        let (width, height) = fit_within(1920, 1080, NOTE_IMAGE_DEFAULT_MAX);
+        let (width, height) =
+            fit_within_bounds(1920, 1080, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_DEFAULT_MAX);
         assert_eq!(width, NOTE_IMAGE_DEFAULT_MAX);
         assert_eq!(height, 135);
         // A tall image is bounded by its height, not its width.
-        assert_eq!(fit_within(200, 1000, 240), (48, 240));
+        assert_eq!(fit_within_bounds(200, 1000, 240, 240), (48, 240));
         // Nothing smaller than the cap is ever blown up.
-        assert_eq!(fit_within(60, 40, 240), (60, 40));
+        assert_eq!(fit_within_bounds(60, 40, 240, 240), (60, 40));
+    }
+
+    #[test]
+    fn a_pasted_image_respects_available_width_and_height_independently() {
+        // Near a screen edge, a 16:9 image may use more horizontal than
+        // vertical room while remaining completely visible.
+        assert_eq!(fit_within_bounds(1920, 1080, 220, 90), (160, 90));
+        // A portrait image is bounded by height; it cannot put its bottom edge
+        // below the note where the resize cursor would become unreachable.
+        assert_eq!(fit_within_bounds(400, 1200, 240, 180), (60, 180));
+    }
+
+    #[test]
+    fn image_resize_limit_accounts_for_the_notes_vertical_room() {
+        let limit = Size {
+            width: 540,
+            height: 440,
+        };
+        let chrome = Size {
+            width: 24,
+            height: 48,
+        };
+        let room = image_room(limit, chrome);
+        assert_eq!(
+            room,
+            Size {
+                width: 516,
+                height: 382
+            }
+        );
+        // A 1:3 portrait is height-limited even though lots of width remains.
+        assert_eq!(resize_width_limit(room, 1.0 / 3.0), 127);
+        // A wide image remains width-limited.
+        assert_eq!(resize_width_limit(room, 16.0 / 9.0), 516);
+        assert_eq!(
+            image_room_after_y(room, 42),
+            Size {
+                width: 516,
+                height: 340
+            }
+        );
+    }
+
+    #[test]
+    fn note_undo_records_mixed_text_and_image_edits_and_clears_redo() {
+        let history: NoteUndoState = Rc::new(RefCell::new(NoteUndo::default()));
+        let before = NoteSnapshot {
+            text: "hello".into(),
+            images: vec![],
+            cursor: 5,
+            size: Size {
+                width: NOTE_WIDTH,
+                height: NOTE_HEIGHT,
+            },
+        };
+        let after = NoteSnapshot {
+            text: format!("hello{IMAGE_PLACEHOLDER}"),
+            images: vec![NoteImage {
+                file: "1.png".into(),
+                width: 200,
+                height: 100,
+            }],
+            cursor: 6,
+            size: Size {
+                width: 224,
+                height: 150,
+            },
+        };
+        record_note_undo(&history, before.clone(), &after);
+        assert_eq!(history.borrow().undo, vec![before]);
+        history.borrow_mut().redo.push(after.clone());
+
+        let typed = NoteSnapshot {
+            text: format!("hello{IMAGE_PLACEHOLDER}!"),
+            cursor: 7,
+            ..after.clone()
+        };
+        record_note_undo(&history, after.clone(), &typed);
+        let history = history.borrow();
+        assert_eq!(history.undo.last(), Some(&after));
+        assert!(history.redo.is_empty());
     }
 
     #[test]
     fn a_pasted_image_fits_the_note_it_lands_in() {
         // A default-width note: the image must stay inside it, or its resize
-        // grip is clipped away with the image edge.
+        // resize edge is clipped away with the image edge.
         let cap = note_image_cap(NOTE_WIDTH - 10);
         assert!(cap <= NOTE_WIDTH - 10);
-        assert_eq!(fit_within(640, 360, cap).0, cap);
+        assert_eq!(fit_within_bounds(640, 360, cap, cap).0, cap);
         // A note dragged wide still pastes at the default size, not wall-sized.
         assert_eq!(note_image_cap(900), NOTE_IMAGE_DEFAULT_MAX);
         // A note dragged to its narrowest still shows something.
@@ -4944,13 +5378,13 @@ mod timer_input_tests {
     }
 
     #[test]
-    fn a_note_grows_around_a_pasted_image_so_the_grip_stays_reachable() {
+    fn a_note_grows_around_a_pasted_image_so_the_edge_stays_reachable() {
         let current = Size {
             width: NOTE_WIDTH,
             height: NOTE_HEIGHT,
         };
         // A default note shows far less than a pasted screenshot's height, so
-        // it has to grow or the grip is clipped away below the fold.
+        // it has to grow or the resize edge is clipped away below the fold.
         let chrome = Size {
             width: 24,
             height: 48,
@@ -4985,29 +5419,37 @@ mod timer_input_tests {
     }
 
     #[test]
-    fn dragging_the_grip_keeps_the_image_aspect_and_stays_within_bounds() {
+    fn dragging_an_image_edge_keeps_the_aspect_and_stays_within_bounds() {
         let aspect = 240.0 / 135.0;
         let room = NOTE_IMAGE_MAX;
-        let (width, height) = resized_image_size(240, aspect, 60.0, 0.0, room);
+        let (width, height) =
+            resized_image_size(240, aspect, 60.0, 0.0, room, ImageResizeAxis::Right);
         assert_eq!(width, 300);
         assert_eq!(height, 169);
         // Dragging down enlarges just as readily as dragging right.
-        let (tall_width, _) = resized_image_size(240, aspect, 0.0, 60.0, room);
+        let (tall_width, _) =
+            resized_image_size(240, aspect, 0.0, 60.0, room, ImageResizeAxis::Bottom);
         assert!(tall_width > 240);
         // The image can never be dragged away to nothing or past the cap.
         assert_eq!(
-            resized_image_size(240, aspect, -5000.0, 0.0, room).0,
+            resized_image_size(240, aspect, -5000.0, 0.0, room, ImageResizeAxis::Right,).0,
             NOTE_IMAGE_MIN
         );
         assert_eq!(
-            resized_image_size(240, aspect, 9000.0, 0.0, room).0,
+            resized_image_size(240, aspect, 9000.0, 0.0, room, ImageResizeAxis::Right,).0,
             NOTE_IMAGE_MAX
         );
         // It also cannot be dragged wider than the note can show, which is what
-        // keeps the grip reachable.
-        assert_eq!(resized_image_size(240, aspect, 9000.0, 0.0, 300).0, 300);
+        // keeps the resize edge reachable.
+        assert_eq!(
+            resized_image_size(240, aspect, 9000.0, 0.0, 300, ImageResizeAxis::Corner,).0,
+            300
+        );
         // A degenerate aspect ratio must not produce a zero or NaN size.
-        assert_eq!(resized_image_size(120, 0.0, 10.0, 0.0, room), (130, 130));
+        assert_eq!(
+            resized_image_size(120, 0.0, 10.0, 0.0, room, ImageResizeAxis::Right,),
+            (130, 130)
+        );
     }
 
     #[test]
