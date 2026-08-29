@@ -29,9 +29,11 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/201001
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(9);
 const MAX_AUDIO_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_DEFINITIONS: usize = 8;
-const MAX_EXAMPLES: usize = 4;
 const MAX_SUGGESTIONS: usize = 8;
+// Long enough for observed proverbs such as "a bird in the hand is worth two
+// in the bush" (11 words), while prose beyond it is overwhelmingly translation
+// input and should not wait for two dictionary services first.
+const MAX_DICTIONARY_WORDS: usize = 12;
 
 /// What a worker sends back to the UI. Lookups and suggestions carry the
 /// generation they were requested at so the receiver can drop replies that a
@@ -60,34 +62,32 @@ pub struct LookupResult {
 }
 
 pub enum ResultKind {
-    /// A pasted sentence or paragraph: machine translation only.
-    Sentence(SentenceResult),
-    /// A single word or short phrase, assembled from every source that answered.
-    Word(Box<WordResult>),
-    /// Neither dictionary knew the word — offer close spellings instead.
-    NotFound { suggestions: Vec<String> },
+    /// Google is the baseline; dictionaries and spelling suggestions enrich it.
+    Content(Box<ContentResult>),
     /// Nothing could be reached at all.
     Error(String),
 }
 
+#[derive(Clone)]
 pub struct SentenceResult {
-    pub source: String,
     pub translation: String,
     /// Set when the input was not English, so the header can say which way the
     /// translation ran.
     pub detected: Option<String>,
 }
 
-pub struct WordResult {
+#[derive(Clone)]
+pub struct ContentResult {
     pub headword: String,
-    /// The one-line Vietnamese gloss, dropped when it just echoes the input.
-    pub gloss: Option<String>,
+    pub translation: Option<SentenceResult>,
     pub pronunciations: Vec<Pronunciation>,
     pub vi_entries: Vec<ViEntry>,
     pub en_definitions: Vec<EnDefinition>,
     pub examples: Vec<BilingualExample>,
+    pub suggestions: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct Pronunciation {
     /// "uk" or "us".
     pub lang: String,
@@ -97,31 +97,43 @@ pub struct Pronunciation {
 
 /// One part-of-speech block of the Vietnamese dictionary, e.g. "tính từ" and
 /// the meanings listed under it.
+#[derive(Clone)]
 pub struct ViEntry {
     pub pos: String,
     pub meanings: Vec<ViMeaning>,
+    pub phrases: Vec<ViPhrase>,
 }
 
 /// A single sense, with whatever sentences the entry illustrates it by. Idioms
 /// lean on these: no English dictionary here carries "in spite of", so the
 /// examples tracau ships are the only thing showing how it is used.
+#[derive(Clone)]
 pub struct ViMeaning {
     pub text: String,
     pub examples: Vec<ViExample>,
 }
 
+#[derive(Clone)]
 pub struct ViExample {
     pub en: String,
     /// tracau translates most, but not all, of its examples.
     pub vi: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct ViPhrase {
+    pub text: String,
+    pub meanings: Vec<ViMeaning>,
+}
+
+#[derive(Clone)]
 pub struct EnDefinition {
     pub pos: String,
     pub text: String,
     pub examples: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct BilingualExample {
     /// Already converted to Pango markup: the searched word comes back wrapped
     /// in `<em>`, which becomes `<b>`.
@@ -142,10 +154,10 @@ pub fn spawn_lookup(query: String, generation: u64, tx: Sender<TranslateEvent>) 
     let started = spawn_named("sysi-lookup", {
         let query = query.clone();
         move || {
-            let kind = if is_sentence(&query) {
-                translate_sentence(&query)
-            } else {
+            let kind = if should_probe_dictionary(&query) {
                 lookup_word(&query)
+            } else {
+                translate_sentence(&query)
             };
             let _ = tx.send_blocking(TranslateEvent::Lookup {
                 generation,
@@ -192,7 +204,7 @@ pub fn spawn_suggest(prefix: String, generation: u64, tx: Sender<TranslateEvent>
 pub fn spawn_audio(url: String, tx: Sender<TranslateEvent>) {
     spawn_named("sysi-audio", move || {
         let path = cached_audio_path(&url);
-        if path.exists() {
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0) {
             let _ = tx.send_blocking(TranslateEvent::AudioReady { url, path });
             return;
         }
@@ -295,31 +307,45 @@ impl Fetch {
 // ------------------------------------------------------------------- lookups
 
 fn translate_sentence(query: &str) -> ResultKind {
-    match google_translate(query, "vi") {
+    match sentence_from_google(query, google_translate(query, "vi")) {
+        Ok(translation) => ResultKind::Content(Box::new(ContentResult {
+            headword: query.trim().to_owned(),
+            translation: Some(translation),
+            pronunciations: Vec::new(),
+            vi_entries: Vec::new(),
+            en_definitions: Vec::new(),
+            examples: Vec::new(),
+            suggestions: Vec::new(),
+        })),
+        Err(error) => ResultKind::Error(error),
+    }
+}
+
+fn sentence_from_google(
+    query: &str,
+    translated: Result<(String, Option<String>), String>,
+) -> Result<SentenceResult, String> {
+    match translated {
         Ok((translation, detected)) => {
             // Google echoes Vietnamese input straight back when asked for
             // Vietnamese; flip the direction so a pasted Vietnamese paragraph
             // still gets translated.
             if detected.as_deref() == Some("vi") {
                 return match google_translate(query, "en") {
-                    Ok((english, _)) => ResultKind::Sentence(SentenceResult {
-                        source: query.to_owned(),
+                    Ok((english, _)) => Ok(SentenceResult {
                         translation: english,
                         detected: Some("vi".into()),
                     }),
-                    // Falling through would present Google's echo of the input
-                    // as if it were the translation.
-                    Err(error) => ResultKind::Error(error),
+                    Err(error) => Err(error),
                 };
             }
-            ResultKind::Sentence(SentenceResult {
-                source: query.to_owned(),
+            Ok(SentenceResult {
                 translation,
                 // Only a non-English source is worth naming in the heading.
                 detected: detected.filter(|language| language != "en"),
             })
         }
-        Err(error) => ResultKind::Error(error),
+        Err(error) => Err(error),
     }
 }
 
@@ -331,7 +357,7 @@ fn lookup_word(query: &str) -> ResultKind {
         "sysi-cambridge",
         format!(
             "https://dictionary-api.eliaschen.dev/api/dictionary/en/{}",
-            percent_encode(query)
+            cambridge_slug(query)
         ),
     );
     let tracau = spawn_fetch(
@@ -341,7 +367,7 @@ fn lookup_word(query: &str) -> ResultKind {
             percent_encode(query)
         ),
     );
-    let gloss = google_translate(query, "vi").ok();
+    let translation = sentence_from_google(query, google_translate(query, "vi"));
 
     let cambridge = cambridge.join();
     let tracau = tracau.join();
@@ -350,7 +376,7 @@ fn lookup_word(query: &str) -> ResultKind {
     // must not count towards the offline check below.
     let reached = !matches!(cambridge, Fetched::Unreachable)
         || !matches!(tracau, Fetched::Unreachable)
-        || gloss.is_some();
+        || translation.is_ok();
     if !reached {
         return ResultKind::Error("Could not reach the dictionary services".into());
     }
@@ -364,31 +390,44 @@ fn lookup_word(query: &str) -> ResultKind {
         _ => (Vec::new(), Vec::new()),
     };
 
-    if en_definitions.is_empty() && vi_entries.is_empty() && examples.is_empty() {
-        // A single accented word that no English dictionary knows is far more
-        // likely to be Vietnamese than a typo, and "did you mean" has nothing
-        // useful to offer for it — translate it instead.
-        if query.chars().any(|c| c.is_alphabetic() && !c.is_ascii()) {
-            return translate_sentence(query);
-        }
-        return ResultKind::NotFound {
-            suggestions: fetch_did_you_mean(query),
-        };
+    let has_dictionary =
+        !en_definitions.is_empty() || !vi_entries.is_empty() || !examples.is_empty();
+    let suggestions = if !has_dictionary
+        && !is_sentence(query)
+        && query.is_ascii()
+    {
+        fetch_did_you_mean(query)
+    } else {
+        Vec::new()
+    };
+    if translation.is_err() && !has_dictionary {
+        return ResultKind::Error(
+            translation
+                .err()
+                .unwrap_or_else(|| "Translation service could not be reached".into()),
+        );
     }
 
-    let gloss = gloss
-        .map(|(text, _)| text)
-        .filter(|text| !text.trim().is_empty())
-        .filter(|text| !text.eq_ignore_ascii_case(query.trim()));
-
-    ResultKind::Word(Box::new(WordResult {
+    ResultKind::Content(Box::new(ContentResult {
         headword: query.trim().to_owned(),
-        gloss,
+        translation: translation.ok(),
         pronunciations,
         vi_entries,
         en_definitions,
         examples,
+        suggestions,
     }))
+}
+
+/// Cambridge's path is a slug, not a percent-encoded phrase: `run out` lives
+/// at `run-out`. Encode each word separately so punctuation and Unicode remain
+/// safe without turning the separators back into `%20`.
+pub fn cambridge_slug(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// The outcome of one JSON request, keeping "the server said no" apart from
@@ -453,6 +492,25 @@ pub fn is_sentence(input: &str) -> bool {
     // plenty of them ("café", "naïve", "résumé"); `lookup_word` falls back to
     // translating when no dictionary recognises it.
     words > 1 && core.chars().any(|c| c.is_alphabetic() && !c.is_ascii())
+}
+
+/// Whether the dictionaries are likely to add anything before Google translates
+/// the input. Punctuation is intentionally allowed because sayings often end in
+/// an exclamation or question mark; paragraphs, long prose, and multi-word
+/// non-English input are not.
+pub fn should_probe_dictionary(input: &str) -> bool {
+    let input = input.trim();
+    if input.is_empty() || input.contains('\n') {
+        return false;
+    }
+    let words = input.split_whitespace().count();
+    if words > MAX_DICTIONARY_WORDS {
+        return false;
+    }
+    !(words > 1
+        && input
+            .chars()
+            .any(|character| character.is_alphabetic() && !character.is_ascii()))
 }
 
 /// Percent-encode a query for use in a URL path or parameter. Hand-rolled
@@ -539,8 +597,93 @@ pub fn cambridge_headword_matches(query: &str, headword: &str) -> bool {
     }
     let query = query.to_lowercase();
     let headword = headword.to_lowercase();
-    let stem: String = query.chars().take(3).collect();
-    headword.starts_with(&stem) || query.starts_with(&headword.chars().take(3).collect::<String>())
+    english_inflection_matches(&query, &headword)
+}
+
+/// Conservative English inflections accepted from Cambridge's search
+/// redirect. A shared three-letter prefix was much too fuzzy (`testing` could
+/// accept `testament`). Generate spellings from the returned lemma rather than
+/// stripping the query into several ambiguous words (`hoped` must not become
+/// `hop`).
+fn english_inflection_matches(word: &str, lemma: &str) -> bool {
+    let plurals = [format!("{lemma}s"), format!("{lemma}es")];
+    if plurals.iter().any(|candidate| candidate == word) {
+        return true;
+    }
+
+    if let Some(stem) = lemma.strip_suffix('e') {
+        if word == format!("{lemma}d") || word == format!("{stem}ing") {
+            return true;
+        }
+    }
+    if let Some(stem) = lemma.strip_suffix('y') {
+        if stem
+            .chars()
+            .next_back()
+            .is_some_and(|character| !"aeiou".contains(character))
+        {
+            let changed_y = [
+                format!("{stem}ies"),
+                format!("{stem}ied"),
+                format!("{stem}ier"),
+                format!("{stem}iest"),
+            ];
+            if changed_y.iter().any(|candidate| candidate == word) {
+                return true;
+            }
+        }
+    }
+
+    let chars: Vec<char> = lemma.chars().collect();
+    let doubles_final = chars.len() >= 3
+        && chars.len() <= 4
+        && !"aeiouy".contains(chars[chars.len() - 1])
+        && "aeiou".contains(chars[chars.len() - 2])
+        && !"aeiou".contains(chars[chars.len() - 3]);
+    let stem = if doubles_final {
+        format!("{lemma}{}", chars[chars.len() - 1])
+    } else {
+        lemma.to_owned()
+    };
+    ["ed", "ing", "er", "est"]
+        .iter()
+        .any(|suffix| word == format!("{stem}{suffix}"))
+}
+
+fn cambridge_reply_matches(json: &Value, query: &str, headword: &str) -> bool {
+    if cambridge_headword_matches(query, headword) {
+        return true;
+    }
+    let normalized_query = normalize_match_text(query);
+    let query_words: Vec<&str> = normalized_query.split_whitespace().collect();
+    if query_words.len() < 2
+        || !query_words[0].eq_ignore_ascii_case(&normalize_match_text(headword))
+    {
+        return false;
+    }
+
+    // Phrasal-verb replies identify themselves by the base verb (`run` for
+    // `run out`). Require the whole phrase on word boundaries somewhere in the
+    // returned senses/examples so scattered words cannot validate a fallback.
+    let mut evidence = String::new();
+    if let Some(definitions) = json.get("definition").and_then(Value::as_array) {
+        for definition in definitions {
+            if let Some(text) = definition.get("text").and_then(Value::as_str) {
+                evidence.push(' ');
+                evidence.push_str(text);
+            }
+            if let Some(examples) = definition.get("example").and_then(Value::as_array) {
+                for example in examples {
+                    if let Some(text) = example.get("text").and_then(Value::as_str) {
+                        evidence.push(' ');
+                        evidence.push_str(text);
+                    }
+                }
+            }
+        }
+    }
+    let evidence = normalize_match_text(&evidence);
+    normalized_phrase_occurs(&evidence, &normalized_query)
 }
 
 /// Read the Cambridge scraper's reply into a pronunciation row and a list of
@@ -552,7 +695,7 @@ pub fn parse_cambridge(json: &Value, query: &str) -> (Vec<Pronunciation>, Vec<En
         return (Vec::new(), Vec::new());
     }
     let headword = json.get("word").and_then(Value::as_str).unwrap_or_default();
-    if !cambridge_headword_matches(query, headword) {
+    if !cambridge_reply_matches(json, query, headword) {
         return (Vec::new(), Vec::new());
     }
 
@@ -596,7 +739,7 @@ pub fn parse_cambridge(json: &Value, query: &str) -> (Vec<Pronunciation>, Vec<En
             if text.is_empty() {
                 continue;
             }
-            let examples = item
+            let examples: Vec<String> = item
                 .get("example")
                 .and_then(Value::as_array)
                 .map(|examples| {
@@ -608,6 +751,11 @@ pub fn parse_cambridge(json: &Value, query: &str) -> (Vec<Pronunciation>, Vec<En
                         .collect()
                 })
                 .unwrap_or_default();
+            // The compact dictionary view is example-led. A bare definition
+            // with no usable example is deliberately omitted.
+            if examples.is_empty() {
+                continue;
+            }
             definitions.push(EnDefinition {
                 pos: item
                     .get("pos")
@@ -617,9 +765,6 @@ pub fn parse_cambridge(json: &Value, query: &str) -> (Vec<Pronunciation>, Vec<En
                 text,
                 examples,
             });
-            if definitions.len() == MAX_DEFINITIONS {
-                break;
-            }
         }
     }
     (pronunciations, definitions)
@@ -628,16 +773,21 @@ pub fn parse_cambridge(json: &Value, query: &str) -> (Vec<Pronunciation>, Vec<En
 /// Read tracau's reply: the Vietnamese dictionary arrives as a blob of HTML
 /// under `tratu`, the bilingual examples as a plain list under `sentences`.
 pub fn parse_tracau(json: &Value, query: &str) -> (Vec<ViEntry>, Vec<BilingualExample>) {
-    let entries = json
-        .get("tratu")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("fields")?.get("fulltext")?.as_str())
-        .map(parse_tracau_fulltext)
-        .unwrap_or_default();
+    let mut entries = Vec::new();
+    if let Some(items) = json.get("tratu").and_then(Value::as_array) {
+        for item in items {
+            if let Some(html) = item
+                .get("fields")
+                .and_then(|fields| fields.get("fulltext"))
+                .and_then(Value::as_str)
+            {
+                entries.extend(parse_tracau_fulltext(html));
+            }
+        }
+    }
 
     let mut examples = Vec::new();
-    // The same sentences as plain lowercase text, kept for the check below.
+    // The same sentences as plain text, kept for the check below.
     let mut plain: Vec<String> = Vec::new();
     if let Some(items) = json.get("sentences").and_then(Value::as_array) {
         for item in items {
@@ -649,14 +799,11 @@ pub fn parse_tracau(json: &Value, query: &str) -> (Vec<ViEntry>, Vec<BilingualEx
             if en.is_empty() || vi.is_empty() {
                 continue;
             }
-            plain.push(strip_tags(en).to_lowercase());
+            plain.push(strip_tags(en));
             examples.push(BilingualExample {
                 en_markup: em_to_pango_bold(en),
                 vi: strip_tags(vi),
             });
-            if examples.len() == MAX_EXAMPLES {
-                break;
-            }
         }
     }
 
@@ -666,8 +813,13 @@ pub fn parse_tracau(json: &Value, query: &str) -> (Vec<ViEntry>, Vec<BilingualEx
     // markup, which has had its apostrophes and ampersands escaped — "don't"
     // would never match `don&apos;t`.
     if entries.is_empty() && !examples.is_empty() {
-        let needle = query.trim().to_lowercase();
-        if !plain.iter().any(|example| example.contains(&needle)) {
+        let needle = normalize_match_text(query);
+        if needle.is_empty()
+            || !plain
+                .iter()
+                .map(|example| normalize_match_text(example))
+                .any(|example| normalized_phrase_occurs(&example, &needle))
+        {
             examples.clear();
         }
     }
@@ -686,9 +838,13 @@ enum TracauRow {
     /// Opens a block: a part of speech, or a label like "thành ngữ".
     Heading,
     Meaning,
-    Example,
+    MeaningExample,
     /// The Vietnamese for the example just above it.
-    ExampleTranslation,
+    MeaningExampleTranslation,
+    Phrase,
+    PhraseMeaning,
+    PhraseExample,
+    PhraseExampleTranslation,
     Ignored,
 }
 
@@ -697,11 +853,15 @@ fn classify_row(id: &str) -> TracauRow {
     // (`mh_ss_n`), so it is removed wherever it sits rather than trimmed.
     match id.replace("_ss", "").as_str() {
         "tl" => TracauRow::Heading,
-        "mn" | "tn_n" => TracauRow::Meaning,
-        "mh" | "tn_mh" => TracauRow::Example,
-        "mh_n" | "tn_mh_n" => TracauRow::ExampleTranslation,
+        "mn" => TracauRow::Meaning,
+        "mh" => TracauRow::MeaningExample,
+        "mh_n" => TracauRow::MeaningExampleTranslation,
+        "tn" => TracauRow::Phrase,
+        "tn_n" => TracauRow::PhraseMeaning,
+        "tn_mh" => TracauRow::PhraseExample,
+        "tn_mh_n" => TracauRow::PhraseExampleTranslation,
         // `pa` is the phonetic spelling, which Cambridge already supplies in
-        // IPA, and `tn` merely repeats the headword being looked up.
+        // IPA.
         _ => TracauRow::Ignored,
     }
 }
@@ -730,6 +890,7 @@ pub fn parse_tracau_fulltext(html: &str) -> Vec<ViEntry> {
                 TracauRow::Heading => entries.push(ViEntry {
                     pos: text,
                     meanings: Vec::new(),
+                    phrases: Vec::new(),
                 }),
                 TracauRow::Meaning => {
                     last_entry(&mut entries).meanings.push(ViMeaning {
@@ -737,14 +898,36 @@ pub fn parse_tracau_fulltext(html: &str) -> Vec<ViEntry> {
                         examples: Vec::new(),
                     });
                 }
-                TracauRow::Example => {
+                TracauRow::MeaningExample => {
                     let meaning = last_meaning(&mut entries);
                     meaning.examples.push(ViExample { en: text, vi: None });
                 }
-                TracauRow::ExampleTranslation => {
+                TracauRow::MeaningExampleTranslation => {
                     // Belongs to the example directly above; with none to
                     // attach to it would read as an untranslated sentence.
                     if let Some(example) = last_meaning(&mut entries).examples.last_mut() {
+                        example.vi = Some(text);
+                    }
+                }
+                TracauRow::Phrase => {
+                    last_entry(&mut entries).phrases.push(ViPhrase {
+                        text,
+                        meanings: Vec::new(),
+                    });
+                }
+                TracauRow::PhraseMeaning => {
+                    last_phrase(&mut entries).meanings.push(ViMeaning {
+                        text,
+                        examples: Vec::new(),
+                    });
+                }
+                TracauRow::PhraseExample => {
+                    last_phrase_meaning(&mut entries)
+                        .examples
+                        .push(ViExample { en: text, vi: None });
+                }
+                TracauRow::PhraseExampleTranslation => {
+                    if let Some(example) = last_phrase_meaning(&mut entries).examples.last_mut() {
                         example.vi = Some(text);
                     }
                 }
@@ -753,7 +936,7 @@ pub fn parse_tracau_fulltext(html: &str) -> Vec<ViEntry> {
         }
         rest = &rest[body_start + close + "</tr>".len()..];
     }
-    entries.retain(|entry| !entry.meanings.is_empty());
+    entries.retain(|entry| !entry.meanings.is_empty() || !entry.phrases.is_empty());
     entries
 }
 
@@ -764,9 +947,61 @@ fn last_entry(entries: &mut Vec<ViEntry>) -> &mut ViEntry {
         entries.push(ViEntry {
             pos: String::new(),
             meanings: Vec::new(),
+            phrases: Vec::new(),
         });
     }
     entries.last_mut().expect("just pushed when empty")
+}
+
+fn last_phrase(entries: &mut Vec<ViEntry>) -> &mut ViPhrase {
+    let entry = last_entry(entries);
+    if entry.phrases.is_empty() {
+        entry.phrases.push(ViPhrase {
+            text: String::new(),
+            meanings: Vec::new(),
+        });
+    }
+    entry.phrases.last_mut().expect("just pushed when empty")
+}
+
+fn last_phrase_meaning(entries: &mut Vec<ViEntry>) -> &mut ViMeaning {
+    let phrase = last_phrase(entries);
+    if phrase.meanings.is_empty() {
+        phrase.meanings.push(ViMeaning {
+            text: String::new(),
+            examples: Vec::new(),
+        });
+    }
+    phrase
+        .meanings
+        .last_mut()
+        .expect("just pushed when empty")
+}
+
+fn normalize_match_text(input: &str) -> String {
+    let mut normalized = String::new();
+    for character in input.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() || matches!(character, '\'' | '\u{2019}') {
+            normalized.push(if character == '\u{2019}' { '\'' } else { character });
+        } else if !normalized.ends_with(' ') {
+            normalized.push(' ');
+        }
+    }
+    normalized.trim().to_owned()
+}
+
+/// Match a normalized word or phrase on token boundaries. Plain substring
+/// matching made a query such as `he` look valid merely because a sentence
+/// contained `the`.
+fn normalized_phrase_occurs(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    haystack.match_indices(needle).any(|(start, _)| {
+        let end = start + needle.len();
+        (start == 0 || bytes[start - 1] == b' ') && (end == bytes.len() || bytes[end] == b' ')
+    })
 }
 
 /// The sense examples attach to, opening an unlabelled one if an example
@@ -952,7 +1187,8 @@ fn http_get(url: &str) -> Result<String, String> {
             .map_err(|error| format!("Could not read the reply: {error}")),
         // A 404 means the word is unknown, not that the service is down; hand
         // back an empty body so the caller treats it as "reached, no answer".
-        Err(ureq::Error::Status(_, _)) => Ok(String::new()),
+        Err(ureq::Error::Status(404, _)) => Ok(String::new()),
+        Err(ureq::Error::Status(code, _)) => Err(format!("Request failed with HTTP {code}")),
         Err(error) => Err(format!("Request failed: {error}")),
     }
 }
@@ -1015,9 +1251,10 @@ fn download_audio(url: &str, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_audio_path, cambridge_headword_matches, em_to_pango_bold, escape_markup, fnv1a,
-        is_sentence, parse_cambridge,
-        parse_google, parse_tracau, parse_tracau_fulltext, percent_encode, strip_tags,
+        cached_audio_path, cambridge_headword_matches, cambridge_slug, em_to_pango_bold,
+        escape_markup, fnv1a, is_sentence, parse_cambridge,
+        parse_google, parse_tracau, parse_tracau_fulltext, percent_encode,
+        should_probe_dictionary, strip_tags,
     };
 
     #[test]
@@ -1062,11 +1299,32 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_probe_keeps_long_proverbs_but_skips_prose() {
+        assert!(should_probe_dictionary(
+            "a bird in the hand is worth two in the bush"
+        ));
+        assert!(should_probe_dictionary("tell that to the marines!"));
+        assert!(!should_probe_dictionary(
+            "one two three four five six seven eight nine ten eleven twelve thirteen"
+        ));
+        assert!(!should_probe_dictionary("first line\nsecond line"));
+        assert!(!should_probe_dictionary("xin chào bạn"));
+        assert!(should_probe_dictionary("café"));
+    }
+
+    #[test]
     fn queries_are_percent_encoded_per_utf8_byte() {
         assert_eq!(percent_encode("kick the bucket"), "kick%20the%20bucket");
         assert_eq!(percent_encode(" hello "), "hello");
         assert_eq!(percent_encode("chào"), "ch%C3%A0o");
         assert_eq!(percent_encode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    #[test]
+    fn cambridge_phrases_use_hyphenated_slugs() {
+        assert_eq!(cambridge_slug("run out"), "run-out");
+        assert_eq!(cambridge_slug("  look   after "), "look-after");
+        assert_eq!(cambridge_slug("don't panic"), "don%27t-panic");
     }
 
     #[test]
@@ -1117,7 +1375,10 @@ mod tests {
         let entries = parse_tracau_fulltext(html);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].pos, "thành ngữ spite");
-        let meaning = &entries[0].meanings[0];
+        assert!(entries[0].meanings.is_empty());
+        let phrase = &entries[0].phrases[0];
+        assert_eq!(phrase.text, "in spite of");
+        let meaning = &phrase.meanings[0];
         assert_eq!(meaning.text, "mặc dù; bất chấp");
         // Both examples hang off that one sense, each with its translation.
         assert_eq!(meaning.examples.len(), 2);
@@ -1237,9 +1498,43 @@ mod tests {
         // would show the definitions of another word entirely.
         let json = serde_json::json!({
             "word": "look",
-            "definition": [{"pos": "verb", "text": "to direct your eyes", "example": []}]
+            "definition": [{
+                "pos": "verb",
+                "text": "to direct your eyes",
+                "example": [{"text": "Look at that."}]
+            }]
         });
         let (_, definitions) = parse_cambridge(&json, "look after");
+        assert!(definitions.is_empty());
+    }
+
+    #[test]
+    fn a_phrasal_reply_named_by_its_base_verb_is_kept() {
+        let json = serde_json::json!({
+            "word": "run",
+            "definition": [{
+                "pos": "verb",
+                "text": "to use all of something",
+                "example": [{"text": "We have run out of milk."}]
+            }]
+        });
+        let (_, definitions) = parse_cambridge(&json, "run out");
+        assert_eq!(definitions.len(), 1);
+        let (_, hyphenated) = parse_cambridge(&json, "run-out");
+        assert_eq!(hyphenated.len(), 1);
+    }
+
+    #[test]
+    fn scattered_words_do_not_validate_a_cambridge_phrasal_fallback() {
+        let json = serde_json::json!({
+            "word": "run",
+            "definition": [{
+                "pos": "verb",
+                "text": "to run somewhere",
+                "example": [{"text": "She stayed out late."}]
+            }]
+        });
+        let (_, definitions) = parse_cambridge(&json, "run out");
         assert!(definitions.is_empty());
     }
 
@@ -1248,6 +1543,10 @@ mod tests {
         // Lemma resolution is the right entry and is kept.
         assert!(cambridge_headword_matches("cats", "cat"));
         assert!(cambridge_headword_matches("happier", "happy"));
+        assert!(cambridge_headword_matches("running", "run"));
+        assert!(cambridge_headword_matches("making", "make"));
+        assert!(cambridge_headword_matches("hoped", "hope"));
+        assert!(cambridge_headword_matches("boxes", "box"));
         assert!(cambridge_headword_matches("Inefficient", "inefficient"));
         assert!(cambridge_headword_matches("hard  work", "hard work"));
         // Every one of these was observed answering the wrong entry.
@@ -1257,6 +1556,10 @@ mod tests {
         assert!(!cambridge_headword_matches("ice cream", "ice cream cone"));
         // A single word must not resolve to something unrelated either.
         assert!(!cambridge_headword_matches("quantum", "zebra"));
+        assert!(!cambridge_headword_matches("testing", "testament"));
+        assert!(!cambridge_headword_matches("testy", "test"));
+        assert!(!cambridge_headword_matches("hoped", "hop"));
+        assert!(!cambridge_headword_matches("ranger", "range"));
         assert!(!cambridge_headword_matches("run", ""));
     }
 
@@ -1297,10 +1600,73 @@ mod tests {
         let json = serde_json::json!({
             "word": "cat",
             "error": null,
-            "definition": [{"pos": "noun", "text": "a small animal", "example": []}]
+            "definition": [{
+                "pos": "noun",
+                "text": "a small animal",
+                "example": [{"text": "The cat slept."}]
+            }]
         });
         let (_, definitions) = parse_cambridge(&json, "cat");
         assert_eq!(definitions.len(), 1);
+    }
+
+    #[test]
+    fn cambridge_keeps_every_definition_with_an_example() {
+        let definitions: Vec<_> = (0..12)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "pos": "verb",
+                    "text": format!("sense {id}"),
+                    "example": if id == 2 {
+                        Vec::<serde_json::Value>::new()
+                    } else {
+                        vec![serde_json::json!({"text": format!("example {id}")})]
+                    }
+                })
+            })
+            .collect();
+        let json = serde_json::json!({"word": "tell", "definition": definitions});
+        let (_, parsed) = parse_cambridge(&json, "tell");
+        assert_eq!(parsed.len(), 11);
+        assert_eq!(parsed.last().map(|item| item.text.as_str()), Some("sense 11"));
+        assert!(!parsed.iter().any(|item| item.text == "sense 2"));
+    }
+
+    #[test]
+    fn tracau_phrases_do_not_attach_to_the_previous_plain_meaning() {
+        let html = r#"
+            <tr id="tl"><td id="C_C">nội động từ</td></tr>
+            <tr id="mn"><td id="C_C">tiết lộ một bí mật</td></tr>
+            <tr id="tn"><td id="C_C">to tell over</td></tr>
+            <tr id="tn_n"><td id="C_C">đếm</td></tr>
+        "#;
+        let entries = parse_tracau_fulltext(html);
+        assert_eq!(entries[0].meanings[0].text, "tiết lộ một bí mật");
+        assert_eq!(entries[0].phrases[0].text, "to tell over");
+        assert_eq!(entries[0].phrases[0].meanings[0].text, "đếm");
+    }
+
+    #[test]
+    fn tracau_sentences_are_not_cut_off_after_four() {
+        let sentences: Vec<_> = (0..9)
+            .map(|id| {
+                serde_json::json!({
+                    "fields": {
+                        "en": format!("Tell example {id}."),
+                        "vi": format!("Ví dụ {id}.")
+                    }
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "tratu": [{"fields": {"fulltext":
+                "<tr id=\"tl\"><td id=\"C_C\">động từ</td></tr><tr id=\"mn\"><td id=\"C_C\">nói</td></tr>"
+            }}],
+            "sentences": sentences
+        });
+        let (_, examples) = parse_tracau(&json, "tell");
+        assert_eq!(examples.len(), 9);
     }
 
     #[test]
@@ -1333,6 +1699,18 @@ mod tests {
         });
         let (_, examples) = parse_tracau(&json, "zzzz");
         assert!(examples.is_empty());
+    }
+
+    #[test]
+    fn tracau_fuzzy_examples_match_whole_words_not_substrings() {
+        let json = serde_json::json!({
+            "tratu": [],
+            "sentences": [{"fields": {"en": "The cat is here.", "vi": "Con mèo ở đây."}}]
+        });
+        let (_, fuzzy) = parse_tracau(&json, "he");
+        assert!(fuzzy.is_empty());
+        let (_, exact) = parse_tracau(&json, "cat");
+        assert_eq!(exact.len(), 1);
     }
 
     #[test]

@@ -36,7 +36,8 @@ const HISTORY_HEIGHT: i32 = 252;
 const HISTORY_ROW_HEIGHT: i32 = 30;
 const HISTORY_CHROME_HEIGHT: i32 = 32;
 const TRANSLATE_WIDTH: i32 = 272;
-const TRANSLATE_HEIGHT: i32 = 320;
+const TRANSLATE_EMPTY_HEIGHT: i32 = 44;
+const TRANSLATE_RESULTS_MAX_HEIGHT: i32 = 520;
 // Long enough that a completion list does not chase the caret on every
 // keystroke, short enough that it still feels like type-ahead.
 const TRANSLATE_SUGGEST_DELAY: Duration = Duration::from_millis(280);
@@ -541,6 +542,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         &state.borrow(),
         "translate",
     )));
+    let translate_fit_height: Rc<dyn Fn()> = {
+        let card = translate.card.clone();
+        let chrome = translate.chrome.clone();
+        let results = translate.results.clone();
+        Rc::new(move || fit_translate_height(&card, &chrome, &results))
+    };
     let translate_position = state
         .borrow()
         .positions
@@ -550,15 +557,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             x: primary_screen.x + 292,
             y: primary_screen.y + 186,
         });
-    apply_widget_size(
-        &translate.card,
-        "translate",
-        &state,
-        Size {
-            width: TRANSLATE_WIDTH,
-            height: TRANSLATE_HEIGHT,
-        },
-    );
+    apply_translate_elastic_size(&translate.card, &state);
     place_card(&root, &translate.card, translate_position);
     register(
         &registry,
@@ -642,12 +641,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // "did you mean" chips, and by the right-click lookup.
     let translate_lookup: Rc<dyn Fn(&str)> = {
         let translate = translate.clone();
+        let state = state.clone();
         let search_open = translate_search_open.clone();
         let lookup_generation = translate_lookup_generation.clone();
         let suggest_generation = translate_suggest_generation.clone();
         let audio_buttons = translate_audio.clone();
         let pending = translate_pending.clone();
         let tx = translate_tx.clone();
+        let fit_height = translate_fit_height.clone();
         Rc::new(move |query: &str| {
             let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
             if query.is_empty() {
@@ -666,6 +667,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             clear_children(&translate.suggestions);
             audio_buttons.borrow_mut().clear();
             lookup_generation.set(lookup_generation.get() + 1);
+            // A fresh answer chooses its own natural height and starts at the
+            // top even if the previous entry had been scrolled down.
+            apply_translate_elastic_size(&translate.card, &state);
+            translate.scroller.vadjustment().set_value(0.0);
             clear_children(&translate.results);
             translate.results.pack_start(
                 &translate_line("Looking it up\u{2026}", "translate-status"),
@@ -674,6 +679,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 0,
             );
             translate.results.show_all();
+            fit_height();
             translate::spawn_lookup(query, lookup_generation.get(), tx.clone());
         })
     };
@@ -689,6 +695,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let suggest_generation = translate_suggest_generation.clone();
         let pending = translate_pending.clone();
         let recents_open = translate_recents_open.clone();
+        let fit_height = translate_fit_height.clone();
         Rc::new(move |open: bool| {
             search_open.set(open);
             translate.set_search_visible(open);
@@ -700,6 +707,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             suggest_generation.set(suggest_generation.get() + 1);
             if !open {
                 clear_children(&translate.suggestions);
+                fit_height();
                 return;
             }
             // Start empty rather than pre-selecting the last query: selecting
@@ -707,7 +715,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             // would clobber whatever the user had highlighted elsewhere — the
             // very thing the "LOOK UP" menu item reads.
             translate.set_query("");
-            render_translate_recents(&translate.suggestions, &state, &lookup, &recents_open);
+            render_translate_recents(
+                &translate.suggestions,
+                &state,
+                &lookup,
+                &recents_open,
+                &fit_height,
+            );
+            fit_height();
             glib::idle_add_local_once({
                 let window = window.clone();
                 let input = translate.input.clone();
@@ -762,30 +777,40 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let tx = translate_tx.clone();
             let lookup = translate_lookup.clone();
             let recents_open = translate_recents_open.clone();
+            let fit_height = translate_fit_height.clone();
             move |_| {
                 if let Some(source) = pending.borrow_mut().take() {
                     source.remove();
                 }
+                // Retire an in-flight request immediately. Waiting until the
+                // next debounce fires leaves a window where suggestions for
+                // the previous prefix can render under the new text.
+                generation.set(generation.get() + 1);
+                let request_generation = generation.get();
                 let text = translate.query();
                 // Prose has no completions worth offering; an empty box goes
                 // back to showing what was searched before.
                 if text.is_empty() {
-                    generation.set(generation.get() + 1);
-                    render_translate_recents(&translate.suggestions, &state, &lookup, &recents_open);
+                    render_translate_recents(
+                        &translate.suggestions,
+                        &state,
+                        &lookup,
+                        &recents_open,
+                        &fit_height,
+                    );
+                    fit_height();
                     return;
                 }
                 clear_children(&translate.suggestions);
+                fit_height();
                 if translate::is_sentence(&text) {
-                    generation.set(generation.get() + 1);
                     return;
                 }
-                let generation_for_timer = generation.clone();
                 let pending_for_timer = pending.clone();
                 let tx = tx.clone();
                 let source = glib::timeout_add_local_once(TRANSLATE_SUGGEST_DELAY, move || {
                     pending_for_timer.borrow_mut().take();
-                    generation_for_timer.set(generation_for_timer.get() + 1);
-                    translate::spawn_suggest(text, generation_for_timer.get(), tx);
+                    translate::spawn_suggest(text, request_generation, tx);
                 });
                 *pending.borrow_mut() = Some(source);
             }
@@ -795,6 +820,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     glib::MainContext::default().spawn_local({
         let suggestions = translate.suggestions.clone();
         let results = translate.results.clone();
+        let scroller = translate.scroller.clone();
+        let fit_height = translate_fit_height.clone();
         let lookup_generation = translate_lookup_generation.clone();
         let suggest_generation = translate_suggest_generation.clone();
         let audio_buttons = translate_audio.clone();
@@ -808,6 +835,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         if at == suggest_generation.get() =>
                     {
                         render_translate_suggestions(&suggestions, &items, &lookup);
+                        fit_height();
                     }
                     translate::TranslateEvent::Lookup { generation: at, result }
                         if at == lookup_generation.get() =>
@@ -816,12 +844,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         // so a typo that found nothing never enters the list.
                         if matches!(
                             result.kind,
-                            translate::ResultKind::Word(_) | translate::ResultKind::Sentence(_)
+                            translate::ResultKind::Content(_)
                         ) {
                             remember_search(&state, &result.query);
                         }
+                        scroller.vadjustment().set_value(0.0);
                         render_translate_result(
                             &results,
+                            &fit_height,
                             &result,
                             &audio_buttons,
                             &tx,
@@ -875,11 +905,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     primary_screen,
                     Size {
                         width: TRANSLATE_WIDTH,
-                        height: TRANSLATE_HEIGHT,
+                        height: TRANSLATE_EMPTY_HEIGHT,
                     },
                     Some(&picker),
                     &registry,
                 );
+                apply_translate_elastic_size(&card, &state);
                 card.show_all();
                 // show_all() reveals the chrome and the query panel regardless
                 // of lock mode; restore both rules.
@@ -1600,7 +1631,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
     }
 
-    track_widget_hover(registry.clone(), history.scroller.clone());
+    track_widget_hover(
+        registry.clone(),
+        vec![history.scroller.clone(), translate.scroller.clone()],
+    );
     start_system_updates(system_card, state.clone());
     start_timer_updates(timer_card, state, window, registry, interactive);
 }
@@ -4245,7 +4279,10 @@ fn rebuild_pinned_notes(
     }
 }
 
-fn track_widget_hover(registry: Rc<RefCell<Vec<RegisteredWidget>>>, history: gtk::ScrolledWindow) {
+fn track_widget_hover(
+    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
+    scrollers: Vec<gtk::ScrolledWindow>,
+) {
     // GTK3 delivers enter/leave to the window under the pointer, so hovering
     // the editor (which owns its own window) never sets :hover on the note
     // card. Poll the pointer position cheaply — one timer serves both the
@@ -4280,18 +4317,20 @@ fn track_widget_hover(registry: Rc<RefCell<Vec<RegisteredWidget>>>, history: gtk
                 context.remove_class("note-hover");
             }
         }
-        let context = history.style_context();
-        let hovered = history.window().is_some_and(|window| {
-            let (_, origin_x, origin_y) = window.origin();
-            pointer_x >= origin_x
-                && pointer_x < origin_x + window.width()
-                && pointer_y >= origin_y
-                && pointer_y < origin_y + window.height()
-        });
-        if hovered {
-            context.add_class("history-hover");
-        } else {
-            context.remove_class("history-hover");
+        for scroller in &scrollers {
+            let context = scroller.style_context();
+            let hovered = scroller.window().is_some_and(|window| {
+                let (_, origin_x, origin_y) = window.origin();
+                pointer_x >= origin_x
+                    && pointer_x < origin_x + window.width()
+                    && pointer_y >= origin_y
+                    && pointer_y < origin_y + window.height()
+            });
+            if hovered {
+                context.add_class("history-hover");
+            } else {
+                context.remove_class("history-hover");
+            }
         }
         glib::ControlFlow::Continue
     });
@@ -4474,7 +4513,9 @@ fn build_history_window(initial_color_mode: ColorMode) -> HistoryWindow {
     scroller.set_shadow_type(gtk::ShadowType::None);
     scroller.set_propagate_natural_width(false);
     scroller.set_propagate_natural_height(false);
-    scroller.set_size_request(1, 1);
+    // Width must remain unconstrained, but a fixed one-pixel height would also
+    // become the natural height and clip every answer to a single line.
+    scroller.set_size_request(1, -1);
     scroller.set_hexpand(true);
     scroller.set_vexpand(true);
     scroller.style_context().add_class("history-scroller");
@@ -4518,6 +4559,7 @@ struct TranslateWindow {
     input: gtk::TextView,
     suggestions: gtk::Box,
     results: gtk::Box,
+    scroller: gtk::ScrolledWindow,
     color_mode: Rc<Cell<ColorMode>>,
     resize: ResizeHandle,
 }
@@ -4635,10 +4677,15 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
     scroller.set_overlay_scrolling(true);
     scroller.set_shadow_type(gtk::ShadowType::None);
     scroller.set_propagate_natural_width(false);
-    scroller.set_propagate_natural_height(false);
-    scroller.set_size_request(1, 1);
+    // Short answers set the card's natural height. Once the content reaches
+    // this cap, the viewport stops growing and the vertical scrollbar takes
+    // over.
+    scroller.set_propagate_natural_height(true);
+    scroller.set_min_content_height(1);
+    scroller.set_max_content_height(TRANSLATE_RESULTS_MAX_HEIGHT);
+    scroller.set_size_request(1, -1);
     scroller.set_hexpand(true);
-    scroller.set_vexpand(true);
+    scroller.set_vexpand(false);
     scroller.style_context().add_class("history-scroller");
     let results = gtk::Box::new(gtk::Orientation::Vertical, 3);
     results.style_context().add_class("translate-results");
@@ -4656,6 +4703,7 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
         input,
         suggestions,
         results,
+        scroller,
         color_mode,
         resize,
     }
@@ -4742,6 +4790,7 @@ fn render_translate_recents(
     state: &Rc<RefCell<AppState>>,
     lookup: &Rc<dyn Fn(&str)>,
     expanded: &Rc<Cell<bool>>,
+    fit_height: &Rc<dyn Fn()>,
 ) {
     clear_children(suggestions);
     let recents = state.borrow().recent_searches.clone();
@@ -4783,9 +4832,11 @@ fn render_translate_recents(
     toggle.connect_clicked({
         let expanded = expanded.clone();
         let apply = apply.clone();
+        let fit_height = fit_height.clone();
         move |_| {
             expanded.set(!expanded.get());
             apply(expanded.get());
+            fit_height();
         }
     });
 }
@@ -4818,10 +4869,317 @@ fn remember_search(state: &Rc<RefCell<AppState>>, query: &str) {
     }
 }
 
+const TRANSLATE_PAGE_SIZE: usize = 5;
+
+fn translate_more_button() -> gtk::Button {
+    let button = gtk::Button::new();
+    button.set_can_focus(false);
+    button.style_context().add_class("translate-more");
+    button
+}
+
+fn append_translate_page<T>(
+    list: &gtk::Box,
+    more: &gtk::Button,
+    items: &[T],
+    shown: &Cell<usize>,
+    render: &Rc<dyn Fn(&T) -> gtk::Box>,
+) {
+    let end = (shown.get() + TRANSLATE_PAGE_SIZE).min(items.len());
+    for item in &items[shown.get()..end] {
+        list.pack_start(&render(item), false, false, 0);
+    }
+    shown.set(end);
+    list.show_all();
+    let remaining = items.len().saturating_sub(end);
+    if remaining == 0 {
+        more.set_no_show_all(true);
+        more.hide();
+    } else {
+        more.set_no_show_all(false);
+        more.set_label(&format!("MORE · {remaining}"));
+        more.show();
+    }
+}
+
+fn translate_paged_list<T: Clone + 'static>(
+    items: Vec<T>,
+    render: Rc<dyn Fn(&T) -> gtk::Box>,
+    fit_height: Rc<dyn Fn()>,
+) -> gtk::Box {
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    let more = translate_more_button();
+    panel.pack_start(&list, false, false, 0);
+    panel.pack_start(&more, false, false, 0);
+
+    let items = Rc::new(items);
+    let shown = Rc::new(Cell::new(0usize));
+    append_translate_page(&list, &more, &items, &shown, &render);
+    more.connect_clicked({
+        let list = list.clone();
+        let items = items.clone();
+        let shown = shown.clone();
+        let render = render.clone();
+        move |more| {
+            append_translate_page(&list, more, &items, &shown, &render);
+            fit_height();
+        }
+    });
+    panel
+}
+
+fn translate_meaning_block(meaning: &crate::translate::ViMeaning) -> gtk::Box {
+    use crate::translate::escape_markup;
+    let block = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    if !meaning.text.is_empty() {
+        block.pack_start(
+            &translate_line(
+                &format!("• {}", escape_markup(&meaning.text)),
+                "translate-meaning",
+            ),
+            false,
+            false,
+            0,
+        );
+    }
+    for example in &meaning.examples {
+        block.pack_start(
+            &translate_line(
+                &format!("<i>{}</i>", escape_markup(&example.en)),
+                "translate-example",
+            ),
+            false,
+            false,
+            0,
+        );
+        if let Some(vi) = &example.vi {
+            block.pack_start(
+                &translate_line(&escape_markup(vi), "translate-example-vi"),
+                false,
+                false,
+                0,
+            );
+        }
+    }
+    block
+}
+
+fn translate_phrase_block(phrase: &crate::translate::ViPhrase) -> gtk::Box {
+    use crate::translate::escape_markup;
+    let block = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    block.pack_start(
+        &translate_line(
+            &format!("▸ <b>{}</b>", escape_markup(&phrase.text)),
+            "translate-phrase",
+        ),
+        false,
+        false,
+        0,
+    );
+    for meaning in &phrase.meanings {
+        block.pack_start(&translate_meaning_block(meaning), false, false, 0);
+    }
+    block
+}
+
+fn build_cambridge_section(
+    content: &gtk::Box,
+    definitions: Vec<crate::translate::EnDefinition>,
+    fit_height: Rc<dyn Fn()>,
+) {
+    use crate::translate::escape_markup;
+    let render: Rc<dyn Fn(&crate::translate::EnDefinition) -> gtk::Box> = Rc::new(|definition| {
+        let block = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        if !definition.pos.is_empty() {
+            block.pack_start(
+                &translate_line(
+                    &escape_markup(&definition.pos.to_uppercase()),
+                    "translate-pos",
+                ),
+                false,
+                false,
+                0,
+            );
+        }
+        block.pack_start(
+            &translate_line(&escape_markup(&definition.text), "translate-body"),
+            false,
+            false,
+            0,
+        );
+        for example in &definition.examples {
+            block.pack_start(
+                &translate_line(
+                    &format!("<i>{}</i>", escape_markup(example)),
+                    "translate-example",
+                ),
+                false,
+                false,
+                0,
+            );
+        }
+        block
+    });
+    content.pack_start(
+        &translate_paged_list(definitions, render, fit_height),
+        false,
+        false,
+        0,
+    );
+}
+
+fn build_vi_section(
+    content: &gtk::Box,
+    entries: Vec<crate::translate::ViEntry>,
+    fit_height: Rc<dyn Fn()>,
+) {
+    use crate::translate::escape_markup;
+    for entry in entries {
+        let pos = if entry.pos.is_empty() {
+            "NGHĨA".to_owned()
+        } else {
+            entry.pos.to_uppercase()
+        };
+        content.pack_start(
+            &translate_line(&escape_markup(&pos), "translate-pos"),
+            false,
+            false,
+            0,
+        );
+        if !entry.meanings.is_empty() {
+            let render: Rc<dyn Fn(&crate::translate::ViMeaning) -> gtk::Box> =
+                Rc::new(translate_meaning_block);
+            content.pack_start(
+                &translate_paged_list(entry.meanings, render, fit_height.clone()),
+                false,
+                false,
+                0,
+            );
+        }
+        if !entry.phrases.is_empty() {
+            content.pack_start(
+                &translate_line("CỤM TỪ", "translate-subsection"),
+                false,
+                false,
+                0,
+            );
+            let render: Rc<dyn Fn(&crate::translate::ViPhrase) -> gtk::Box> =
+                Rc::new(translate_phrase_block);
+            content.pack_start(
+                &translate_paged_list(entry.phrases, render, fit_height.clone()),
+                false,
+                false,
+                0,
+            );
+        }
+    }
+}
+
+fn build_examples_section(
+    content: &gtk::Box,
+    examples: Vec<crate::translate::BilingualExample>,
+    fit_height: Rc<dyn Fn()>,
+) {
+    use crate::translate::escape_markup;
+    let render: Rc<dyn Fn(&crate::translate::BilingualExample) -> gtk::Box> = Rc::new(|example| {
+        let block = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        block.pack_start(
+            &translate_line(&example.en_markup, "translate-example-en"),
+            false,
+            false,
+            0,
+        );
+        block.pack_start(
+            &translate_line(&escape_markup(&example.vi), "translate-example-vi"),
+            false,
+            false,
+            0,
+        );
+        block
+    });
+    content.pack_start(
+        &translate_paged_list(examples, render, fit_height),
+        false,
+        false,
+        0,
+    );
+}
+
+type TranslateSectionBuilder = Rc<dyn Fn(&gtk::Box)>;
+type TranslateSection = (
+    glib::WeakRef<gtk::Button>,
+    gtk::Box,
+    String,
+    TranslateSectionBuilder,
+);
+
+fn add_translate_section(
+    results: &gtk::Box,
+    sections: &Rc<RefCell<Vec<TranslateSection>>>,
+    open: &Rc<Cell<Option<usize>>>,
+    fit_height: &Rc<dyn Fn()>,
+    label: &str,
+    count: usize,
+    build: TranslateSectionBuilder,
+) {
+    let index = sections.borrow().len();
+    let caption = format!("{label} · {count}");
+    let button = gtk::Button::with_label(&format!("▸  {caption}"));
+    button.set_can_focus(false);
+    button.style_context().add_class("translate-section-toggle");
+    if let Some(label) = button.child().and_then(|child| child.downcast::<gtk::Label>().ok()) {
+        label.set_xalign(0.0);
+    }
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    content.style_context().add_class("translate-section-content");
+    content.set_no_show_all(true);
+    content.hide();
+    results.pack_start(&button, false, false, 0);
+    results.pack_start(&content, false, false, 0);
+    sections
+        .borrow_mut()
+        .push((button.downgrade(), content.clone(), caption, build));
+
+    button.connect_clicked({
+        let sections = sections.clone();
+        let open = open.clone();
+        let fit_height = fit_height.clone();
+        move |_| {
+            let closing = open.get() == Some(index);
+            for (header, panel, caption, _) in sections.borrow().iter() {
+                if let Some(header) = header.upgrade() {
+                    header.set_label(&format!("▸  {caption}"));
+                }
+                clear_children(panel);
+                panel.hide();
+            }
+            open.set(None);
+            if closing {
+                fit_height();
+                return;
+            }
+            let sections = sections.borrow();
+            let (header, panel, caption, build) = &sections[index];
+            let Some(header) = header.upgrade() else {
+                return;
+            };
+            build(panel);
+            panel.set_no_show_all(false);
+            panel.show_all();
+            panel.set_no_show_all(true);
+            header.set_label(&format!("▾  {caption}"));
+            open.set(Some(index));
+            fit_height();
+        }
+    });
+}
+
 /// Replace the answer column wholesale. Rebuilding rather than patching keeps
 /// the render a pure function of the result, the way the note list works.
 fn render_translate_result(
     results: &gtk::Box,
+    fit_height: &Rc<dyn Fn()>,
     result: &crate::translate::LookupResult,
     audio_buttons: &Rc<RefCell<HashMap<String, gtk::Button>>>,
     audio_tx: &async_channel::Sender<crate::translate::TranslateEvent>,
@@ -4835,32 +5193,7 @@ fn render_translate_result(
     audio_buttons.borrow_mut().clear();
 
     match &result.kind {
-        ResultKind::Sentence(sentence) => {
-            let heading = match sentence.detected.as_deref() {
-                Some("vi") => "VIETNAMESE \u{2192} ENGLISH",
-                _ => "VIETNAMESE",
-            };
-            results.pack_start(&translate_line(heading, "translate-pos"), false, false, 0);
-            results.pack_start(
-                &translate_line(&escape_markup(&sentence.translation), "translate-body"),
-                false,
-                false,
-                0,
-            );
-            results.pack_start(
-                &translate_line("ORIGINAL", "translate-pos"),
-                false,
-                false,
-                0,
-            );
-            results.pack_start(
-                &translate_line(&escape_markup(&sentence.source), "translate-source"),
-                false,
-                false,
-                0,
-            );
-        }
-        ResultKind::Word(word) => {
+        ResultKind::Content(word) => {
             results.pack_start(
                 &translate_line(
                     &format!("<b>{}</b>", escape_markup(&word.headword)),
@@ -4870,9 +5203,23 @@ fn render_translate_result(
                 false,
                 0,
             );
-            if let Some(gloss) = &word.gloss {
+            if let Some(translation) = &word.translation {
+                let heading = if translation.detected.as_deref() == Some("vi") {
+                    "GOOGLE · ENGLISH"
+                } else {
+                    "GOOGLE · VIETNAMESE"
+                };
                 results.pack_start(
-                    &translate_line(&escape_markup(gloss), "translate-gloss"),
+                    &translate_line(heading, "translate-pos"),
+                    false,
+                    false,
+                    0,
+                );
+                results.pack_start(
+                    &translate_line(
+                        &escape_markup(&translation.translation),
+                        "translate-gloss",
+                    ),
                     false,
                     false,
                     0,
@@ -4880,7 +5227,7 @@ fn render_translate_result(
             }
 
             if !word.pronunciations.is_empty() {
-                let row = translate_row(6);
+                let row = translate_row(12);
                 for pronunciation in &word.pronunciations {
                     let cell = translate_row(2);
                     cell.pack_start(
@@ -4919,130 +5266,83 @@ fn render_translate_result(
                 results.pack_start(&row, false, false, 0);
             }
 
-            for entry in &word.vi_entries {
-                let pos = if entry.pos.is_empty() {
-                    "NGHĨA".to_owned()
-                } else {
-                    entry.pos.to_uppercase()
-                };
-                results.pack_start(
-                    &translate_line(&escape_markup(&pos), "translate-pos"),
-                    false,
-                    false,
-                    0,
-                );
-                for meaning in &entry.meanings {
-                    // A block can open on an example when the source lists one
-                    // before any wording of the sense itself.
-                    if !meaning.text.is_empty() {
-                        results.pack_start(
-                            &translate_line(
-                                &format!("\u{2022} {}", escape_markup(&meaning.text)),
-                                "translate-meaning",
-                            ),
-                            false,
-                            false,
-                            0,
-                        );
-                    }
-                    for example in &meaning.examples {
-                        results.pack_start(
-                            &translate_line(
-                                &format!("<i>{}</i>", escape_markup(&example.en)),
-                                "translate-example",
-                            ),
-                            false,
-                            false,
-                            0,
-                        );
-                        if let Some(vi) = &example.vi {
-                            results.pack_start(
-                                &translate_line(&escape_markup(vi), "translate-example-vi"),
-                                false,
-                                false,
-                                0,
-                            );
+            let sections: Rc<RefCell<Vec<TranslateSection>>> = Rc::new(RefCell::new(Vec::new()));
+            let open = Rc::new(Cell::new(None));
+            if !word.en_definitions.is_empty() {
+                let definitions = word.en_definitions.clone();
+                let count = definitions.len();
+                add_translate_section(
+                    results,
+                    &sections,
+                    &open,
+                    fit_height,
+                    "CAMBRIDGE",
+                    count,
+                    Rc::new({
+                        let fit_height = fit_height.clone();
+                        move |content| {
+                            build_cambridge_section(
+                                content,
+                                definitions.clone(),
+                                fit_height.clone(),
+                            )
                         }
-                    }
-                }
-            }
-
-            for definition in &word.en_definitions {
-                if !definition.pos.is_empty() {
-                    results.pack_start(
-                        &translate_line(
-                            &escape_markup(&definition.pos.to_uppercase()),
-                            "translate-pos",
-                        ),
-                        false,
-                        false,
-                        0,
-                    );
-                }
-                results.pack_start(
-                    &translate_line(&escape_markup(&definition.text), "translate-body"),
-                    false,
-                    false,
-                    0,
+                    }),
                 );
-                for example in &definition.examples {
-                    results.pack_start(
-                        &translate_line(
-                            &format!("<i>{}</i>", escape_markup(example)),
-                            "translate-example",
-                        ),
-                        false,
-                        false,
-                        0,
-                    );
-                }
             }
-
+            if !word.vi_entries.is_empty() {
+                let entries = word.vi_entries.clone();
+                let count = entries
+                    .iter()
+                    .map(|entry| entry.meanings.len() + entry.phrases.len())
+                    .sum();
+                add_translate_section(
+                    results,
+                    &sections,
+                    &open,
+                    fit_height,
+                    "ANH–VIỆT",
+                    count,
+                    Rc::new({
+                        let fit_height = fit_height.clone();
+                        move |content| {
+                            build_vi_section(content, entries.clone(), fit_height.clone())
+                        }
+                    }),
+                );
+            }
             if !word.examples.is_empty() {
-                results.pack_start(
-                    &translate_line("EXAMPLES", "translate-pos"),
-                    false,
-                    false,
-                    0,
+                let examples = word.examples.clone();
+                let count = examples.len();
+                add_translate_section(
+                    results,
+                    &sections,
+                    &open,
+                    fit_height,
+                    "EXAMPLES",
+                    count,
+                    Rc::new({
+                        let fit_height = fit_height.clone();
+                        move |content| {
+                            build_examples_section(content, examples.clone(), fit_height.clone())
+                        }
+                    }),
                 );
-                for example in &word.examples {
-                    results.pack_start(
-                        &translate_line(&example.en_markup, "translate-example-en"),
-                        false,
-                        false,
-                        0,
-                    );
-                    results.pack_start(
-                        &translate_line(&escape_markup(&example.vi), "translate-example-vi"),
-                        false,
-                        false,
-                        0,
-                    );
-                }
             }
-        }
-        ResultKind::NotFound { suggestions } => {
-            results.pack_start(
-                &translate_line(
-                    &format!(
-                        "No dictionary entry for <b>{}</b>",
-                        escape_markup(&result.query)
-                    ),
-                    "translate-status",
-                ),
-                false,
-                false,
-                0,
-            );
-            if !suggestions.is_empty() {
+            if !word.suggestions.is_empty() {
                 results.pack_start(
                     &translate_line("DID YOU MEAN", "translate-pos"),
                     false,
                     false,
                     0,
                 );
-                for word in suggestions {
-                    results.pack_start(&translate_word_button(word, lookup), false, false, 0);
+                for suggestion in &word.suggestions {
+                    results.pack_start(
+                        &translate_word_button(suggestion, lookup),
+                        false,
+                        false,
+                        0,
+                    );
                 }
             }
         }
@@ -5065,6 +5365,7 @@ fn render_translate_result(
     }
     // Freshly built widgets start hidden; without this the card renders empty.
     results.show_all();
+    fit_height();
 }
 
 fn picker_button(label: &str) -> gtk::Button {
@@ -5870,6 +6171,55 @@ fn apply_widget_size(
         fallback.height
     };
     card.set_size_request(width, height);
+}
+
+fn apply_translate_elastic_size(card: &gtk::EventBox, state: &Rc<RefCell<AppState>>) {
+    let width = state
+        .borrow()
+        .sizes
+        .get("translate")
+        .map(|size| size.width)
+        .filter(|width| *width > 0)
+        .unwrap_or(TRANSLATE_WIDTH);
+    // The empty/loading state is deliberately compact. Once content exists,
+    // `fit_translate_height` replaces this with a measured height.
+    card.set_size_request(width, TRANSLATE_EMPTY_HEIGHT);
+    card.queue_resize();
+}
+
+fn fit_translate_height(card: &gtk::EventBox, chrome: &gtk::EventBox, results: &gtk::Box) {
+    // GtkFixed and GtkScrolledWindow do not reliably bubble an async child's
+    // new natural height up to the card. Measure the two visible columns after
+    // GTK has built their layouts, then make that measured height explicit.
+    // The result column is capped; content beyond it belongs to the scrollbar.
+    let card = card.clone();
+    let chrome = chrome.clone();
+    let results = results.clone();
+    glib::idle_add_local_once(move || {
+        let width = if card.width_request() > 0 {
+            card.width_request()
+        } else {
+            card.allocation().width().max(TRANSLATE_WIDTH)
+        };
+        let content_width = (width - 4).max(1);
+        let chrome_height = if chrome.is_visible() {
+            chrome.preferred_height_for_width(content_width).1
+        } else {
+            0
+        };
+        let results_height = if results.is_visible() {
+            results
+                .preferred_height_for_width(content_width)
+                .1
+                .min(TRANSLATE_RESULTS_MAX_HEIGHT)
+        } else {
+            0
+        };
+        let spacing = i32::from(chrome_height > 0 && results_height > 0) * 5;
+        let height = (chrome_height + spacing + results_height).max(TRANSLATE_EMPTY_HEIGHT);
+        card.set_size_request(width, height);
+        card.queue_resize();
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
