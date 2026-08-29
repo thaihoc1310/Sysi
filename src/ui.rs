@@ -634,6 +634,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // show_all() on the card would otherwise reveal it along with everything
     // else, exactly like the history window's search mode.
     let translate_search_open = Rc::new(Cell::new(false));
+    // The recents start folded away behind their arrow: opening the panel is a
+    // move to type something, not to read the last ten things typed.
+    let translate_recents_open = Rc::new(Cell::new(false));
 
     // Run a query: used by Enter, by the completion and recent rows, by the
     // "did you mean" chips, and by the right-click lookup.
@@ -685,6 +688,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let lookup = translate_lookup.clone();
         let suggest_generation = translate_suggest_generation.clone();
         let pending = translate_pending.clone();
+        let recents_open = translate_recents_open.clone();
         Rc::new(move |open: bool| {
             search_open.set(open);
             translate.set_search_visible(open);
@@ -703,7 +707,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             // would clobber whatever the user had highlighted elsewhere — the
             // very thing the "LOOK UP" menu item reads.
             translate.set_query("");
-            render_translate_recents(&translate.suggestions, &state, &lookup);
+            render_translate_recents(&translate.suggestions, &state, &lookup, &recents_open);
             glib::idle_add_local_once({
                 let window = window.clone();
                 let input = translate.input.clone();
@@ -757,6 +761,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let pending = translate_pending.clone();
             let tx = translate_tx.clone();
             let lookup = translate_lookup.clone();
+            let recents_open = translate_recents_open.clone();
             move |_| {
                 if let Some(source) = pending.borrow_mut().take() {
                     source.remove();
@@ -766,7 +771,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 // back to showing what was searched before.
                 if text.is_empty() {
                     generation.set(generation.get() + 1);
-                    render_translate_recents(&translate.suggestions, &state, &lookup);
+                    render_translate_recents(&translate.suggestions, &state, &lookup, &recents_open);
                     return;
                 }
                 clear_children(&translate.suggestions);
@@ -4591,7 +4596,7 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
 
     // The search panel drops down under the header: a text view that grows with
     // what is typed or pasted, and the completions right beneath it.
-    let search_panel = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let search_panel = gtk::Box::new(gtk::Orientation::Vertical, 1);
     search_panel.style_context().add_class("translate-search-panel");
     let input_scroller =
         gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
@@ -4730,22 +4735,59 @@ fn render_translate_suggestions(
 }
 
 /// What an empty search box offers instead of completions: the queries the user
-/// ran before, newest first.
+/// ran before, newest first, folded away behind an arrow so that opening the
+/// panel shows one line rather than the whole history.
 fn render_translate_recents(
     suggestions: &gtk::Box,
     state: &Rc<RefCell<AppState>>,
     lookup: &Rc<dyn Fn(&str)>,
+    expanded: &Rc<Cell<bool>>,
 ) {
     clear_children(suggestions);
     let recents = state.borrow().recent_searches.clone();
     if recents.is_empty() {
         return;
     }
-    suggestions.pack_start(&translate_line("RECENT", "translate-pos"), false, false, 0);
+
+    let toggle = gtk::Button::new();
+    toggle.set_can_focus(false);
+    toggle.style_context().add_class("translate-recent-toggle");
+    let caption = gtk::Label::new(None);
+    caption.set_xalign(0.0);
+    toggle.add(&caption);
+
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
     for query in &recents {
-        suggestions.pack_start(&translate_word_button(query, lookup), false, false, 0);
+        list.pack_start(&translate_word_button(query, lookup), false, false, 0);
     }
+
+    suggestions.pack_start(&toggle, false, false, 0);
+    suggestions.pack_start(&list, false, false, 0);
     suggestions.show_all();
+
+    // show_all() reveals the list whatever the fold said, so the arrow and the
+    // list are put back in step right after it — and again on every click.
+    let apply: Rc<dyn Fn(bool)> = {
+        let caption = caption.clone();
+        let list = list.clone();
+        Rc::new(move |open: bool| {
+            caption.set_label(if open {
+                "\u{25be}  RECENT"
+            } else {
+                "\u{25b8}  RECENT"
+            });
+            list.set_visible(open);
+        })
+    };
+    apply(expanded.get());
+    toggle.connect_clicked({
+        let expanded = expanded.clone();
+        let apply = apply.clone();
+        move |_| {
+            expanded.set(!expanded.get());
+            apply(expanded.get());
+        }
+    });
 }
 
 /// Move a query to the front of the recents, keeping the list short and free of
