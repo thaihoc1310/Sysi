@@ -5430,16 +5430,18 @@ fn logical_screen_rects(scale: i32, fallback_width: i32, fallback_height: i32) -
     let Some(display) = gdk::Display::default() else {
         return vec![fallback];
     };
+    // Two rectangles per monitor. The geometry is the physical panel of glass
+    // and is what the coordinate maths below is calibrated against; the work
+    // area is that minus the shell's own furniture — the top bar, the dock — and
+    // is the only part a widget may be placed in. Using the geometry here let a
+    // window land under the top bar, where the bar paints over its header and
+    // there is nothing left to drag it back out by.
     let mut raw_screens = Vec::new();
+    let mut raw_areas = Vec::new();
     for index in 0..display.n_monitors() {
         if let Some(monitor) = display.monitor(index) {
-            let geometry = monitor.geometry();
-            raw_screens.push(ScreenRect {
-                x: geometry.x(),
-                y: geometry.y(),
-                width: geometry.width(),
-                height: geometry.height(),
-            });
+            raw_screens.push(screen_rect(monitor.geometry()));
+            raw_areas.push(screen_rect(monitor.workarea()));
         }
     }
     if raw_screens.is_empty() {
@@ -5447,7 +5449,7 @@ fn logical_screen_rects(scale: i32, fallback_width: i32, fallback_height: i32) -
     }
     let divisor = monitor_coordinate_divisor(&raw_screens, scale, fallback);
     let root_bounds = monitor_root_bounds(&raw_screens, divisor, fallback);
-    let screens: Vec<_> = raw_screens
+    let screens: Vec<_> = raw_areas
         .into_iter()
         .filter_map(|screen| normalize_monitor_rect(screen, divisor, root_bounds))
         .collect();
@@ -5455,6 +5457,15 @@ fn logical_screen_rects(scale: i32, fallback_width: i32, fallback_height: i32) -
         vec![fallback]
     } else {
         screens
+    }
+}
+
+fn screen_rect(rectangle: gdk::Rectangle) -> ScreenRect {
+    ScreenRect {
+        x: rectangle.x(),
+        y: rectangle.y(),
+        width: rectangle.width(),
+        height: rectangle.height(),
     }
 }
 
@@ -5504,24 +5515,12 @@ fn logical_primary_screen(
     };
     let display = gdk::Display::default()?;
     let monitor = display.primary_monitor()?;
-    let primary_geometry = monitor.geometry();
-    let primary = ScreenRect {
-        x: primary_geometry.x(),
-        y: primary_geometry.y(),
-        width: primary_geometry.width(),
-        height: primary_geometry.height(),
-    };
+    // The work area, for the same reason as above: a default position derived
+    // from the full geometry starts the widget under the top bar.
+    let primary = screen_rect(monitor.workarea());
     let raw_screens: Vec<_> = (0..display.n_monitors())
         .filter_map(|index| display.monitor(index))
-        .map(|monitor| {
-            let geometry = monitor.geometry();
-            ScreenRect {
-                x: geometry.x(),
-                y: geometry.y(),
-                width: geometry.width(),
-                height: geometry.height(),
-            }
-        })
+        .map(|monitor| screen_rect(monitor.geometry()))
         .collect();
     if raw_screens.is_empty() {
         return Some(fallback);
@@ -5584,6 +5583,59 @@ fn normalize_monitor_rect(
         width: right - left,
         height: bottom - top,
     })
+}
+
+fn screen_overlap(point: Point, width: i32, height: i32, screen: &ScreenRect) -> i64 {
+    let left = point.x.max(screen.x);
+    let top = point.y.max(screen.y);
+    let right = (point.x + width).min(screen.x + screen.width);
+    let bottom = (point.y + height).min(screen.y + screen.height);
+    i64::from((right - left).max(0)) * i64::from((bottom - top).max(0))
+}
+
+/// The monitor a widget sits on: the one it covers most of.
+///
+/// It has to be chosen by where the widget actually is, not by which work area
+/// could hold the most of it — a portrait monitor elsewhere on the desk would
+/// otherwise be judged the better fit for a tall widget and leave it oversized
+/// on the screen it is really on.
+fn host_screen(point: Point, width: i32, height: i32, screens: &[ScreenRect]) -> Option<ScreenRect> {
+    let covered = screens
+        .iter()
+        .copied()
+        .max_by_key(|screen| screen_overlap(point, width, height, screen))
+        .filter(|screen| screen_overlap(point, width, height, screen) > 0);
+    if covered.is_some() {
+        return covered;
+    }
+    // Touching nothing — left on a monitor that has since been unplugged.
+    // Fall back to whichever one it would travel least far to reach.
+    screens.iter().copied().min_by_key(|screen| {
+        let max_x = (screen.x + screen.width - width).max(screen.x);
+        let max_y = (screen.y + screen.height - height).max(screen.y);
+        let dx = i64::from(point.x.clamp(screen.x, max_x) - point.x);
+        let dy = i64::from(point.y.clamp(screen.y, max_y) - point.y);
+        dx * dx + dy * dy
+    })
+}
+
+/// Trim a widget to its monitor's work area.
+///
+/// A widget taller than the area it lives in cannot be positioned at all:
+/// `clamp_to_screens` collapses that axis to a single point and pins it there,
+/// so it can no longer be dragged. That is how a window sized against the full
+/// screen height ends up frozen once the shell's top bar is excluded from the
+/// space it may occupy — it still slides sideways, but not up or down.
+fn fit_to_work_area(
+    point: Point,
+    width: i32,
+    height: i32,
+    screens: &[ScreenRect],
+) -> (i32, i32) {
+    match host_screen(point, width, height, screens) {
+        Some(screen) => (width.min(screen.width), height.min(screen.height)),
+        None => (width, height),
+    }
 }
 
 fn clamp_to_screens(point: Point, width: i32, height: i32, screens: &[ScreenRect]) -> Point {
@@ -5744,15 +5796,20 @@ fn clamp_registered_widgets(
         if allocation.width() <= 1 || allocation.height() <= 1 {
             continue;
         }
-        let point = clamp_to_screens(
-            Point {
-                x: allocation.x(),
-                y: allocation.y(),
-            },
-            allocation.width(),
-            allocation.height(),
-            screens,
-        );
+        // Shrink before placing: a widget larger than the work area has no room
+        // to be moved in, and clamping its position alone would wedge it in the
+        // corner with nothing to drag it back by.
+        let origin = Point {
+            x: allocation.x(),
+            y: allocation.y(),
+        };
+        let (width, height) =
+            fit_to_work_area(origin, allocation.width(), allocation.height(), screens);
+        if width != allocation.width() || height != allocation.height() {
+            item.widget.set_size_request(width, height);
+            data.sizes.insert(item.key.clone(), Size { width, height });
+        }
+        let point = clamp_to_screens(origin, width, height, screens);
         if point.x != allocation.x() || point.y != allocation.y() {
             root.move_(&item.widget, point.x, point.y);
         }
@@ -6421,7 +6478,8 @@ mod timer_input_tests {
         cascade_point, ellipsize, fit_within_bounds, history_row_budget, image_room,
         image_room_after_y, monitor_coordinate_divisor, monitor_root_bounds,
         normalize_monitor_rect, note_headline, note_image_cap, note_size_for_image,
-        parse_timer_input, push_recent_search, record_note_undo, reopen_point, resize_width_limit,
+        fit_to_work_area, parse_timer_input, push_recent_search, record_note_undo, reopen_point,
+        resize_width_limit,
         resized_image_size, round_pixbuf_corners, system_content_size, timer_style_size,
         NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT,
         HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
@@ -6863,6 +6921,43 @@ mod timer_input_tests {
         // Newest first, oldest dropped off the end.
         assert_eq!(recents[0], "word11");
         assert_eq!(recents[9], "word2");
+    }
+
+    #[test]
+    fn a_widget_taller_than_the_work_area_is_trimmed_to_it() {
+        let area = [ScreenRect { x: 0, y: 32, width: 1280, height: 688 }];
+        let origin = Point { x: 100, y: 40 };
+        // The exact case that froze the dictionary: sized against the full
+        // screen height, then judged against the height minus the top bar.
+        assert_eq!(fit_to_work_area(origin, 359, 700, &area), (359, 688));
+        assert_eq!(fit_to_work_area(origin, 2000, 100, &area), (1280, 100));
+        // Anything that already fits is left alone.
+        assert_eq!(fit_to_work_area(origin, 300, 400, &area), (300, 400));
+        assert_eq!(fit_to_work_area(origin, 300, 400, &[]), (300, 400));
+    }
+
+    #[test]
+    fn a_widget_is_trimmed_to_the_monitor_it_sits_on_not_the_roomiest_one() {
+        // A landscape monitor beside a portrait one — the layout that hid this:
+        // the portrait screen is tall enough for the widget, so judging by
+        // "which could hold most of it" left the widget oversized and frozen on
+        // the landscape screen it was actually on.
+        let screens = [
+            ScreenRect { x: 0, y: 0, width: 540, height: 809 },
+            ScreenRect { x: 540, y: 151, width: 1280, height: 691 },
+        ];
+        let on_landscape = Point { x: 756, y: 151 };
+        assert_eq!(fit_to_work_area(on_landscape, 359, 700, &screens), (359, 691));
+        let on_portrait = Point { x: 40, y: 200 };
+        assert_eq!(fit_to_work_area(on_portrait, 359, 700, &screens), (359, 700));
+    }
+
+    #[test]
+    fn a_widget_on_no_monitor_at_all_falls_back_to_the_nearest() {
+        let screens = [ScreenRect { x: 0, y: 0, width: 800, height: 600 }];
+        // Left behind on a monitor that has since been unplugged.
+        let stranded = Point { x: 5000, y: 5000 };
+        assert_eq!(fit_to_work_area(stranded, 900, 700, &screens), (800, 600));
     }
 
     #[test]
