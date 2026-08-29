@@ -6143,6 +6143,7 @@ fn attach_drag(
     gesture.connect_drag_end({
         let start = start.clone();
         let card = card.clone();
+        let root = root.clone();
         let registry = registry.clone();
         let window = window.clone();
         let interactive = interactive.clone();
@@ -6152,11 +6153,34 @@ fn attach_drag(
             }
             start.set(None);
             let allocation = card.allocation();
-            let point = Point {
+            let origin = Point {
                 x: allocation.x(),
                 y: allocation.y(),
             };
+            // The widget may have just landed on a shorter monitor than the one
+            // it was sized on. Left oversized it would be stuck there: the
+            // position clamp collapses that axis to a single point, so it could
+            // slide sideways but never up or down again.
+            let root_allocation = root.allocation();
+            let screens = logical_screen_rects(
+                card.scale_factor(),
+                root_allocation.width(),
+                root_allocation.height(),
+            );
+            let (width, height) =
+                fit_to_work_area(origin, allocation.width(), allocation.height(), &screens);
+            let resized = width != allocation.width() || height != allocation.height();
+            if resized {
+                card.set_size_request(width, height);
+            }
+            let point = clamp_to_screens(origin, width, height, &screens);
+            if point.x != origin.x || point.y != origin.y {
+                root.move_(&card, point.x, point.y);
+            }
             let mut data = state.borrow_mut();
+            if resized {
+                data.sizes.insert(key.clone(), Size { width, height });
+            }
             if let Some(id) = key
                 .strip_prefix("note:")
                 .and_then(|id| id.parse::<u64>().ok())
