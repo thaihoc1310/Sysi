@@ -13,7 +13,7 @@
  * label down to a couple of characters rather than clipping the last button. */
 #panel .sysi-panel-action,
 #panel .sysi-panel-gear {
-  padding: 0 5px;
+  padding: 0 9px;
   margin: 0;
   border: 0;
   /* Square, not pill: the corners are the whole point of the look. */
@@ -30,35 +30,41 @@
   transition-duration: 0ms;
 }
 
+/* A 12px icon plus 9px either side comes out about as wide as the panel is
+   tall, which is what makes the cell read as a square. With no padding it
+   collapses to the width of the bare icon. */
 #panel .sysi-panel-gear {
-  padding: 0 8px;
+  padding: 0 9px;
 }
 
-/* Full inversion, and because the button fills the panel vertically the block
-   reaches both edges instead of floating in the middle of the bar. */
+/* Small enough to sit within the cap height of the words beside it. */
+#panel .sysi-panel-gear-icon {
+  icon-size: 12px;
+  padding: 0;
+  margin: 0;
+}
+
+/* Cells butt straight up against one another; the row adds no gaps. */
+#panel .sysi-panel-row {
+  spacing: 0;
+}
+
+/* A quiet grey wash rather than a full inversion: the cell lights up without
+   the row flashing black-on-white as the pointer crosses it. Because the button
+   fills the panel vertically the wash reaches both edges instead of floating as
+   a pill in the middle of the bar. */
 #panel .sysi-panel-action:hover,
 #panel .sysi-panel-action:focus,
 #panel .sysi-panel-gear:hover,
 #panel .sysi-panel-gear:focus {
   border-radius: 0;
-  background-color: #f2f2f2;
-  color: #0a0a0a;
+  background-color: rgba(242, 242, 242, 0.13);
+  color: #f2f2f2;
 }
 
 #panel .sysi-panel-action:active,
 #panel .sysi-panel-gear:active {
   border-radius: 0;
-  background-color: #b4b4b4;
-  color: #0a0a0a;
-}
-
-/* The decorative double rule that stands between one action and the next. */
-#panel .sysi-panel-separator {
-  padding: 7px 2px;
-  spacing: 2px;
-}
-
-#panel .sysi-panel-rule {
-  width: 2px;
-  background-color: rgba(242, 242, 242, 0.38);
+  background-color: rgba(242, 242, 242, 0.22);
+  color: #ffffff;
 }

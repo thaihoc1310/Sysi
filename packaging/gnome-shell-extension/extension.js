@@ -22,7 +22,7 @@ export default class SysiPanelExtension extends Extension {
         // allocation, so the row has to run the whole height of the panel for
         // that block to reach the top and bottom edges.
         this._content = new St.BoxLayout({
-            style_class: 'panel-status-menu-box',
+            style_class: 'sysi-panel-row',
             y_expand: true,
             y_align: Clutter.ActorAlign.FILL,
         });
@@ -38,12 +38,17 @@ export default class SysiPanelExtension extends Extension {
         });
         this._gear.add_child(new St.Icon({
             icon_name: 'preferences-system-symbolic',
-            style_class: 'system-status-icon',
+            // Not `system-status-icon`: that class carries the shell's own
+            // sizing, which is what made the gear tower over the text beside
+            // it. The replacement class must set an icon-size of its own —
+            // with none in force the icon draws at nothing at all.
+            icon_size: 12,
+            style_class: 'sysi-panel-gear-icon',
         }));
         this._content.add_child(this._gear);
 
         this._strip = new St.BoxLayout({
-            style_class: 'panel-status-menu-box',
+            style_class: 'sysi-panel-row',
             y_expand: true,
             y_align: Clutter.ActorAlign.FILL,
         });
@@ -104,9 +109,6 @@ export default class SysiPanelExtension extends Extension {
     }
 
     _addAction(label, action) {
-        // A rule stands between neighbours, never at the ends of the row.
-        if (this._strip.get_n_children() > 0)
-            this._addSeparator();
         const button = new St.Button({
             style_class: 'sysi-panel-action',
             reactive: true,
@@ -133,22 +135,6 @@ export default class SysiPanelExtension extends Extension {
         if (action === 'next-color-mode')
             this._modeLabel = text;
         return button;
-    }
-
-    _addSeparator() {
-        const rules = new St.BoxLayout({
-            style_class: 'sysi-panel-separator',
-            y_expand: true,
-            y_align: Clutter.ActorAlign.FILL,
-        });
-        for (let index = 0; index < 2; index++) {
-            rules.add_child(new St.Widget({
-                style_class: 'sysi-panel-rule',
-                y_expand: true,
-                y_align: Clutter.ActorAlign.FILL,
-            }));
-        }
-        this._strip.add_child(rules);
     }
 
     _readColorMode() {
