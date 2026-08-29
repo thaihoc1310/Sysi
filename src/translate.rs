@@ -99,7 +99,21 @@ pub struct Pronunciation {
 /// the meanings listed under it.
 pub struct ViEntry {
     pub pos: String,
-    pub meanings: Vec<String>,
+    pub meanings: Vec<ViMeaning>,
+}
+
+/// A single sense, with whatever sentences the entry illustrates it by. Idioms
+/// lean on these: no English dictionary here carries "in spite of", so the
+/// examples tracau ships are the only thing showing how it is used.
+pub struct ViMeaning {
+    pub text: String,
+    pub examples: Vec<ViExample>,
+}
+
+pub struct ViExample {
+    pub en: String,
+    /// tracau translates most, but not all, of its examples.
+    pub vi: Option<String>,
 }
 
 pub struct EnDefinition {
@@ -342,7 +356,7 @@ fn lookup_word(query: &str) -> ResultKind {
     }
 
     let (pronunciations, en_definitions) = match &cambridge {
-        Fetched::Json(json) => parse_cambridge(json),
+        Fetched::Json(json) => parse_cambridge(json, query),
         _ => (Vec::new(), Vec::new()),
     };
     let (vi_entries, examples) = match &tracau {
@@ -504,12 +518,41 @@ pub fn parse_google(json: &Value) -> Option<(String, Option<String>)> {
     Some((text, detected))
 }
 
+/// Whether a Cambridge reply is actually about the word that was asked for.
+///
+/// The endpoint resolves by search rather than by slug, and answers a phrase it
+/// does not carry with whatever it found first instead of a 404: "look after"
+/// comes back as "look", "give up" as "give someone a heads-up", "of course" as
+/// "course of action". Rendering those means quietly showing the definitions of
+/// a different word.
+pub fn cambridge_headword_matches(query: &str, headword: &str) -> bool {
+    let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    let headword = headword.split_whitespace().collect::<Vec<_>>().join(" ");
+    if query.eq_ignore_ascii_case(&headword) {
+        return true;
+    }
+    // A lemma is still the right entry — "cats" answers with "cat", "happier"
+    // with "happy" — but only one word can be lemmatised into one other word,
+    // and it stays recognisably the same word.
+    if query.contains(' ') || headword.contains(' ') || headword.is_empty() {
+        return false;
+    }
+    let query = query.to_lowercase();
+    let headword = headword.to_lowercase();
+    let stem: String = query.chars().take(3).collect();
+    headword.starts_with(&stem) || query.starts_with(&headword.chars().take(3).collect::<String>())
+}
+
 /// Read the Cambridge scraper's reply into a pronunciation row and a list of
 /// definition blocks.
-pub fn parse_cambridge(json: &Value) -> (Vec<Pronunciation>, Vec<EnDefinition>) {
+pub fn parse_cambridge(json: &Value, query: &str) -> (Vec<Pronunciation>, Vec<EnDefinition>) {
     // A present-but-null "error" is a success in JSON terms; only a real value
     // means the word was not found.
     if json.get("error").is_some_and(|error| !error.is_null()) {
+        return (Vec::new(), Vec::new());
+    }
+    let headword = json.get("word").and_then(Value::as_str).unwrap_or_default();
+    if !cambridge_headword_matches(query, headword) {
         return (Vec::new(), Vec::new());
     }
 
@@ -632,8 +675,39 @@ pub fn parse_tracau(json: &Value, query: &str) -> (Vec<ViEntry>, Vec<BilingualEx
     (entries, examples)
 }
 
-/// Walk the `<table id="definition">` rows of a tracau entry. `tl` rows open a
-/// part-of-speech block ("tính từ"), `mn` rows are the meanings under it.
+/// What one row of a tracau definition table carries.
+///
+/// The ids vary by the kind of entry, and a single headword can mix them: a
+/// plain word uses `tl`/`mn`, an idiom block uses `tn`/`tn_n`, and a saying or
+/// slang block suffixes everything with `_ss`. Missing the variants is why
+/// multi-word lookups came back blank — "in spite of" carries no `mn` row at
+/// all, so the whole entry was skipped.
+enum TracauRow {
+    /// Opens a block: a part of speech, or a label like "thành ngữ".
+    Heading,
+    Meaning,
+    Example,
+    /// The Vietnamese for the example just above it.
+    ExampleTranslation,
+    Ignored,
+}
+
+fn classify_row(id: &str) -> TracauRow {
+    // `_ss` marks the saying/slang block and appears in the middle of the id
+    // (`mh_ss_n`), so it is removed wherever it sits rather than trimmed.
+    match id.replace("_ss", "").as_str() {
+        "tl" => TracauRow::Heading,
+        "mn" | "tn_n" => TracauRow::Meaning,
+        "mh" | "tn_mh" => TracauRow::Example,
+        "mh_n" | "tn_mh_n" => TracauRow::ExampleTranslation,
+        // `pa` is the phonetic spelling, which Cambridge already supplies in
+        // IPA, and `tn` merely repeats the headword being looked up.
+        _ => TracauRow::Ignored,
+    }
+}
+
+/// Walk the `<table id="definition">` rows of a tracau entry, folding them into
+/// blocks of meanings and the sentences that illustrate them.
 ///
 /// Hand-rolled rather than pulled in as an HTML crate: the markup is a fixed,
 /// machine-generated shape and this only needs the row ids.
@@ -652,29 +726,60 @@ pub fn parse_tracau_fulltext(html: &str) -> Vec<ViEntry> {
         let id = attribute(open_tag, "id").unwrap_or_default();
         let text = strip_tags(content_cell(body));
         if !text.is_empty() {
-            match id {
-                "tl" => entries.push(ViEntry {
+            match classify_row(id) {
+                TracauRow::Heading => entries.push(ViEntry {
                     pos: text,
                     meanings: Vec::new(),
                 }),
-                "mn" => {
-                    if entries.is_empty() {
-                        entries.push(ViEntry {
-                            pos: String::new(),
-                            meanings: Vec::new(),
-                        });
-                    }
-                    if let Some(entry) = entries.last_mut() {
-                        entry.meanings.push(text);
+                TracauRow::Meaning => {
+                    last_entry(&mut entries).meanings.push(ViMeaning {
+                        text,
+                        examples: Vec::new(),
+                    });
+                }
+                TracauRow::Example => {
+                    let meaning = last_meaning(&mut entries);
+                    meaning.examples.push(ViExample { en: text, vi: None });
+                }
+                TracauRow::ExampleTranslation => {
+                    // Belongs to the example directly above; with none to
+                    // attach to it would read as an untranslated sentence.
+                    if let Some(example) = last_meaning(&mut entries).examples.last_mut() {
+                        example.vi = Some(text);
                     }
                 }
-                _ => {}
+                TracauRow::Ignored => {}
             }
         }
         rest = &rest[body_start + close + "</tr>".len()..];
     }
     entries.retain(|entry| !entry.meanings.is_empty());
     entries
+}
+
+/// The block rows are being folded into, opening an unlabelled one if the entry
+/// started with a meaning rather than a heading.
+fn last_entry(entries: &mut Vec<ViEntry>) -> &mut ViEntry {
+    if entries.is_empty() {
+        entries.push(ViEntry {
+            pos: String::new(),
+            meanings: Vec::new(),
+        });
+    }
+    entries.last_mut().expect("just pushed when empty")
+}
+
+/// The sense examples attach to, opening an unlabelled one if an example
+/// arrives before any meaning has.
+fn last_meaning(entries: &mut Vec<ViEntry>) -> &mut ViMeaning {
+    let entry = last_entry(entries);
+    if entry.meanings.is_empty() {
+        entry.meanings.push(ViMeaning {
+            text: String::new(),
+            examples: Vec::new(),
+        });
+    }
+    entry.meanings.last_mut().expect("just pushed when empty")
 }
 
 /// The text of a row lives in its `C_C` cell; the cells before it hold the
@@ -910,7 +1015,8 @@ fn download_audio(url: &str, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_audio_path, em_to_pango_bold, escape_markup, fnv1a, is_sentence, parse_cambridge,
+        cached_audio_path, cambridge_headword_matches, em_to_pango_bold, escape_markup, fnv1a,
+        is_sentence, parse_cambridge,
         parse_google, parse_tracau, parse_tracau_fulltext, percent_encode, strip_tags,
     };
 
@@ -987,14 +1093,75 @@ mod tests {
         let entries = parse_tracau_fulltext(html);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].pos, "tính từ");
-        assert_eq!(entries[0].meanings, ["thiếu khả năng, bất tài", "không có hiệu quả"]);
+        let wording: Vec<_> = entries[0].meanings.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(wording, ["thiếu khả năng, bất tài", "không có hiệu quả"]);
         assert_eq!(entries[1].pos, "danh từ");
-        assert_eq!(entries[1].meanings, ["sự kém cỏi"]);
+        assert_eq!(entries[1].meanings[0].text, "sự kém cỏi");
+    }
+
+    #[test]
+    fn an_idiom_block_is_read_from_its_tn_rows() {
+        // "in spite of" carries no `mn` row at all: its wording is in `tn_n`
+        // and its examples in `tn_mh` / `tn_mh_n`. Matching only `tl` and `mn`
+        // dropped the entry whole, which is why multi-word lookups came back
+        // blank even though tracau had them.
+        let html = r##"<table id="definition">
+            <tr id="tl"><td id="C_C"><b>thành ngữ spite</b></td></tr>
+            <tr id="tn"><td id="C_C">in spite of</td></tr>
+            <tr id="tn_n"><td id="C_C">mặc dù; bất chấp</td></tr>
+            <tr id="tn_mh"><td id="C_C">they went out in spite of the rain</td></tr>
+            <tr id="tn_mh_n"><td id="C_C">họ ra đi bất chấp trời mưa</td></tr>
+            <tr id="tn_mh"><td id="C_C">in spite of all his efforts, he failed</td></tr>
+            <tr id="tn_mh_n"><td id="C_C">dù hết sức cố gắng, nó vẫn thi trượt</td></tr>
+        </table>"##;
+        let entries = parse_tracau_fulltext(html);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pos, "thành ngữ spite");
+        let meaning = &entries[0].meanings[0];
+        assert_eq!(meaning.text, "mặc dù; bất chấp");
+        // Both examples hang off that one sense, each with its translation.
+        assert_eq!(meaning.examples.len(), 2);
+        assert_eq!(meaning.examples[0].en, "they went out in spite of the rain");
+        assert_eq!(meaning.examples[0].vi.as_deref(), Some("họ ra đi bất chấp trời mưa"));
+        assert_eq!(meaning.examples[1].en, "in spite of all his efforts, he failed");
+    }
+
+    #[test]
+    fn a_saying_block_suffixed_with_ss_is_read_like_any_other() {
+        // "kick the bucket" comes back entirely in the _ss variants.
+        let html = r##"<table id="definition">
+            <tr id="pa_ss"><td id="C_C">[kick the bucket]</td></tr>
+            <tr id="tl_ss"><td id="C_C"><b>saying &amp;&amp; slang</b></td></tr>
+            <tr id="mn_ss"><td id="C_C">die, buy the farm, pass away</td></tr>
+            <tr id="mh_ss"><td id="C_C">Charlie finally kicked the bucket.</td></tr>
+        </table>"##;
+        let entries = parse_tracau_fulltext(html);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pos, "saying && slang");
+        let meaning = &entries[0].meanings[0];
+        assert_eq!(meaning.text, "die, buy the farm, pass away");
+        assert_eq!(meaning.examples[0].en, "Charlie finally kicked the bucket.");
+        // No `_n` row followed it, so there is nothing to translate it by.
+        assert!(meaning.examples[0].vi.is_none());
+    }
+
+    #[test]
+    fn an_example_translation_with_no_example_above_it_is_dropped() {
+        let html = r##"<table id="definition">
+            <tr id="tl"><td id="C_C">danh từ</td></tr>
+            <tr id="mn"><td id="C_C">nghĩa</td></tr>
+            <tr id="mh_n"><td id="C_C">mồ côi</td></tr>
+        </table>"##;
+        let entries = parse_tracau_fulltext(html);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].meanings[0].examples.is_empty());
     }
 
     #[test]
     fn a_part_of_speech_with_no_meanings_is_dropped() {
         assert!(parse_tracau_fulltext(r#"<tr id="tl"><td>tính từ</td></tr>"#).is_empty());
+        // A phonetic row alone is not a definition either.
+        assert!(parse_tracau_fulltext(r#"<tr id="pa_ss"><td id="C_C">[x]</td></tr>"#).is_empty());
         assert!(parse_tracau_fulltext("no markup at all").is_empty());
     }
 
@@ -1040,6 +1207,7 @@ mod tests {
     #[test]
     fn cambridge_keeps_one_pronunciation_per_accent_uk_first() {
         let json = serde_json::json!({
+            "word": "inefficient",
             "pronunciation": [
                 {"lang": "us", "pron": "/us-one/", "url": "us1.mp3"},
                 {"lang": "uk", "pron": "/uk-one/", "url": "uk1.mp3"},
@@ -1050,7 +1218,7 @@ mod tests {
                 {"pos": "adjective", "text": "", "example": [{"text": "An orphan."}]},
             ]
         });
-        let (pronunciations, definitions) = parse_cambridge(&json);
+        let (pronunciations, definitions) = parse_cambridge(&json, "inefficient");
         assert_eq!(pronunciations.len(), 2);
         assert_eq!(pronunciations[0].lang, "uk");
         assert_eq!(pronunciations[0].ipa, "/uk-one/");
@@ -1063,9 +1231,39 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_about_a_different_word_is_discarded() {
+        // The endpoint resolves by search, so a phrase it does not carry comes
+        // back as whatever it found first rather than as a 404. Rendering it
+        // would show the definitions of another word entirely.
+        let json = serde_json::json!({
+            "word": "look",
+            "definition": [{"pos": "verb", "text": "to direct your eyes", "example": []}]
+        });
+        let (_, definitions) = parse_cambridge(&json, "look after");
+        assert!(definitions.is_empty());
+    }
+
+    #[test]
+    fn a_headword_is_matched_past_inflection_but_not_past_truncation() {
+        // Lemma resolution is the right entry and is kept.
+        assert!(cambridge_headword_matches("cats", "cat"));
+        assert!(cambridge_headword_matches("happier", "happy"));
+        assert!(cambridge_headword_matches("Inefficient", "inefficient"));
+        assert!(cambridge_headword_matches("hard  work", "hard work"));
+        // Every one of these was observed answering the wrong entry.
+        assert!(!cambridge_headword_matches("look after", "look"));
+        assert!(!cambridge_headword_matches("give up", "give someone a heads-up"));
+        assert!(!cambridge_headword_matches("of course", "course of action"));
+        assert!(!cambridge_headword_matches("ice cream", "ice cream cone"));
+        // A single word must not resolve to something unrelated either.
+        assert!(!cambridge_headword_matches("quantum", "zebra"));
+        assert!(!cambridge_headword_matches("run", ""));
+    }
+
+    #[test]
     fn an_unknown_word_parses_to_nothing() {
         let json = serde_json::json!({"error": "word not found"});
-        let (pronunciations, definitions) = parse_cambridge(&json);
+        let (pronunciations, definitions) = parse_cambridge(&json, "whatever");
         assert!(pronunciations.is_empty());
         assert!(definitions.is_empty());
     }
@@ -1085,7 +1283,7 @@ mod tests {
         let html = r#"<tr data-id="xx" id="mn"><td id="C_C">nghĩa</td></tr>"#;
         let entries = parse_tracau_fulltext(html);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].meanings, ["nghĩa"]);
+        assert_eq!(entries[0].meanings[0].text, "nghĩa");
     }
 
     #[test]
@@ -1097,10 +1295,11 @@ mod tests {
     fn a_null_error_field_is_not_a_missing_word() {
         // `{"error": null}` is a success; only a real value means not found.
         let json = serde_json::json!({
+            "word": "cat",
             "error": null,
             "definition": [{"pos": "noun", "text": "a small animal", "example": []}]
         });
-        let (_, definitions) = parse_cambridge(&json);
+        let (_, definitions) = parse_cambridge(&json, "cat");
         assert_eq!(definitions.len(), 1);
     }
 

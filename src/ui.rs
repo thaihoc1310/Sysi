@@ -4932,15 +4932,38 @@ fn render_translate_result(
                     0,
                 );
                 for meaning in &entry.meanings {
-                    results.pack_start(
-                        &translate_line(
-                            &format!("\u{2022} {}", escape_markup(meaning)),
-                            "translate-meaning",
-                        ),
-                        false,
-                        false,
-                        0,
-                    );
+                    // A block can open on an example when the source lists one
+                    // before any wording of the sense itself.
+                    if !meaning.text.is_empty() {
+                        results.pack_start(
+                            &translate_line(
+                                &format!("\u{2022} {}", escape_markup(&meaning.text)),
+                                "translate-meaning",
+                            ),
+                            false,
+                            false,
+                            0,
+                        );
+                    }
+                    for example in &meaning.examples {
+                        results.pack_start(
+                            &translate_line(
+                                &format!("<i>{}</i>", escape_markup(&example.en)),
+                                "translate-example",
+                            ),
+                            false,
+                            false,
+                            0,
+                        );
+                        if let Some(vi) = &example.vi {
+                            results.pack_start(
+                                &translate_line(&escape_markup(vi), "translate-example-vi"),
+                                false,
+                                false,
+                                0,
+                            );
+                        }
+                    }
                 }
             }
 
