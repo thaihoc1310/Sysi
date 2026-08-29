@@ -50,6 +50,7 @@ export default class SysiPanelExtension extends Extension {
         this._lock = this._addAction('lock', 'toggle-lock');
         this._addAction('+ note', 'new-note');
         this._addAction('history', 'toggle-history');
+        this._addAction('translate', 'toggle-translate');
         this._addAction('quit', 'quit');
 
         this._gear.connect('clicked', () => {

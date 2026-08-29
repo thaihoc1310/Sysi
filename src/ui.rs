@@ -1,5 +1,6 @@
 use crate::{
     platform,
+    translate,
     state::{
         AppState, ColorMode, Note, NoteImage, Point, Size, SystemDetails, TimerStyle,
         IMAGE_PLACEHOLDER,
@@ -34,6 +35,14 @@ const HISTORY_HEIGHT: i32 = 252;
 // rows the window renders to how tall the user dragged it.
 const HISTORY_ROW_HEIGHT: i32 = 30;
 const HISTORY_CHROME_HEIGHT: i32 = 32;
+const TRANSLATE_WIDTH: i32 = 272;
+const TRANSLATE_HEIGHT: i32 = 320;
+// Long enough that a completion list does not chase the caret on every
+// keystroke, short enough that it still feels like type-ahead.
+const TRANSLATE_SUGGEST_DELAY: Duration = Duration::from_millis(280);
+// The width a result line asks for, in characters. Comfortably narrower than
+// the window's minimum, so the answer never widens the card on its own.
+const TRANSLATE_WRAP_CHARS: i32 = 16;
 const RESIZE_HIT_SIZE: i32 = 18;
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
@@ -510,6 +519,335 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         },
     );
 
+    let translate = build_translate_window(saved_color_mode(&state.borrow(), "translate"));
+    let translate_position = state
+        .borrow()
+        .positions
+        .get("translate")
+        .copied()
+        .unwrap_or(Point {
+            x: primary_screen.x + 292,
+            y: primary_screen.y + 186,
+        });
+    apply_widget_size(
+        &translate.card,
+        "translate",
+        &state,
+        Size {
+            width: TRANSLATE_WIDTH,
+            height: TRANSLATE_HEIGHT,
+        },
+    );
+    place_card(&root, &translate.card, translate_position);
+    register(
+        &registry,
+        "translate",
+        &translate.card,
+        translate.color_mode.clone(),
+    );
+    if let Some(item) = registry
+        .borrow_mut()
+        .iter_mut()
+        .find(|item| item.key == "translate")
+    {
+        item.edit_only = Some(translate.header.clone());
+    }
+    attach_color_mode_menu(
+        &translate.card,
+        "translate".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        None,
+        None,
+    );
+    attach_drag(
+        &translate.header,
+        &translate.card,
+        &root,
+        "translate".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+    );
+    attach_resize(
+        &translate.resize,
+        &translate.card,
+        &root,
+        "translate".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+        ResizeBounds {
+            min_width: 196,
+            min_height: 120,
+            max_width: 680,
+            max_height: 860,
+            aspect_ratio: None,
+            preserve_current_aspect: false,
+        },
+    );
+
+    // Lookups and completions run on worker threads and report back here. One
+    // counter numbers every request so a reply that a newer keystroke has
+    // already superseded can be dropped instead of overwriting the answer the
+    // user is reading.
+    let (translate_tx, translate_rx) = async_channel::unbounded::<translate::TranslateEvent>();
+    let translate_generation = Rc::new(Cell::new(0u64));
+    // The play buttons currently on screen, keyed by the clip they are waiting
+    // for. Cleared on every rebuild, so a download that outlives its button
+    // finds nothing to re-enable and quietly does nothing.
+    let translate_audio: Rc<RefCell<HashMap<String, gtk::Button>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let translate_pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    // Set while the entry is being filled in on the user's behalf, so clicking
+    // a completion does not immediately ask for completions of itself.
+    let translate_echo = Rc::new(Cell::new(false));
+
+    // Run a query: used by Enter, by the completion rows, and by the "did you
+    // mean" chips.
+    let translate_lookup: Rc<dyn Fn(&str)> = {
+        let entry = translate.entry.clone();
+        let suggestions = translate.suggestions.clone();
+        let results = translate.results.clone();
+        let generation = translate_generation.clone();
+        let audio_buttons = translate_audio.clone();
+        let pending = translate_pending.clone();
+        let echo = translate_echo.clone();
+        let tx = translate_tx.clone();
+        Rc::new(move |query: &str| {
+            let query = query.trim().to_owned();
+            if query.is_empty() {
+                return;
+            }
+            if entry.text() != query {
+                echo.set(true);
+                entry.set_text(&query);
+                entry.set_position(-1);
+                echo.set(false);
+            }
+            // A completion that is still in flight would land on top of the
+            // answer; retiring the generation drops it on arrival.
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            clear_children(&suggestions);
+            audio_buttons.borrow_mut().clear();
+            generation.set(generation.get() + 1);
+            clear_children(&results);
+            results.pack_start(
+                &translate_line("Looking it up\u{2026}", "translate-status"),
+                false,
+                false,
+                0,
+            );
+            results.show_all();
+            translate::spawn_lookup(query, generation.get(), tx.clone());
+        })
+    };
+
+    translate.entry.connect_activate({
+        let translate_lookup = translate_lookup.clone();
+        move |entry| translate_lookup(&entry.text())
+    });
+
+    translate.entry.connect_changed({
+        let suggestions = translate.suggestions.clone();
+        let generation = translate_generation.clone();
+        let pending = translate_pending.clone();
+        let echo = translate_echo.clone();
+        let tx = translate_tx.clone();
+        move |entry| {
+            if echo.get() {
+                return;
+            }
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            clear_children(&suggestions);
+            let text = entry.text().trim().to_owned();
+            // Prose has no completions worth offering, and neither does an
+            // empty box.
+            if text.is_empty() || translate::is_sentence(&text) {
+                generation.set(generation.get() + 1);
+                return;
+            }
+            let generation_for_timer = generation.clone();
+            let pending_for_timer = pending.clone();
+            let tx = tx.clone();
+            let source = glib::timeout_add_local_once(TRANSLATE_SUGGEST_DELAY, move || {
+                pending_for_timer.borrow_mut().take();
+                generation_for_timer.set(generation_for_timer.get() + 1);
+                translate::spawn_suggest(text, generation_for_timer.get(), tx);
+            });
+            *pending.borrow_mut() = Some(source);
+        }
+    });
+
+    // GtkEntry drops everything after the first newline of a paste, which would
+    // silently truncate the paragraph the user meant to translate. Take the
+    // clipboard over and flatten it into one line instead.
+    translate.entry.connect_paste_clipboard(|entry| {
+        entry.stop_signal_emission_by_name("paste-clipboard");
+        let Some(text) = entry
+            .clipboard(&gdk::SELECTION_CLIPBOARD)
+            .wait_for_text()
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|text| !text.is_empty())
+        else {
+            return;
+        };
+        entry.delete_selection();
+        let mut position = entry.position();
+        entry.insert_text(&text, &mut position);
+        entry.set_position(position);
+    });
+
+    let clear_translate: Rc<dyn Fn()> = {
+        let entry = translate.entry.clone();
+        let suggestions = translate.suggestions.clone();
+        let results = translate.results.clone();
+        let audio_buttons = translate_audio.clone();
+        let generation = translate_generation.clone();
+        let pending = translate_pending.clone();
+        Rc::new(move || {
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            // Retire the generation too: a lookup already in flight must not
+            // repaint the column the user just emptied.
+            generation.set(generation.get() + 1);
+            audio_buttons.borrow_mut().clear();
+            clear_children(&suggestions);
+            clear_children(&results);
+            entry.set_text("");
+        })
+    };
+    translate.clear.connect_clicked({
+        let clear_translate = clear_translate.clone();
+        move |_| clear_translate()
+    });
+
+    glib::MainContext::default().spawn_local({
+        let suggestions = translate.suggestions.clone();
+        let results = translate.results.clone();
+        let generation = translate_generation.clone();
+        let audio_buttons = translate_audio.clone();
+        let lookup = translate_lookup.clone();
+        let tx = translate_tx.clone();
+        async move {
+            while let Ok(event) = translate_rx.recv().await {
+                match event {
+                    translate::TranslateEvent::Suggestions { generation: at, items }
+                        if at == generation.get() =>
+                    {
+                        render_translate_suggestions(&suggestions, &items, &lookup);
+                    }
+                    translate::TranslateEvent::Lookup { generation: at, result }
+                        if at == generation.get() =>
+                    {
+                        render_translate_result(
+                            &results,
+                            &result,
+                            &audio_buttons,
+                            &tx,
+                            &lookup,
+                        );
+                    }
+                    translate::TranslateEvent::AudioReady { url, path } => {
+                        if let Some(button) = audio_buttons.borrow_mut().remove(&url) {
+                            button.set_sensitive(true);
+                        }
+                        translate::play_audio(&path);
+                    }
+                    translate::TranslateEvent::AudioFailed { url } => {
+                        if let Some(button) = audio_buttons.borrow_mut().remove(&url) {
+                            button.set_sensitive(true);
+                            button.set_tooltip_text(Some("Audio unavailable"));
+                        }
+                    }
+                    // A reply for a query the user has already moved on from.
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let toggle_translate: Rc<dyn Fn()> = {
+        let card = translate.card.clone();
+        let header = translate.header.clone();
+        let entry = translate.entry.clone();
+        let suggestions = translate.suggestions.clone();
+        let state = state.clone();
+        let window = window.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let root = root.clone();
+        let screens = screens.clone();
+        let picker = widget_picker.card.clone();
+        Rc::new(move || {
+            let open = !card.is_visible();
+            if open {
+                reopen_widget(
+                    &card,
+                    "translate",
+                    &root,
+                    &state,
+                    &screens,
+                    primary_screen,
+                    Size {
+                        width: TRANSLATE_WIDTH,
+                        height: TRANSLATE_HEIGHT,
+                    },
+                    Some(&picker),
+                    &registry,
+                );
+                card.show_all();
+                // show_all() reveals the header regardless of lock mode, and
+                // any stale completions from the last session.
+                clear_children(&suggestions);
+                header.set_visible(interactive.get());
+                if interactive.get() {
+                    // Focus once the reopened card is mapped, so the user can
+                    // type straight away.
+                    glib::idle_add_local_once({
+                        let window = window.clone();
+                        let entry = entry.clone();
+                        move || {
+                            present_overlay(&window);
+                            entry.grab_focus();
+                        }
+                    });
+                }
+            } else {
+                card.hide();
+            }
+            state.borrow_mut().settings.translate_open = open;
+            let _ = state.borrow().save();
+            refresh_input_shape(&window, &registry, interactive.get());
+            glib::idle_add_local_once({
+                let window = window.clone();
+                let registry = registry.clone();
+                let interactive = interactive.clone();
+                let root = root.clone();
+                let screens = screens.clone();
+                let state = state.clone();
+                move || {
+                    if open {
+                        clamp_registered_widgets(&root, &registry, &screens, &state);
+                    }
+                    refresh_input_shape(&window, &registry, interactive.get());
+                }
+            });
+        })
+    };
+    translate.hide.connect_clicked({
+        let toggle_translate = toggle_translate.clone();
+        move |_| toggle_translate()
+    });
+
     let note_refresh: CallbackSlot = Rc::new(RefCell::new(None));
     // How many rows the list renders, derived from the window height so
     // dragging the grip down shows more entries and dragging it up shows
@@ -946,6 +1284,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let new_note = widget_picker.new_note.clone();
         let quit = widget_picker.quit.clone();
         let toggle_history = toggle_history.clone();
+        let toggle_translate = toggle_translate.clone();
+        let translate_card = translate.card.clone();
         let interactive = interactive.clone();
         Rc::new(move || match take_panel_action().as_deref() {
             Some("toggle-system") => system.set_active(!system.is_active()),
@@ -961,6 +1301,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 new_note.clicked();
             }
             Some("toggle-history") => toggle_history(),
+            Some("toggle-translate") => {
+                // The entry is edit chrome, so a translate window opened while
+                // locked would have nothing to type into; unlock first, the way
+                // a new note does.
+                if !translate_card.is_visible() && !interactive.get() {
+                    lock.clicked();
+                }
+                toggle_translate();
+            }
             Some("quit") => quit.clicked(),
             _ => {}
         })
@@ -972,6 +1321,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let searching = searching.clone();
         let history_card = history.card.clone();
         let close_history_search = close_history_search.clone();
+        let translate_card = translate.card.clone();
+        let translate_entry = translate.entry.clone();
+        let clear_translate = clear_translate.clone();
         move |_, event| {
             if event.keyval() == gdk::keys::constants::Escape {
                 // The overlay sees key events before the focused widget, so
@@ -979,6 +1331,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 // lock the whole overlay out from under the user.
                 if searching.get() && history_card.is_visible() {
                     close_history_search();
+                    return glib::Propagation::Stop;
+                }
+                // Same for a translate query in progress: the first Escape
+                // empties the box, and only a second one locks the overlay.
+                if translate_card.is_visible()
+                    && translate_entry.has_focus()
+                    && !translate_entry.text().is_empty()
+                {
+                    clear_translate();
                     return glib::Propagation::Stop;
                 }
                 if interactive.get() {
@@ -1023,6 +1384,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     history.bar.set_search_mode(false);
     if !state.borrow().settings.history_open {
         history.card.hide();
+    }
+    if !state.borrow().settings.translate_open {
+        translate.card.hide();
     }
     if !system_enabled {
         system_card.card.hide();
@@ -4041,6 +4405,390 @@ fn build_history_window(initial_color_mode: ColorMode) -> HistoryWindow {
     }
 }
 
+// The translate window is the history window's twin: the same note chrome and
+// resize grip, but the header entry drives dictionary lookups instead of a
+// filter, and the scrolling column below holds the rendered answer.
+struct TranslateWindow {
+    card: gtk::EventBox,
+    header: gtk::EventBox,
+    entry: gtk::Entry,
+    hide: gtk::Button,
+    clear: gtk::Button,
+    suggestions: gtk::Box,
+    results: gtk::Box,
+    color_mode: Rc<Cell<ColorMode>>,
+    resize: ResizeHandle,
+}
+
+fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
+    let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
+    card.style_context().add_class("pinned-note");
+    card.style_context().add_class("translate-window");
+    card.set_visible_window(true);
+
+    let header = gtk::EventBox::new();
+    header.set_visible_window(true);
+    header.set_hexpand(true);
+    header.style_context().add_class("note-header");
+    header.style_context().add_class("history-header");
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    bar.set_hexpand(true);
+    let hide = small_button("\u{2212}");
+    hide.style_context().add_class("note-window-button");
+    hide.style_context().add_class("note-hide");
+    hide.set_tooltip_text(Some("Hide Translate"));
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("TYPE OR PASTE\u{2026}"));
+    entry.set_has_frame(false);
+    // Same reason as the history search: GtkEntry's default width-chars is a
+    // hard minimum GtkFixed would honour, pinning the window open at ~150px.
+    entry.set_width_chars(1);
+    entry.set_max_width_chars(1);
+    entry.set_hexpand(true);
+    entry.style_context().add_class("history-search");
+    let clear = small_button("\u{00d7}");
+    clear.style_context().add_class("note-window-button");
+    clear.style_context().add_class("note-close");
+    clear.set_tooltip_text(Some("Clear"));
+    bar.pack_start(&hide, false, false, 0);
+    bar.pack_start(&entry, true, true, 0);
+    bar.pack_end(&clear, false, false, 0);
+    header.add(&bar);
+    body.pack_start(&header, false, false, 0);
+
+    // The completions sit outside the scroller so a long answer never scrolls
+    // them out of reach of the caret they belong to.
+    let suggestions = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    suggestions.style_context().add_class("translate-suggestions");
+    body.pack_start(&suggestions, false, false, 0);
+
+    let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    // External (not Never) horizontally, or the widest definition line would
+    // stop the window from ever being dragged narrower again.
+    scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
+    scroller.set_overlay_scrolling(true);
+    scroller.set_shadow_type(gtk::ShadowType::None);
+    scroller.set_propagate_natural_width(false);
+    scroller.set_propagate_natural_height(false);
+    scroller.set_size_request(1, 1);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.style_context().add_class("history-scroller");
+    let results = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    results.style_context().add_class("translate-results");
+    scroller.add(&results);
+    body.pack_start(&scroller, true, true, 0);
+
+    TranslateWindow {
+        card,
+        header,
+        entry,
+        hide,
+        clear,
+        suggestions,
+        results,
+        color_mode,
+        resize,
+    }
+}
+
+fn clear_children(container: &gtk::Box) {
+    for child in container.children() {
+        container.remove(&child);
+    }
+}
+
+// Every line of a result is a wrapped, left-aligned label; only the CSS class
+// and the markup differ. WordChar wrapping matters because a long IPA string or
+// a URL-like token would otherwise have no break point at all.
+fn translate_line(markup: &str, class: &str) -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.set_markup(markup);
+    label.set_xalign(0.0);
+    label.set_line_wrap(true);
+    label.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
+    // A wrapping label asks for its whole unwrapped text as its natural width,
+    // and GtkFixed hands out natural sizes — so one long definition would drag
+    // the card wider than the user ever sized it. Capping the request keeps the
+    // width the user's to choose and lets the text reflow into it.
+    label.set_max_width_chars(TRANSLATE_WRAP_CHARS);
+    label.set_selectable(true);
+    label.style_context().add_class(class);
+    label
+}
+
+fn translate_row(spacing: i32) -> gtk::Box {
+    gtk::Box::new(gtk::Orientation::Horizontal, spacing)
+}
+
+// A phonetic transcription is short and has no sensible break point, so it is
+// the one line that stays on one line.
+fn translate_inline(markup: &str, class: &str) -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.set_markup(markup);
+    label.set_xalign(0.0);
+    label.set_selectable(true);
+    label.style_context().add_class(class);
+    label
+}
+
+/// A word the user can click to look up: the completions under the entry and
+/// the "did you mean" chips both use it.
+fn translate_word_button(word: &str, lookup: &Rc<dyn Fn(&str)>) -> gtk::Button {
+    let button = gtk::Button::with_label(word);
+    button.set_can_focus(false);
+    button.style_context().add_class("translate-suggestion");
+    if let Some(label) = button.child().and_then(|child| child.downcast::<gtk::Label>().ok()) {
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        // The completions sit outside the scroller, so a long word would widen
+        // the card the same way a definition line would.
+        label.set_max_width_chars(TRANSLATE_WRAP_CHARS);
+    }
+    button.connect_clicked({
+        let lookup = lookup.clone();
+        let word = word.to_owned();
+        move |_| lookup(&word)
+    });
+    button
+}
+
+fn render_translate_suggestions(
+    suggestions: &gtk::Box,
+    items: &[String],
+    lookup: &Rc<dyn Fn(&str)>,
+) {
+    clear_children(suggestions);
+    for word in items {
+        suggestions.pack_start(&translate_word_button(word, lookup), false, false, 0);
+    }
+    suggestions.show_all();
+}
+
+/// Replace the answer column wholesale. Rebuilding rather than patching keeps
+/// the render a pure function of the result, the way the note list works.
+fn render_translate_result(
+    results: &gtk::Box,
+    result: &crate::translate::LookupResult,
+    audio_buttons: &Rc<RefCell<HashMap<String, gtk::Button>>>,
+    audio_tx: &async_channel::Sender<crate::translate::TranslateEvent>,
+    lookup: &Rc<dyn Fn(&str)>,
+) {
+    use crate::translate::{escape_markup, ResultKind};
+
+    clear_children(results);
+    // The buttons in the column just went away; anything still downloading for
+    // them has nothing left to re-enable.
+    audio_buttons.borrow_mut().clear();
+
+    match &result.kind {
+        ResultKind::Sentence(sentence) => {
+            let heading = match sentence.detected.as_deref() {
+                Some("vi") => "VIETNAMESE \u{2192} ENGLISH",
+                _ => "VIETNAMESE",
+            };
+            results.pack_start(&translate_line(heading, "translate-pos"), false, false, 0);
+            results.pack_start(
+                &translate_line(&escape_markup(&sentence.translation), "translate-body"),
+                false,
+                false,
+                0,
+            );
+            results.pack_start(
+                &translate_line("ORIGINAL", "translate-pos"),
+                false,
+                false,
+                0,
+            );
+            results.pack_start(
+                &translate_line(&escape_markup(&sentence.source), "translate-source"),
+                false,
+                false,
+                0,
+            );
+        }
+        ResultKind::Word(word) => {
+            results.pack_start(
+                &translate_line(
+                    &format!("<b>{}</b>", escape_markup(&word.headword)),
+                    "translate-headword",
+                ),
+                false,
+                false,
+                0,
+            );
+            if let Some(gloss) = &word.gloss {
+                results.pack_start(
+                    &translate_line(&escape_markup(gloss), "translate-gloss"),
+                    false,
+                    false,
+                    0,
+                );
+            }
+
+            if !word.pronunciations.is_empty() {
+                let row = translate_row(6);
+                for pronunciation in &word.pronunciations {
+                    let cell = translate_row(2);
+                    cell.pack_start(
+                        &translate_inline(
+                            &format!(
+                                "<b>{}</b> {}",
+                                escape_markup(&pronunciation.lang.to_uppercase()),
+                                escape_markup(&pronunciation.ipa)
+                            ),
+                            "translate-ipa",
+                        ),
+                        false,
+                        false,
+                        0,
+                    );
+                    let speaker = small_button("\u{25b6}");
+                    speaker.style_context().add_class("translate-speaker");
+                    speaker.set_tooltip_text(Some("Play pronunciation"));
+                    speaker.connect_clicked({
+                        let audio_buttons = audio_buttons.clone();
+                        let audio_tx = audio_tx.clone();
+                        let url = pronunciation.audio_url.clone();
+                        move |button| {
+                            // Disabled until the clip lands, so a slow download
+                            // cannot be queued up a dozen times.
+                            button.set_sensitive(false);
+                            audio_buttons
+                                .borrow_mut()
+                                .insert(url.clone(), button.clone());
+                            crate::translate::spawn_audio(url.clone(), audio_tx.clone());
+                        }
+                    });
+                    cell.pack_start(&speaker, false, false, 0);
+                    row.pack_start(&cell, false, false, 0);
+                }
+                results.pack_start(&row, false, false, 0);
+            }
+
+            for entry in &word.vi_entries {
+                let pos = if entry.pos.is_empty() {
+                    "NGHĨA".to_owned()
+                } else {
+                    entry.pos.to_uppercase()
+                };
+                results.pack_start(
+                    &translate_line(&escape_markup(&pos), "translate-pos"),
+                    false,
+                    false,
+                    0,
+                );
+                for meaning in &entry.meanings {
+                    results.pack_start(
+                        &translate_line(
+                            &format!("\u{2022} {}", escape_markup(meaning)),
+                            "translate-meaning",
+                        ),
+                        false,
+                        false,
+                        0,
+                    );
+                }
+            }
+
+            for definition in &word.en_definitions {
+                if !definition.pos.is_empty() {
+                    results.pack_start(
+                        &translate_line(
+                            &escape_markup(&definition.pos.to_uppercase()),
+                            "translate-pos",
+                        ),
+                        false,
+                        false,
+                        0,
+                    );
+                }
+                results.pack_start(
+                    &translate_line(&escape_markup(&definition.text), "translate-body"),
+                    false,
+                    false,
+                    0,
+                );
+                for example in &definition.examples {
+                    results.pack_start(
+                        &translate_line(
+                            &format!("<i>{}</i>", escape_markup(example)),
+                            "translate-example",
+                        ),
+                        false,
+                        false,
+                        0,
+                    );
+                }
+            }
+
+            if !word.examples.is_empty() {
+                results.pack_start(
+                    &translate_line("EXAMPLES", "translate-pos"),
+                    false,
+                    false,
+                    0,
+                );
+                for example in &word.examples {
+                    results.pack_start(
+                        &translate_line(&example.en_markup, "translate-example-en"),
+                        false,
+                        false,
+                        0,
+                    );
+                    results.pack_start(
+                        &translate_line(&escape_markup(&example.vi), "translate-example-vi"),
+                        false,
+                        false,
+                        0,
+                    );
+                }
+            }
+        }
+        ResultKind::NotFound { suggestions } => {
+            results.pack_start(
+                &translate_line(
+                    &format!(
+                        "No dictionary entry for <b>{}</b>",
+                        escape_markup(&result.query)
+                    ),
+                    "translate-status",
+                ),
+                false,
+                false,
+                0,
+            );
+            if !suggestions.is_empty() {
+                results.pack_start(
+                    &translate_line("DID YOU MEAN", "translate-pos"),
+                    false,
+                    false,
+                    0,
+                );
+                for word in suggestions {
+                    results.pack_start(&translate_word_button(word, lookup), false, false, 0);
+                }
+            }
+        }
+        ResultKind::Error(message) => {
+            results.pack_start(
+                &translate_line(&escape_markup(message), "translate-status"),
+                false,
+                false,
+                0,
+            );
+            results.pack_start(
+                &translate_line("Press Enter to try again.", "translate-source"),
+                false,
+                false,
+                0,
+            );
+        }
+    }
+    // Freshly built widgets start hidden; without this the card renders empty.
+    results.show_all();
+}
+
 fn picker_button(label: &str) -> gtk::Button {
     let button = gtk::Button::with_label(label);
     button.set_can_focus(false);
@@ -5117,7 +5865,9 @@ fn refresh_input_shape(
         // Notes and the history list keep receiving input in lock mode so
         // their content can still be scrolled; editing is disabled separately
         // via the read-only editor, and their headers hide as edit chrome.
-        let lock_note = item.key.starts_with("note:") || item.key == "history";
+        let lock_note = item.key.starts_with("note:")
+            || item.key == "history"
+            || item.key == "translate";
         if interactive
             || settings
             || lock_timer

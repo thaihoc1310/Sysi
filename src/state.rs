@@ -104,6 +104,8 @@ pub struct Settings {
     #[serde(default)]
     pub history_open: bool,
     #[serde(default)]
+    pub translate_open: bool,
+    #[serde(default)]
     pub color_mode: ColorMode,
     #[serde(default)]
     pub system_details: SystemDetails,
@@ -116,6 +118,7 @@ impl Default for Settings {
             timer: true,
             settings_button: true,
             history_open: false,
+            translate_open: false,
             color_mode: ColorMode::default(),
             system_details: SystemDetails::default(),
         }
@@ -330,6 +333,13 @@ mod tests {
         let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
             .expect("state without a history flag should remain readable");
         assert!(!state.settings.history_open);
+    }
+
+    #[test]
+    fn old_state_defaults_to_a_closed_translate_window() {
+        let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
+            .expect("state without a translate flag should remain readable");
+        assert!(!state.settings.translate_open);
     }
 
     #[test]

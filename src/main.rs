@@ -1,6 +1,7 @@
 mod platform;
 mod state;
 mod system;
+mod translate;
 mod ui;
 
 use fs2::FileExt;

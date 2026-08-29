@@ -417,6 +417,104 @@ textview, textview text {
   background-color: alpha(currentColor, 0.68);
 }
 
+/* The translate window shares the history chrome (.history-header, the search
+   entry, the fading scrollbar) and adds only the typography of an answer: a
+   headword, small capitalised section tags, and wrapped body lines. */
+.translate-results {
+  padding: 2px 2px 6px 2px;
+}
+
+/* currentColor throughout, like the notes: the card already carries the
+   light/gray/dark mode class, and a fixed colour would go invisible in one of
+   the three. */
+.translate-headword {
+  color: currentColor;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.translate-gloss {
+  color: alpha(currentColor, 0.82);
+  font-size: 12px;
+  font-style: italic;
+}
+
+/* Section tags: part of speech, "EXAMPLES", "DID YOU MEAN". Same small-caps
+   treatment as the history title so the two windows read as a set. */
+/* Section tags — part of speech, "EXAMPLES", "DID YOU MEAN" — wear the same
+   small-caps treatment as the history title so the two windows read as a set. */
+.translate-pos {
+  color: alpha(currentColor, 0.6);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+  margin-top: 5px;
+}
+
+.translate-ipa {
+  font-size: 11px;
+}
+
+.translate-body,
+.translate-meaning {
+  font-size: 12px;
+}
+
+.translate-example,
+.translate-example-en {
+  color: alpha(currentColor, 0.88);
+  font-size: 11px;
+  padding-left: 6px;
+}
+
+.translate-example-vi {
+  color: alpha(currentColor, 0.68);
+  font-size: 11px;
+  font-style: italic;
+  padding-left: 6px;
+}
+
+.translate-source,
+.translate-status {
+  color: alpha(currentColor, 0.66);
+  font-size: 11px;
+}
+
+/* A completion row is a full-width flat button: only the hover wash tells it
+   apart from the answer lines above it. */
+.translate-suggestion {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 3px;
+  box-shadow: none;
+  color: currentColor;
+  font-size: 12px;
+  min-height: 18px;
+  padding: 1px 5px;
+  text-shadow: none;
+}
+
+.translate-suggestion:hover {
+  background-color: alpha(currentColor, 0.14);
+}
+
+.translate-speaker {
+  color: alpha(currentColor, 0.7);
+  font-size: 9px;
+  min-height: 13px;
+  min-width: 13px;
+  padding: 0 3px;
+}
+
+.translate-speaker:hover {
+  color: currentColor;
+}
+
+.translate-speaker:disabled {
+  color: alpha(currentColor, 0.3);
+}
+
 /* The timer renders without the overlay text halo; placed after the
    .mode-* .card rules so it wins at equal specificity. */
 .timer-card .card {
