@@ -424,6 +424,23 @@ textview, textview text {
   padding: 2px 2px 6px 2px;
 }
 
+/* The query panel drops out of the header, so it reads as a recess in the card
+   rather than another floating box: a faint wash, no border. */
+.translate-search-panel {
+  background-color: alpha(currentColor, 0.07);
+  border-radius: 3px;
+  margin: 2px 1px;
+  padding: 3px;
+}
+
+.translate-search-input,
+.translate-search-input text {
+  background-color: transparent;
+  caret-color: currentColor;
+  color: currentColor;
+  font-size: 12px;
+}
+
 /* currentColor throughout, like the notes: the card already carries the
    light/gray/dark mode class, and a fixed colour would go invisible in one of
    the three. */
@@ -439,8 +456,6 @@ textview, textview text {
   font-style: italic;
 }
 
-/* Section tags: part of speech, "EXAMPLES", "DID YOU MEAN". Same small-caps
-   treatment as the history title so the two windows read as a set. */
 /* Section tags — part of speech, "EXAMPLES", "DID YOU MEAN" — wear the same
    small-caps treatment as the history title so the two windows read as a set. */
 .translate-pos {

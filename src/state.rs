@@ -187,6 +187,9 @@ pub struct AppState {
     pub widget_color_modes: HashMap<String, ColorMode>,
     #[serde(default)]
     pub notes: Vec<Note>,
+    /// The last few dictionary queries, most recent first.
+    #[serde(default)]
+    pub recent_searches: Vec<String>,
     #[serde(default = "default_timer")]
     pub timer_seconds: i64,
     #[serde(default)]
@@ -209,6 +212,7 @@ impl Default for AppState {
             sizes: HashMap::new(),
             widget_color_modes: HashMap::new(),
             notes: Vec::new(),
+            recent_searches: Vec::new(),
             timer_seconds: default_timer(),
             timer_style: TimerStyle::default(),
             next_note_id: 1,
@@ -340,6 +344,13 @@ mod tests {
         let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
             .expect("state without a translate flag should remain readable");
         assert!(!state.settings.translate_open);
+    }
+
+    #[test]
+    fn old_state_loads_without_recent_searches() {
+        let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
+            .expect("state saved before search history should remain readable");
+        assert!(state.recent_searches.is_empty());
     }
 
     #[test]

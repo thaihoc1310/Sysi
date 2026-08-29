@@ -43,9 +43,18 @@ const TRANSLATE_SUGGEST_DELAY: Duration = Duration::from_millis(280);
 // The width a result line asks for, in characters. Comfortably narrower than
 // the window's minimum, so the answer never widens the card on its own.
 const TRANSLATE_WRAP_CHARS: i32 = 16;
+// The search box starts one line tall and grows with the text to about four,
+// after which it scrolls rather than eating the results below it.
+const TRANSLATE_INPUT_MIN_HEIGHT: i32 = 22;
+const TRANSLATE_INPUT_MAX_HEIGHT: i32 = 92;
+// How many past queries the window offers back.
+const TRANSLATE_RECENT_LIMIT: usize = 10;
 const RESIZE_HIT_SIZE: i32 = 18;
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+// The dictionary lookup, handed to context menus that are built before it
+// exists. Filled in once during startup, like `CallbackSlot`.
+type LookupSlot = Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>;
 type SystemValues = Rc<RefCell<SystemSnapshot>>;
 
 struct SystemCard {
@@ -270,6 +279,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     let registry: Rc<RefCell<Vec<RegisteredWidget>>> = Rc::new(RefCell::new(Vec::new()));
     let interactive = Rc::new(Cell::new(true));
+    // Context menus are attached while their windows are built, well before the
+    // dictionary lookup they call into exists; the slot is filled once both do.
+    let lookup_slot: LookupSlot = Rc::new(RefCell::new(None));
     window.set_accept_focus(true);
     window.style_context().add_class("editing");
     let (system_color_mode, timer_color_mode, picker_color_mode, system_details) = {
@@ -318,6 +330,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             values: system_card.values.clone(),
             details: system_card.details.clone(),
         }),
+        None,
     );
     attach_drag(
         &system_card.drag,
@@ -387,6 +400,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             open_edit: timer_card.open_edit.clone(),
         }),
         None,
+        None,
     );
     attach_drag(
         &timer_card.drag,
@@ -435,6 +449,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
+        None,
         None,
         None,
     );
@@ -489,6 +504,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         None,
         None,
+        Some(lookup_slot.clone()),
     );
     attach_drag(
         &history.header,
@@ -519,7 +535,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         },
     );
 
-    let translate = build_translate_window(saved_color_mode(&state.borrow(), "translate"));
+    // Shared rather than moved piecemeal into each closure: the query panel,
+    // the completions and the results all have to be reachable together.
+    let translate = Rc::new(build_translate_window(saved_color_mode(
+        &state.borrow(),
+        "translate",
+    )));
     let translate_position = state
         .borrow()
         .positions
@@ -550,7 +571,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         .iter_mut()
         .find(|item| item.key == "translate")
     {
-        item.edit_only = Some(translate.header.clone());
+        item.edit_only = Some(translate.chrome.clone());
     }
     attach_color_mode_menu(
         &translate.card,
@@ -560,6 +581,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         None,
         None,
+        Some(lookup_slot.clone()),
     );
     attach_drag(
         &translate.header,
@@ -595,159 +617,204 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // already superseded can be dropped instead of overwriting the answer the
     // user is reading.
     let (translate_tx, translate_rx) = async_channel::unbounded::<translate::TranslateEvent>();
-    let translate_generation = Rc::new(Cell::new(0u64));
+    // Two counters, not one: a lookup can be in flight for seconds while the
+    // user types the next query, and a shared counter would let those
+    // keystrokes retire the lookup — leaving "Looking it up…" on screen with
+    // nothing left to replace it.
+    let translate_lookup_generation = Rc::new(Cell::new(0u64));
+    let translate_suggest_generation = Rc::new(Cell::new(0u64));
     // The play buttons currently on screen, keyed by the clip they are waiting
     // for. Cleared on every rebuild, so a download that outlives its button
-    // finds nothing to re-enable and quietly does nothing.
+    // finds no one waiting and is neither re-enabled nor played.
     let translate_audio: Rc<RefCell<HashMap<String, gtk::Button>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let translate_pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    // Set while the entry is being filled in on the user's behalf, so clicking
-    // a completion does not immediately ask for completions of itself.
-    let translate_echo = Rc::new(Cell::new(false));
 
-    // Run a query: used by Enter, by the completion rows, and by the "did you
-    // mean" chips.
+    // Whether the query panel is dropped down. Tracked explicitly because
+    // show_all() on the card would otherwise reveal it along with everything
+    // else, exactly like the history window's search mode.
+    let translate_search_open = Rc::new(Cell::new(false));
+
+    // Run a query: used by Enter, by the completion and recent rows, by the
+    // "did you mean" chips, and by the right-click lookup.
     let translate_lookup: Rc<dyn Fn(&str)> = {
-        let entry = translate.entry.clone();
-        let suggestions = translate.suggestions.clone();
-        let results = translate.results.clone();
-        let generation = translate_generation.clone();
+        let translate = translate.clone();
+        let search_open = translate_search_open.clone();
+        let lookup_generation = translate_lookup_generation.clone();
+        let suggest_generation = translate_suggest_generation.clone();
         let audio_buttons = translate_audio.clone();
         let pending = translate_pending.clone();
-        let echo = translate_echo.clone();
         let tx = translate_tx.clone();
         Rc::new(move |query: &str| {
-            let query = query.trim().to_owned();
+            let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
             if query.is_empty() {
                 return;
             }
-            if entry.text() != query {
-                echo.set(true);
-                entry.set_text(&query);
-                entry.set_position(-1);
-                echo.set(false);
-            }
             // A completion that is still in flight would land on top of the
-            // answer; retiring the generation drops it on arrival.
+            // answer; cancel its timer and retire its generation.
             if let Some(source) = pending.borrow_mut().take() {
                 source.remove();
             }
-            clear_children(&suggestions);
+            suggest_generation.set(suggest_generation.get() + 1);
+            // The answer is what the user wants to see now, so the panel gets
+            // out of the way until they ask for it again.
+            search_open.set(false);
+            translate.set_search_visible(false);
+            clear_children(&translate.suggestions);
             audio_buttons.borrow_mut().clear();
-            generation.set(generation.get() + 1);
-            clear_children(&results);
-            results.pack_start(
+            lookup_generation.set(lookup_generation.get() + 1);
+            clear_children(&translate.results);
+            translate.results.pack_start(
                 &translate_line("Looking it up\u{2026}", "translate-status"),
                 false,
                 false,
                 0,
             );
-            results.show_all();
-            translate::spawn_lookup(query, generation.get(), tx.clone());
+            translate.results.show_all();
+            translate::spawn_lookup(query, lookup_generation.get(), tx.clone());
         })
     };
 
-    translate.entry.connect_activate({
-        let translate_lookup = translate_lookup.clone();
-        move |entry| translate_lookup(&entry.text())
-    });
-
-    translate.entry.connect_changed({
-        let suggestions = translate.suggestions.clone();
-        let generation = translate_generation.clone();
+    // Opening and closing the query panel, including the focus grab that lets
+    // the user start typing the moment it appears.
+    let set_translate_search: Rc<dyn Fn(bool)> = {
+        let translate = translate.clone();
+        let search_open = translate_search_open.clone();
+        let state = state.clone();
+        let window = window.clone();
+        let lookup = translate_lookup.clone();
+        let suggest_generation = translate_suggest_generation.clone();
         let pending = translate_pending.clone();
-        let echo = translate_echo.clone();
-        let tx = translate_tx.clone();
-        move |entry| {
-            if echo.get() {
-                return;
-            }
+        Rc::new(move |open: bool| {
+            search_open.set(open);
+            translate.set_search_visible(open);
+            // Whichever way the panel moves, a completion request that has not
+            // fired yet is no longer wanted.
             if let Some(source) = pending.borrow_mut().take() {
                 source.remove();
             }
-            clear_children(&suggestions);
-            let text = entry.text().trim().to_owned();
-            // Prose has no completions worth offering, and neither does an
-            // empty box.
-            if text.is_empty() || translate::is_sentence(&text) {
-                generation.set(generation.get() + 1);
+            suggest_generation.set(suggest_generation.get() + 1);
+            if !open {
+                clear_children(&translate.suggestions);
                 return;
             }
-            let generation_for_timer = generation.clone();
-            let pending_for_timer = pending.clone();
-            let tx = tx.clone();
-            let source = glib::timeout_add_local_once(TRANSLATE_SUGGEST_DELAY, move || {
-                pending_for_timer.borrow_mut().take();
-                generation_for_timer.set(generation_for_timer.get() + 1);
-                translate::spawn_suggest(text, generation_for_timer.get(), tx);
+            // Start empty rather than pre-selecting the last query: selecting
+            // text in a GtkTextView hands it the X11 primary selection, which
+            // would clobber whatever the user had highlighted elsewhere — the
+            // very thing the "LOOK UP" menu item reads.
+            translate.set_query("");
+            render_translate_recents(&translate.suggestions, &state, &lookup);
+            glib::idle_add_local_once({
+                let window = window.clone();
+                let input = translate.input.clone();
+                let search_open = search_open.clone();
+                move || {
+                    // The panel can be closed again before this runs, e.g. when
+                    // a right-click lookup opens the window and immediately
+                    // shows a result.
+                    if !search_open.get() {
+                        return;
+                    }
+                    present_overlay(&window);
+                    input.grab_focus();
+                }
             });
-            *pending.borrow_mut() = Some(source);
+        })
+    };
+
+    translate.open_search.connect_clicked({
+        let set_translate_search = set_translate_search.clone();
+        move |_| set_translate_search(true)
+    });
+    translate.close_search.connect_clicked({
+        let set_translate_search = set_translate_search.clone();
+        move |_| set_translate_search(false)
+    });
+
+    // Enter runs the query; Shift+Enter is left alone so a multi-line paste can
+    // still be edited by hand.
+    translate.input.connect_key_press_event({
+        let translate = translate.clone();
+        let translate_lookup = translate_lookup.clone();
+        move |_, event| {
+            let enter = matches!(
+                event.keyval(),
+                gdk::keys::constants::Return | gdk::keys::constants::KP_Enter
+            );
+            if enter && !event.state().contains(gdk::ModifierType::SHIFT_MASK) {
+                translate_lookup(&translate.query());
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
         }
     });
 
-    // GtkEntry drops everything after the first newline of a paste, which would
-    // silently truncate the paragraph the user meant to translate. Take the
-    // clipboard over and flatten it into one line instead.
-    translate.entry.connect_paste_clipboard(|entry| {
-        entry.stop_signal_emission_by_name("paste-clipboard");
-        let Some(text) = entry
-            .clipboard(&gdk::SELECTION_CLIPBOARD)
-            .wait_for_text()
-            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
-            .filter(|text| !text.is_empty())
-        else {
-            return;
-        };
-        entry.delete_selection();
-        let mut position = entry.position();
-        entry.insert_text(&text, &mut position);
-        entry.set_position(position);
-    });
-
-    let clear_translate: Rc<dyn Fn()> = {
-        let entry = translate.entry.clone();
-        let suggestions = translate.suggestions.clone();
-        let results = translate.results.clone();
-        let audio_buttons = translate_audio.clone();
-        let generation = translate_generation.clone();
-        let pending = translate_pending.clone();
-        Rc::new(move || {
-            if let Some(source) = pending.borrow_mut().take() {
-                source.remove();
+    if let Some(buffer) = translate.input.buffer() {
+        buffer.connect_changed({
+            let translate = translate.clone();
+            let state = state.clone();
+            let generation = translate_suggest_generation.clone();
+            let pending = translate_pending.clone();
+            let tx = translate_tx.clone();
+            let lookup = translate_lookup.clone();
+            move |_| {
+                if let Some(source) = pending.borrow_mut().take() {
+                    source.remove();
+                }
+                let text = translate.query();
+                // Prose has no completions worth offering; an empty box goes
+                // back to showing what was searched before.
+                if text.is_empty() {
+                    generation.set(generation.get() + 1);
+                    render_translate_recents(&translate.suggestions, &state, &lookup);
+                    return;
+                }
+                clear_children(&translate.suggestions);
+                if translate::is_sentence(&text) {
+                    generation.set(generation.get() + 1);
+                    return;
+                }
+                let generation_for_timer = generation.clone();
+                let pending_for_timer = pending.clone();
+                let tx = tx.clone();
+                let source = glib::timeout_add_local_once(TRANSLATE_SUGGEST_DELAY, move || {
+                    pending_for_timer.borrow_mut().take();
+                    generation_for_timer.set(generation_for_timer.get() + 1);
+                    translate::spawn_suggest(text, generation_for_timer.get(), tx);
+                });
+                *pending.borrow_mut() = Some(source);
             }
-            // Retire the generation too: a lookup already in flight must not
-            // repaint the column the user just emptied.
-            generation.set(generation.get() + 1);
-            audio_buttons.borrow_mut().clear();
-            clear_children(&suggestions);
-            clear_children(&results);
-            entry.set_text("");
-        })
-    };
-    translate.clear.connect_clicked({
-        let clear_translate = clear_translate.clone();
-        move |_| clear_translate()
-    });
+        });
+    }
 
     glib::MainContext::default().spawn_local({
         let suggestions = translate.suggestions.clone();
         let results = translate.results.clone();
-        let generation = translate_generation.clone();
+        let lookup_generation = translate_lookup_generation.clone();
+        let suggest_generation = translate_suggest_generation.clone();
         let audio_buttons = translate_audio.clone();
         let lookup = translate_lookup.clone();
+        let state = state.clone();
         let tx = translate_tx.clone();
         async move {
             while let Ok(event) = translate_rx.recv().await {
                 match event {
                     translate::TranslateEvent::Suggestions { generation: at, items }
-                        if at == generation.get() =>
+                        if at == suggest_generation.get() =>
                     {
                         render_translate_suggestions(&suggestions, &items, &lookup);
                     }
                     translate::TranslateEvent::Lookup { generation: at, result }
-                        if at == generation.get() =>
+                        if at == lookup_generation.get() =>
                     {
+                        // Remembered here rather than when the query was sent,
+                        // so a typo that found nothing never enters the list.
+                        if matches!(
+                            result.kind,
+                            translate::ResultKind::Word(_) | translate::ResultKind::Sentence(_)
+                        ) {
+                            remember_search(&state, &result.query);
+                        }
                         render_translate_result(
                             &results,
                             &result,
@@ -757,10 +824,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         );
                     }
                     translate::TranslateEvent::AudioReady { url, path } => {
+                        // Only play for a button that is still on screen: a clip
+                        // that finished downloading after the user moved on to
+                        // another word would otherwise speak over the new one.
                         if let Some(button) = audio_buttons.borrow_mut().remove(&url) {
                             button.set_sensitive(true);
+                            translate::play_audio(&path);
                         }
-                        translate::play_audio(&path);
                     }
                     translate::TranslateEvent::AudioFailed { url } => {
                         if let Some(button) = audio_buttons.borrow_mut().remove(&url) {
@@ -776,10 +846,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     });
 
     let toggle_translate: Rc<dyn Fn()> = {
+        let translate = translate.clone();
         let card = translate.card.clone();
-        let header = translate.header.clone();
-        let entry = translate.entry.clone();
-        let suggestions = translate.suggestions.clone();
+        let chrome = translate.chrome.clone();
+        let search_open = translate_search_open.clone();
+        let set_translate_search = set_translate_search.clone();
         let state = state.clone();
         let window = window.clone();
         let registry = registry.clone();
@@ -805,21 +876,16 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     &registry,
                 );
                 card.show_all();
-                // show_all() reveals the header regardless of lock mode, and
-                // any stale completions from the last session.
-                clear_children(&suggestions);
-                header.set_visible(interactive.get());
+                // show_all() reveals the chrome and the query panel regardless
+                // of lock mode; restore both rules.
+                chrome.set_visible(interactive.get());
                 if interactive.get() {
-                    // Focus once the reopened card is mapped, so the user can
-                    // type straight away.
-                    glib::idle_add_local_once({
-                        let window = window.clone();
-                        let entry = entry.clone();
-                        move || {
-                            present_overlay(&window);
-                            entry.grab_focus();
-                        }
-                    });
+                    // Opening the window is an intent to look something up, so
+                    // the query panel comes down ready to type into.
+                    set_translate_search(true);
+                } else {
+                    search_open.set(false);
+                    translate.set_search_visible(false);
                 }
             } else {
                 card.hide();
@@ -846,6 +912,25 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     translate.hide.connect_clicked({
         let toggle_translate = toggle_translate.clone();
         move |_| toggle_translate()
+    });
+
+    // Now that both halves exist, the "LOOK UP" context-menu item can bring the
+    // dictionary up and run the query in one go.
+    *lookup_slot.borrow_mut() = Some({
+        let card = translate.card.clone();
+        let toggle_translate = toggle_translate.clone();
+        let translate_lookup = translate_lookup.clone();
+        let interactive = interactive.clone();
+        let lock = widget_picker.lock.clone();
+        Rc::new(move |query: &str| {
+            if !interactive.get() {
+                lock.clicked();
+            }
+            if !card.is_visible() {
+                toggle_translate();
+            }
+            translate_lookup(query);
+        }) as Rc<dyn Fn(&str)>
     });
 
     let note_refresh: CallbackSlot = Rc::new(RefCell::new(None));
@@ -891,6 +976,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 note_refresh.clone(),
                 interactive.clone(),
                 window.clone(),
+                lookup_slot.clone(),
             );
             refresh_input_shape(&window, &registry, interactive.get());
             glib::idle_add_local_once({
@@ -1322,8 +1408,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let history_card = history.card.clone();
         let close_history_search = close_history_search.clone();
         let translate_card = translate.card.clone();
-        let translate_entry = translate.entry.clone();
-        let clear_translate = clear_translate.clone();
+        let translate_search_open = translate_search_open.clone();
+        let set_translate_search = set_translate_search.clone();
         move |_, event| {
             if event.keyval() == gdk::keys::constants::Escape {
                 // The overlay sees key events before the focused widget, so
@@ -1333,13 +1419,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     close_history_search();
                     return glib::Propagation::Stop;
                 }
-                // Same for a translate query in progress: the first Escape
-                // empties the box, and only a second one locks the overlay.
-                if translate_card.is_visible()
-                    && translate_entry.has_focus()
-                    && !translate_entry.text().is_empty()
-                {
-                    clear_translate();
+                // Same for the dictionary's query panel: the first Escape puts
+                // it away, and only a second one locks the overlay. In lock
+                // mode the panel is already hidden as edit chrome, so there is
+                // nothing to put away.
+                if interactive.get() && translate_card.is_visible() && translate_search_open.get() {
+                    set_translate_search(false);
                     return glib::Propagation::Stop;
                 }
                 if interactive.get() {
@@ -1385,6 +1470,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     if !state.borrow().settings.history_open {
         history.card.hide();
     }
+    // Likewise the dictionary: show_all() dropped its query panel down, but a
+    // window restored from the last session was not asked for just now.
+    translate.set_search_visible(false);
     if !state.borrow().settings.translate_open {
         translate.card.hide();
     }
@@ -3903,6 +3991,7 @@ fn rebuild_pinned_notes(
     refresh: CallbackSlot,
     interactive: Rc<Cell<bool>>,
     window: gtk::ApplicationWindow,
+    lookup: LookupSlot,
 ) {
     let old: Vec<gtk::EventBox> = registry
         .borrow()
@@ -4038,6 +4127,7 @@ fn rebuild_pinned_notes(
             interactive.clone(),
             None,
             None,
+            Some(lookup.clone()),
         );
         attach_drag(
             &header_drag,
@@ -4405,19 +4495,53 @@ fn build_history_window(initial_color_mode: ColorMode) -> HistoryWindow {
     }
 }
 
-// The translate window is the history window's twin: the same note chrome and
-// resize grip, but the header entry drives dictionary lookups instead of a
-// filter, and the scrolling column below holds the rendered answer.
+// The dictionary window is the history window's twin: the same note chrome and
+// resize grip, a plain title bar to grab it by, and a scrolling column of
+// results. The query box is a drop-down panel rather than part of the header,
+// so the header stays easy to grab and the box is free to grow with a paste.
 struct TranslateWindow {
     card: gtk::EventBox,
+    /// The header and the query panel together. Registered as the window's edit
+    /// chrome, so locking the overlay takes the whole search affordance away
+    /// instead of leaving a headless card with a live text box in it.
+    chrome: gtk::EventBox,
     header: gtk::EventBox,
-    entry: gtk::Entry,
     hide: gtk::Button,
-    clear: gtk::Button,
+    open_search: gtk::Button,
+    close_search: gtk::Button,
+    search_panel: gtk::Box,
+    input: gtk::TextView,
     suggestions: gtk::Box,
     results: gtk::Box,
     color_mode: Rc<Cell<ColorMode>>,
     resize: ResizeHandle,
+}
+
+impl TranslateWindow {
+    /// Drop the query panel down or put it away. The magnifier and the cross
+    /// share the header's trailing slot, so only one of them ever shows.
+    fn set_search_visible(&self, open: bool) {
+        self.search_panel.set_visible(open);
+        self.open_search.set_visible(!open);
+        self.close_search.set_visible(open);
+    }
+
+    fn query(&self) -> String {
+        let Some(buffer) = self.input.buffer() else {
+            return String::new();
+        };
+        let (start, end) = buffer.bounds();
+        buffer
+            .text(&start, &end, false)
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
+    }
+
+    fn set_query(&self, text: &str) {
+        if let Some(buffer) = self.input.buffer() {
+            buffer.set_text(text);
+        }
+    }
 }
 
 fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
@@ -4425,6 +4549,15 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
     card.style_context().add_class("pinned-note");
     card.style_context().add_class("translate-window");
     card.set_visible_window(true);
+
+    // The title bar and the query panel move together in and out of lock mode,
+    // so they share one container that the registry can hide as edit chrome.
+    let chrome = gtk::EventBox::new();
+    chrome.set_visible_window(false);
+    chrome.set_hexpand(true);
+    let chrome_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    chrome.add(&chrome_box);
+    body.pack_start(&chrome, false, false, 0);
 
     let header = gtk::EventBox::new();
     header.set_visible_window(true);
@@ -4436,31 +4569,59 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
     let hide = small_button("\u{2212}");
     hide.style_context().add_class("note-window-button");
     hide.style_context().add_class("note-hide");
-    hide.set_tooltip_text(Some("Hide Translate"));
-    let entry = gtk::Entry::new();
-    entry.set_placeholder_text(Some("TYPE OR PASTE\u{2026}"));
-    entry.set_has_frame(false);
-    // Same reason as the history search: GtkEntry's default width-chars is a
-    // hard minimum GtkFixed would honour, pinning the window open at ~150px.
-    entry.set_width_chars(1);
-    entry.set_max_width_chars(1);
-    entry.set_hexpand(true);
-    entry.style_context().add_class("history-search");
-    let clear = small_button("\u{00d7}");
-    clear.style_context().add_class("note-window-button");
-    clear.style_context().add_class("note-close");
-    clear.set_tooltip_text(Some("Clear"));
+    hide.set_tooltip_text(Some("Hide Dictionary"));
+    // The title fills the row so almost all of the header is drag surface.
+    let title = gtk::Label::new(Some("DICTIONARY"));
+    title.set_xalign(0.0);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.style_context().add_class("history-title");
+    let open_search = icon_button("edit-find-symbolic", "Search");
+    let close_search = small_button("\u{00d7}");
+    close_search.style_context().add_class("note-window-button");
+    close_search.style_context().add_class("note-close");
+    close_search.set_tooltip_text(Some("Close search"));
     bar.pack_start(&hide, false, false, 0);
-    bar.pack_start(&entry, true, true, 0);
-    bar.pack_end(&clear, false, false, 0);
+    bar.pack_start(&title, true, true, 0);
+    // Packed end-first so both occupants of the trailing slot land in the same
+    // spot, whichever one is showing.
+    bar.pack_end(&close_search, false, false, 0);
+    bar.pack_end(&open_search, false, false, 0);
     header.add(&bar);
-    body.pack_start(&header, false, false, 0);
+    chrome_box.pack_start(&header, false, false, 0);
 
-    // The completions sit outside the scroller so a long answer never scrolls
-    // them out of reach of the caret they belong to.
+    // The search panel drops down under the header: a text view that grows with
+    // what is typed or pasted, and the completions right beneath it.
+    let search_panel = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    search_panel.style_context().add_class("translate-search-panel");
+    let input_scroller =
+        gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    input_scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
+    input_scroller.set_shadow_type(gtk::ShadowType::None);
+    input_scroller.set_overlay_scrolling(true);
+    // Height follows the content, capped at a few lines: a pasted paragraph
+    // makes the box taller instead of scrolling a single line sideways, but it
+    // can never crowd out the results below it.
+    input_scroller.set_propagate_natural_height(true);
+    input_scroller.set_min_content_height(TRANSLATE_INPUT_MIN_HEIGHT);
+    input_scroller.set_max_content_height(TRANSLATE_INPUT_MAX_HEIGHT);
+    input_scroller.set_propagate_natural_width(false);
+    input_scroller.set_size_request(1, 1);
+    input_scroller.set_hexpand(true);
+    let input = gtk::TextView::new();
+    input.set_wrap_mode(gtk::WrapMode::WordChar);
+    input.set_accepts_tab(false);
+    // Same width discipline as the note editor: without it the longest line
+    // would set a minimum the card could never be dragged below.
+    input.set_size_request(1, 1);
+    input.style_context().add_class("translate-search-input");
+    input_scroller.add(&input);
+    search_panel.pack_start(&input_scroller, false, false, 0);
+
+    // The completions live inside the panel so they come and go with it.
     let suggestions = gtk::Box::new(gtk::Orientation::Vertical, 0);
     suggestions.style_context().add_class("translate-suggestions");
-    body.pack_start(&suggestions, false, false, 0);
+    search_panel.pack_start(&suggestions, false, false, 0);
+    chrome_box.pack_start(&search_panel, false, false, 0);
 
     let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     // External (not Never) horizontally, or the widest definition line would
@@ -4481,10 +4642,13 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
 
     TranslateWindow {
         card,
+        chrome,
         header,
-        entry,
         hide,
-        clear,
+        open_search,
+        close_search,
+        search_panel,
+        input,
         suggestions,
         results,
         color_mode,
@@ -4563,6 +4727,53 @@ fn render_translate_suggestions(
         suggestions.pack_start(&translate_word_button(word, lookup), false, false, 0);
     }
     suggestions.show_all();
+}
+
+/// What an empty search box offers instead of completions: the queries the user
+/// ran before, newest first.
+fn render_translate_recents(
+    suggestions: &gtk::Box,
+    state: &Rc<RefCell<AppState>>,
+    lookup: &Rc<dyn Fn(&str)>,
+) {
+    clear_children(suggestions);
+    let recents = state.borrow().recent_searches.clone();
+    if recents.is_empty() {
+        return;
+    }
+    suggestions.pack_start(&translate_line("RECENT", "translate-pos"), false, false, 0);
+    for query in &recents {
+        suggestions.pack_start(&translate_word_button(query, lookup), false, false, 0);
+    }
+    suggestions.show_all();
+}
+
+/// Move a query to the front of the recents, keeping the list short and free of
+/// duplicates that differ only in case or spacing. Returns whether anything
+/// changed, so an unchanged list costs no disk write.
+fn push_recent_search(recents: &mut Vec<String>, query: &str, limit: usize) -> bool {
+    let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    if query.is_empty() || limit == 0 {
+        return false;
+    }
+    if recents.first().is_some_and(|first| *first == query) {
+        return false;
+    }
+    // Case-insensitively, so searching "Hello" after "hello" re-ranks the entry
+    // rather than listing it twice.
+    recents.retain(|past| !past.eq_ignore_ascii_case(&query));
+    recents.insert(0, query);
+    recents.truncate(limit);
+    true
+}
+
+/// Record a query and persist it. Called once a lookup has actually produced
+/// something, so the unbatched `save()` runs at most once per result.
+fn remember_search(state: &Rc<RefCell<AppState>>, query: &str) {
+    let mut data = state.borrow_mut();
+    if push_recent_search(&mut data.recent_searches, query, TRANSLATE_RECENT_LIMIT) {
+        let _ = data.save();
+    }
 }
 
 /// Replace the answer column wholesale. Rebuilding rather than patching keeps
@@ -4778,7 +4989,9 @@ fn render_translate_result(
                 0,
             );
             results.pack_start(
-                &translate_line("Press Enter to try again.", "translate-source"),
+                // The query panel is closed by now, so there is no caret to
+                // press Enter in — point at the control that is actually there.
+                &translate_line("Open search to try again.", "translate-source"),
                 false,
                 false,
                 0,
@@ -4906,6 +5119,26 @@ fn register(
     });
 }
 
+/// Whatever text is currently selected anywhere on the desktop, flattened to a
+/// single line. X11 keeps the primary selection up to date as text is
+/// highlighted, so this needs no cooperation from the widget under the pointer.
+fn primary_selection() -> String {
+    gtk::Clipboard::get(&gdk::SELECTION_PRIMARY)
+        .wait_for_text()
+        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
+}
+
+/// Shorten a selection for display in a menu label, counting characters rather
+/// than bytes so a Vietnamese phrase is never cut mid-codepoint.
+fn ellipsize(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{}\u{2026}", kept.trim_end())
+}
+
 fn saved_color_mode(state: &AppState, key: &str) -> ColorMode {
     state
         .widget_color_modes
@@ -4927,6 +5160,7 @@ fn set_edit_chrome_visibility(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, vis
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attach_color_mode_menu(
     widget: &gtk::EventBox,
     key: String,
@@ -4935,8 +5169,41 @@ fn attach_color_mode_menu(
     interactive: Rc<Cell<bool>>,
     timer_style: Option<TimerStylePreview>,
     system_details: Option<SystemDetailsPreview>,
+    lookup: Option<LookupSlot>,
 ) {
     let menu = gtk::Menu::new();
+
+    // Looking up the selection sits at the top, above the colour modes: it is
+    // the one item that acts on what the user just highlighted rather than on
+    // the widget itself. The label is rewritten and the row shown or hidden
+    // each time the menu pops up, from whatever is in the X11 primary
+    // selection — which is set by selecting text in any application, so this
+    // works on a note, on a result, or on text selected in a browser.
+    let selected: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let lookup_item = lookup.map(|lookup| {
+        let item = gtk::MenuItem::with_label("LOOK UP");
+        item.connect_activate({
+            let lookup = lookup.clone();
+            let selected = selected.clone();
+            move |_| {
+                let query = selected.borrow().clone();
+                if query.is_empty() {
+                    return;
+                }
+                // Cloned out of the borrow: the callback re-enters the UI, and
+                // holding the slot borrowed across that would be a trap for
+                // whoever next writes to it.
+                let run = lookup.borrow().clone();
+                if let Some(run) = run {
+                    run(&query);
+                }
+            }
+        });
+        let separator = gtk::SeparatorMenuItem::new();
+        menu.append(&item);
+        menu.append(&separator);
+        (item, separator)
+    });
     for mode in [ColorMode::Light, ColorMode::Gray, ColorMode::Dark] {
         let item = gtk::MenuItem::with_label(mode.label());
         item.connect_activate({
@@ -5060,6 +5327,19 @@ fn attach_color_mode_menu(
         if !interactive.get() {
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
+        }
+        if let Some((item, separator)) = &lookup_item {
+            let query = primary_selection();
+            // The separator belongs to the item; leaving it behind would open
+            // every menu with a stray rule above the colour modes.
+            item.set_visible(!query.is_empty());
+            separator.set_visible(!query.is_empty());
+            if !query.is_empty() {
+                if let Some(label) = item.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+                    label.set_label(&format!("LOOK UP  \u{201c}{}\u{201d}", ellipsize(&query, 22)));
+                }
+            }
+            *selected.borrow_mut() = query;
         }
         gesture.set_state(gtk::EventSequenceState::Claimed);
         menu.popup_easy(3, gtk::current_event_time());
@@ -6096,11 +6376,12 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        cascade_point, fit_within_bounds, history_row_budget, image_room, image_room_after_y,
-        monitor_coordinate_divisor, monitor_root_bounds, normalize_monitor_rect, note_headline,
-        note_image_cap, note_size_for_image, parse_timer_input, record_note_undo, reopen_point,
-        resize_width_limit, resized_image_size, round_pixbuf_corners, system_content_size,
-        timer_style_size, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT,
+        cascade_point, ellipsize, fit_within_bounds, history_row_budget, image_room,
+        image_room_after_y, monitor_coordinate_divisor, monitor_root_bounds,
+        normalize_monitor_rect, note_headline, note_image_cap, note_size_for_image,
+        parse_timer_input, push_recent_search, record_note_undo, reopen_point, resize_width_limit,
+        resized_image_size, round_pixbuf_corners, system_content_size, timer_style_size,
+        NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT,
         HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
         NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT, NOTE_WIDTH,
     };
@@ -6508,5 +6789,46 @@ mod timer_input_tests {
                 height: 76
             }
         );
+    }
+
+    #[test]
+    fn a_repeated_search_moves_to_the_front_instead_of_being_listed_twice() {
+        let mut recents = vec!["beta".to_owned(), "alpha".to_owned()];
+        assert!(push_recent_search(&mut recents, "alpha", 10));
+        assert_eq!(recents, ["alpha", "beta"]);
+        // Case and spacing differences are the same search.
+        assert!(push_recent_search(&mut recents, "  BETA  ", 10));
+        assert_eq!(recents, ["BETA", "alpha"]);
+    }
+
+    #[test]
+    fn searching_the_same_thing_twice_running_changes_nothing() {
+        // The caller only writes to disk when this reports a change.
+        let mut recents = vec!["alpha".to_owned()];
+        assert!(!push_recent_search(&mut recents, "alpha", 10));
+        assert!(!push_recent_search(&mut recents, "   ", 10));
+        assert!(!push_recent_search(&mut recents, "beta", 0));
+        assert_eq!(recents, ["alpha"]);
+    }
+
+    #[test]
+    fn the_recent_list_stops_growing_at_its_limit() {
+        let mut recents = Vec::new();
+        for index in 0..12 {
+            assert!(push_recent_search(&mut recents, &format!("word{index}"), 10));
+        }
+        assert_eq!(recents.len(), 10);
+        // Newest first, oldest dropped off the end.
+        assert_eq!(recents[0], "word11");
+        assert_eq!(recents[9], "word2");
+    }
+
+    #[test]
+    fn a_menu_label_is_shortened_without_splitting_a_character() {
+        assert_eq!(ellipsize("short", 22), "short");
+        assert_eq!(ellipsize("abcdefghij", 5), "abcde\u{2026}");
+        // Counted in characters, so Vietnamese is never cut mid-codepoint.
+        assert_eq!(ellipsize("nền tảng cho khách", 8), "nền tảng\u{2026}");
+        assert_eq!(ellipsize("ab cdef", 3), "ab\u{2026}");
     }
 }

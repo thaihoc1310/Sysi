@@ -14,6 +14,10 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     thread,
     time::Duration,
 };
@@ -120,17 +124,32 @@ pub struct BilingualExample {
 /// user typed after it, and the generation counter already makes late replies
 /// free to discard.
 pub fn spawn_lookup(query: String, generation: u64, tx: Sender<TranslateEvent>) {
-    spawn_named("sysi-lookup", move || {
-        let kind = if is_sentence(&query) {
-            translate_sentence(&query)
-        } else {
-            lookup_word(&query)
-        };
-        let _ = tx.send_blocking(TranslateEvent::Lookup {
-            generation,
-            result: LookupResult { query, kind },
-        });
+    let failed = tx.clone();
+    let started = spawn_named("sysi-lookup", {
+        let query = query.clone();
+        move || {
+            let kind = if is_sentence(&query) {
+                translate_sentence(&query)
+            } else {
+                lookup_word(&query)
+            };
+            let _ = tx.send_blocking(TranslateEvent::Lookup {
+                generation,
+                result: LookupResult { query, kind },
+            });
+        }
     });
+    if !started {
+        // The window is showing "Looking it up…" and only a Lookup event takes
+        // it down, so a worker that never started still owes one back.
+        let _ = failed.send_blocking(TranslateEvent::Lookup {
+            generation,
+            result: LookupResult {
+                query,
+                kind: ResultKind::Error("Could not start the lookup".into()),
+            },
+        });
+    }
 }
 
 /// Fetch the type-ahead completions for a prefix.
@@ -206,8 +225,57 @@ pub fn play_audio(path: &Path) {
     }
 }
 
-fn spawn_named<F: FnOnce() + Send + 'static>(name: &str, work: F) {
-    let _ = thread::Builder::new().name(name.to_owned()).spawn(work);
+/// Start a worker, reporting whether it actually got off the ground. Every
+/// caller has to cope with `false`: the process can be out of thread slots, and
+/// silently dropping the work would leave the window waiting for a reply that
+/// is never coming.
+fn spawn_named<F: FnOnce() + Send + 'static>(name: &str, work: F) -> bool {
+    thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(work)
+        .is_ok()
+}
+
+/// One in-flight GET. Described by its URL rather than by a closure, so that a
+/// request which could not get a thread can still be run in series at join
+/// time instead of being dropped on the floor.
+enum Fetch {
+    Running(thread::JoinHandle<Result<String, String>>),
+    Deferred(String),
+}
+
+fn spawn_fetch(name: &str, url: String) -> Fetch {
+    let work = {
+        let url = url.clone();
+        move || http_get(&url)
+    };
+    match thread::Builder::new().name(name.to_owned()).spawn(work) {
+        Ok(handle) => Fetch::Running(handle),
+        Err(_) => Fetch::Deferred(url),
+    }
+}
+
+impl Fetch {
+    fn join(self) -> Fetched {
+        let body = match self {
+            Fetch::Running(handle) => match handle.join() {
+                Ok(body) => body,
+                // The worker died mid-request; treat it as unreachable rather
+                // than as "the word does not exist".
+                Err(_) => return Fetched::Unreachable,
+            },
+            Fetch::Deferred(url) => http_get(&url),
+        };
+        match body {
+            Ok(body) => match serde_json::from_str::<Value>(&body) {
+                Ok(json) => Fetched::Json(json),
+                // http_get turns a non-2xx status into an empty body, so an
+                // unparseable reply here really is "reached, nothing to say".
+                Err(_) => Fetched::Empty,
+            },
+            Err(_) => Fetched::Unreachable,
+        }
+    }
 }
 
 // ------------------------------------------------------------------- lookups
@@ -219,18 +287,22 @@ fn translate_sentence(query: &str) -> ResultKind {
             // Vietnamese; flip the direction so a pasted Vietnamese paragraph
             // still gets translated.
             if detected.as_deref() == Some("vi") {
-                if let Ok((english, _)) = google_translate(query, "en") {
-                    return ResultKind::Sentence(SentenceResult {
+                return match google_translate(query, "en") {
+                    Ok((english, _)) => ResultKind::Sentence(SentenceResult {
                         source: query.to_owned(),
                         translation: english,
                         detected: Some("vi".into()),
-                    });
-                }
+                    }),
+                    // Falling through would present Google's echo of the input
+                    // as if it were the translation.
+                    Err(error) => ResultKind::Error(error),
+                };
             }
             ResultKind::Sentence(SentenceResult {
                 source: query.to_owned(),
                 translation,
-                detected: None,
+                // Only a non-English source is worth naming in the heading.
+                detected: detected.filter(|language| language != "en"),
             })
         }
         Err(error) => ResultKind::Error(error),
@@ -238,30 +310,27 @@ fn translate_sentence(query: &str) -> ResultKind {
 }
 
 fn lookup_word(query: &str) -> ResultKind {
-    // The three sources are independent, so they run at once and the slowest
-    // one sets the wait rather than the sum of all three.
-    let cambridge = {
-        let url = format!(
+    // The two dictionaries are independent, so they run at once and the slower
+    // one sets the wait. The gloss runs here on the calling thread, which would
+    // otherwise just block waiting for them.
+    let cambridge = spawn_fetch(
+        "sysi-cambridge",
+        format!(
             "https://dictionary-api.eliaschen.dev/api/dictionary/en/{}",
             percent_encode(query)
-        );
-        spawn_fetch(url)
-    };
-    let tracau = {
-        let url = format!(
+        ),
+    );
+    let tracau = spawn_fetch(
+        "sysi-tracau",
+        format!(
             "https://api.tracau.vn/WBBcwnwQpV89/s/{}/en",
             percent_encode(query)
-        );
-        spawn_fetch(url)
-    };
-    let gloss = {
-        let query = query.to_owned();
-        thread::spawn(move || google_translate(&query, "vi"))
-    };
+        ),
+    );
+    let gloss = google_translate(query, "vi").ok();
 
-    let cambridge = join_json(cambridge);
-    let tracau = join_json(tracau);
-    let gloss = gloss.join().ok().and_then(|result| result.ok());
+    let cambridge = cambridge.join();
+    let tracau = tracau.join();
 
     // A 404 from Cambridge is "no such word", not a failure to reach it, so it
     // must not count towards the offline check below.
@@ -282,6 +351,12 @@ fn lookup_word(query: &str) -> ResultKind {
     };
 
     if en_definitions.is_empty() && vi_entries.is_empty() && examples.is_empty() {
+        // A single accented word that no English dictionary knows is far more
+        // likely to be Vietnamese than a typo, and "did you mean" has nothing
+        // useful to offer for it — translate it instead.
+        if query.chars().any(|c| c.is_alphabetic() && !c.is_ascii()) {
+            return translate_sentence(query);
+        }
         return ResultKind::NotFound {
             suggestions: fetch_did_you_mean(query),
         };
@@ -309,23 +384,6 @@ enum Fetched {
     /// Reached, but the answer was an error or unparseable (e.g. a 404).
     Empty,
     Unreachable,
-}
-
-fn spawn_fetch(url: String) -> thread::JoinHandle<Result<String, String>> {
-    thread::spawn(move || http_get(&url))
-}
-
-fn join_json(handle: thread::JoinHandle<Result<String, String>>) -> Fetched {
-    match handle.join() {
-        Ok(Ok(body)) => match serde_json::from_str::<Value>(&body) {
-            Ok(json) => Fetched::Json(json),
-            Err(_) => Fetched::Empty,
-        },
-        // http_get maps a non-2xx status to Empty by returning Ok(String::new()),
-        // so anything left here really is a transport failure.
-        Ok(Err(_)) => Fetched::Unreachable,
-        Err(_) => Fetched::Unreachable,
-    }
 }
 
 fn fetch_did_you_mean(word: &str) -> Vec<String> {
@@ -362,19 +420,25 @@ fn google_translate(query: &str, target: &str) -> Result<(String, Option<String>
 
 /// Decide whether the input is prose to translate or a word to look up.
 pub fn is_sentence(input: &str) -> bool {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
+    // Punctuation that merely bookends the query says nothing about whether it
+    // is prose: "hello." typed in a hurry is still a word to look up.
+    let core = input.trim_matches(|c: char| !c.is_alphanumeric());
+    if core.is_empty() {
         return false;
     }
-    // Anything outside the Latin alphabet is never a Cambridge headword, so a
-    // pasted Vietnamese line goes straight to the translator.
-    if trimmed.chars().any(|c| c.is_alphabetic() && !c.is_ascii()) {
+    let words = core.split_whitespace().count();
+    if words > 4 {
         return true;
     }
-    if trimmed.contains(['.', '?', '!', ';', ':', '\n', ',']) {
+    // Punctuation *inside* the text is what separates clauses.
+    if core.contains(['.', '?', '!', ';', ':', ',', '\n']) {
         return true;
     }
-    trimmed.split_whitespace().count() > 4
+    // Several accented words together are a foreign phrase, not a headword. A
+    // single one goes to the dictionary anyway, because English has borrowed
+    // plenty of them ("café", "naïve", "résumé"); `lookup_word` falls back to
+    // translating when no dictionary recognises it.
+    words > 1 && core.chars().any(|c| c.is_alphabetic() && !c.is_ascii())
 }
 
 /// Percent-encode a query for use in a URL path or parameter. Hand-rolled
@@ -419,7 +483,11 @@ pub fn parse_google(json: &Value) -> Option<(String, Option<String>)> {
     let mut text = String::new();
     let mut detected = None;
     for item in items {
-        let pair = item.as_array()?;
+        // One odd element must not discard the segments already collected: the
+        // endpoint is unversioned and free, and grows trailing fields.
+        let Some(pair) = item.as_array() else {
+            continue;
+        };
         if let Some(segment) = pair.first().and_then(Value::as_str) {
             if !text.is_empty() && !text.ends_with(' ') {
                 text.push(' ');
@@ -439,7 +507,9 @@ pub fn parse_google(json: &Value) -> Option<(String, Option<String>)> {
 /// Read the Cambridge scraper's reply into a pronunciation row and a list of
 /// definition blocks.
 pub fn parse_cambridge(json: &Value) -> (Vec<Pronunciation>, Vec<EnDefinition>) {
-    if json.get("error").is_some() {
+    // A present-but-null "error" is a success in JSON terms; only a real value
+    // means the word was not found.
+    if json.get("error").is_some_and(|error| !error.is_null()) {
         return (Vec::new(), Vec::new());
     }
 
@@ -524,6 +594,8 @@ pub fn parse_tracau(json: &Value, query: &str) -> (Vec<ViEntry>, Vec<BilingualEx
         .unwrap_or_default();
 
     let mut examples = Vec::new();
+    // The same sentences as plain lowercase text, kept for the check below.
+    let mut plain: Vec<String> = Vec::new();
     if let Some(items) = json.get("sentences").and_then(Value::as_array) {
         for item in items {
             let Some(fields) = item.get("fields") else {
@@ -534,6 +606,7 @@ pub fn parse_tracau(json: &Value, query: &str) -> (Vec<ViEntry>, Vec<BilingualEx
             if en.is_empty() || vi.is_empty() {
                 continue;
             }
+            plain.push(strip_tags(en).to_lowercase());
             examples.push(BilingualExample {
                 en_markup: em_to_pango_bold(en),
                 vi: strip_tags(vi),
@@ -546,13 +619,12 @@ pub fn parse_tracau(json: &Value, query: &str) -> (Vec<ViEntry>, Vec<BilingualEx
 
     // tracau answers a nonsense query with example sentences that merely
     // contain the letters typed; without a dictionary entry they are not
-    // evidence the word exists.
+    // evidence the word exists. Matched against the plain text rather than the
+    // markup, which has had its apostrophes and ampersands escaped — "don't"
+    // would never match `don&apos;t`.
     if entries.is_empty() && !examples.is_empty() {
-        let query = query.trim().to_lowercase();
-        let matched = examples
-            .iter()
-            .any(|example| example.en_markup.to_lowercase().contains(&query));
-        if !matched {
+        let needle = query.trim().to_lowercase();
+        if !plain.iter().any(|example| example.contains(&needle)) {
             examples.clear();
         }
     }
@@ -580,7 +652,7 @@ pub fn parse_tracau_fulltext(html: &str) -> Vec<ViEntry> {
         let id = attribute(open_tag, "id").unwrap_or_default();
         let text = strip_tags(content_cell(body));
         if !text.is_empty() {
-            match id.as_str() {
+            match id {
                 "tl" => entries.push(ViEntry {
                     pos: text,
                     meanings: Vec::new(),
@@ -623,12 +695,27 @@ fn content_cell(row: &str) -> &str {
     }
 }
 
-fn attribute(open_tag: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=\"");
-    let start = open_tag.find(&needle)? + needle.len();
-    let rest = &open_tag[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_owned())
+fn attribute<'a>(open_tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = [name, "=\""].concat();
+    let mut from = 0usize;
+    while let Some(hit) = open_tag[from..].find(&needle) {
+        let at = from + hit;
+        // `id="` also appears inside `data-id="`, which would hand back the
+        // wrong attribute's value; a real one starts at a word boundary.
+        let boundary = at == 0
+            || open_tag[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace());
+        let start = at + needle.len();
+        if boundary {
+            let rest = &open_tag[start..];
+            let end = rest.find('"')?;
+            return Some(&rest[..end]);
+        }
+        from = start;
+    }
+    None
 }
 
 /// Strip tags and decode the handful of entities tracau emits, collapsing the
@@ -641,21 +728,46 @@ pub fn strip_tags(html: &str) -> String {
 /// several pieces without losing the spaces that separated them.
 fn flatten_markup(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
-    let mut depth = 0usize;
-    for character in html.chars() {
-        match character {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            _ if depth > 0 => {}
-            _ if character.is_whitespace() => {
-                if !text.ends_with(' ') {
-                    text.push(' ');
-                }
-            }
-            _ => text.push(character),
+    let mut rest = html;
+    loop {
+        // Only a '<' that actually starts a tag opens one. A bare comparison
+        // ("a < b") would otherwise swallow the rest of the sentence, and the
+        // matching '>' would vanish from the output.
+        let Some(open) = rest.find('<') else {
+            push_flattened(&mut text, rest);
+            break;
+        };
+        let after = &rest[open + 1..];
+        let is_tag = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '!');
+        if !is_tag {
+            push_flattened(&mut text, &rest[..open + 1]);
+            rest = after;
+            continue;
+        }
+        push_flattened(&mut text, &rest[..open]);
+        match after.find('>') {
+            Some(close) => rest = &after[close + 1..],
+            // An unterminated tag runs to the end of the input.
+            None => break,
         }
     }
     decode_entities(&text)
+}
+
+/// Append text with its whitespace runs collapsed to single spaces.
+fn push_flattened(text: &mut String, chunk: &str) {
+    for character in chunk.chars() {
+        if character.is_whitespace() {
+            if !text.ends_with(' ') {
+                text.push(' ');
+            }
+        } else {
+            text.push(character);
+        }
+    }
 }
 
 fn decode_entities(input: &str) -> String {
@@ -711,13 +823,25 @@ pub fn escape_markup(text: &str) -> String {
 
 // ----------------------------------------------------------------------- http
 
+/// One agent for the whole process. It owns the connection pool, so the three
+/// requests a lookup makes — and the two `clients5` calls a Vietnamese
+/// paragraph makes back to back — reuse connections instead of paying for a
+/// fresh TCP and TLS handshake every time. Cloning is cheap; it is an `Arc`.
+fn agent() -> ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::builder()
+                .timeout_connect(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .user_agent(USER_AGENT)
+                .build()
+        })
+        .clone()
+}
+
 fn http_get(url: &str) -> Result<String, String> {
-    let agent = ureq::builder()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build();
-    match agent.get(url).call() {
+    match agent().get(url).call() {
         Ok(response) => response
             .into_string()
             .map_err(|error| format!("Could not read the reply: {error}")),
@@ -746,41 +870,48 @@ fn fnv1a(input: &str) -> u64 {
 }
 
 fn download_audio(url: &str, path: &Path) -> Result<(), String> {
-    let agent = ureq::builder()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build();
-    let response = agent
+    let response = agent()
         .get(url)
         .call()
         .map_err(|error| format!("Could not fetch the audio: {error}"))?;
     let mut bytes = Vec::new();
+    // One byte past the cap, so an oversized reply is detected rather than
+    // silently truncated into a file that would be cached and replayed forever.
     response
         .into_reader()
-        .take(MAX_AUDIO_BYTES)
+        .take(MAX_AUDIO_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("Could not read the audio: {error}"))?;
     if bytes.is_empty() {
         return Err("The audio was empty".into());
+    }
+    if bytes.len() as u64 > MAX_AUDIO_BYTES {
+        return Err("The audio was too large".into());
     }
     let Some(parent) = path.parent() else {
         return Err("The cache path has no parent".into());
     };
     fs::create_dir_all(parent).map_err(|error| format!("Could not create the cache: {error}"))?;
     // Write beside the target and rename, so a clip interrupted mid-download
-    // never leaves a truncated file that later plays as silence.
-    let temporary = path.with_extension("part");
+    // never leaves a truncated file that later plays as silence. The temporary
+    // name is unique per attempt: two threads fetching the same clip would
+    // otherwise truncate each other's file and rename half of one into place.
+    static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+    let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("part{}-{attempt}", std::process::id()));
     fs::write(&temporary, &bytes).map_err(|error| format!("Could not save the audio: {error}"))?;
-    fs::rename(&temporary, path).map_err(|error| format!("Could not store the audio: {error}"))?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Could not store the audio: {error}"));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_audio_path, em_to_pango_bold, escape_markup, is_sentence, parse_cambridge,
-        parse_google, parse_tracau_fulltext, percent_encode, strip_tags,
+        cached_audio_path, em_to_pango_bold, escape_markup, fnv1a, is_sentence, parse_cambridge,
+        parse_google, parse_tracau, parse_tracau_fulltext, percent_encode, strip_tags,
     };
 
     #[test]
@@ -788,6 +919,8 @@ mod tests {
         assert!(!is_sentence("inefficient"));
         assert!(!is_sentence("  kick the bucket "));
         assert!(!is_sentence(""));
+        assert!(!is_sentence("   "));
+        assert!(!is_sentence("!?"));
     }
 
     #[test]
@@ -795,6 +928,31 @@ mod tests {
         assert!(is_sentence("Hello there, how are you?"));
         assert!(is_sentence("one two three four five"));
         assert!(is_sentence("xin chào bạn"));
+    }
+
+    #[test]
+    fn punctuation_around_a_word_does_not_make_it_prose() {
+        // Typed in a hurry, or copied with the sentence's full stop attached.
+        assert!(!is_sentence("hello."));
+        assert!(!is_sentence("\"serendipity\""));
+        assert!(!is_sentence("(inefficient)"));
+        // An apostrophe is part of the word, not a clause break.
+        assert!(!is_sentence("don't"));
+    }
+
+    #[test]
+    fn a_borrowed_accented_headword_still_goes_to_the_dictionary() {
+        // English has these as headwords; only a run of accented words reads as
+        // a foreign phrase.
+        assert!(!is_sentence("café"));
+        assert!(!is_sentence("naïve"));
+        assert!(is_sentence("cà phê sữa"));
+    }
+
+    #[test]
+    fn the_word_count_boundary_is_four() {
+        assert!(!is_sentence("one two three four"));
+        assert!(is_sentence("one two three four five"));
     }
 
     #[test]
@@ -910,6 +1068,81 @@ mod tests {
         let (pronunciations, definitions) = parse_cambridge(&json);
         assert!(pronunciations.is_empty());
         assert!(definitions.is_empty());
+    }
+
+    #[test]
+    fn comparison_operators_survive_tag_stripping() {
+        // A bare "<" is not a tag, and used to swallow the rest of the line.
+        assert_eq!(strip_tags("a < b và c"), "a < b và c");
+        assert_eq!(strip_tags("x > y"), "x > y");
+        assert_eq!(strip_tags("5 < 6 <b>times</b>"), "5 < 6 times");
+        // An unterminated tag simply ends the text.
+        assert_eq!(strip_tags("keep<td id="), "keep");
+    }
+
+    #[test]
+    fn a_row_id_is_not_matched_inside_another_attribute() {
+        let html = r#"<tr data-id="xx" id="mn"><td id="C_C">nghĩa</td></tr>"#;
+        let entries = parse_tracau_fulltext(html);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].meanings, ["nghĩa"]);
+    }
+
+    #[test]
+    fn an_unclosed_em_still_yields_its_text() {
+        assert_eq!(em_to_pango_bold("a <em>b"), "a b");
+    }
+
+    #[test]
+    fn a_null_error_field_is_not_a_missing_word() {
+        // `{"error": null}` is a success; only a real value means not found.
+        let json = serde_json::json!({
+            "error": null,
+            "definition": [{"pos": "noun", "text": "a small animal", "example": []}]
+        });
+        let (_, definitions) = parse_cambridge(&json);
+        assert_eq!(definitions.len(), 1);
+    }
+
+    #[test]
+    fn one_odd_element_does_not_discard_the_whole_translation() {
+        // The endpoint is unversioned; a trailing field must not lose the text.
+        let json = serde_json::json!([["Xin chào.", "en"], null, ["Tạm biệt.", "en"]]);
+        let (text, _) = parse_google(&json).expect("a translation");
+        assert_eq!(text, "Xin chào. Tạm biệt.");
+    }
+
+    #[test]
+    fn tracau_examples_survive_an_apostrophe_in_the_query() {
+        // The markup has apostrophes escaped, so matching against it directly
+        // would throw away examples that genuinely contain the query.
+        let json = serde_json::json!({
+            "tratu": [],
+            "sentences": [{"fields": {"en": "I <em>don't</em> know.", "vi": "Tôi không biết."}}]
+        });
+        let (entries, examples) = parse_tracau(&json, "don't");
+        assert!(entries.is_empty());
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0].en_markup, "I <b>don&apos;t</b> know.");
+    }
+
+    #[test]
+    fn examples_for_a_word_tracau_does_not_know_are_dropped() {
+        let json = serde_json::json!({
+            "tratu": [],
+            "sentences": [{"fields": {"en": "Something else.", "vi": "Chuyện khác."}}]
+        });
+        let (_, examples) = parse_tracau(&json, "zzzz");
+        assert!(examples.is_empty());
+    }
+
+    #[test]
+    fn the_hash_behind_the_audio_cache_matches_the_reference_vectors() {
+        // Pinned against the published FNV-1a 64-bit vectors: a typo in the
+        // offset basis or the prime would silently invalidate every cached clip
+        // and re-download the lot.
+        assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
     }
 
     #[test]
