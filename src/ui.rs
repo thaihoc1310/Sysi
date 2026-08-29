@@ -53,6 +53,9 @@ const TRANSLATE_RECENT_LIMIT: usize = 10;
 const RESIZE_HIT_SIZE: i32 = 18;
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+// The history row the pointer is on, or None. The history window's right-click
+// menu reads it to know which note a delete applies to.
+type HoveredRow = Rc<Cell<Option<u64>>>;
 // The dictionary lookup, handed to context menus that are built before it
 // exists. Filled in once during startup, like `CallbackSlot`.
 type LookupSlot = Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>;
@@ -283,6 +286,16 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // Context menus are attached while their windows are built, well before the
     // dictionary lookup they call into exists; the slot is filled once both do.
     let lookup_slot: LookupSlot = Rc::new(RefCell::new(None));
+    let note_refresh: CallbackSlot = Rc::new(RefCell::new(None));
+    // Which history row the pointer is on: the rows set it as they are entered
+    // and left, and the history window's right-click menu reads it. Built here,
+    // with the menu, because the menu is attached while the window is.
+    let hovered_history_row: HoveredRow = Rc::new(Cell::new(None));
+    let history_row_menu = build_history_row_menu(
+        state.clone(),
+        note_refresh.clone(),
+        hovered_history_row.clone(),
+    );
     window.set_accept_focus(true);
     window.style_context().add_class("editing");
     let (system_color_mode, timer_color_mode, picker_color_mode, system_details) = {
@@ -331,6 +344,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             values: system_card.values.clone(),
             details: system_card.details.clone(),
         }),
+        None,
         None,
     );
     attach_drag(
@@ -402,6 +416,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }),
         None,
         None,
+        None,
     );
     attach_drag(
         &timer_card.drag,
@@ -450,6 +465,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
+        None,
         None,
         None,
         None,
@@ -506,6 +522,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         None,
         None,
         Some(lookup_slot.clone()),
+        Some(history_row_menu),
     );
     attach_drag(
         &history.header,
@@ -581,6 +598,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         None,
         None,
         Some(lookup_slot.clone()),
+        None,
     );
     attach_drag(
         &translate.header,
@@ -969,7 +987,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }) as Rc<dyn Fn(&str)>
     });
 
-    let note_refresh: CallbackSlot = Rc::new(RefCell::new(None));
     // How many rows the list renders, derived from the window height so
     // dragging the grip down shows more entries and dragging it up shows
     // fewer. Kept in a cell so every rebuild path agrees on the current one.
@@ -996,6 +1013,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let window = window.clone();
         let search = history.bar.search.clone();
         let history_limit = history_limit.clone();
+        let hovered_history_row = hovered_history_row.clone();
         Rc::new(move || {
             rebuild_note_list(
                 &list,
@@ -1004,6 +1022,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 note_refresh.clone(),
                 &search.text(),
                 history_limit.get(),
+                hovered_history_row.clone(),
             );
             rebuild_pinned_notes(
                 &root,
@@ -1036,6 +1055,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let note_refresh = note_refresh.clone();
         let search = history.bar.search.clone();
         let history_limit = history_limit.clone();
+        let hovered_history_row = hovered_history_row.clone();
         Rc::new(move || {
             rebuild_note_list(
                 &list,
@@ -1044,6 +1064,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 note_refresh.clone(),
                 &search.text(),
                 history_limit.get(),
+                hovered_history_row.clone(),
             );
         })
     };
@@ -2706,6 +2727,70 @@ fn start_timer_updates(
     *timer_ui.wake_updates.borrow_mut() = Some(wake_updates);
 }
 
+// Dropping a note takes its per-note layout keys with it, and any image file it
+// was the last owner of, so nothing is left behind in state.json or on disk.
+fn delete_note(state: &Rc<RefCell<AppState>>, id: u64) {
+    let mut data = state.borrow_mut();
+    data.notes.retain(|note| note.id != id);
+    data.sizes.remove(&format!("note:{id}"));
+    data.widget_color_modes.remove(&format!("note:{id}"));
+    drop(data);
+    let _ = state.borrow().save();
+    state.borrow().prune_orphan_images();
+}
+
+// One menu serves the whole history list: it acts on whichever row the pointer
+// is on, so a rebuild does not have to build (and leak) a menu per row. Returns
+// a closure that pops it up and reports whether it did — the history window's
+// colour-mode menu calls it first and stands down when a row claims the click.
+fn build_history_row_menu(
+    state: Rc<RefCell<AppState>>,
+    refresh: CallbackSlot,
+    hovered: HoveredRow,
+) -> Rc<dyn Fn() -> bool> {
+    let menu = context_menu();
+    // The row the menu was opened on, latched at popup time. Reading `hovered`
+    // when the item is activated would always come up empty: popping the menu
+    // grabs the pointer, which leaves the row and clears it before the click.
+    let target: HoveredRow = Rc::new(Cell::new(None));
+    let delete = gtk::MenuItem::with_label("DELETE");
+    // The one irreversible item in the app; it warms to red on hover.
+    delete.style_context().add_class("menu-destructive");
+    delete.connect_activate({
+        let state = state.clone();
+        let refresh = refresh.clone();
+        let target = target.clone();
+        move |_| {
+            let Some(id) = target.take() else {
+                return;
+            };
+            delete_note(&state, id);
+            // Cloned out of the borrow: the refresh re-enters the UI and would
+            // trip over the slot still being borrowed.
+            let callback = refresh.borrow().clone();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    });
+    menu.append(&delete);
+    menu.show_all();
+
+    Rc::new(move || {
+        let Some(id) = hovered.get() else {
+            return false;
+        };
+        // A stale id (its row rebuilt away under the pointer) must not swallow
+        // the click; let the colour-mode menu have it instead.
+        if !state.borrow().notes.iter().any(|note| note.id == id) {
+            return false;
+        }
+        target.set(Some(id));
+        menu.popup_easy(3, gtk::current_event_time());
+        true
+    })
+}
+
 fn rebuild_note_list(
     list: &gtk::Box,
     root: &gtk::Fixed,
@@ -2713,10 +2798,14 @@ fn rebuild_note_list(
     refresh: CallbackSlot,
     query: &str,
     limit: usize,
+    hovered: HoveredRow,
 ) {
     for child in list.children() {
         list.remove(&child);
     }
+    // Every row the pointer could have been on is gone; the fresh one under it
+    // announces itself with its own enter event.
+    hovered.set(None);
     let query = query.trim().to_lowercase();
     // Borrow the notes instead of cloning every one; only matches become
     // widgets, and only as many as the window is tall enough to scroll
@@ -2744,6 +2833,7 @@ fn rebuild_note_list(
             root,
             state.clone(),
             refresh.clone(),
+            hovered.clone(),
         );
         list.pack_start(&row, false, false, 0);
         shown += 1;
@@ -2770,20 +2860,57 @@ fn draggable_note_preview(
     root: &gtk::Fixed,
     state: Rc<RefCell<AppState>>,
     refresh: CallbackSlot,
+    hovered: HoveredRow,
 ) -> gtk::EventBox {
     let row = gtk::EventBox::new();
-    row.set_visible_window(false);
+    // A GtkEventBox only paints its CSS background when it owns a window, so
+    // the hover tint needs a visible one; the class stays transparent at rest.
+    row.set_visible_window(true);
     row.style_context().add_class("note-preview");
-    row.set_tooltip_text(Some("Click or drag onto the desktop to pin"));
+    row.set_tooltip_text(Some(
+        "Click or drag onto the desktop to pin  ·  right-click to delete",
+    ));
     row.add_events(
         gdk::EventMask::BUTTON_PRESS_MASK
             | gdk::EventMask::BUTTON1_MOTION_MASK
-            | gdk::EventMask::BUTTON_RELEASE_MASK,
+            | gdk::EventMask::BUTTON_RELEASE_MASK
+            | gdk::EventMask::ENTER_NOTIFY_MASK
+            | gdk::EventMask::LEAVE_NOTIFY_MASK,
     );
     let label = gtk::Label::new(Some(text));
     label.set_xalign(0.0);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     row.add(&label);
+
+    // The pointer's row drives both the hover tint and what the history
+    // window's right-click menu deletes, so one pair of handlers owns both.
+    row.connect_enter_notify_event({
+        let hovered = hovered.clone();
+        move |row, _| {
+            hovered.set(Some(note_id));
+            row.style_context().add_class("note-preview-hover");
+            if let Some(window) = row.window() {
+                let cursor = gdk::Cursor::from_name(&window.display(), "pointer");
+                window.set_cursor(cursor.as_ref());
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    row.connect_leave_notify_event({
+        let hovered = hovered.clone();
+        move |row, _| {
+            // Guarded: moving between two rows can land the next row's enter
+            // before this leave, and clearing then would lose the new row.
+            if hovered.get() == Some(note_id) {
+                hovered.set(None);
+            }
+            row.style_context().remove_class("note-preview-hover");
+            if let Some(window) = row.window() {
+                window.set_cursor(None);
+            }
+            glib::Propagation::Proceed
+        }
+    });
 
     let start = Rc::new(Cell::new(None::<(f64, f64)>));
     let ghost: Rc<RefCell<Option<gtk::Label>>> = Rc::new(RefCell::new(None));
@@ -4075,15 +4202,14 @@ fn rebuild_pinned_notes(
         header_drag.style_context().add_class("note-header");
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         header.set_hexpand(true);
-        let delete = small_button("×");
-        delete.style_context().add_class("note-window-button");
-        delete.style_context().add_class("note-close");
-        delete.set_tooltip_text(Some("Delete note"));
+        // No delete button here on purpose: it sat next to the hide button, so
+        // one stray click threw a note's text away for good. Deleting lives on
+        // the history row's right-click menu instead, where it takes a
+        // deliberate second click on a named item.
         let unpin = small_button("−");
         unpin.style_context().add_class("note-window-button");
         unpin.style_context().add_class("note-hide");
         unpin.set_tooltip_text(Some("Move to History"));
-        header.pack_start(&delete, false, false, 0);
         header.pack_start(&unpin, false, false, 0);
         header_drag.add(&header);
         body.pack_start(&header_drag, false, false, 0);
@@ -4167,6 +4293,7 @@ fn rebuild_pinned_notes(
             None,
             None,
             Some(lookup.clone()),
+            None,
         );
         attach_drag(
             &header_drag,
@@ -4252,23 +4379,6 @@ fn rebuild_pinned_notes(
                     note.pinned = false;
                 }
                 let _ = state.borrow().save();
-                if let Some(callback) = refresh.borrow().as_ref() {
-                    callback();
-                }
-            }
-        });
-        delete.connect_clicked({
-            let state = state.clone();
-            let refresh = refresh.clone();
-            let id = note.id;
-            move |_| {
-                let mut data = state.borrow_mut();
-                data.notes.retain(|note| note.id != id);
-                data.sizes.remove(&format!("note:{id}"));
-                data.widget_color_modes.remove(&format!("note:{id}"));
-                drop(data);
-                let _ = state.borrow().save();
-                state.borrow().prune_orphan_images();
                 if let Some(callback) = refresh.borrow().as_ref() {
                     callback();
                 }
@@ -5536,8 +5646,11 @@ fn attach_color_mode_menu(
     timer_style: Option<TimerStylePreview>,
     system_details: Option<SystemDetailsPreview>,
     lookup: Option<LookupSlot>,
+    // Pops a menu for whatever the click landed on inside the widget, and says
+    // whether it did. Only the history window has one (its note rows).
+    row_menu: Option<Rc<dyn Fn() -> bool>>,
 ) {
-    let menu = gtk::Menu::new();
+    let menu = context_menu();
 
     // Looking up the selection sits at the top, above the colour modes: it is
     // the one item that acts on what the user just highlighted rather than on
@@ -5590,7 +5703,7 @@ fn attach_color_mode_menu(
 
     if let Some(timer_style) = timer_style {
         let parent = gtk::MenuItem::with_label("STYLE");
-        let submenu = gtk::Menu::new();
+        let submenu = context_menu();
         for style in TimerStyle::ALL {
             let item = gtk::MenuItem::with_label(style.label());
             item.connect_select({
@@ -5631,6 +5744,7 @@ fn attach_color_mode_menu(
         menu.append(&edit_time);
     }
     if let Some(system_details) = system_details {
+        menu.set_reserve_toggle_size(true);
         menu.append(&gtk::SeparatorMenuItem::new());
         let cpu = gtk::CheckMenuItem::with_label("CPU");
         cpu.set_active(system_details.details.get().cpu);
@@ -5693,6 +5807,15 @@ fn attach_color_mode_menu(
         if !interactive.get() {
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
+        }
+        // The gesture is in the capture phase, so it sees the press before any
+        // child does; ask the row menu first or the rows could never own a
+        // right-click of their own.
+        if let Some(row_menu) = &row_menu {
+            if row_menu() {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                return;
+            }
         }
         if let Some((item, separator)) = &lookup_item {
             let query = primary_selection();
@@ -6786,6 +6909,19 @@ fn timer_style_size(size: Size, from: TimerStyle, to: TimerStyle) -> Size {
         width: (f64::from(to_default.width) * factor).round().max(1.0) as i32,
         height: (f64::from(to_default.height) * factor).round().max(1.0) as i32,
     }
+}
+
+// Every right-click menu in Sysi wears the same chrome. Left to the desktop
+// theme they arrived in whatever shape and accent colour the session happened
+// to use, which read as a foreign window dropped on top of the overlay; the
+// look lives in style.css instead, under `.sysi-menu`.
+fn context_menu() -> gtk::Menu {
+    let menu = gtk::Menu::new();
+    menu.style_context().add_class("sysi-menu");
+    // Nothing to tick in most menus, and the reserved gutter left them looking
+    // like a list with a missing column. The system menu turns it back on.
+    menu.set_reserve_toggle_size(false);
+    menu
 }
 
 fn small_button(label: &str) -> gtk::Button {

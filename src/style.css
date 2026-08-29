@@ -157,20 +157,31 @@ textview, textview text {
   padding: 3px 2px;
 }
 
+/* The list sits inside the history window's own frame rather than out on the
+   desktop, so its rows drop the overlay halo the cards wear: at this size the
+   shadow read as a smear under every line instead of as legibility. */
 .history-empty {
   color: alpha(currentColor, 0.5);
   padding: 5px 8px;
+  text-shadow: none;
 }
 
 .note-preview {
   background-color: transparent;
   color: currentColor;
   border: none;
+  border-radius: 5px;
   padding: 3px 7px;
+  text-shadow: none;
+  transition: 130ms ease-out;
 }
 
-.note-preview:hover {
-  color: currentColor;
+/* The row toggles .note-preview-hover from its own enter/leave handlers: GTK3
+ * routes crossing events by GdkWindow, so :hover alone is not something a row
+ * can count on. Both selectors carry the same tint, whichever one lands. */
+.note-preview:hover,
+.note-preview.note-preview-hover {
+  background-color: alpha(currentColor, 0.15);
 }
 
 .note-ghost {
@@ -607,4 +618,81 @@ textview, textview text {
    .mode-* .card rules so it wins at equal specificity. */
 .timer-card .card {
   text-shadow: none;
+}
+
+/* ------------------------------------------------------------------- menus
+ * Right-click menus are separate toplevels, so they inherit none of the card
+ * classes and none of the widget colour modes. They keep one dark chrome in
+ * every mode on purpose: a menu that flipped to dark-on-dark alongside the
+ * DARK widget mode would be unreadable.
+ *
+ * The look is the app's own: a small translucent slab with a hairline edge,
+ * the same soft-tinted hover the note scrollbars use, and no theme accent
+ * anywhere. Kept deliberately tight — the desktop theme's menu metrics made a
+ * three-word menu the size of a dialog. */
+.sysi-menu {
+  background-color: rgba(22, 22, 24, 0.90);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.sysi-menu menuitem {
+  background-color: transparent;
+  border-radius: 5px;
+  color: alpha(#f4f4f4, 0.88);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.1px;
+  min-height: 0;
+  padding: 3px 9px;
+  text-shadow: none;
+  transition: 110ms ease-out;
+}
+
+.sysi-menu menuitem:hover {
+  background-color: rgba(255, 255, 255, 0.10);
+  color: #ffffff;
+}
+
+.sysi-menu menuitem:disabled {
+  color: alpha(#f4f4f4, 0.34);
+}
+
+/* Deleting a note is the only thing in Sysi that cannot be undone, so the row
+ * that does it warms to red under the pointer. A wash rather than a block: it
+ * should read as a warning, not as an alarm going off. */
+.sysi-menu menuitem.menu-destructive:hover {
+  background-color: rgba(206, 84, 78, 0.16);
+  color: #ff9b93;
+}
+
+.sysi-menu separator {
+  background-color: rgba(255, 255, 255, 0.09);
+  margin: 3px 5px;
+  min-height: 1px;
+}
+
+.sysi-menu menuitem arrow {
+  color: alpha(#f4f4f4, 0.5);
+  min-width: 11px;
+}
+
+/* The SYSTEM menu's toggles: a small square that fills with the menu's own
+ * foreground when ticked, instead of the desktop theme's accent colour. */
+.sysi-menu menuitem check {
+  background-color: transparent;
+  background-image: none;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 3px;
+  color: #17171a;
+  margin-right: 7px;
+  min-height: 10px;
+  min-width: 10px;
+  -gtk-icon-source: none;
+}
+
+.sysi-menu menuitem check:checked {
+  background-color: #f4f4f4;
+  border-color: #f4f4f4;
 }
