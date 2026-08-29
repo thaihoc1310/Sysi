@@ -18,18 +18,23 @@ export default class SysiPanelExtension extends Extension {
         this._indicator.reactive = false;
         this._indicator.can_focus = false;
         this._indicator.track_hover = false;
+        // FILL, not CENTER: the hover block is drawn on the button's own
+        // allocation, so the row has to run the whole height of the panel for
+        // that block to reach the top and bottom edges.
         this._content = new St.BoxLayout({
             style_class: 'panel-status-menu-box',
-            y_align: Clutter.ActorAlign.CENTER,
+            y_expand: true,
+            y_align: Clutter.ActorAlign.FILL,
         });
         this._indicator.add_child(this._content);
 
         this._gear = new St.Button({
-            style_class: 'panel-button',
+            style_class: 'sysi-panel-gear',
             reactive: true,
             can_focus: true,
             track_hover: true,
-            style: 'padding: 0 7px;',
+            y_expand: true,
+            y_align: Clutter.ActorAlign.FILL,
         });
         this._gear.add_child(new St.Icon({
             icon_name: 'preferences-system-symbolic',
@@ -39,7 +44,8 @@ export default class SysiPanelExtension extends Extension {
 
         this._strip = new St.BoxLayout({
             style_class: 'panel-status-menu-box',
-            y_align: Clutter.ActorAlign.CENTER,
+            y_expand: true,
+            y_align: Clutter.ActorAlign.FILL,
         });
         this._content.add_child(this._strip);
         this._strip.visible = false;
@@ -50,7 +56,7 @@ export default class SysiPanelExtension extends Extension {
         this._lock = this._addAction('lock', 'toggle-lock');
         this._addAction('+ note', 'new-note');
         this._addAction('history', 'toggle-history');
-        this._addAction('translate', 'toggle-translate');
+        this._addAction('trans', 'toggle-translate');
         this._addAction('quit', 'quit');
 
         this._gear.connect('clicked', () => {
@@ -98,17 +104,26 @@ export default class SysiPanelExtension extends Extension {
     }
 
     _addAction(label, action) {
+        // A rule stands between neighbours, never at the ends of the row.
+        if (this._strip.get_n_children() > 0)
+            this._addSeparator();
         const button = new St.Button({
-            style_class: 'panel-button sysi-panel-action',
+            style_class: 'sysi-panel-action',
             reactive: true,
             can_focus: true,
             track_hover: true,
-            style: 'padding: 0 8px;',
+            y_expand: true,
+            y_align: Clutter.ActorAlign.FILL,
         });
+        // The font is set here so the label measures itself with the same face
+        // it is painted in — inheriting it left every word ellipsized down to a
+        // couple of characters. Colour is deliberately left out: an inline
+        // colour would outrank the stylesheet and the text would stay pale
+        // against the inverted hover block.
         const text = new St.Label({
             text: label,
             y_align: Clutter.ActorAlign.CENTER,
-            style: 'font-family: Noto Sans, sans-serif; font-size: 12px; font-weight: 500; color: #f2f2f2; text-shadow: none;',
+            style: 'font-family: Noto Sans, sans-serif; font-size: 11px; font-weight: 500; text-shadow: none;',
         });
         button.add_child(text);
         button.connect('clicked', () => this._runAction(action));
@@ -118,6 +133,22 @@ export default class SysiPanelExtension extends Extension {
         if (action === 'next-color-mode')
             this._modeLabel = text;
         return button;
+    }
+
+    _addSeparator() {
+        const rules = new St.BoxLayout({
+            style_class: 'sysi-panel-separator',
+            y_expand: true,
+            y_align: Clutter.ActorAlign.FILL,
+        });
+        for (let index = 0; index < 2; index++) {
+            rules.add_child(new St.Widget({
+                style_class: 'sysi-panel-rule',
+                y_expand: true,
+                y_align: Clutter.ActorAlign.FILL,
+            }));
+        }
+        this._strip.add_child(rules);
     }
 
     _readColorMode() {

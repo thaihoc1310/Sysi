@@ -20,6 +20,8 @@ install -Dm644 "$project_dir/packaging/gnome-shell-extension/metadata.json" \
   "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/metadata.json"
 install -Dm644 "$project_dir/packaging/gnome-shell-extension/extension.js" \
   "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/extension.js"
+install -Dm644 "$project_dir/packaging/gnome-shell-extension/stylesheet.css" \
+  "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/stylesheet.css"
 install -Dm644 "$project_dir/README.md" \
   "$package_root/usr/share/doc/sysi-overlay/README.md"
 install -Dm644 "$project_dir/LICENSE" \

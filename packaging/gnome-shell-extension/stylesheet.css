@@ -1,0 +1,64 @@
+/* Neo-brutalist panel strip.
+ *
+ * The actions deliberately do not wear GNOME's `panel-button` class, so none of
+ * the shell theme's rounded, inset, fading hover pill applies to them. Every
+ * rule the strip needs lives here instead: flat words in a row, and on hover the
+ * whole cell inverts as a hard-edged block that runs the full height of the
+ * panel. The `#panel` prefix keeps these ahead of any generic StButton rule the
+ * user's theme might carry.
+ */
+
+/* The row has to fit between the panel's left edge and the centred clock. Go
+ * wider than this and GNOME compresses the whole strip, which ellipsizes every
+ * label down to a couple of characters rather than clipping the last button. */
+#panel .sysi-panel-action,
+#panel .sysi-panel-gear {
+  padding: 0 5px;
+  margin: 0;
+  border: 0;
+  /* Square, not pill: the corners are the whole point of the look. */
+  border-radius: 0;
+  background-color: transparent;
+  background-gradient-direction: none;
+  box-shadow: none;
+  color: #f2f2f2;
+  font-family: "Noto Sans", sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  text-shadow: none;
+  /* Brutalist means instant. No easing on the way in or out. */
+  transition-duration: 0ms;
+}
+
+#panel .sysi-panel-gear {
+  padding: 0 8px;
+}
+
+/* Full inversion, and because the button fills the panel vertically the block
+   reaches both edges instead of floating in the middle of the bar. */
+#panel .sysi-panel-action:hover,
+#panel .sysi-panel-action:focus,
+#panel .sysi-panel-gear:hover,
+#panel .sysi-panel-gear:focus {
+  border-radius: 0;
+  background-color: #f2f2f2;
+  color: #0a0a0a;
+}
+
+#panel .sysi-panel-action:active,
+#panel .sysi-panel-gear:active {
+  border-radius: 0;
+  background-color: #b4b4b4;
+  color: #0a0a0a;
+}
+
+/* The decorative double rule that stands between one action and the next. */
+#panel .sysi-panel-separator {
+  padding: 7px 2px;
+  spacing: 2px;
+}
+
+#panel .sysi-panel-rule {
+  width: 2px;
+  background-color: rgba(242, 242, 242, 0.38);
+}

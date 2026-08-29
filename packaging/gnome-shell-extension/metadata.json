@@ -3,5 +3,5 @@
   "name": "Sysi Panel Gear",
   "description": "Opens Sysi's lightweight desktop-widget settings from the GNOME panel.",
   "shell-version": ["46"],
-  "version": 4
+  "version": 5
 }
