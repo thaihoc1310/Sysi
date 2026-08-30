@@ -6045,10 +6045,12 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title.style_context().add_class("history-title");
     let open_search = icon_button("edit-find-symbolic", "Search");
-    let close_search = small_button("\u{00d7}");
-    close_search.style_context().add_class("note-window-button");
-    close_search.style_context().add_class("note-close");
-    close_search.set_tooltip_text(Some("Close search"));
+    // Not another cross. The window's own close button is one, sitting a few
+    // pixels away in the same bar, and the two read as the same control — press
+    // the wrong one and the window goes for good, cached answers and all. The
+    // query panel drops down out of the header, so the chevron that folds it
+    // back up says plainly which of the two this is.
+    let close_search = icon_button("pan-up-symbolic", "Close search (Esc)");
     // The close cross and the two arrows are one cluster of window controls, so
     // they sit tight against each other and keep the header's wider spacing
     // only between the cluster and the title.
