@@ -20,6 +20,8 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 ## Controls
 
 - `Ctrl+Alt+O` — lock or unlock interaction.
+- `Ctrl+F` — find text in the focused note. Use `Enter` / `Shift+Enter` (or
+  `F3` / `Shift+F3`) to move between matches and `Escape` to close the panel.
 - `Escape` — return to click-through lock mode.
 - `sysi --toggle` — toggle interaction from a terminal or a custom desktop shortcut.
 - `sysi --quit` — stop the running overlay.

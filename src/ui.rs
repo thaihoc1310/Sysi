@@ -1,16 +1,17 @@
 use crate::{
     platform,
-    translate,
     state::{
         AppState, ColorMode, Note, NoteImage, Point, Size, SystemDetails, TimerStyle,
         IMAGE_PLACEHOLDER,
     },
     system::{SystemReader, SystemSnapshot},
+    translate,
 };
 use cairo::{Context, FontSlant, FontWeight, RectangleInt, Region};
 use gdk::prelude::*;
 use gdk_pixbuf::{InterpType, Pixbuf};
 use gtk::prelude::*;
+use regex::RegexBuilder;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -102,6 +103,34 @@ struct RegisteredWidget {
     color_mode: Rc<Cell<ColorMode>>,
     edit_only: Option<gtk::EventBox>,
     editor: Option<gtk::TextView>,
+    note_search: Option<NoteSearchControls>,
+}
+
+#[derive(Clone)]
+struct NoteSearchControls {
+    revealer: gtk::Revealer,
+    entry: gtk::Entry,
+    close: Rc<dyn Fn()>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NoteSearchOptions {
+    case_sensitive: bool,
+    whole_word: bool,
+    regular_expression: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NoteSearchMatch {
+    start: i32,
+    end: i32,
+}
+
+#[derive(Default)]
+struct NoteSearchState {
+    options: NoteSearchOptions,
+    matches: Vec<NoteSearchMatch>,
+    current: Option<usize>,
 }
 
 struct TimerRuntime {
@@ -849,21 +878,20 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         async move {
             while let Ok(event) = translate_rx.recv().await {
                 match event {
-                    translate::TranslateEvent::Suggestions { generation: at, items }
-                        if at == suggest_generation.get() =>
-                    {
+                    translate::TranslateEvent::Suggestions {
+                        generation: at,
+                        items,
+                    } if at == suggest_generation.get() => {
                         render_translate_suggestions(&suggestions, &items, &lookup);
                         fit_height();
                     }
-                    translate::TranslateEvent::Lookup { generation: at, result }
-                        if at == lookup_generation.get() =>
-                    {
+                    translate::TranslateEvent::Lookup {
+                        generation: at,
+                        result,
+                    } if at == lookup_generation.get() => {
                         // Remembered here rather than when the query was sent,
                         // so a typo that found nothing never enters the list.
-                        if matches!(
-                            result.kind,
-                            translate::ResultKind::Content(_)
-                        ) {
+                        if matches!(result.kind, translate::ResultKind::Content(_)) {
                             remember_search(&state, &result.query);
                         }
                         scroller.vadjustment().set_value(0.0);
@@ -1402,6 +1430,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 window.style_context().add_class("editing");
             } else {
                 commit_timer_edit();
+                let open_searches: Vec<NoteSearchControls> = registry
+                    .borrow()
+                    .iter()
+                    .filter_map(|item| item.note_search.clone())
+                    .filter(|search| search.revealer.reveals_child())
+                    .collect();
+                for search in open_searches {
+                    (search.close)();
+                }
                 window.set_accept_focus(false);
                 window.style_context().remove_class("editing");
             }
@@ -1461,6 +1498,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     window.connect_key_press_event({
         let toggle_action = toggle_action.clone();
         let interactive = interactive.clone();
+        let registry = registry.clone();
         let searching = searching.clone();
         let history_card = history.card.clone();
         let close_history_search = close_history_search.clone();
@@ -1469,6 +1507,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let set_translate_search = set_translate_search.clone();
         move |_, event| {
             if event.keyval() == gdk::keys::constants::Escape {
+                let open_note_search = registry
+                    .borrow()
+                    .iter()
+                    .filter_map(|item| item.note_search.clone())
+                    .find(|search| search.revealer.reveals_child());
+                if let Some(search) = open_note_search {
+                    (search.close)();
+                    return glib::Propagation::Stop;
+                }
                 // The overlay sees key events before the focused widget, so
                 // Escape while searching must close the search box rather than
                 // lock the whole overlay out from under the user.
@@ -3804,6 +3851,429 @@ fn undo_note_edit(
     true
 }
 
+fn is_note_search_word_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn note_search_matches(
+    text: &str,
+    query: &str,
+    options: NoteSearchOptions,
+) -> Result<Vec<NoteSearchMatch>, regex::Error> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pattern = if options.regular_expression {
+        query.to_owned()
+    } else {
+        regex::escape(query)
+    };
+    let expression = RegexBuilder::new(&pattern)
+        .case_insensitive(!options.case_sensitive)
+        .unicode(true)
+        .build()?;
+    Ok(expression
+        .find_iter(text)
+        .filter(|found| {
+            if !options.whole_word {
+                return true;
+            }
+            let before = text[..found.start()].chars().next_back();
+            let after = text[found.end()..].chars().next();
+            !before.is_some_and(is_note_search_word_char)
+                && !after.is_some_and(is_note_search_word_char)
+        })
+        .map(|found| NoteSearchMatch {
+            // GtkTextBuffer offsets count Unicode characters, while regex
+            // offsets count UTF-8 bytes. Convert both edges so Vietnamese and
+            // every other multi-byte script highlight the right glyphs.
+            start: text[..found.start()].chars().count() as i32,
+            end: text[..found.end()].chars().count() as i32,
+        })
+        .collect())
+}
+
+fn clear_note_search_tags(
+    buffer: &gtk::TextBuffer,
+    match_tag: &gtk::TextTag,
+    current_tag: &gtk::TextTag,
+) {
+    let (start, end) = buffer.bounds();
+    buffer.remove_tag(match_tag, &start, &end);
+    buffer.remove_tag(current_tag, &start, &end);
+}
+
+fn paint_note_search(
+    editor: &gtk::TextView,
+    count: &gtk::Label,
+    match_tag: &gtk::TextTag,
+    current_tag: &gtk::TextTag,
+    state: &NoteSearchState,
+    scroll: bool,
+) {
+    let Some(buffer) = editor.buffer() else {
+        return;
+    };
+    clear_note_search_tags(&buffer, match_tag, current_tag);
+    for found in &state.matches {
+        buffer.apply_tag(
+            match_tag,
+            &buffer.iter_at_offset(found.start),
+            &buffer.iter_at_offset(found.end),
+        );
+    }
+    let Some(current) = state.current.and_then(|index| state.matches.get(index)) else {
+        count.set_text("0/0");
+        return;
+    };
+    let start = buffer.iter_at_offset(current.start);
+    let end = buffer.iter_at_offset(current.end);
+    buffer.apply_tag(current_tag, &start, &end);
+    count.set_text(&format!(
+        "{}/{}",
+        state.current.unwrap_or_default() + 1,
+        state.matches.len()
+    ));
+    if scroll {
+        let mut target = start;
+        editor.scroll_to_iter(&mut target, 0.18, false, 0.0, 0.0);
+    }
+}
+
+fn set_note_search_toggle_open(button: &gtk::Button, open: bool) {
+    if let Some(image) = button
+        .child()
+        .and_then(|child| child.downcast::<gtk::Image>().ok())
+    {
+        image.set_from_icon_name(
+            Some(if open {
+                "window-close-symbolic"
+            } else {
+                "edit-find-symbolic"
+            }),
+            gtk::IconSize::Menu,
+        );
+        image.set_pixel_size(11);
+    }
+    button.set_tooltip_text(Some(if open {
+        "Close search (Esc)"
+    } else {
+        "Find in note (Ctrl+F)"
+    }));
+}
+
+fn build_note_search(
+    editor: &gtk::TextView,
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+    toggle: &gtk::Button,
+) -> NoteSearchControls {
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    revealer.set_transition_duration(120);
+    revealer.set_reveal_child(false);
+
+    let panel = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    panel.set_hexpand(true);
+    panel.style_context().add_class("note-search-panel");
+
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("Find in note"));
+    entry.set_width_chars(5);
+    entry.set_hexpand(true);
+    entry.style_context().add_class("note-search-entry");
+    panel.pack_start(&entry, true, true, 0);
+
+    let count = gtk::Label::new(Some("0/0"));
+    count.set_width_chars(4);
+    count.set_xalign(0.5);
+    count.set_yalign(0.5);
+    count.style_context().add_class("note-search-count");
+    panel.pack_start(&count, false, false, 0);
+
+    let previous = icon_button("go-up-symbolic", "Previous match (Shift+Enter)");
+    let next = icon_button("go-down-symbolic", "Next match (Enter)");
+    let settings = icon_button("emblem-system-symbolic", "Search options");
+    // The popover itself explains this control. Leaving the tooltip armed
+    // after the click lets it float above and cover the first checkbox.
+    settings.set_tooltip_text(None);
+    for button in [&previous, &next, &settings] {
+        button.style_context().add_class("note-search-button");
+    }
+    panel.pack_start(&previous, false, false, 0);
+    panel.pack_start(&next, false, false, 0);
+    panel.pack_start(&settings, false, false, 0);
+    revealer.add(&panel);
+
+    let options_popover = gtk::Popover::new(Some(&settings));
+    options_popover.set_position(gtk::PositionType::Bottom);
+    options_popover
+        .style_context()
+        .add_class("note-search-popover");
+    let options_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    options_box.set_border_width(3);
+    let case_sensitive = gtk::CheckButton::with_label("Case sensitive");
+    let whole_word = gtk::CheckButton::with_label("Match whole word only");
+    let regular_expression = gtk::CheckButton::with_label("Regular expression");
+    for checkbox in [&case_sensitive, &whole_word, &regular_expression] {
+        checkbox.style_context().add_class("note-search-option");
+        options_box.pack_start(checkbox, false, false, 0);
+    }
+    options_popover.add(&options_box);
+    options_popover.show_all();
+    options_popover.popdown();
+    settings.connect_clicked({
+        let options_popover = options_popover.clone();
+        move |_| options_popover.popup()
+    });
+
+    let buffer = editor.buffer().expect("note search buffer");
+    let match_tag = gtk::TextTag::new(Some("sysi-note-search-match"));
+    match_tag.set_background_rgba(Some(&gdk::RGBA::new(0.98, 0.78, 0.20, 0.42)));
+    let current_tag = gtk::TextTag::new(Some("sysi-note-search-current"));
+    current_tag.set_background_rgba(Some(&gdk::RGBA::new(1.0, 0.52, 0.08, 0.78)));
+    if let Some(table) = buffer.tag_table() {
+        table.add(&match_tag);
+        table.add(&current_tag);
+    }
+
+    let search_state = Rc::new(RefCell::new(NoteSearchState::default()));
+    let refresh: Rc<dyn Fn(bool, bool)> = Rc::new({
+        let editor = editor.clone();
+        let entry = entry.clone();
+        let count = count.clone();
+        let match_tag = match_tag.clone();
+        let current_tag = current_tag.clone();
+        let search_state = search_state.clone();
+        move |reset_current, scroll| {
+            let Some(buffer) = editor.buffer() else {
+                return;
+            };
+            let query = entry.text().to_string();
+            let options = search_state.borrow().options;
+            match note_search_matches(&note_buffer_text(&buffer), &query, options) {
+                Ok(matches) => {
+                    entry.style_context().remove_class("search-error");
+                    entry.set_tooltip_text(None);
+                    let mut state = search_state.borrow_mut();
+                    state.matches = matches;
+                    state.current = if state.matches.is_empty() {
+                        None
+                    } else if reset_current {
+                        Some(0)
+                    } else {
+                        Some(state.current.unwrap_or(0).min(state.matches.len() - 1))
+                    };
+                    paint_note_search(&editor, &count, &match_tag, &current_tag, &state, scroll);
+                }
+                Err(error) => {
+                    clear_note_search_tags(&buffer, &match_tag, &current_tag);
+                    let mut state = search_state.borrow_mut();
+                    state.matches.clear();
+                    state.current = None;
+                    count.set_text("ERR");
+                    entry.style_context().add_class("search-error");
+                    entry.set_tooltip_text(Some(&format!("Invalid regular expression: {error}")));
+                }
+            }
+        }
+    });
+
+    entry.connect_changed({
+        let refresh = refresh.clone();
+        move |_| refresh(true, true)
+    });
+    buffer.connect_changed({
+        let refresh = refresh.clone();
+        let revealer = revealer.clone();
+        move |_| {
+            if revealer.reveals_child() {
+                refresh(false, false);
+            }
+        }
+    });
+
+    case_sensitive.connect_toggled({
+        let search_state = search_state.clone();
+        let refresh = refresh.clone();
+        move |checkbox| {
+            search_state.borrow_mut().options.case_sensitive = checkbox.is_active();
+            refresh(true, true);
+        }
+    });
+    whole_word.connect_toggled({
+        let search_state = search_state.clone();
+        let refresh = refresh.clone();
+        move |checkbox| {
+            search_state.borrow_mut().options.whole_word = checkbox.is_active();
+            refresh(true, true);
+        }
+    });
+    regular_expression.connect_toggled({
+        let search_state = search_state.clone();
+        let refresh = refresh.clone();
+        move |checkbox| {
+            search_state.borrow_mut().options.regular_expression = checkbox.is_active();
+            refresh(true, true);
+        }
+    });
+
+    let navigate: Rc<dyn Fn(i32)> = Rc::new({
+        let editor = editor.clone();
+        let count = count.clone();
+        let match_tag = match_tag.clone();
+        let current_tag = current_tag.clone();
+        let search_state = search_state.clone();
+        move |direction| {
+            let mut state = search_state.borrow_mut();
+            let total = state.matches.len();
+            if total == 0 {
+                return;
+            }
+            let current = state.current.unwrap_or(0);
+            state.current = Some(if direction < 0 {
+                (current + total - 1) % total
+            } else {
+                (current + 1) % total
+            });
+            paint_note_search(&editor, &count, &match_tag, &current_tag, &state, true);
+        }
+    });
+    previous.connect_clicked({
+        let navigate = navigate.clone();
+        move |_| navigate(-1)
+    });
+    next.connect_clicked({
+        let navigate = navigate.clone();
+        move |_| navigate(1)
+    });
+
+    let close: Rc<dyn Fn()> = Rc::new({
+        let editor = editor.clone();
+        let revealer = revealer.clone();
+        let entry = entry.clone();
+        let options_popover = options_popover.clone();
+        let match_tag = match_tag.clone();
+        let current_tag = current_tag.clone();
+        let toggle = toggle.clone();
+        move || {
+            revealer.set_reveal_child(false);
+            set_note_search_toggle_open(&toggle, false);
+            options_popover.popdown();
+            if let Some(buffer) = editor.buffer() {
+                clear_note_search_tags(&buffer, &match_tag, &current_tag);
+            }
+            entry.style_context().remove_class("search-error");
+            entry.set_tooltip_text(None);
+            editor.grab_focus();
+        }
+    });
+
+    let open: Rc<dyn Fn()> = Rc::new({
+        let registry = registry.clone();
+        let revealer = revealer.clone();
+        let entry = entry.clone();
+        let refresh = refresh.clone();
+        let toggle = toggle.clone();
+        move || {
+            let other_searches: Vec<NoteSearchControls> = registry
+                .borrow()
+                .iter()
+                .filter_map(|item| item.note_search.clone())
+                .filter(|search| search.entry != entry && search.revealer.reveals_child())
+                .collect();
+            for search in other_searches {
+                (search.close)();
+            }
+            revealer.set_reveal_child(true);
+            set_note_search_toggle_open(&toggle, true);
+            refresh(false, true);
+            glib::idle_add_local_once({
+                let entry = entry.clone();
+                move || {
+                    entry.grab_focus();
+                    entry.select_region(0, -1);
+                }
+            });
+        }
+    });
+    toggle.connect_clicked({
+        let revealer = revealer.clone();
+        let open = open.clone();
+        let close = close.clone();
+        move |_| {
+            if revealer.reveals_child() {
+                close();
+            } else {
+                open();
+            }
+        }
+    });
+
+    entry.connect_key_press_event({
+        let entry = entry.clone();
+        let close = close.clone();
+        let navigate = navigate.clone();
+        move |_, event| {
+            let key = event.keyval();
+            if key == gdk::keys::constants::Escape {
+                close();
+                return glib::Propagation::Stop;
+            }
+            let ctrl_f = event.state().contains(gdk::ModifierType::CONTROL_MASK)
+                && matches!(key, gdk::keys::constants::f | gdk::keys::constants::F);
+            if ctrl_f {
+                entry.select_region(0, -1);
+                return glib::Propagation::Stop;
+            }
+            let activate = matches!(
+                key,
+                gdk::keys::constants::Return
+                    | gdk::keys::constants::KP_Enter
+                    | gdk::keys::constants::F3
+            );
+            if activate {
+                navigate(if event.state().contains(gdk::ModifierType::SHIFT_MASK) {
+                    -1
+                } else {
+                    1
+                });
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+
+    editor.connect_key_press_event({
+        let revealer = revealer.clone();
+        let open = open.clone();
+        let navigate = navigate.clone();
+        move |_, event| {
+            let key = event.keyval();
+            let ctrl_f = event.state().contains(gdk::ModifierType::CONTROL_MASK)
+                && matches!(key, gdk::keys::constants::f | gdk::keys::constants::F);
+            if ctrl_f {
+                open();
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::keys::constants::F3 && revealer.reveals_child() {
+                navigate(if event.state().contains(gdk::ModifierType::SHIFT_MASK) {
+                    -1
+                } else {
+                    1
+                });
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+
+    NoteSearchControls {
+        revealer,
+        entry,
+        close,
+    }
+}
+
 // Hover the right/bottom image edge to resize it directly. Clicking the image
 // still focuses it and parks the cursor immediately after it, so Backspace
 // deletes it and typing continues after it.
@@ -4191,6 +4661,10 @@ fn rebuild_pinned_notes(
         let key = format!("note:{}", note.id);
         let initial_color_mode = saved_color_mode(&state.borrow(), &key);
         let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
+        // Note rows are intentionally flush: the editor already owns its text
+        // padding, and the find bar must not inherit CardBody's generic 4px
+        // gap above and below it.
+        body.set_spacing(0);
         card.style_context().add_class("pinned-note");
         // Own a GdkWindow so the hover tracker can test pointer containment and
         // fade the note scrollbar in without GTK3's per-window :hover routing.
@@ -4210,7 +4684,9 @@ fn rebuild_pinned_notes(
         unpin.style_context().add_class("note-window-button");
         unpin.style_context().add_class("note-hide");
         unpin.set_tooltip_text(Some("Move to History"));
+        let search_toggle = icon_button("edit-find-symbolic", "Find in note (Ctrl+F)");
         header.pack_start(&unpin, false, false, 0);
+        header.pack_end(&search_toggle, false, false, 0);
         header_drag.add(&header);
         body.pack_start(&header_drag, false, false, 0);
 
@@ -4263,6 +4739,8 @@ fn rebuild_pinned_notes(
         scroller.set_propagate_natural_width(false);
         scroller.set_propagate_natural_height(false);
         scroller.add(&editor);
+        let note_search = build_note_search(&editor, &registry, &search_toggle);
+        body.pack_start(&note_search.revealer, false, false, 0);
         body.pack_start(&scroller, true, true, 0);
 
         apply_widget_size(
@@ -4283,6 +4761,7 @@ fn rebuild_pinned_notes(
         {
             item.edit_only = Some(header_drag.clone());
             item.editor = Some(editor.clone());
+            item.note_search = Some(note_search);
         }
         attach_color_mode_menu(
             &card,
@@ -4749,7 +5228,9 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
     // The search panel drops down under the header: a text view that grows with
     // what is typed or pasted, and the completions right beneath it.
     let search_panel = gtk::Box::new(gtk::Orientation::Vertical, 1);
-    search_panel.style_context().add_class("translate-search-panel");
+    search_panel
+        .style_context()
+        .add_class("translate-search-panel");
     let input_scroller =
         gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     input_scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
@@ -4776,7 +5257,9 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
 
     // The completions live inside the panel so they come and go with it.
     let suggestions = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    suggestions.style_context().add_class("translate-suggestions");
+    suggestions
+        .style_context()
+        .add_class("translate-suggestions");
     search_panel.pack_start(&suggestions, false, false, 0);
     chrome_box.pack_start(&search_panel, false, false, 0);
 
@@ -4865,7 +5348,10 @@ fn translate_word_button(word: &str, lookup: &Rc<dyn Fn(&str)>) -> gtk::Button {
     let button = gtk::Button::with_label(word);
     button.set_can_focus(false);
     button.style_context().add_class("translate-suggestion");
-    if let Some(label) = button.child().and_then(|child| child.downcast::<gtk::Label>().ok()) {
+    if let Some(label) = button
+        .child()
+        .and_then(|child| child.downcast::<gtk::Label>().ok())
+    {
         label.set_xalign(0.0);
         label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         // The completions sit outside the scroller, so a long word would widen
@@ -4913,6 +5399,14 @@ fn render_translate_recents(
     toggle.style_context().add_class("translate-recent-toggle");
     let caption = gtk::Label::new(None);
     caption.set_xalign(0.0);
+    // Ellipsizing is what the completion rows do, and here it is load-bearing
+    // for a second reason: with the row's CSS letter-spacing, an un-ellipsized
+    // label reports a two-line height on its first measurement, so the fold
+    // asked for 24px instead of the 14px its style says. Nothing put that
+    // right until the pointer crossed the row and its :hover state forced a
+    // restyle -- which is the gap that used to sit above RECENT for as long as
+    // the mouse stayed away from the panel.
+    caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
     toggle.add(&caption);
 
     let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -5238,11 +5732,16 @@ fn add_translate_section(
     let button = gtk::Button::with_label(&format!("▸  {caption}"));
     button.set_can_focus(false);
     button.style_context().add_class("translate-section-toggle");
-    if let Some(label) = button.child().and_then(|child| child.downcast::<gtk::Label>().ok()) {
+    if let Some(label) = button
+        .child()
+        .and_then(|child| child.downcast::<gtk::Label>().ok())
+    {
         label.set_xalign(0.0);
     }
     let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    content.style_context().add_class("translate-section-content");
+    content
+        .style_context()
+        .add_class("translate-section-content");
     content.set_no_show_all(true);
     content.hide();
     results.pack_start(&button, false, false, 0);
@@ -5319,17 +5818,9 @@ fn render_translate_result(
                 } else {
                     "GOOGLE · VIETNAMESE"
                 };
+                results.pack_start(&translate_line(heading, "translate-pos"), false, false, 0);
                 results.pack_start(
-                    &translate_line(heading, "translate-pos"),
-                    false,
-                    false,
-                    0,
-                );
-                results.pack_start(
-                    &translate_line(
-                        &escape_markup(&translation.translation),
-                        "translate-gloss",
-                    ),
+                    &translate_line(&escape_markup(&translation.translation), "translate-gloss"),
                     false,
                     false,
                     0,
@@ -5447,12 +5938,7 @@ fn render_translate_result(
                     0,
                 );
                 for suggestion in &word.suggestions {
-                    results.pack_start(
-                        &translate_word_button(suggestion, lookup),
-                        false,
-                        false,
-                        0,
-                    );
+                    results.pack_start(&translate_word_button(suggestion, lookup), false, false, 0);
                 }
             }
         }
@@ -5592,6 +6078,7 @@ fn register(
         color_mode,
         edit_only: None,
         editor: None,
+        note_search: None,
     });
 }
 
@@ -5825,7 +6312,10 @@ fn attach_color_mode_menu(
             separator.set_visible(!query.is_empty());
             if !query.is_empty() {
                 if let Some(label) = item.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
-                    label.set_label(&format!("LOOK UP  \u{201c}{}\u{201d}", ellipsize(&query, 22)));
+                    label.set_label(&format!(
+                        "LOOK UP  \u{201c}{}\u{201d}",
+                        ellipsize(&query, 22)
+                    ));
                 }
             }
             *selected.borrow_mut() = query;
@@ -6046,7 +6536,12 @@ fn screen_overlap(point: Point, width: i32, height: i32, screen: &ScreenRect) ->
 /// could hold the most of it — a portrait monitor elsewhere on the desk would
 /// otherwise be judged the better fit for a tall widget and leave it oversized
 /// on the screen it is really on.
-fn host_screen(point: Point, width: i32, height: i32, screens: &[ScreenRect]) -> Option<ScreenRect> {
+fn host_screen(
+    point: Point,
+    width: i32,
+    height: i32,
+    screens: &[ScreenRect],
+) -> Option<ScreenRect> {
     let covered = screens
         .iter()
         .copied()
@@ -6073,12 +6568,7 @@ fn host_screen(point: Point, width: i32, height: i32, screens: &[ScreenRect]) ->
 /// so it can no longer be dragged. That is how a window sized against the full
 /// screen height ends up frozen once the shell's top bar is excluded from the
 /// space it may occupy — it still slides sideways, but not up or down.
-fn fit_to_work_area(
-    point: Point,
-    width: i32,
-    height: i32,
-    screens: &[ScreenRect],
-) -> (i32, i32) {
+fn fit_to_work_area(point: Point, width: i32, height: i32, screens: &[ScreenRect]) -> (i32, i32) {
     match host_screen(point, width, height, screens) {
         Some(screen) => (width.min(screen.width), height.min(screen.height)),
         None => (width, height),
@@ -6764,9 +7254,8 @@ fn refresh_input_shape(
         // Notes and the history list keep receiving input in lock mode so
         // their content can still be scrolled; editing is disabled separately
         // via the read-only editor, and their headers hide as edit chrome.
-        let lock_note = item.key.starts_with("note:")
-            || item.key == "history"
-            || item.key == "translate";
+        let lock_note =
+            item.key.starts_with("note:") || item.key == "history" || item.key == "translate";
         if interactive
             || settings
             || lock_timer
@@ -7008,15 +7497,15 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        cascade_point, ellipsize, fit_within_bounds, history_row_budget, image_room,
-        image_room_after_y, monitor_coordinate_divisor, monitor_root_bounds,
-        normalize_monitor_rect, note_headline, note_image_cap, note_size_for_image,
-        fit_to_work_area, parse_timer_input, push_recent_search, record_note_undo, reopen_point,
-        resize_width_limit,
-        resized_image_size, round_pixbuf_corners, system_content_size, timer_style_size,
-        NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT,
-        HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
-        NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT, NOTE_WIDTH,
+        cascade_point, ellipsize, fit_to_work_area, fit_within_bounds, history_row_budget,
+        image_room, image_room_after_y, monitor_coordinate_divisor, monitor_root_bounds,
+        normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
+        note_size_for_image, parse_timer_input, push_recent_search, record_note_undo, reopen_point,
+        resize_width_limit, resized_image_size, round_pixbuf_corners, system_content_size,
+        timer_style_size, NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo,
+        NoteUndoState, ScreenRect, HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT,
+        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
+        NOTE_MAX_HEIGHT, NOTE_WIDTH,
     };
     use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
     use gdk_pixbuf::{Colorspace, Pixbuf};
@@ -7322,6 +7811,60 @@ mod timer_input_tests {
     }
 
     #[test]
+    fn note_search_is_case_insensitive_and_uses_character_offsets() {
+        let matches = note_search_matches(
+            "Đây là ghi chú. GHI CHÚ nữa.",
+            "ghi chú",
+            Default::default(),
+        )
+        .expect("literal search must compile");
+        assert_eq!(
+            matches,
+            [
+                NoteSearchMatch { start: 7, end: 14 },
+                NoteSearchMatch { start: 16, end: 23 },
+            ]
+        );
+    }
+
+    #[test]
+    fn note_search_options_handle_case_words_and_regular_expressions() {
+        let case_sensitive = NoteSearchOptions {
+            case_sensitive: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            note_search_matches("Note note notebook", "Note", case_sensitive).unwrap(),
+            [NoteSearchMatch { start: 0, end: 4 }]
+        );
+
+        let whole_word = NoteSearchOptions {
+            whole_word: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            note_search_matches("Note note notebook", "note", whole_word).unwrap(),
+            [
+                NoteSearchMatch { start: 0, end: 4 },
+                NoteSearchMatch { start: 5, end: 9 },
+            ]
+        );
+
+        let regex = NoteSearchOptions {
+            regular_expression: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            note_search_matches("item 7, item 42", r"item \d+", regex).unwrap(),
+            [
+                NoteSearchMatch { start: 0, end: 6 },
+                NoteSearchMatch { start: 8, end: 15 },
+            ]
+        );
+        assert!(note_search_matches("text", "(", regex).is_err());
+    }
+
+    #[test]
     fn parses_supported_timer_formats() {
         assert_eq!(parse_timer_input("10"), Some(600));
         assert_eq!(parse_timer_input("10:50"), Some(650));
@@ -7448,7 +7991,11 @@ mod timer_input_tests {
     fn the_recent_list_stops_growing_at_its_limit() {
         let mut recents = Vec::new();
         for index in 0..12 {
-            assert!(push_recent_search(&mut recents, &format!("word{index}"), 10));
+            assert!(push_recent_search(
+                &mut recents,
+                &format!("word{index}"),
+                10
+            ));
         }
         assert_eq!(recents.len(), 10);
         // Newest first, oldest dropped off the end.
@@ -7458,7 +8005,12 @@ mod timer_input_tests {
 
     #[test]
     fn a_widget_taller_than_the_work_area_is_trimmed_to_it() {
-        let area = [ScreenRect { x: 0, y: 32, width: 1280, height: 688 }];
+        let area = [ScreenRect {
+            x: 0,
+            y: 32,
+            width: 1280,
+            height: 688,
+        }];
         let origin = Point { x: 100, y: 40 };
         // The exact case that froze the dictionary: sized against the full
         // screen height, then judged against the height minus the top bar.
@@ -7476,18 +8028,39 @@ mod timer_input_tests {
         // "which could hold most of it" left the widget oversized and frozen on
         // the landscape screen it was actually on.
         let screens = [
-            ScreenRect { x: 0, y: 0, width: 540, height: 809 },
-            ScreenRect { x: 540, y: 151, width: 1280, height: 691 },
+            ScreenRect {
+                x: 0,
+                y: 0,
+                width: 540,
+                height: 809,
+            },
+            ScreenRect {
+                x: 540,
+                y: 151,
+                width: 1280,
+                height: 691,
+            },
         ];
         let on_landscape = Point { x: 756, y: 151 };
-        assert_eq!(fit_to_work_area(on_landscape, 359, 700, &screens), (359, 691));
+        assert_eq!(
+            fit_to_work_area(on_landscape, 359, 700, &screens),
+            (359, 691)
+        );
         let on_portrait = Point { x: 40, y: 200 };
-        assert_eq!(fit_to_work_area(on_portrait, 359, 700, &screens), (359, 700));
+        assert_eq!(
+            fit_to_work_area(on_portrait, 359, 700, &screens),
+            (359, 700)
+        );
     }
 
     #[test]
     fn a_widget_on_no_monitor_at_all_falls_back_to_the_nearest() {
-        let screens = [ScreenRect { x: 0, y: 0, width: 800, height: 600 }];
+        let screens = [ScreenRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }];
         // Left behind on a monitor that has since been unplugged.
         let stranded = Point { x: 5000, y: 5000 };
         assert_eq!(fit_to_work_area(stranded, 900, 700, &screens), (800, 600));
