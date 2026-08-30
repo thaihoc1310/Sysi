@@ -61,17 +61,12 @@ export default class SysiPanelExtension extends Extension {
         this._lock = this._addAction('lock', 'toggle-lock');
         this._addAction('+ note', 'new-note');
         this._addAction('history', 'toggle-history');
-        this._addAction('trans', 'toggle-translate');
+        this._addAction('dict', 'toggle-translate');
         this._addAction('quit', 'quit');
 
         this._gear.connect('clicked', () => {
+            this._syncPanelState();
             this._strip.visible = !this._strip.visible;
-        });
-        this._lock.connect('clicked', () => {
-            this._lockLabel.text = this._lockLabel.text === 'lock' ? 'unlock' : 'lock';
-        });
-        this._mode.connect('clicked', () => {
-            this._modeLabel.text = this._nextColorMode(this._modeLabel.text);
         });
 
         // Append after Ubuntu's left-side indicator instead of prepending it.
@@ -88,12 +83,31 @@ export default class SysiPanelExtension extends Extension {
         } catch (error) {
             logError(error, 'Sysi panel gear could not watch the app state');
         }
+        // Both labels describe state Sysi owns, and either can be changed
+        // without going near this strip — locking with Escape or the hotkey,
+        // cycling the colour from the widget picker. So the strip never guesses
+        // from its own clicks; it reads what Sysi published.
+        this._panelStateFile = Gio.File.new_for_path(
+            GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi', 'panel-state']),
+        );
+        try {
+            this._panelStateMonitor = this._panelStateFile.monitor_file(
+                Gio.FileMonitorFlags.NONE,
+                null,
+            );
+            this._panelStateMonitor.connect('changed', () => this._syncPanelState());
+        } catch (error) {
+            logError(error, 'Sysi panel gear could not watch the overlay state');
+        }
+        this._syncPanelState();
         this._syncVisibility();
     }
 
     disable() {
         this._pidMonitor?.cancel();
         this._pidMonitor = null;
+        this._panelStateMonitor?.cancel();
+        this._panelStateMonitor = null;
         this._indicator?.destroy();
         this._indicator = null;
         this._content = null;
@@ -106,6 +120,7 @@ export default class SysiPanelExtension extends Extension {
         this._lock = null;
         this._lockLabel = null;
         this._pidFile = null;
+        this._panelStateFile = null;
     }
 
     _addAction(label, action) {
@@ -154,11 +169,6 @@ export default class SysiPanelExtension extends Extension {
         }
     }
 
-    _nextColorMode(current) {
-        const modes = ['light', 'gray', 'dark'];
-        return modes[(modes.indexOf(current) + 1) % modes.length];
-    }
-
     _runAction(action) {
         try {
             GLib.spawn_async(
@@ -184,5 +194,33 @@ export default class SysiPanelExtension extends Extension {
         this._indicator.visible = running;
         if (!running)
             this._strip.visible = false;
+    }
+
+    // `<editing|locked> <light|gray|dark>`, written by Sysi whenever either
+    // changes and removed when it exits. With no file to read — Sysi is not
+    // running — the labels fall back to what the saved settings say.
+    _readPanelState() {
+        try {
+            const [ok, contents] = GLib.file_get_contents(this._panelStateFile.get_path());
+            if (!ok)
+                return [null, null];
+            const [interaction, mode] = new TextDecoder().decode(contents).trim().split(/\s+/);
+            return [
+                interaction === 'locked' || interaction === 'editing' ? interaction : null,
+                ['light', 'gray', 'dark'].includes(mode) ? mode : null,
+            ];
+        } catch (_) {
+            return [null, null];
+        }
+    }
+
+    _syncPanelState() {
+        if (!this._panelStateFile)
+            return;
+        const [interaction, mode] = this._readPanelState();
+        if (this._lockLabel)
+            this._lockLabel.text = interaction === 'locked' ? 'unlock' : 'lock';
+        if (this._modeLabel)
+            this._modeLabel.text = mode ?? this._readColorMode();
     }
 }

@@ -16,7 +16,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Arc, OnceLock,
     },
     thread,
     time::Duration,
@@ -34,6 +34,38 @@ const MAX_SUGGESTIONS: usize = 8;
 // in the bush" (11 words), while prose beyond it is overwhelmingly translation
 // input and should not wait for two dictionary services first.
 const MAX_DICTIONARY_WORDS: usize = 12;
+
+/// A request's claim on the window that asked for it.
+///
+/// The UI already drops replies from a superseded lookup, but dropping them at
+/// the far end still pays for every request the worker made in the meantime —
+/// and a word typed over a slow connection can leave four of them in flight for
+/// the nine seconds it takes them to time out. `ureq` has no way to abort a
+/// call already in progress, so the next best thing is to check between them:
+/// a worker whose generation has moved on stops instead of starting the next
+/// request. Closing the window retires every generation at once.
+#[derive(Clone)]
+pub struct Request {
+    latest: Arc<AtomicU64>,
+    generation: u64,
+}
+
+impl Request {
+    pub fn new(latest: Arc<AtomicU64>, generation: u64) -> Self {
+        Self { latest, generation }
+    }
+
+    /// False as soon as the window has asked for something newer, or closed.
+    pub fn is_current(&self) -> bool {
+        self.latest.load(Ordering::Relaxed) == self.generation
+    }
+
+    /// Retires every request against this counter. A closed window wants none
+    /// of them, whatever generation they were started at.
+    pub fn retire_all(latest: &Arc<AtomicU64>) {
+        latest.store(u64::MAX, Ordering::Relaxed);
+    }
+}
 
 /// What a worker sends back to the UI. Lookups and suggestions carry the
 /// generation they were requested at so the receiver can drop replies that a
@@ -149,15 +181,21 @@ pub struct BilingualExample {
 /// on the 9s timeout would otherwise block the suggestions for everything the
 /// user typed after it, and the generation counter already makes late replies
 /// free to discard.
-pub fn spawn_lookup(query: String, generation: u64, tx: Sender<TranslateEvent>) {
+pub fn spawn_lookup(query: String, request: Request, tx: Sender<TranslateEvent>) {
+    let generation = request.generation;
     let failed = tx.clone();
     let started = spawn_named("sysi-lookup", {
         let query = query.clone();
         move || {
             let kind = if should_probe_dictionary(&query) {
-                lookup_word(&query)
+                lookup_word(&query, &request)
             } else {
-                translate_sentence(&query)
+                translate_sentence(&query, &request)
+            };
+            // Nothing to report when the window moved on: whatever it is
+            // waiting for now owes it an answer of its own.
+            let Some(kind) = kind else {
+                return;
             };
             let _ = tx.send_blocking(TranslateEvent::Lookup {
                 generation,
@@ -179,8 +217,14 @@ pub fn spawn_lookup(query: String, generation: u64, tx: Sender<TranslateEvent>) 
 }
 
 /// Fetch the type-ahead completions for a prefix.
-pub fn spawn_suggest(prefix: String, generation: u64, tx: Sender<TranslateEvent>) {
+pub fn spawn_suggest(prefix: String, request: Request, tx: Sender<TranslateEvent>) {
+    let generation = request.generation;
     spawn_named("sysi-suggest", move || {
+        // Typing carries on while this thread waits for a slot; the letters it
+        // was going to complete may already be gone.
+        if !request.is_current() {
+            return;
+        }
         let url = format!(
             "https://api.datamuse.com/sug?s={}&max={MAX_SUGGESTIONS}",
             percent_encode(&prefix)
@@ -267,17 +311,23 @@ fn spawn_named<F: FnOnce() + Send + 'static>(name: &str, work: F) -> bool {
 /// time instead of being dropped on the floor.
 enum Fetch {
     Running(thread::JoinHandle<Result<String, String>>),
-    Deferred(String),
+    Deferred(String, Request),
 }
 
-fn spawn_fetch(name: &str, url: String) -> Fetch {
+fn spawn_fetch(name: &str, url: String, request: Request) -> Fetch {
     let work = {
         let url = url.clone();
-        move || http_get(&url)
+        let request = request.clone();
+        move || {
+            if !request.is_current() {
+                return Err("superseded".to_owned());
+            }
+            http_get(&url)
+        }
     };
     match thread::Builder::new().name(name.to_owned()).spawn(work) {
         Ok(handle) => Fetch::Running(handle),
-        Err(_) => Fetch::Deferred(url),
+        Err(_) => Fetch::Deferred(url, request),
     }
 }
 
@@ -290,7 +340,12 @@ impl Fetch {
                 // than as "the word does not exist".
                 Err(_) => return Fetched::Unreachable,
             },
-            Fetch::Deferred(url) => http_get(&url),
+            Fetch::Deferred(url, request) => {
+                if !request.is_current() {
+                    return Fetched::Unreachable;
+                }
+                http_get(&url)
+            }
         };
         match body {
             Ok(body) => match serde_json::from_str::<Value>(&body) {
@@ -306,19 +361,24 @@ impl Fetch {
 
 // ------------------------------------------------------------------- lookups
 
-fn translate_sentence(query: &str) -> ResultKind {
-    match sentence_from_google(query, google_translate(query, "vi")) {
-        Ok(translation) => ResultKind::Content(Box::new(ContentResult {
-            headword: query.trim().to_owned(),
-            translation: Some(translation),
-            pronunciations: Vec::new(),
-            vi_entries: Vec::new(),
-            en_definitions: Vec::new(),
-            examples: Vec::new(),
-            suggestions: Vec::new(),
-        })),
-        Err(error) => ResultKind::Error(error),
+fn translate_sentence(query: &str, request: &Request) -> Option<ResultKind> {
+    if !request.is_current() {
+        return None;
     }
+    Some(
+        match sentence_from_google(query, google_translate(query, "vi")) {
+            Ok(translation) => ResultKind::Content(Box::new(ContentResult {
+                headword: query.trim().to_owned(),
+                translation: Some(translation),
+                pronunciations: Vec::new(),
+                vi_entries: Vec::new(),
+                en_definitions: Vec::new(),
+                examples: Vec::new(),
+                suggestions: Vec::new(),
+            })),
+            Err(error) => ResultKind::Error(error),
+        },
+    )
 }
 
 fn sentence_from_google(
@@ -349,7 +409,10 @@ fn sentence_from_google(
     }
 }
 
-fn lookup_word(query: &str) -> ResultKind {
+fn lookup_word(query: &str, request: &Request) -> Option<ResultKind> {
+    if !request.is_current() {
+        return None;
+    }
     // The two dictionaries are independent, so they run at once and the slower
     // one sets the wait. The gloss runs here on the calling thread, which would
     // otherwise just block waiting for them.
@@ -359,6 +422,7 @@ fn lookup_word(query: &str) -> ResultKind {
             "https://dictionary-api.eliaschen.dev/api/dictionary/en/{}",
             cambridge_slug(query)
         ),
+        request.clone(),
     );
     let tracau = spawn_fetch(
         "sysi-tracau",
@@ -366,11 +430,15 @@ fn lookup_word(query: &str) -> ResultKind {
             "https://api.tracau.vn/WBBcwnwQpV89/s/{}/en",
             percent_encode(query)
         ),
+        request.clone(),
     );
     let translation = sentence_from_google(query, google_translate(query, "vi"));
 
     let cambridge = cambridge.join();
     let tracau = tracau.join();
+    if !request.is_current() {
+        return None;
+    }
 
     // A 404 from Cambridge is "no such word", not a failure to reach it, so it
     // must not count towards the offline check below.
@@ -378,7 +446,9 @@ fn lookup_word(query: &str) -> ResultKind {
         || !matches!(tracau, Fetched::Unreachable)
         || translation.is_ok();
     if !reached {
-        return ResultKind::Error("Could not reach the dictionary services".into());
+        return Some(ResultKind::Error(
+            "Could not reach the dictionary services".into(),
+        ));
     }
 
     let (pronunciations, en_definitions) = match &cambridge {
@@ -392,23 +462,21 @@ fn lookup_word(query: &str) -> ResultKind {
 
     let has_dictionary =
         !en_definitions.is_empty() || !vi_entries.is_empty() || !examples.is_empty();
-    let suggestions = if !has_dictionary
-        && !is_sentence(query)
-        && query.is_ascii()
-    {
-        fetch_did_you_mean(query)
-    } else {
-        Vec::new()
-    };
+    // "Did you mean" is a fifth request, and by now the user may well have
+    // typed the word they meant themselves.
+    let suggestions =
+        if !has_dictionary && !is_sentence(query) && query.is_ascii() && request.is_current() {
+            fetch_did_you_mean(query)
+        } else {
+            Vec::new()
+        };
     if translation.is_err() && !has_dictionary {
-        return ResultKind::Error(
-            translation
-                .err()
-                .unwrap_or_else(|| "Translation service could not be reached".into()),
-        );
+        return Some(ResultKind::Error(translation.err().unwrap_or_else(|| {
+            "Translation service could not be reached".into()
+        })));
     }
 
-    ResultKind::Content(Box::new(ContentResult {
+    Some(ResultKind::Content(Box::new(ContentResult {
         headword: query.trim().to_owned(),
         translation: translation.ok(),
         pronunciations,
@@ -416,7 +484,7 @@ fn lookup_word(query: &str) -> ResultKind {
         en_definitions,
         examples,
         suggestions,
-    }))
+    })))
 }
 
 /// Cambridge's path is a slug, not a percent-encoded phrase: `run out` lives
@@ -751,11 +819,6 @@ pub fn parse_cambridge(json: &Value, query: &str) -> (Vec<Pronunciation>, Vec<En
                         .collect()
                 })
                 .unwrap_or_default();
-            // The compact dictionary view is example-led. A bare definition
-            // with no usable example is deliberately omitted.
-            if examples.is_empty() {
-                continue;
-            }
             definitions.push(EnDefinition {
                 pos: item
                     .get("pos")
@@ -876,7 +939,9 @@ pub fn parse_tracau_fulltext(html: &str) -> Vec<ViEntry> {
     let mut rest = html;
     while let Some(start) = rest.find("<tr") {
         rest = &rest[start..];
-        let Some(open_end) = rest.find('>') else { break };
+        let Some(open_end) = rest.find('>') else {
+            break;
+        };
         let open_tag = &rest[..open_end];
         let body_start = open_end + 1;
         let Some(close) = rest[body_start..].find("</tr>") else {
@@ -972,17 +1037,18 @@ fn last_phrase_meaning(entries: &mut Vec<ViEntry>) -> &mut ViMeaning {
             examples: Vec::new(),
         });
     }
-    phrase
-        .meanings
-        .last_mut()
-        .expect("just pushed when empty")
+    phrase.meanings.last_mut().expect("just pushed when empty")
 }
 
 fn normalize_match_text(input: &str) -> String {
     let mut normalized = String::new();
     for character in input.chars().flat_map(char::to_lowercase) {
         if character.is_alphanumeric() || matches!(character, '\'' | '\u{2019}') {
-            normalized.push(if character == '\u{2019}' { '\'' } else { character });
+            normalized.push(if character == '\u{2019}' {
+                '\''
+            } else {
+                character
+            });
         } else if !normalized.ends_with(' ') {
             normalized.push(' ');
         }
@@ -1252,9 +1318,12 @@ fn download_audio(url: &str, path: &Path) -> Result<(), String> {
 mod tests {
     use super::{
         cached_audio_path, cambridge_headword_matches, cambridge_slug, em_to_pango_bold,
-        escape_markup, fnv1a, is_sentence, parse_cambridge,
-        parse_google, parse_tracau, parse_tracau_fulltext, percent_encode,
-        should_probe_dictionary, strip_tags,
+        escape_markup, fnv1a, is_sentence, parse_cambridge, parse_google, parse_tracau,
+        parse_tracau_fulltext, percent_encode, should_probe_dictionary, strip_tags, Request,
+    };
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
     };
 
     #[test]
@@ -1351,7 +1420,11 @@ mod tests {
         let entries = parse_tracau_fulltext(html);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].pos, "tính từ");
-        let wording: Vec<_> = entries[0].meanings.iter().map(|m| m.text.as_str()).collect();
+        let wording: Vec<_> = entries[0]
+            .meanings
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
         assert_eq!(wording, ["thiếu khả năng, bất tài", "không có hiệu quả"]);
         assert_eq!(entries[1].pos, "danh từ");
         assert_eq!(entries[1].meanings[0].text, "sự kém cỏi");
@@ -1383,8 +1456,14 @@ mod tests {
         // Both examples hang off that one sense, each with its translation.
         assert_eq!(meaning.examples.len(), 2);
         assert_eq!(meaning.examples[0].en, "they went out in spite of the rain");
-        assert_eq!(meaning.examples[0].vi.as_deref(), Some("họ ra đi bất chấp trời mưa"));
-        assert_eq!(meaning.examples[1].en, "in spite of all his efforts, he failed");
+        assert_eq!(
+            meaning.examples[0].vi.as_deref(),
+            Some("họ ra đi bất chấp trời mưa")
+        );
+        assert_eq!(
+            meaning.examples[1].en,
+            "in spite of all his efforts, he failed"
+        );
     }
 
     #[test]
@@ -1551,7 +1630,10 @@ mod tests {
         assert!(cambridge_headword_matches("hard  work", "hard work"));
         // Every one of these was observed answering the wrong entry.
         assert!(!cambridge_headword_matches("look after", "look"));
-        assert!(!cambridge_headword_matches("give up", "give someone a heads-up"));
+        assert!(!cambridge_headword_matches(
+            "give up",
+            "give someone a heads-up"
+        ));
         assert!(!cambridge_headword_matches("of course", "course of action"));
         assert!(!cambridge_headword_matches("ice cream", "ice cream cone"));
         // A single word must not resolve to something unrelated either.
@@ -1611,7 +1693,21 @@ mod tests {
     }
 
     #[test]
-    fn cambridge_keeps_every_definition_with_an_example() {
+    fn a_request_stops_being_current_once_the_window_asks_for_something_newer() {
+        let latest = Arc::new(AtomicU64::new(0));
+        let first = Request::new(latest.clone(), latest.load(Ordering::Relaxed));
+        assert!(first.is_current());
+        // The user typed another word before the first answer came back.
+        let second = Request::new(latest.clone(), latest.fetch_add(1, Ordering::Relaxed) + 1);
+        assert!(!first.is_current());
+        assert!(second.is_current());
+        // Closing the window retires whatever is still out there.
+        Request::retire_all(&latest);
+        assert!(!second.is_current());
+    }
+
+    #[test]
+    fn cambridge_keeps_definitions_even_without_examples() {
         let definitions: Vec<_> = (0..12)
             .map(|id| {
                 serde_json::json!({
@@ -1628,9 +1724,44 @@ mod tests {
             .collect();
         let json = serde_json::json!({"word": "tell", "definition": definitions});
         let (_, parsed) = parse_cambridge(&json, "tell");
-        assert_eq!(parsed.len(), 11);
-        assert_eq!(parsed.last().map(|item| item.text.as_str()), Some("sense 11"));
-        assert!(!parsed.iter().any(|item| item.text == "sense 2"));
+        assert_eq!(parsed.len(), 12);
+        assert_eq!(
+            parsed.last().map(|item| item.text.as_str()),
+            Some("sense 11")
+        );
+        let bare = parsed
+            .iter()
+            .find(|item| item.text == "sense 2")
+            .expect("a definition does not need an example");
+        assert!(bare.examples.is_empty());
+    }
+
+    #[test]
+    fn a_plural_reply_keeps_bare_cambridge_definitions() {
+        // The live endpoint answers `toxins` with the `toxin` lemma. Its two
+        // definitions carry no examples, but are still the useful part of the
+        // reply and must not disappear while pronunciation survives.
+        let json = serde_json::json!({
+            "word": "toxin",
+            "pronunciation": [{
+                "lang": "uk",
+                "url": "toxin.mp3",
+                "pron": "/ˈtɒk.sɪn/"
+            }],
+            "definition": [{
+                "pos": "noun",
+                "text": "a poisonous substance, especially one produced by bacteria, that causes disease",
+                "example": []
+            }, {
+                "pos": "noun",
+                "text": "a poisonous substance, esp. one that is produced by bacteria and causes disease",
+                "example": []
+            }]
+        });
+        let (pronunciations, definitions) = parse_cambridge(&json, "toxins");
+        assert_eq!(pronunciations.len(), 1);
+        assert_eq!(definitions.len(), 2);
+        assert!(definitions.iter().all(|item| item.examples.is_empty()));
     }
 
     #[test]

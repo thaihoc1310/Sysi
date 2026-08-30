@@ -4,7 +4,7 @@ use crate::{
         AppState, ColorMode, DictionaryWindow, Note, NoteImage, Point, Size, SystemDetails,
         TimerStyle, IMAGE_PLACEHOLDER,
     },
-    system::{SystemReader, SystemSnapshot},
+    system::{SystemReadOptions, SystemReader, SystemSnapshot},
     translate,
 };
 use cairo::{Context, FontSlant, FontWeight, RectangleInt, Region};
@@ -17,13 +17,29 @@ use std::{
     collections::HashMap,
     f64::consts::{PI, TAU},
     fs,
-    rc::Rc,
+    rc::{Rc, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 const SYSTEM_WIDTH: i32 = 196;
 const SYSTEM_HEIGHT: i32 = 76;
 const SYSTEM_SINGLE_WIDTH: i32 = 76;
+/// One meter's share of a row. Two of them make up the classic CPU + RAM card.
+const SYSTEM_METER_CELL: f64 = 94.0;
+/// Rings stay legible at this size, so a row never holds more than three.
+const SYSTEM_METERS_PER_ROW: usize = 3;
+/// Where a caption sits inside its ring, measured from the top of the meter.
+/// Four above the ring's widest point, which is what buys the caption enough
+/// clear room for a word as long as "NVIDIA".
+const SYSTEM_METER_LABEL_BASELINE: f64 = 52.0;
+/// How wide a caption can be at that baseline before it crosses the stroke:
+/// the ring's inner edge is 18 either side of centre there, and a centred
+/// caption has to clear both.
+const SYSTEM_METER_LABEL_WIDTH: f64 = 34.0;
 const TIMER_SIZE: i32 = 116;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
@@ -65,6 +81,9 @@ type HoveredRow = Rc<Cell<Option<u64>>>;
 // The dictionary lookup, handed to context menus that are built before it
 // exists. Filled in once during startup, like `CallbackSlot`.
 type LookupSlot = Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>;
+/// A recursive lookup callback must be weak or the callback and its slot keep
+/// an already-closed dictionary window alive forever.
+type WeakLookupSlot = Rc<RefCell<Option<Weak<dyn Fn(&str)>>>>;
 type SystemValues = Rc<RefCell<SystemSnapshot>>;
 /// Opens a dictionary window, going straight to a word when one is given.
 type SpawnDictionary = Rc<dyn Fn(Option<&str>)>;
@@ -113,6 +132,9 @@ struct TranslateInstance {
     /// Answers this window has already shown, keyed by query. Emptied when the
     /// window is closed.
     cache: TranslateCache,
+    /// Stops timers and the channel receiver, and breaks the one recursive
+    /// lookup reference before the GTK widgets are destroyed.
+    cleanup: Rc<dyn Fn()>,
 }
 
 /// What spawning a dictionary window needs from the rest of the overlay.
@@ -143,6 +165,13 @@ struct SystemCard {
     canvas: gtk::DrawingArea,
     values: SystemValues,
     details: Rc<Cell<SystemDetails>>,
+    /// The last size the layout itself asked for. Compared against rather than
+    /// against the allocation, so a card whose natural size never quite matches
+    /// its request is not re-requested on every sample.
+    auto_size: Rc<Cell<Option<Size>>>,
+    /// Asks the sampler for a reading now. Filled in by `start_system_updates`,
+    /// which runs after the details menu has already been attached.
+    resample: CallbackSlot,
     resize: ResizeHandle,
 }
 
@@ -152,6 +181,8 @@ struct SystemDetailsPreview {
     canvas: gtk::DrawingArea,
     values: SystemValues,
     details: Rc<Cell<SystemDetails>>,
+    auto_size: Rc<Cell<Option<Size>>>,
+    resample: CallbackSlot,
 }
 
 #[derive(Clone)]
@@ -339,7 +370,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }
         if data.layout_version < 6 {
             let details = data.settings.system_details;
-            if system_meter_count(details) == 1
+            // Frozen at what version 6 knew about: CPU and RAM were the only
+            // two meters that existed when this migration was written.
+            if usize::from(details.cpu) + usize::from(details.ram) == 1
                 && !details.processes
                 && !details.cores
                 && data.sizes.get("system").copied()
@@ -411,6 +444,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     let registry: Rc<RefCell<Vec<RegisteredWidget>>> = Rc::new(RefCell::new(Vec::new()));
     let interactive = Rc::new(Cell::new(true));
+    publish_panel_state(true, state.borrow().settings.color_mode);
     // Context menus are attached while their windows are built, well before the
     // dictionary lookup they call into exists; the slot is filled once both do.
     let lookup_slot: LookupSlot = Rc::new(RefCell::new(None));
@@ -450,7 +484,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         &system_card.card,
         "system",
         &state,
-        system_content_size(system_details, 0),
+        system_content_size(system_details, &SystemSnapshot::default()),
     );
     place_card(
         &root,
@@ -480,6 +514,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             canvas: system_card.canvas.clone(),
             values: system_card.values.clone(),
             details: system_card.details.clone(),
+            auto_size: system_card.auto_size.clone(),
+            resample: system_card.resample.clone(),
         }),
         None,
         None,
@@ -743,10 +779,22 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     instance.window.card.show_all();
                     instance.window.chrome.set_visible(ctx.interactive.get());
                     (instance.refresh_nav)();
+                    {
+                        let mut data = ctx.state.borrow_mut();
+                        data.settings.translate_open = true;
+                        let _ = data.save();
+                    }
                     match query {
                         Some(query) => (instance.lookup)(query),
                         None => (instance.set_search)(true),
                     }
+                    refresh_input_shape(&ctx.window, &ctx.registry, ctx.interactive.get());
+                    glib::idle_add_local_once({
+                        let ctx = ctx.clone();
+                        move || {
+                            refresh_input_shape(&ctx.window, &ctx.registry, ctx.interactive.get());
+                        }
+                    });
                 }
                 return;
             }
@@ -819,10 +867,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     instance.window.card.show_all();
                     // show_all() reveals the chrome and the query panel
                     // regardless of lock mode; restore both rules.
-                    instance
-                        .window
-                        .chrome
-                        .set_visible(ctx.interactive.get());
+                    instance.window.chrome.set_visible(ctx.interactive.get());
                     instance.search_open.set(false);
                     instance.window.set_search_visible(false);
                     (instance.refresh_nav)();
@@ -878,9 +923,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let open: Vec<TranslateInstance> = instances
                 .borrow()
                 .iter()
-                .filter(|instance| {
-                    instance.window.card.is_visible() && instance.search_open.get()
-                })
+                .filter(|instance| instance.window.card.is_visible() && instance.search_open.get())
                 .cloned()
                 .collect();
             let Some(instance) = open
@@ -1249,6 +1292,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     widget_picker.mode.connect_clicked({
         let state = state.clone();
         let registry = registry.clone();
+        let interactive = interactive.clone();
         move |button| {
             let next = state.borrow().settings.color_mode.next();
             {
@@ -1259,6 +1303,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let _ = state.borrow().save();
             button.set_label(next.label());
             apply_color_mode(&registry, next);
+            publish_panel_state(interactive.get(), next);
         }
     });
 
@@ -1356,6 +1401,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let window = window.clone();
         let registry = registry.clone();
         let lock = widget_picker.lock.clone();
+        let state = state.clone();
         let commit_timer_edit = timer_card.commit_edit.clone();
         Rc::new(move || {
             let enabled = !interactive.get();
@@ -1378,6 +1424,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 window.style_context().remove_class("editing");
             }
             lock.set_label(if enabled { "LOCK" } else { "UNLOCK" });
+            publish_panel_state(enabled, state.borrow().settings.color_mode);
             set_edit_chrome_visibility(&registry, enabled);
             for item in registry.borrow().iter() {
                 item.widget.queue_draw();
@@ -1667,41 +1714,75 @@ fn build_system_card(initial_color_mode: ColorMode, initial_details: SystemDetai
         canvas,
         values,
         details,
+        auto_size: Rc::new(Cell::new(None)),
+        resample: Rc::new(RefCell::new(None)),
         resize,
     }
 }
 
 fn start_system_updates(system: SystemCard, state: Rc<RefCell<AppState>>) {
-    let reader = Rc::new(RefCell::new(SystemReader::default()));
-    let update: Rc<dyn Fn()> = Rc::new({
-        let reader = reader.clone();
+    // /proc is cheap most of the time, but TOP PROCESSES walks every PID and
+    // NVIDIA sampling starts a helper process. Keep all of it off GTK's main
+    // loop so a slow driver or a machine with many processes cannot freeze the
+    // overlay every two seconds.
+    let (request_tx, request_rx) = async_channel::bounded::<SystemReadOptions>(1);
+    let (snapshot_tx, snapshot_rx) = async_channel::bounded::<SystemSnapshot>(1);
+    let _ = std::thread::Builder::new()
+        .name("sysi-system-sampler".into())
+        .spawn(move || {
+            let mut reader = SystemReader::default();
+            while let Ok(options) = request_rx.recv_blocking() {
+                if snapshot_tx.send_blocking(reader.read(options)).is_err() {
+                    break;
+                }
+            }
+        });
+
+    glib::MainContext::default().spawn_local({
         let canvas = system.canvas.clone();
         let values = system.values.clone();
-        let details = system.details.clone();
         let card = system.card.clone();
         let state = state.clone();
-        move || {
-            let options = details.get();
-            let snapshot = reader.borrow_mut().read(options.processes, options.cores);
-            let desired = system_content_size(options, snapshot.cores.len());
-            let current = card.allocation();
-            // Only auto-grow the default layout (new core rows); a size the
-            // user set with the resize handle must not be overridden.
-            let custom = state.borrow().sizes.get("system").copied();
-            if custom.is_none()
-                && current.width() == desired.width
-                && current.height() < desired.height
-            {
-                card.set_size_request(desired.width, desired.height);
-                card.queue_resize();
+        let details = system.details.clone();
+        let auto_size = system.auto_size.clone();
+        async move {
+            while let Ok(snapshot) = snapshot_rx.recv().await {
+                let desired = system_content_size(details.get(), &snapshot);
+                // Re-fit the default layout whenever what it has to show
+                // changes: a core grid that grew a row, or a GPU that only
+                // appeared once the first sample came back. A size the user set
+                // with the resize handle is left alone.
+                let custom = state.borrow().sizes.get("system").copied();
+                if custom.is_none() && auto_size.get() != Some(desired) {
+                    auto_size.set(Some(desired));
+                    card.set_size_request(desired.width, desired.height);
+                    card.queue_resize();
+                }
+                *values.borrow_mut() = snapshot;
+                canvas.queue_draw();
             }
-            *values.borrow_mut() = snapshot;
-            canvas.queue_draw();
         }
     });
-    update();
+
+    let request: Rc<dyn Fn()> = Rc::new({
+        let details = system.details.clone();
+        move || {
+            let details = details.get();
+            let _ = request_tx.try_send(SystemReadOptions {
+                processes: details.processes,
+                cores: details.cores,
+                gpus: details.gpus,
+                root_disk: details.root_disk,
+                home_disk: details.home_disk,
+            });
+        }
+    });
+    request();
+    // Toggling a section on should not leave the card a sample behind, so the
+    // details menu gets a way to ask for one straight away.
+    *system.resample.borrow_mut() = Some(request.clone());
     glib::timeout_add_local(Duration::from_secs(2), move || {
-        update();
+        request();
         glib::ControlFlow::Continue
     });
 }
@@ -1715,66 +1796,74 @@ fn draw_system(
 ) {
     let allocation = area.allocation();
     let width = f64::from(allocation.width().max(1));
-    let meter_count = system_meter_count(details);
-    let meter_width = if meter_count == 1 {
-        f64::from(SYSTEM_SINGLE_WIDTH)
-    } else {
-        188.0
-    };
-    let scale = (width / meter_width).clamp(0.1, 1.0);
-    let content_width = meter_width * scale;
+    let meters = system_meters(details, values);
+    let rows = system_meter_rows(meters.len());
+    let layout_width = system_meter_layout_width(meters.len());
+    let scale = (width / layout_width).clamp(0.1, 1.0);
+    let content_width = layout_width * scale;
     let (ink, muted, accent) = match color_mode {
         ColorMode::Light => ((0.97, 0.97, 0.97), (0.72, 0.72, 0.72), (0.9, 0.9, 0.9)),
         ColorMode::Gray => ((0.7, 0.7, 0.7), (0.5, 0.5, 0.5), (0.64, 0.64, 0.64)),
         ColorMode::Dark => ((0.08, 0.08, 0.08), (0.24, 0.24, 0.24), (0.14, 0.14, 0.14)),
     };
-    let meters = match (details.cpu, details.ram) {
-        (true, true) => [
-            Some((47.0, values.cpu_percent, "CPU")),
-            Some((141.0, values.memory_percent, "RAM")),
-        ],
-        (true, false) => [Some((38.0, values.cpu_percent, "CPU")), None],
-        (false, true) => [Some((38.0, values.memory_percent, "RAM")), None],
-        (false, false) => [None, None],
-    };
-    if meters[0].is_some() {
+    if !meters.is_empty() {
         let _ = ctx.save();
         ctx.translate((width - content_width) / 2.0, 0.0);
         ctx.scale(scale, scale);
-        for (x, value, title) in meters.into_iter().flatten() {
-            ctx.set_line_width(6.5);
-            ctx.set_line_cap(cairo::LineCap::Round);
-            ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
-            ctx.new_sub_path();
-            ctx.arc(x, 35.0, 28.0, -PI * 0.75, PI * 0.75);
-            let _ = ctx.stroke();
-            ctx.set_source_rgba(accent.0, accent.1, accent.2, 0.96);
-            ctx.new_sub_path();
-            ctx.arc(
-                x,
-                35.0,
-                28.0,
-                -PI * 0.75,
-                -PI * 0.75 + PI * 1.5 * (value / 100.0).clamp(0.0, 1.0),
-            );
-            let _ = ctx.stroke();
-            center_text(
-                ctx,
-                x,
-                37.0,
-                &format!("{value:.0}%"),
-                18.0,
-                FontWeight::Bold,
-                ink,
-            );
-            center_text(ctx, x, 56.0, title, 8.5, FontWeight::Bold, muted);
+        let mut meters = meters.iter();
+        for (row, count) in rows.iter().copied().enumerate() {
+            let y = row as f64 * f64::from(SYSTEM_HEIGHT);
+            // Every row is centred on the card, so a last row that came up
+            // short sits under the middle of the one above it.
+            let left = (layout_width - count as f64 * SYSTEM_METER_CELL) / 2.0;
+            for column in 0..count {
+                let Some((value, title)) = meters.next() else {
+                    break;
+                };
+                let x = left + (column as f64 + 0.5) * SYSTEM_METER_CELL;
+                ctx.set_line_width(6.5);
+                ctx.set_line_cap(cairo::LineCap::Round);
+                ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
+                ctx.new_sub_path();
+                ctx.arc(x, y + 35.0, 28.0, -PI * 0.75, PI * 0.75);
+                let _ = ctx.stroke();
+                ctx.set_source_rgba(accent.0, accent.1, accent.2, 0.96);
+                ctx.new_sub_path();
+                ctx.arc(
+                    x,
+                    y + 35.0,
+                    28.0,
+                    -PI * 0.75,
+                    -PI * 0.75 + PI * 1.5 * (value / 100.0).clamp(0.0, 1.0),
+                );
+                let _ = ctx.stroke();
+                center_text(
+                    ctx,
+                    x,
+                    y + 37.0,
+                    &format!("{value:.0}%"),
+                    18.0,
+                    FontWeight::Bold,
+                    ink,
+                );
+                center_text_fitted(
+                    ctx,
+                    x,
+                    y + SYSTEM_METER_LABEL_BASELINE,
+                    title,
+                    8.5,
+                    SYSTEM_METER_LABEL_WIDTH,
+                    FontWeight::Bold,
+                    muted,
+                );
+            }
         }
         let _ = ctx.restore();
     }
-    let mut cursor_y = if details.cpu || details.ram {
-        76.0 * scale
-    } else {
+    let mut cursor_y = if rows.is_empty() {
         2.0
+    } else {
+        rows.len() as f64 * f64::from(SYSTEM_HEIGHT) * scale
     };
     if details.processes {
         draw_system_processes(ctx, values, width, cursor_y, ink, muted);
@@ -1785,32 +1874,96 @@ fn draw_system(
     }
 }
 
-fn system_content_size(details: SystemDetails, core_count: usize) -> Size {
-    let mut height = if details.cpu || details.ram {
-        SYSTEM_HEIGHT
-    } else {
+/// Every ring the card shows, in the order they are laid out. Both the drawing
+/// and the sizing read this one list, so what is measured is always what ends
+/// up on screen — a machine with no NVIDIA card contributes no ring and no row.
+fn system_meters(details: SystemDetails, values: &SystemSnapshot) -> Vec<(f64, String)> {
+    let mut meters = Vec::new();
+    if details.cpu {
+        meters.push((values.cpu_percent, "CPU".into()));
+    }
+    if details.ram {
+        meters.push((values.memory_percent, "RAM".into()));
+    }
+    if details.gpus {
+        meters.extend(
+            values
+                .gpus
+                .iter()
+                .map(|gpu| (gpu.percent, gpu.label.clone())),
+        );
+    }
+    if details.root_disk {
+        if let Some(percent) = values.root_disk_percent {
+            meters.push((percent, "ROOT".into()));
+        }
+    }
+    if details.home_disk {
+        if let Some(percent) = values.home_disk_percent {
+            meters.push((percent, "HOME".into()));
+        }
+    }
+    meters
+}
+
+/// How many meters go on each row. Rows hold at most three and are filled as
+/// evenly as they divide, so four rings read as two over two rather than three
+/// over a lone one.
+fn system_meter_rows(count: usize) -> Vec<usize> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let rows = count.div_ceil(SYSTEM_METERS_PER_ROW);
+    let per_row = count / rows;
+    let leftover = count % rows;
+    (0..rows)
+        .map(|row| per_row + usize::from(row < leftover))
+        .collect()
+}
+
+/// The width the rings are laid out in, before the card scales them to fit.
+fn system_meter_layout_width(count: usize) -> f64 {
+    match count {
+        // One ring keeps the tight square card it has always had.
+        0 | 1 => f64::from(SYSTEM_SINGLE_WIDTH),
+        _ => {
+            let widest = system_meter_rows(count).into_iter().max().unwrap_or(1);
+            widest as f64 * SYSTEM_METER_CELL
+        }
+    }
+}
+
+fn system_content_size(details: SystemDetails, values: &SystemSnapshot) -> Size {
+    let rows = system_meter_rows(system_meters(details, values).len());
+    let mut height = if rows.is_empty() {
         10
+    } else {
+        rows.len() as i32 * SYSTEM_HEIGHT
     };
     if details.processes {
         height += 108;
     }
     if details.cores {
-        height += 16 + (core_count.max(1).div_ceil(4) as i32 * 17);
+        height += 16 + (values.cores.len().max(1).div_ceil(4) as i32 * 17);
     }
+    let meter_count: usize = rows.iter().sum();
     Size {
         width: if details.processes || details.cores {
             318
-        } else if system_meter_count(details) == 1 {
-            SYSTEM_SINGLE_WIDTH
+        } else if meter_count <= 1 {
+            // No meters at all still leaves a strip to right-click on.
+            if meter_count == 0 {
+                SYSTEM_WIDTH
+            } else {
+                SYSTEM_SINGLE_WIDTH
+            }
         } else {
-            SYSTEM_WIDTH
+            // The classic two-across card is 196 wide; three-across grows to
+            // match, and the eight either side stays the card's own margin.
+            system_meter_layout_width(meter_count) as i32 + (SYSTEM_WIDTH - 188)
         },
         height,
     }
-}
-
-fn system_meter_count(details: SystemDetails) -> usize {
-    usize::from(details.cpu) + usize::from(details.ram)
 }
 
 fn draw_system_processes(
@@ -5136,32 +5289,29 @@ fn store_dictionary_history(
 /// fresh rather than inheriting a slot the user closed.
 fn close_translate_window(ctx: &TranslateContext, id: u64) {
     let key = dictionary_key(id);
-    let card = ctx
+    let instance = ctx
         .instances
         .borrow()
         .iter()
         .find(|instance| instance.id == id)
-        .map(|instance| instance.window.card.clone());
-    let Some(card) = card else {
+        .cloned();
+    let Some(instance) = instance else {
         return;
     };
+    // Stop every callback which can still reach the card before destroying
+    // it. In particular, a slow network reply must not render into children
+    // that gtk_widget_destroy() has already torn down.
+    (instance.cleanup)();
+    instance.cache.borrow_mut().clear();
+    let card = instance.window.card.clone();
     ctx.root.remove(&card);
     // The card's own handlers hold it, the same cycle the note rebuild breaks.
     // SAFETY: it has just been unparented and nothing reads it again.
     unsafe { card.destroy() };
     ctx.registry.borrow_mut().retain(|item| item.key != key);
-    // Emptied rather than left to the instance being dropped: the answers are
-    // the biggest thing a window holds, and closing it should hand that memory
-    // straight back.
-    if let Some(instance) = ctx
-        .instances
-        .borrow()
-        .iter()
-        .find(|instance| instance.id == id)
-    {
-        instance.cache.borrow_mut().clear();
-    }
-    ctx.instances.borrow_mut().retain(|instance| instance.id != id);
+    ctx.instances
+        .borrow_mut()
+        .retain(|instance| instance.id != id);
     ctx.scrollers
         .borrow_mut()
         .retain(|scroller| scroller.window().is_some());
@@ -5191,11 +5341,16 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         &ctx.state.borrow(),
         &key,
     )));
+    // Closing the receiver wakes its task immediately. The flag also prevents
+    // an event already queued before close from touching the destroyed GTK
+    // children while the closed channel is being drained.
+    let alive = Rc::new(Cell::new(true));
     let fit_height: Rc<dyn Fn()> = {
         let card = translate.card.clone();
         let chrome = translate.chrome.clone();
         let results = translate.results.clone();
-        Rc::new(move || fit_translate_height(&card, &chrome, &results))
+        let alive = alive.clone();
+        Rc::new(move || fit_translate_height(&card, &chrome, &results, &alive))
     };
 
     // The card joins the container first, whatever decides its place. Only
@@ -5288,8 +5443,10 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
     // user types the next query, and a shared counter would let those
     // keystrokes retire the lookup — leaving "Looking it up…" on screen with
     // nothing left to replace it.
-    let lookup_generation = Rc::new(Cell::new(0u64));
-    let suggest_generation = Rc::new(Cell::new(0u64));
+    // Shared with the worker threads, which read them to find out whether the
+    // request they are part-way through is still the one the window wants.
+    let lookup_generation = Arc::new(AtomicU64::new(0));
+    let suggest_generation = Arc::new(AtomicU64::new(0));
     // The play buttons currently on screen, keyed by the clip they are waiting
     // for. Cleared on every rebuild, so a download that outlives its button
     // finds no one waiting and is neither re-enabled nor played.
@@ -5307,7 +5464,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
     let cache: TranslateCache = Rc::new(RefCell::new(HashMap::new()));
     // Rendering a cached answer needs the very closure that is being built, so
     // it goes through a slot filled in as soon as that closure exists.
-    let lookup_self: LookupSlot = Rc::new(RefCell::new(None));
+    let lookup_self: WeakLookupSlot = Rc::new(RefCell::new(None));
 
     let saved = ctx
         .state
@@ -5316,9 +5473,15 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         .iter()
         .find(|entry| entry.id == id)
         .cloned();
-    let history_stack: Rc<RefCell<Vec<String>>> =
-        Rc::new(RefCell::new(saved.as_ref().map(|entry| entry.history.clone()).unwrap_or_default()));
-    let history_cursor = Rc::new(Cell::new(saved.as_ref().map(|entry| entry.cursor).unwrap_or(0)));
+    let history_stack: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(
+        saved
+            .as_ref()
+            .map(|entry| entry.history.clone())
+            .unwrap_or_default(),
+    ));
+    let history_cursor = Rc::new(Cell::new(
+        saved.as_ref().map(|entry| entry.cursor).unwrap_or(0),
+    ));
 
     let update_nav: Rc<dyn Fn()> = {
         let back = translate.back.clone();
@@ -5382,14 +5545,14 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
             if let Some(source) = pending.borrow_mut().take() {
                 source.remove();
             }
-            suggest_generation.set(suggest_generation.get() + 1);
+            suggest_generation.fetch_add(1, Ordering::Relaxed);
             // The answer is what the user wants to see now, so the panel gets
             // out of the way until they ask for it again.
             search_open.set(false);
             translate.set_search_visible(false);
             clear_children(&translate.suggestions);
             audio_buttons.borrow_mut().clear();
-            lookup_generation.set(lookup_generation.get() + 1);
+            lookup_generation.fetch_add(1, Ordering::Relaxed);
             // A fresh answer chooses its own natural height and starts at the
             // top even if the previous entry had been scrolled down.
             apply_translate_elastic_size(&translate.card, &state);
@@ -5404,7 +5567,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
                 remember_search(&state, &result.query);
                 // Cloned out of the borrow: rendering wires up rows that can
                 // call straight back into this closure.
-                let run = lookup_self.borrow().clone();
+                let run = lookup_self.borrow().as_ref().and_then(Weak::upgrade);
                 if let Some(run) = run {
                     render_translate_result(
                         &translate.results,
@@ -5425,14 +5588,21 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
             );
             translate.results.show_all();
             fit_height();
-            translate::spawn_lookup(query, lookup_generation.get(), tx.clone());
+            translate::spawn_lookup(
+                query,
+                translate::Request::new(
+                    lookup_generation.clone(),
+                    lookup_generation.load(Ordering::Relaxed),
+                ),
+                tx.clone(),
+            );
         })
     };
     let lookup: Rc<dyn Fn(&str)> = {
         let run_lookup = run_lookup.clone();
         Rc::new(move |query: &str| run_lookup(query, true))
     };
-    *lookup_self.borrow_mut() = Some(lookup.clone());
+    *lookup_self.borrow_mut() = Some(Rc::downgrade(&lookup));
 
     // Opening and closing the query panel, including the focus grab that lets
     // the user start typing the moment it appears.
@@ -5454,7 +5624,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
             if let Some(source) = pending.borrow_mut().take() {
                 source.remove();
             }
-            suggest_generation.set(suggest_generation.get() + 1);
+            suggest_generation.fetch_add(1, Ordering::Relaxed);
             if !open {
                 clear_children(&translate.suggestions);
                 fit_height();
@@ -5572,8 +5742,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
                 // Retire an in-flight request immediately. Waiting until the
                 // next debounce fires leaves a window where suggestions for
                 // the previous prefix can render under the new text.
-                generation.set(generation.get() + 1);
-                let request_generation = generation.get();
+                let request_generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
                 let text = translate.query();
                 // Prose has no completions worth offering; an empty box goes
                 // back to showing what was searched before.
@@ -5595,15 +5764,21 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
                 }
                 let pending_for_timer = pending.clone();
                 let tx = tx.clone();
+                let generation = generation.clone();
                 let source = glib::timeout_add_local_once(TRANSLATE_SUGGEST_DELAY, move || {
                     pending_for_timer.borrow_mut().take();
-                    translate::spawn_suggest(text, request_generation, tx);
+                    translate::spawn_suggest(
+                        text,
+                        translate::Request::new(generation, request_generation),
+                        tx,
+                    );
                 });
                 *pending.borrow_mut() = Some(source);
             }
         });
     }
 
+    let rx_cleanup = rx.clone();
     glib::MainContext::default().spawn_local({
         let suggestions = translate.suggestions.clone();
         let results = translate.results.clone();
@@ -5617,20 +5792,24 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         let tx = tx.clone();
         let cache = cache.clone();
         let stack = history_stack.clone();
+        let alive = alive.clone();
         async move {
             while let Ok(event) = rx.recv().await {
+                if !alive.get() {
+                    break;
+                }
                 match event {
                     translate::TranslateEvent::Suggestions {
                         generation: at,
                         items,
-                    } if at == suggest_generation.get() => {
+                    } if at == suggest_generation.load(Ordering::Relaxed) => {
                         render_translate_suggestions(&suggestions, &items, &lookup);
                         fit_height();
                     }
                     translate::TranslateEvent::Lookup {
                         generation: at,
                         result,
-                    } if at == lookup_generation.get() => {
+                    } if at == lookup_generation.load(Ordering::Relaxed) => {
                         // Remembered here rather than when the query was sent,
                         // so a typo that found nothing never enters the list.
                         if let translate::ResultKind::Content(content) = &result.kind {
@@ -5701,6 +5880,31 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
     );
 
     ctx.scrollers.borrow_mut().push(translate.scroller.clone());
+    let cleanup: Rc<dyn Fn()> = {
+        let alive = alive.clone();
+        let rx = rx_cleanup;
+        let pending = pending.clone();
+        let lookup_self = lookup_self.clone();
+        let search_open = search_open.clone();
+        let lookup_generation = lookup_generation.clone();
+        let suggest_generation = suggest_generation.clone();
+        Rc::new(move || {
+            if !alive.replace(false) {
+                return;
+            }
+            search_open.set(false);
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            // Workers still out on the network belong to a window that no
+            // longer exists; retiring both counters stops them at their next
+            // checkpoint instead of at their timeout.
+            translate::Request::retire_all(&lookup_generation);
+            translate::Request::retire_all(&suggest_generation);
+            lookup_self.borrow_mut().take();
+            rx.close();
+        })
+    };
     ctx.instances.borrow_mut().push(TranslateInstance {
         id,
         window: translate,
@@ -5709,6 +5913,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         search_open,
         refresh_nav: update_nav.clone(),
         cache: cache.clone(),
+        cleanup,
     });
     update_nav();
     // Put back the word this window was showing when Sysi last closed.
@@ -6552,6 +6757,32 @@ fn take_panel_action() -> Option<String> {
     Some(action.trim().to_owned())
 }
 
+/// One short line for the GNOME panel extension to read: whether the overlay is
+/// accepting edits, and which colour mode it is in.
+///
+/// The extension used to flip its own two labels on click, which was wrong the
+/// moment either was changed from anywhere else — locking with Escape or the
+/// hotkey, or cycling the colour from the widget picker. Sysi owns both facts,
+/// so it publishes them and the panel just reads. A tiny file of its own rather
+/// than state.json: the shell would otherwise re-parse every note on the
+/// overlay's every save.
+fn publish_panel_state(interactive: bool, mode: ColorMode) {
+    let dir = crate::state::cache_dir();
+    let result = fs::create_dir_all(&dir).and_then(|_| {
+        fs::write(
+            dir.join("panel-state"),
+            format!(
+                "{} {}\n",
+                if interactive { "editing" } else { "locked" },
+                mode.key()
+            ),
+        )
+    });
+    if let Err(error) = result {
+        eprintln!("Could not publish the Sysi panel state: {error}");
+    }
+}
+
 fn card_shell(
     title: &str,
     kicker: &str,
@@ -6872,6 +7103,45 @@ fn attach_color_mode_menu(
             }
         });
         menu.append(&cores);
+
+        let gpus = gtk::CheckMenuItem::with_label("GPUS");
+        gpus.set_active(system_details.details.get().gpus);
+        gpus.connect_toggled({
+            let preview = system_details.clone();
+            let state = state.clone();
+            move |item| {
+                let mut details = preview.details.get();
+                details.gpus = item.is_active();
+                apply_system_details(&preview, &state, details);
+            }
+        });
+        menu.append(&gpus);
+
+        let root_disk = gtk::CheckMenuItem::with_label("DISK /");
+        root_disk.set_active(system_details.details.get().root_disk);
+        root_disk.connect_toggled({
+            let preview = system_details.clone();
+            let state = state.clone();
+            move |item| {
+                let mut details = preview.details.get();
+                details.root_disk = item.is_active();
+                apply_system_details(&preview, &state, details);
+            }
+        });
+        menu.append(&root_disk);
+
+        let home_disk = gtk::CheckMenuItem::with_label("DISK /HOME");
+        home_disk.set_active(system_details.details.get().home_disk);
+        home_disk.connect_toggled({
+            let preview = system_details.clone();
+            let state = state.clone();
+            move |item| {
+                let mut details = preview.details.get();
+                details.home_disk = item.is_active();
+                apply_system_details(&preview, &state, details);
+            }
+        });
+        menu.append(&home_disk);
     }
     menu.show_all();
 
@@ -6942,10 +7212,17 @@ fn apply_system_details(
     details: SystemDetails,
 ) {
     preview.details.set(details);
-    let size = system_content_size(details, preview.values.borrow().cores.len());
+    let size = system_content_size(details, &preview.values.borrow());
+    preview.auto_size.set(Some(size));
     preview.card.set_size_request(size.width, size.height);
     preview.card.queue_resize();
     preview.canvas.queue_draw();
+    // A section switched on has nothing sampled behind it yet. Ask for a
+    // reading now so the card settles in one step instead of two seconds later.
+    let resample = preview.resample.borrow().clone();
+    if let Some(resample) = resample {
+        resample();
+    }
     let mut data = state.borrow_mut();
     data.settings.system_details = details;
     // Drop any stored size instead of pinning this one. Turning CPU CORES on
@@ -7406,7 +7683,12 @@ fn apply_translate_elastic_size(card: &gtk::EventBox, state: &Rc<RefCell<AppStat
     card.queue_resize();
 }
 
-fn fit_translate_height(card: &gtk::EventBox, chrome: &gtk::EventBox, results: &gtk::Box) {
+fn fit_translate_height(
+    card: &gtk::EventBox,
+    chrome: &gtk::EventBox,
+    results: &gtk::Box,
+    alive: &Rc<Cell<bool>>,
+) {
     // GtkFixed and GtkScrolledWindow do not reliably bubble an async child's
     // new natural height up to the card. Measure the two visible columns after
     // GTK has built their layouts, then make that measured height explicit.
@@ -7414,7 +7696,11 @@ fn fit_translate_height(card: &gtk::EventBox, chrome: &gtk::EventBox, results: &
     let card = card.clone();
     let chrome = chrome.clone();
     let results = results.clone();
+    let alive = alive.clone();
     glib::idle_add_local_once(move || {
+        if !alive.get() {
+            return;
+        }
         let width = if card.width_request() > 0 {
             card.width_request()
         } else {
@@ -7860,8 +8146,7 @@ fn refresh_input_shape(
         // Notes and the history list keep receiving input in lock mode so
         // their content can still be scrolled; editing is disabled separately
         // via the read-only editor, and their headers hide as edit chrome.
-        let lock_note =
-            item.key.starts_with("note:") || item.key == "history" || item.key == "translate";
+        let lock_note = receives_input_when_locked(&item.key);
         if interactive
             || settings
             || lock_timer
@@ -7903,6 +8188,10 @@ fn refresh_input_shape(
     }
     gdk_window.input_shape_combine_region(&region, 0, 0);
     LAST_INPUT_SHAPE.with(|last| *last.borrow_mut() = Some(parts));
+}
+
+fn receives_input_when_locked(key: &str) -> bool {
+    key.starts_with("note:") || key.starts_with("dict:") || key == "history"
 }
 
 fn union_circle_region(region: &Region, x: i32, y: i32, width: i32, height: i32) {
@@ -8099,6 +8388,47 @@ fn center_text(
     let _ = ctx.show_text(text);
 }
 
+/// A meter caption sits in the gap at the bottom of its ring, which is only so
+/// wide. Anything longer than that ("DISK /HOME", a spelt-out GPU model) is
+/// stepped down in size until it fits rather than being drawn over the stroke.
+#[allow(clippy::too_many_arguments)]
+fn center_text_fitted(
+    ctx: &Context,
+    x: f64,
+    y: f64,
+    text: &str,
+    size: f64,
+    max_width: f64,
+    weight: FontWeight,
+    color: (f64, f64, f64),
+) {
+    center_text(
+        ctx,
+        x,
+        y,
+        text,
+        fitted_font_size(ctx, text, size, max_width),
+        weight,
+        color,
+    );
+}
+
+fn fitted_font_size(ctx: &Context, text: &str, size: f64, max_width: f64) -> f64 {
+    let mut chosen = size;
+    while chosen > 6.0 {
+        ctx.set_font_size(chosen);
+        let width = ctx
+            .text_extents(text)
+            .map(|extents| extents.x_advance())
+            .unwrap_or(0.0);
+        if width <= max_width {
+            break;
+        }
+        chosen -= 0.25;
+    }
+    chosen
+}
+
 fn install_css(screen: &gdk::Screen) {
     let css = include_str!("style.css");
     let provider = gtk::CssProvider::new();
@@ -8118,14 +8448,16 @@ mod timer_input_tests {
         cascade_point, ellipsize, fit_to_work_area, fit_within_bounds, history_row_budget,
         image_room, image_room_after_y, monitor_coordinate_divisor, monitor_root_bounds,
         normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
-        note_size_for_image, parse_timer_input, push_recent_search, record_note_undo, reopen_point,
-        resize_width_limit, resized_image_size, round_pixbuf_corners, system_content_size,
+        note_size_for_image, parse_timer_input, push_recent_search, receives_input_when_locked,
+        record_note_undo, reopen_point, resize_width_limit, resized_image_size,
+        round_pixbuf_corners, system_content_size, system_meter_layout_width, system_meter_rows,
         timer_style_size, NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo,
         NoteUndoState, ScreenRect, HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT,
         NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
-        NOTE_MAX_HEIGHT, NOTE_WIDTH,
+        NOTE_MAX_HEIGHT, NOTE_WIDTH, SYSTEM_METER_CELL,
     };
     use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
+    use crate::system::SystemSnapshot;
     use gdk_pixbuf::{Colorspace, Pixbuf};
     use std::{cell::RefCell, rc::Rc};
 
@@ -8139,6 +8471,16 @@ mod timer_input_tests {
         width: HISTORY_WIDTH,
         height: HISTORY_HEIGHT,
     };
+
+    #[test]
+    fn dictionary_content_keeps_receiving_input_while_locked() {
+        assert!(receives_input_when_locked("dict:1"));
+        assert!(receives_input_when_locked("dict:42"));
+        assert!(receives_input_when_locked("note:7"));
+        assert!(receives_input_when_locked("history"));
+        assert!(!receives_input_when_locked("system"));
+        assert!(!receives_input_when_locked("translate"));
+    }
 
     #[test]
     fn a_reopened_window_lands_near_the_click_and_fully_on_screen() {
@@ -8573,14 +8915,104 @@ mod timer_input_tests {
                 ram: false,
                 processes: false,
                 cores: false,
+                ..SystemDetails::default()
             },
-            0,
+            &SystemSnapshot::default(),
         );
         assert_eq!(
             size,
             Size {
                 width: 76,
                 height: 76
+            }
+        );
+    }
+
+    #[test]
+    fn meters_fill_rows_of_three_and_split_evenly_rather_than_leaving_a_stray() {
+        assert!(system_meter_rows(0).is_empty());
+        assert_eq!(system_meter_rows(1), [1]);
+        assert_eq!(system_meter_rows(2), [2]);
+        assert_eq!(system_meter_rows(3), [3]);
+        // Four rings read as two over two, not three over one.
+        assert_eq!(system_meter_rows(4), [2, 2]);
+        assert_eq!(system_meter_rows(5), [3, 2]);
+        assert_eq!(system_meter_rows(6), [3, 3]);
+        assert_eq!(system_meter_rows(7), [3, 2, 2]);
+        assert_eq!(system_meter_rows(8), [3, 3, 2]);
+    }
+
+    #[test]
+    fn a_row_of_meters_stays_centred_on_the_card_it_is_drawn_in() {
+        // The two-across card keeps the geometry it has always had: 188 wide,
+        // rings at 47 and 141.
+        assert_eq!(system_meter_layout_width(2), 188.0);
+        let centres = |count: usize| -> Vec<f64> {
+            let width = system_meter_layout_width(count);
+            let mut result = Vec::new();
+            for row in system_meter_rows(count) {
+                let left = (width - row as f64 * SYSTEM_METER_CELL) / 2.0;
+                for column in 0..row {
+                    result.push(left + (column as f64 + 0.5) * SYSTEM_METER_CELL);
+                }
+            }
+            result
+        };
+        assert_eq!(centres(1), [38.0]);
+        assert_eq!(centres(2), [47.0, 141.0]);
+        assert_eq!(centres(3), [47.0, 141.0, 235.0]);
+        // Five rings: three across, then two centred underneath them.
+        assert_eq!(centres(5), [47.0, 141.0, 235.0, 94.0, 188.0]);
+    }
+
+    #[test]
+    fn the_card_grows_a_row_at_a_time_as_meters_are_switched_on() {
+        let details = SystemDetails {
+            cpu: true,
+            ram: true,
+            gpus: true,
+            root_disk: true,
+            home_disk: true,
+            processes: false,
+            cores: false,
+        };
+        let values = SystemSnapshot {
+            gpus: vec![
+                crate::system::GpuSnapshot {
+                    label: "RTX 4060".into(),
+                    percent: 12.0,
+                },
+                crate::system::GpuSnapshot {
+                    label: "AMD GPU".into(),
+                    percent: 4.0,
+                },
+            ],
+            root_disk_percent: Some(66.0),
+            home_disk_percent: Some(63.0),
+            ..SystemSnapshot::default()
+        };
+        // Six meters: two rows of three, and a card wide enough for three.
+        assert_eq!(
+            system_content_size(details, &values),
+            Size {
+                width: 290,
+                height: 152
+            }
+        );
+        // A machine where nothing answered for the GPUs must not be left
+        // holding an empty row.
+        assert_eq!(
+            system_content_size(
+                details,
+                &SystemSnapshot {
+                    root_disk_percent: Some(66.0),
+                    home_disk_percent: Some(63.0),
+                    ..SystemSnapshot::default()
+                }
+            ),
+            Size {
+                width: 196,
+                height: 152
             }
         );
     }

@@ -27,6 +27,16 @@ impl ColorMode {
         }
     }
 
+    /// What the GNOME panel prints on its colour-mode button, and what it
+    /// writes into the shared panel-state file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Gray => "gray",
+            Self::Dark => "dark",
+        }
+    }
+
     pub fn css_class(self) -> &'static str {
         match self {
             Self::Light => "mode-light",
@@ -135,6 +145,12 @@ pub struct SystemDetails {
     pub processes: bool,
     #[serde(default)]
     pub cores: bool,
+    #[serde(default)]
+    pub gpus: bool,
+    #[serde(default)]
+    pub root_disk: bool,
+    #[serde(default)]
+    pub home_disk: bool,
 }
 
 impl Default for SystemDetails {
@@ -144,6 +160,9 @@ impl Default for SystemDetails {
             ram: true,
             processes: false,
             cores: false,
+            gpus: false,
+            root_disk: false,
+            home_disk: false,
         }
     }
 }
@@ -295,13 +314,19 @@ impl AppState {
     }
 
     pub fn save(&self) -> io::Result<()> {
-        let dir = config_dir();
-        fs::create_dir_all(&dir)?;
-        let path = dir.join("state.json");
-        let temp = dir.join("state.json.tmp");
-        let raw = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        fs::write(&temp, raw)?;
-        fs::rename(temp, path)
+        let result = (|| {
+            let dir = config_dir();
+            fs::create_dir_all(&dir)?;
+            let path = dir.join("state.json");
+            let temp = dir.join("state.json.tmp");
+            let raw = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+            fs::write(&temp, raw)?;
+            fs::rename(temp, path)
+        })();
+        if let Err(error) = &result {
+            eprintln!("Could not save Sysi state: {error}");
+        }
+        result
     }
 
     // Delete image files no note points at any more. Deleting a note that

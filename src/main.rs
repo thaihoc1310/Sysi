@@ -21,8 +21,7 @@ const PANEL_EXTENSION_UUID: &str = "sysi-panel@thaihoc";
 const PANEL_EXTENSION_METADATA: &str =
     include_str!("../packaging/gnome-shell-extension/metadata.json");
 const PANEL_EXTENSION_JS: &str = include_str!("../packaging/gnome-shell-extension/extension.js");
-const PANEL_EXTENSION_CSS: &str =
-    include_str!("../packaging/gnome-shell-extension/stylesheet.css");
+const PANEL_EXTENSION_CSS: &str = include_str!("../packaging/gnome-shell-extension/stylesheet.css");
 
 fn main() {
     if std::env::args().any(|arg| arg == "--install-panel-extension") {
@@ -108,6 +107,7 @@ fn main() {
     application.connect_shutdown(move |_| {
         let _ = state.borrow().save();
         let _ = fs::remove_file(state::cache_dir().join("pid"));
+        let _ = fs::remove_file(state::cache_dir().join("panel-state"));
     });
     application.run();
 }
