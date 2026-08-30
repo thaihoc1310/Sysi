@@ -1,6 +1,16 @@
 use async_channel::Sender;
-use std::{mem, ptr, thread};
+use std::{
+    mem, ptr,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+};
 use x11::xlib;
+
+/// Set when a grab is refused. X reports that asynchronously, so the only way
+/// to hear about it is to catch the error and look afterwards — and a hotkey
+/// that quietly does nothing for the rest of the session is worth a line on
+/// stderr rather than a mystery.
+static GRAB_REFUSED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug)]
 pub enum HotkeyAction {
@@ -13,8 +23,12 @@ pub enum HotkeyAction {
 // this is for.
 unsafe extern "C" fn ignore_x_error(
     _display: *mut xlib::Display,
-    _error: *mut xlib::XErrorEvent,
+    error: *mut xlib::XErrorEvent,
 ) -> i32 {
+    // BadAccess from XGrabKey means someone else already holds the combination.
+    if !error.is_null() && (*error).error_code == xlib::BadAccess {
+        GRAB_REFUSED.store(true, Ordering::Relaxed);
+    }
     0
 }
 
@@ -59,6 +73,12 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
                 );
             }
             xlib::XSync(display, xlib::False);
+            if GRAB_REFUSED.swap(false, Ordering::Relaxed) {
+                eprintln!(
+                    "Sysi could not take Ctrl+Alt+O: another application already holds it. \
+                     Lock and unlock from the panel strip instead."
+                );
+            }
             let connection = xlib::XConnectionNumber(display);
             'listen: loop {
                 // Take what Xlib has already buffered. XNextEvent must only be

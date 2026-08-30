@@ -355,13 +355,21 @@ fn read_process_name(pid: u32, comm: String) -> String {
 }
 
 fn process_name_from_cmdline(raw: &[u8]) -> Option<String> {
-    // Kernel threads publish an empty cmdline; their `comm` is all there is.
-    let argv0 = String::from_utf8_lossy(raw.split(|byte| *byte == 0).next()?);
-    let argv0 = argv0.trim();
-    // Servers such as postgres rewrite argv[0] into a status line with no path
-    // in it. Splitting on '/' leaves that sentence intact, which is still the
-    // most informative thing available.
-    let name = argv0.rsplit('/').next()?.trim();
+    // Arguments are meant to be NUL-separated, but Chromium and every Electron
+    // app built on it rewrite their argv into one contiguous blob with spaces
+    // between the arguments instead. Splitting on the NUL alone hands back that
+    // whole command line, and taking the part after its last '/' then lands
+    // somewhere inside --user-data-dir or a crash-reporter GUID. Treat
+    // whitespace as a separator too and the first token is the executable
+    // either way.
+    let text = String::from_utf8_lossy(raw);
+    let argv0 = text
+        .split(|character: char| character == '\0' || character.is_whitespace())
+        .find(|token| !token.is_empty())?;
+    // Servers such as postgres rewrite argv[0] into a status line — "postgres:
+    // checkpointer" — with no path in it. There is nothing to strip there, and
+    // the bare program name is still the useful half.
+    let name = argv0.rsplit('/').next()?.trim_end_matches(':');
     (!name.is_empty()).then(|| name.to_owned())
 }
 
@@ -450,10 +458,35 @@ mod tests {
             process_name_from_cmdline(b"/usr/bin/python3\0script.py\0").as_deref(),
             Some("python3")
         );
-        // A rewritten argv[0] has no path to strip and stays as it is.
+        // A rewritten argv[0] has no path to strip; the program name is the
+        // half worth keeping.
         assert_eq!(
             process_name_from_cmdline(b"postgres: checkpointer\0").as_deref(),
-            Some("postgres: checkpointer")
+            Some("postgres")
+        );
+    }
+
+    #[test]
+    fn a_chromium_style_cmdline_is_not_mistaken_for_one_long_argument() {
+        // Both observed verbatim. Chromium and Electron write every argument
+        // into a single NUL-terminated blob, so splitting on the NUL alone used
+        // to take the last '/' out of --user-data-dir or a crash-reporter GUID
+        // and call the process "VQ6BtEUZqoCU04zoRU=--c" or "Codex --owl-...".
+        assert_eq!(
+            process_name_from_cmdline(
+                b"/opt/brave.com/brave/brave --type=renderer \
+--enable-crash-reporter=254aa1ef-75fb-4888-b266-41763658ad75,VQ6BtEUZqoCU04zoRU=\0"
+            )
+            .as_deref(),
+            Some("brave")
+        );
+        assert_eq!(
+            process_name_from_cmdline(
+                b"/usr/lib/chatgpt/ChatGPT --type=renderer \
+--user-data-dir=/home/someone/.config/Codex --owl-electron-scheme\0"
+            )
+            .as_deref(),
+            Some("ChatGPT")
         );
     }
 

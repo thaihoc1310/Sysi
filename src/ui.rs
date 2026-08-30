@@ -195,7 +195,7 @@ struct ResizeHandle {
     color_mode: Rc<Cell<ColorMode>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ResizeBounds {
     min_width: i32,
     min_height: i32,
@@ -203,6 +203,11 @@ struct ResizeBounds {
     max_height: i32,
     aspect_ratio: Option<f64>,
     preserve_current_aspect: bool,
+    /// The height a card of this width must have. Set on cards whose content
+    /// reflows — widen the system card until its rings sit on one row and the
+    /// rows it no longer needs have to go, rather than staying as blank space
+    /// the drag has no way to take back.
+    height_for_width: Option<Rc<dyn Fn(i32) -> i32>>,
 }
 
 #[derive(Clone)]
@@ -490,7 +495,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         &system_card.card,
         "system",
         &state,
-        system_content_size(system_details, &SystemSnapshot::default()),
+        system_card_size(system_details, &SystemSnapshot::default(), &state.borrow()),
     );
     place_card(
         &root,
@@ -548,10 +553,19 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         ResizeBounds {
             min_width: 72,
             min_height: 64,
-            max_width: 520,
+            // Room for eight rings side by side, so a card dragged wide really
+            // can put every meter on one row.
+            max_width: 8 * SYSTEM_METER_CELL as i32 + (SYSTEM_WIDTH - 188),
             max_height: 640,
             aspect_ratio: None,
             preserve_current_aspect: false,
+            height_for_width: Some(Rc::new({
+                let details = system_card.details.clone();
+                let values = system_card.values.clone();
+                move |width| {
+                    system_content_size(details.get(), &values.borrow(), Some(width)).height
+                }
+            })),
         },
     );
 
@@ -623,6 +637,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             max_height: 320,
             aspect_ratio: Some(1.0),
             preserve_current_aspect: true,
+            height_for_width: None,
         },
     );
 
@@ -729,6 +744,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             max_height: 760,
             aspect_ratio: None,
             preserve_current_aspect: false,
+            height_for_width: None,
         },
     );
 
@@ -1757,16 +1773,27 @@ fn start_system_updates(system: SystemCard, state: Rc<RefCell<AppState>>) {
         let auto_size = system.auto_size.clone();
         async move {
             while let Ok(snapshot) = snapshot_rx.recv().await {
-                let desired = system_content_size(details.get(), &snapshot);
-                // Re-fit the default layout whenever what it has to show
-                // changes: a core grid that grew a row, or a GPU that only
-                // appeared once the first sample came back. A size the user set
-                // with the resize handle is left alone.
-                let custom = state.borrow().sizes.get("system").copied();
-                if custom.is_none() && auto_size.get() != Some(desired) {
+                // Re-fit whenever what the card has to show changes: a core
+                // grid that grew a row, or a GPU that only appeared once the
+                // first sample came back. The width the user dragged to is
+                // kept; the height that follows from it is not theirs to set.
+                let desired = system_card_size(details.get(), &snapshot, &state.borrow());
+                if auto_size.get() != Some(desired) {
                     auto_size.set(Some(desired));
                     card.set_size_request(desired.width, desired.height);
                     card.queue_resize();
+                    // Keep the stored height honest too, or the next launch
+                    // lays the card out at a height it will only correct once
+                    // the first sample comes back.
+                    let mut data = state.borrow_mut();
+                    if data
+                        .sizes
+                        .get("system")
+                        .is_some_and(|stored| stored.height != desired.height)
+                    {
+                        data.sizes.insert("system".into(), desired);
+                        let _ = data.save();
+                    }
                 }
                 *values.borrow_mut() = snapshot;
                 canvas.queue_draw();
@@ -1807,8 +1834,8 @@ fn draw_system(
     let allocation = area.allocation();
     let width = f64::from(allocation.width().max(1));
     let meters = system_meters(details, values);
-    let rows = system_meter_rows(meters.len());
-    let layout_width = system_meter_layout_width(meters.len());
+    let rows = system_meter_rows(meters.len(), system_meter_columns(meters.len(), width));
+    let layout_width = system_meter_layout_width(rows.iter().copied().max().unwrap_or(0));
     let scale = (width / layout_width).clamp(0.1, 1.0);
     let content_width = layout_width * scale;
     let (ink, muted, accent) = match color_mode {
@@ -1916,14 +1943,25 @@ fn system_meters(details: SystemDetails, values: &SystemSnapshot) -> Vec<(f64, S
     meters
 }
 
-/// How many meters go on each row. Rows hold at most three and are filled as
-/// evenly as they divide, so four rings read as two over two rather than three
-/// over a lone one.
-fn system_meter_rows(count: usize) -> Vec<usize> {
+/// How many rings a card this wide can put side by side. The card reflows: drag
+/// it out and six meters end up on one row, pull it in and they stack. Never
+/// more columns than there are meters, and never fewer than one — below a
+/// single cell the rings scale down instead of disappearing.
+fn system_meter_columns(count: usize, card_width: f64) -> usize {
     if count == 0 {
+        return 0;
+    }
+    ((card_width / SYSTEM_METER_CELL).floor() as usize).clamp(1, count)
+}
+
+/// How many meters go on each row, given how many fit across. Rows divide as
+/// evenly as they can, so four rings over two rows read as two and two rather
+/// than three and a lone one.
+fn system_meter_rows(count: usize, columns: usize) -> Vec<usize> {
+    if count == 0 || columns == 0 {
         return Vec::new();
     }
-    let rows = count.div_ceil(SYSTEM_METERS_PER_ROW);
+    let rows = count.div_ceil(columns);
     let per_row = count / rows;
     let leftover = count % rows;
     (0..rows)
@@ -1932,19 +1970,33 @@ fn system_meter_rows(count: usize) -> Vec<usize> {
 }
 
 /// The width the rings are laid out in, before the card scales them to fit.
-fn system_meter_layout_width(count: usize) -> f64 {
-    match count {
+/// `widest` is the busiest row's meter count.
+fn system_meter_layout_width(widest: usize) -> f64 {
+    match widest {
         // One ring keeps the tight square card it has always had.
         0 | 1 => f64::from(SYSTEM_SINGLE_WIDTH),
-        _ => {
-            let widest = system_meter_rows(count).into_iter().max().unwrap_or(1);
-            widest as f64 * SYSTEM_METER_CELL
-        }
+        columns => columns as f64 * SYSTEM_METER_CELL,
     }
 }
 
-fn system_content_size(details: SystemDetails, values: &SystemSnapshot) -> Size {
-    let rows = system_meter_rows(system_meters(details, values).len());
+/// The size the card wants.
+///
+/// `card_width` is the width the user dragged it to, when they have dragged it.
+/// The height is always ours: every part of this card stacks at a fixed height,
+/// so a card widened until its rings fit on one row has to give the rows it no
+/// longer needs back rather than keep them as blank space.
+fn system_content_size(
+    details: SystemDetails,
+    values: &SystemSnapshot,
+    card_width: Option<i32>,
+) -> Size {
+    let meter_count = system_meters(details, values).len();
+    let columns = match card_width {
+        Some(width) => system_meter_columns(meter_count, f64::from(width.max(1))),
+        // Nothing to reflow into yet, so fall back to the default shape.
+        None => meter_count.min(SYSTEM_METERS_PER_ROW),
+    };
+    let rows = system_meter_rows(meter_count, columns);
     let mut height = if rows.is_empty() {
         10
     } else {
@@ -1956,24 +2008,30 @@ fn system_content_size(details: SystemDetails, values: &SystemSnapshot) -> Size 
     if details.cores {
         height += 16 + (values.cores.len().max(1).div_ceil(4) as i32 * 17);
     }
-    let meter_count: usize = rows.iter().sum();
-    Size {
-        width: if details.processes || details.cores {
-            318
-        } else if meter_count <= 1 {
-            // No meters at all still leaves a strip to right-click on.
-            if meter_count == 0 {
-                SYSTEM_WIDTH
-            } else {
-                SYSTEM_SINGLE_WIDTH
-            }
-        } else {
-            // The classic two-across card is 196 wide; three-across grows to
-            // match, and the eight either side stays the card's own margin.
-            system_meter_layout_width(meter_count) as i32 + (SYSTEM_WIDTH - 188)
-        },
-        height,
-    }
+    let width = match card_width {
+        Some(width) => width,
+        None if details.processes || details.cores => 318,
+        // No meters at all still leaves a strip to right-click on.
+        None if meter_count == 0 => SYSTEM_WIDTH,
+        None if meter_count == 1 => SYSTEM_SINGLE_WIDTH,
+        // The classic two-across card is 196 wide; three-across grows to
+        // match, and the eight either side stays the card's own margin.
+        None => {
+            system_meter_layout_width(rows.iter().copied().max().unwrap_or(1)) as i32
+                + (SYSTEM_WIDTH - 188)
+        }
+    };
+    Size { width, height }
+}
+
+/// What the card should measure right now: the width the user chose if they
+/// chose one, and a height that follows from how the rings reflow into it.
+fn system_card_size(details: SystemDetails, values: &SystemSnapshot, state: &AppState) -> Size {
+    system_content_size(
+        details,
+        values,
+        state.sizes.get("system").map(|size| size.width),
+    )
 }
 
 fn draw_system_processes(
@@ -4892,6 +4950,7 @@ fn rebuild_pinned_notes(
                 max_height: NOTE_MAX_HEIGHT,
                 aspect_ratio: None,
                 preserve_current_aspect: false,
+                height_for_width: None,
             },
         );
 
@@ -5456,6 +5515,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
             max_height: 860,
             aspect_ratio: None,
             preserve_current_aspect: false,
+            height_for_width: None,
         },
     );
 
@@ -7249,7 +7309,7 @@ fn apply_system_details(
     details: SystemDetails,
 ) {
     preview.details.set(details);
-    let size = system_content_size(details, &preview.values.borrow());
+    let size = system_card_size(details, &preview.values.borrow(), &state.borrow());
     preview.auto_size.set(Some(size));
     preview.card.set_size_request(size.width, size.height);
     preview.card.queue_resize();
@@ -7262,14 +7322,13 @@ fn apply_system_details(
     }
     let mut data = state.borrow_mut();
     data.settings.system_details = details;
-    // Drop any stored size instead of pinning this one. Turning CPU CORES on
-    // computes the height from the cores read so far — none, because the
-    // reader was not collecting them — so it would lock the card to a single
-    // row and, because a stored size means "the user resized this", the
-    // periodic update would never grow it and the core grid stayed clipped.
-    // Handing the card back to the layout lets that auto-grow run; a real
-    // resize-handle drag still stores a size and still wins.
-    data.sizes.remove("system");
+    // A width the user dragged to survives; the height belongs to whatever the
+    // card now has to show. Turning CPU CORES on computes that height from the
+    // cores read so far — none, because the reader was not collecting them —
+    // so the periodic update corrects it as soon as the first sample lands.
+    if let Some(stored) = data.sizes.get_mut("system") {
+        stored.height = size.height;
+    }
     let _ = data.save();
 }
 
@@ -7934,10 +7993,15 @@ fn attach_resize(
                     height: (f64::from(start_height) + delta_y).round() as i32,
                 }
             };
-            let next = Size {
+            let mut next = Size {
                 width: next.width.clamp(bounds.min_width, max_width),
                 height: next.height.clamp(bounds.min_height, max_height),
             };
+            if let Some(height_for_width) = &bounds.height_for_width {
+                // Not clamped to max_height: the content is what it is, and a
+                // card cut short would simply hide the bottom of it.
+                next.height = height_for_width(next.width).max(bounds.min_height);
+            }
             drop(screens);
             let previous = latest.replace(next);
             card.set_size_request(next.width, next.height);
@@ -8512,9 +8576,9 @@ mod timer_input_tests {
         normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
         note_size_for_image, parse_timer_input, push_recent_search, receives_input_when_locked,
         record_note_undo, reopen_point, resize_width_limit, resized_image_size,
-        round_pixbuf_corners, system_content_size, system_meter_layout_width, system_meter_rows,
-        timer_style_size, NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo,
-        NoteUndoState, ScreenRect, HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT,
+        round_pixbuf_corners, system_content_size, system_meter_columns, system_meter_layout_width,
+        system_meter_rows, timer_style_size, NoteSearchMatch, NoteSearchOptions, NoteSnapshot,
+        NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT,
         NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
         NOTE_MAX_HEIGHT, NOTE_WIDTH, SYSTEM_METER_CELL,
     };
@@ -8980,6 +9044,7 @@ mod timer_input_tests {
                 ..SystemDetails::default()
             },
             &SystemSnapshot::default(),
+            None,
         );
         assert_eq!(
             size,
@@ -8991,17 +9056,39 @@ mod timer_input_tests {
     }
 
     #[test]
-    fn meters_fill_rows_of_three_and_split_evenly_rather_than_leaving_a_stray() {
-        assert!(system_meter_rows(0).is_empty());
-        assert_eq!(system_meter_rows(1), [1]);
-        assert_eq!(system_meter_rows(2), [2]);
-        assert_eq!(system_meter_rows(3), [3]);
+    fn meters_split_evenly_across_their_rows_rather_than_leaving_a_stray() {
+        let default_rows = |count: usize| system_meter_rows(count, count.min(3));
+        assert!(default_rows(0).is_empty());
+        assert_eq!(default_rows(1), [1]);
+        assert_eq!(default_rows(2), [2]);
+        assert_eq!(default_rows(3), [3]);
         // Four rings read as two over two, not three over one.
-        assert_eq!(system_meter_rows(4), [2, 2]);
-        assert_eq!(system_meter_rows(5), [3, 2]);
-        assert_eq!(system_meter_rows(6), [3, 3]);
-        assert_eq!(system_meter_rows(7), [3, 2, 2]);
-        assert_eq!(system_meter_rows(8), [3, 3, 2]);
+        assert_eq!(default_rows(4), [2, 2]);
+        assert_eq!(default_rows(5), [3, 2]);
+        assert_eq!(default_rows(6), [3, 3]);
+        assert_eq!(default_rows(7), [3, 2, 2]);
+        assert_eq!(default_rows(8), [3, 3, 2]);
+        // A row never carries more than fits across, and the split stays even.
+        assert_eq!(system_meter_rows(6, 6), [6]);
+        assert_eq!(system_meter_rows(6, 4), [3, 3]);
+        assert_eq!(system_meter_rows(6, 1), [1, 1, 1, 1, 1, 1]);
+        assert_eq!(system_meter_rows(7, 4), [4, 3]);
+    }
+
+    #[test]
+    fn the_rings_reflow_into_whatever_width_the_card_was_dragged_to() {
+        // Six meters on the default card: three across, two rows.
+        assert_eq!(system_meter_columns(6, 290.0), 3);
+        // Dragged wide enough for all six, they take one row.
+        assert_eq!(system_meter_columns(6, 564.0), 6);
+        // One cell short of six is five, and the even split makes it 3 + 3.
+        assert_eq!(system_meter_columns(6, 500.0), 5);
+        assert_eq!(system_meter_rows(6, 5), [3, 3]);
+        // Never more columns than there are rings, however wide it gets.
+        assert_eq!(system_meter_columns(2, 900.0), 2);
+        // Narrower than a single cell still draws one ring, scaled down.
+        assert_eq!(system_meter_columns(4, 76.0), 1);
+        assert_eq!(system_meter_columns(0, 900.0), 0);
     }
 
     #[test]
@@ -9009,10 +9096,11 @@ mod timer_input_tests {
         // The two-across card keeps the geometry it has always had: 188 wide,
         // rings at 47 and 141.
         assert_eq!(system_meter_layout_width(2), 188.0);
-        let centres = |count: usize| -> Vec<f64> {
-            let width = system_meter_layout_width(count);
+        let centres = |count: usize, columns: usize| -> Vec<f64> {
+            let rows = system_meter_rows(count, columns);
+            let width = system_meter_layout_width(rows.iter().copied().max().unwrap_or(0));
             let mut result = Vec::new();
-            for row in system_meter_rows(count) {
+            for row in rows {
                 let left = (width - row as f64 * SYSTEM_METER_CELL) / 2.0;
                 for column in 0..row {
                     result.push(left + (column as f64 + 0.5) * SYSTEM_METER_CELL);
@@ -9020,11 +9108,13 @@ mod timer_input_tests {
             }
             result
         };
-        assert_eq!(centres(1), [38.0]);
-        assert_eq!(centres(2), [47.0, 141.0]);
-        assert_eq!(centres(3), [47.0, 141.0, 235.0]);
+        assert_eq!(centres(1, 1), [38.0]);
+        assert_eq!(centres(2, 2), [47.0, 141.0]);
+        assert_eq!(centres(3, 3), [47.0, 141.0, 235.0]);
         // Five rings: three across, then two centred underneath them.
-        assert_eq!(centres(5), [47.0, 141.0, 235.0, 94.0, 188.0]);
+        assert_eq!(centres(5, 3), [47.0, 141.0, 235.0, 94.0, 188.0]);
+        // Six across on a widened card: still one centred block, no gaps.
+        assert_eq!(centres(6, 6), [47.0, 141.0, 235.0, 329.0, 423.0, 517.0]);
     }
 
     #[test]
@@ -9053,9 +9143,9 @@ mod timer_input_tests {
             home_disk_percent: Some(63.0),
             ..SystemSnapshot::default()
         };
-        // Six meters: two rows of three, and a card wide enough for three.
+        // Six meters, untouched card: two rows of three, wide enough for three.
         assert_eq!(
-            system_content_size(details, &values),
+            system_content_size(details, &values, None),
             Size {
                 width: 290,
                 height: 152
@@ -9070,11 +9160,44 @@ mod timer_input_tests {
                     root_disk_percent: Some(66.0),
                     home_disk_percent: Some(63.0),
                     ..SystemSnapshot::default()
-                }
+                },
+                None
             ),
             Size {
                 width: 196,
                 height: 152
+            }
+        );
+        // Dragged out to six across, the second row has to be handed back
+        // rather than left behind as empty space.
+        assert_eq!(
+            system_content_size(details, &values, Some(572)),
+            Size {
+                width: 572,
+                height: 76
+            }
+        );
+        // And pulled in to one across, the card has to find five more rows.
+        assert_eq!(
+            system_content_size(details, &values, Some(76)),
+            Size {
+                width: 76,
+                height: 456
+            }
+        );
+        // The process table keeps its own 108 on top of whatever the rings need.
+        assert_eq!(
+            system_content_size(
+                SystemDetails {
+                    processes: true,
+                    ..details
+                },
+                &values,
+                Some(572)
+            ),
+            Size {
+                width: 572,
+                height: 184
             }
         );
     }
