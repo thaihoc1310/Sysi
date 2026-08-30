@@ -287,6 +287,15 @@ textview, textview text {
   color: #666666;
 }
 
+/* The dictionary's back and forward arrows. Trimmed below the other header
+   buttons: two of them sit between the close button and the title, and at the
+   shared size they lifted the whole header. */
+.translate-nav {
+  min-height: 11px;
+  min-width: 11px;
+  padding: 0;
+}
+
 .mode-dark .note-window-button {
   color: #f2f2f2;
 }

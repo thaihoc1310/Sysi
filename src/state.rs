@@ -173,6 +173,24 @@ pub struct Note {
     pub images: Vec<NoteImage>,
 }
 
+/// One dictionary window. The queries it has shown are kept with it so that
+/// back and forward still work after a restart, the way browser tabs do.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DictionaryWindow {
+    pub id: u64,
+    /// Oldest first; `cursor` points at the entry currently on screen.
+    #[serde(default)]
+    pub history: Vec<String>,
+    #[serde(default)]
+    pub cursor: usize,
+}
+
+impl DictionaryWindow {
+    pub fn query(&self) -> Option<&str> {
+        self.history.get(self.cursor).map(String::as_str)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppState {
     #[serde(default)]
@@ -187,6 +205,9 @@ pub struct AppState {
     pub widget_color_modes: HashMap<String, ColorMode>,
     #[serde(default)]
     pub notes: Vec<Note>,
+    /// The dictionary windows that exist, in the order they were opened.
+    #[serde(default)]
+    pub dictionaries: Vec<DictionaryWindow>,
     /// The last few dictionary queries, most recent first.
     #[serde(default)]
     pub recent_searches: Vec<String>,
@@ -196,6 +217,8 @@ pub struct AppState {
     pub timer_style: TimerStyle,
     #[serde(default = "default_next_id")]
     pub next_note_id: u64,
+    #[serde(default = "default_next_id")]
+    pub next_dictionary_id: u64,
     #[serde(default = "default_next_id")]
     pub next_image_id: u64,
 }
@@ -212,10 +235,12 @@ impl Default for AppState {
             sizes: HashMap::new(),
             widget_color_modes: HashMap::new(),
             notes: Vec::new(),
+            dictionaries: Vec::new(),
             recent_searches: Vec::new(),
             timer_seconds: default_timer(),
             timer_style: TimerStyle::default(),
             next_note_id: 1,
+            next_dictionary_id: 1,
             next_image_id: 1,
         }
     }

@@ -1,8 +1,8 @@
 use crate::{
     platform,
     state::{
-        AppState, ColorMode, Note, NoteImage, Point, Size, SystemDetails, TimerStyle,
-        IMAGE_PLACEHOLDER,
+        AppState, ColorMode, DictionaryWindow, Note, NoteImage, Point, Size, SystemDetails,
+        TimerStyle, IMAGE_PLACEHOLDER,
     },
     system::{SystemReader, SystemSnapshot},
     translate,
@@ -51,6 +51,11 @@ const TRANSLATE_INPUT_MIN_HEIGHT: i32 = 22;
 const TRANSLATE_INPUT_MAX_HEIGHT: i32 = 92;
 // How many past queries the window offers back.
 const TRANSLATE_RECENT_LIMIT: usize = 10;
+/// How many words one dictionary window remembers for back and forward.
+const TRANSLATE_HISTORY_LIMIT: usize = 50;
+/// Past this many dictionary windows a new lookup reuses the most recent one
+/// rather than burying the desk in cards.
+const TRANSLATE_WINDOW_LIMIT: usize = 8;
 const RESIZE_HIT_SIZE: i32 = 18;
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
@@ -61,6 +66,75 @@ type HoveredRow = Rc<Cell<Option<u64>>>;
 // exists. Filled in once during startup, like `CallbackSlot`.
 type LookupSlot = Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>;
 type SystemValues = Rc<RefCell<SystemSnapshot>>;
+/// Opens a dictionary window, going straight to a word when one is given.
+type SpawnDictionary = Rc<dyn Fn(Option<&str>)>;
+/// Runs a query in one window. The flag says whether it joins that window's
+/// back/forward history or is a step through it.
+type RunLookup = Rc<dyn Fn(&str, bool)>;
+/// Holds the closure that opens dictionary windows. The menus that offer it
+/// are built while that closure is still being assembled.
+type SpawnSlot = Rc<RefCell<Option<SpawnDictionary>>>;
+/// One window's remembered answers. Stepping back through words already read
+/// should be instant, and should still work once the network is gone.
+type TranslateCache = Rc<RefCell<HashMap<String, translate::ContentResult>>>;
+
+/// The two ways the right-click menu can run a lookup: in the window the click
+/// came from -- or the most recently used one, for a widget that is not a
+/// dictionary -- and in a window of its own.
+#[derive(Clone)]
+struct LookupActions {
+    here: LookupSlot,
+    new_window: LookupSlot,
+    /// Opens an empty dictionary, with no selection involved.
+    open_window: Option<NewWindowAction>,
+}
+
+/// "NEW WINDOW" on a dictionary's own menu. It is a title-bar action, so it is
+/// offered only when the right-click actually landed on the header -- from the
+/// middle of a definition it would just be clutter.
+#[derive(Clone)]
+struct NewWindowAction {
+    spawn: SpawnSlot,
+    header: gtk::EventBox,
+}
+
+/// One live dictionary window, as its neighbours need to see it.
+#[derive(Clone)]
+struct TranslateInstance {
+    id: u64,
+    window: Rc<TranslateWindow>,
+    lookup: Rc<dyn Fn(&str)>,
+    set_search: Rc<dyn Fn(bool)>,
+    search_open: Rc<Cell<bool>>,
+    /// Re-applies which arrows this window's history allows. show_all() on the
+    /// card reveals both whatever the history says, so every path that shows a
+    /// card has to run this afterwards.
+    refresh_nav: Rc<dyn Fn()>,
+    /// Answers this window has already shown, keyed by query. Emptied when the
+    /// window is closed.
+    cache: TranslateCache,
+}
+
+/// What spawning a dictionary window needs from the rest of the overlay.
+#[derive(Clone)]
+struct TranslateContext {
+    state: Rc<RefCell<AppState>>,
+    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
+    interactive: Rc<Cell<bool>>,
+    window: gtk::ApplicationWindow,
+    root: gtk::Fixed,
+    screens: Rc<Vec<ScreenRect>>,
+    primary: ScreenRect,
+    /// Kept out from under a freshly placed card, like any reopened widget.
+    picker: gtk::EventBox,
+    instances: Rc<RefCell<Vec<TranslateInstance>>>,
+    /// The window a lookup goes to when the click came from somewhere else.
+    recent: Rc<Cell<Option<u64>>>,
+    /// Every scroller whose thumb the hover poll should fade in.
+    scrollers: Rc<RefCell<Vec<gtk::ScrolledWindow>>>,
+    lookup_new_window: LookupSlot,
+    spawn: SpawnSlot,
+}
 
 struct SystemCard {
     card: gtk::EventBox,
@@ -285,6 +359,31 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             data.layout_version = 6;
             let _ = data.save();
         }
+        if data.layout_version < 7 {
+            // The dictionary used to be a single window under the fixed key
+            // "translate". Carry its place, size and colour over to the first
+            // of the per-window keys so an upgrade finds it where it was left.
+            if data.dictionaries.is_empty() {
+                let key = dictionary_key(1);
+                if let Some(point) = data.positions.remove("translate") {
+                    data.positions.insert(key.clone(), point);
+                }
+                if let Some(size) = data.sizes.remove("translate") {
+                    data.sizes.insert(key.clone(), size);
+                }
+                if let Some(mode) = data.widget_color_modes.remove("translate") {
+                    data.widget_color_modes.insert(key, mode);
+                }
+                data.dictionaries.push(DictionaryWindow {
+                    id: 1,
+                    history: Vec::new(),
+                    cursor: 0,
+                });
+                data.next_dictionary_id = 2;
+            }
+            data.layout_version = 7;
+            let _ = data.save();
+        }
     }
     // Image files left behind by a note deleted while Sysi was not running, or
     // by an image backspaced out of a note, are reclaimed once per launch.
@@ -315,6 +414,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // Context menus are attached while their windows are built, well before the
     // dictionary lookup they call into exists; the slot is filled once both do.
     let lookup_slot: LookupSlot = Rc::new(RefCell::new(None));
+    let lookup_new_slot: LookupSlot = Rc::new(RefCell::new(None));
+    let lookup_actions = LookupActions {
+        here: lookup_slot.clone(),
+        new_window: lookup_new_slot.clone(),
+        open_window: None,
+    };
+    // Grown as dictionary windows come and go, so the hover poll keeps up.
+    let translate_scrollers: Rc<RefCell<Vec<gtk::ScrolledWindow>>> =
+        Rc::new(RefCell::new(Vec::new()));
     let note_refresh: CallbackSlot = Rc::new(RefCell::new(None));
     // Which history row the pointer is on: the rows set it as they are entered
     // and left, and the history window's right-click menu reads it. Built here,
@@ -550,7 +658,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         None,
         None,
-        Some(lookup_slot.clone()),
+        Some(lookup_actions.clone()),
         Some(history_row_menu),
     );
     attach_drag(
@@ -582,436 +690,263 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         },
     );
 
-    // Shared rather than moved piecemeal into each closure: the query panel,
-    // the completions and the results all have to be reachable together.
-    let translate = Rc::new(build_translate_window(saved_color_mode(
-        &state.borrow(),
-        "translate",
-    )));
-    let translate_fit_height: Rc<dyn Fn()> = {
-        let card = translate.card.clone();
-        let chrome = translate.chrome.clone();
-        let results = translate.results.clone();
-        Rc::new(move || fit_translate_height(&card, &chrome, &results))
-    };
-    let translate_position = state
-        .borrow()
-        .positions
-        .get("translate")
-        .copied()
-        .unwrap_or(Point {
-            x: primary_screen.x + 292,
-            y: primary_screen.y + 186,
-        });
-    apply_translate_elastic_size(&translate.card, &state);
-    place_card(&root, &translate.card, translate_position);
-    register(
-        &registry,
-        "translate",
-        &translate.card,
-        translate.color_mode.clone(),
-    );
-    if let Some(item) = registry
-        .borrow_mut()
-        .iter_mut()
-        .find(|item| item.key == "translate")
-    {
-        item.edit_only = Some(translate.chrome.clone());
-    }
-    attach_color_mode_menu(
-        &translate.card,
-        "translate".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        None,
-        None,
-        Some(lookup_slot.clone()),
-        None,
-    );
-    attach_drag(
-        &translate.header,
-        &translate.card,
-        &root,
-        "translate".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        window.clone(),
-    );
-    attach_resize(
-        &translate.resize,
-        &translate.card,
-        &root,
-        "translate".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        window.clone(),
-        ResizeBounds {
-            min_width: 196,
-            min_height: 120,
-            max_width: 680,
-            max_height: 860,
-            aspect_ratio: None,
-            preserve_current_aspect: false,
-        },
-    );
-
-    // Lookups and completions run on worker threads and report back here. One
-    // counter numbers every request so a reply that a newer keystroke has
-    // already superseded can be dropped instead of overwriting the answer the
-    // user is reading.
-    let (translate_tx, translate_rx) = async_channel::unbounded::<translate::TranslateEvent>();
-    // Two counters, not one: a lookup can be in flight for seconds while the
-    // user types the next query, and a shared counter would let those
-    // keystrokes retire the lookup — leaving "Looking it up…" on screen with
-    // nothing left to replace it.
-    let translate_lookup_generation = Rc::new(Cell::new(0u64));
-    let translate_suggest_generation = Rc::new(Cell::new(0u64));
-    // The play buttons currently on screen, keyed by the clip they are waiting
-    // for. Cleared on every rebuild, so a download that outlives its button
-    // finds no one waiting and is neither re-enabled nor played.
-    let translate_audio: Rc<RefCell<HashMap<String, gtk::Button>>> =
-        Rc::new(RefCell::new(HashMap::new()));
-    let translate_pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-
-    // Whether the query panel is dropped down. Tracked explicitly because
-    // show_all() on the card would otherwise reveal it along with everything
-    // else, exactly like the history window's search mode.
-    let translate_search_open = Rc::new(Cell::new(false));
-    // The recents start folded away behind their arrow: opening the panel is a
-    // move to type something, not to read the last ten things typed.
-    let translate_recents_open = Rc::new(Cell::new(false));
-
-    // Run a query: used by Enter, by the completion and recent rows, by the
-    // "did you mean" chips, and by the right-click lookup.
-    let translate_lookup: Rc<dyn Fn(&str)> = {
-        let translate = translate.clone();
-        let state = state.clone();
-        let search_open = translate_search_open.clone();
-        let lookup_generation = translate_lookup_generation.clone();
-        let suggest_generation = translate_suggest_generation.clone();
-        let audio_buttons = translate_audio.clone();
-        let pending = translate_pending.clone();
-        let tx = translate_tx.clone();
-        let fit_height = translate_fit_height.clone();
-        Rc::new(move |query: &str| {
-            let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
-            if query.is_empty() {
-                return;
-            }
-            // A completion that is still in flight would land on top of the
-            // answer; cancel its timer and retire its generation.
-            if let Some(source) = pending.borrow_mut().take() {
-                source.remove();
-            }
-            suggest_generation.set(suggest_generation.get() + 1);
-            // The answer is what the user wants to see now, so the panel gets
-            // out of the way until they ask for it again.
-            search_open.set(false);
-            translate.set_search_visible(false);
-            clear_children(&translate.suggestions);
-            audio_buttons.borrow_mut().clear();
-            lookup_generation.set(lookup_generation.get() + 1);
-            // A fresh answer chooses its own natural height and starts at the
-            // top even if the previous entry had been scrolled down.
-            apply_translate_elastic_size(&translate.card, &state);
-            translate.scroller.vadjustment().set_value(0.0);
-            clear_children(&translate.results);
-            translate.results.pack_start(
-                &translate_line("Looking it up\u{2026}", "translate-status"),
-                false,
-                false,
-                0,
-            );
-            translate.results.show_all();
-            fit_height();
-            translate::spawn_lookup(query, lookup_generation.get(), tx.clone());
-        })
+    // Each dictionary is a window of its own, the way notes are, so several
+    // words can sit open side by side. What a window needs from the rest of
+    // the overlay is gathered once here instead of being threaded through
+    // every spawn.
+    let translate_ctx = TranslateContext {
+        state: state.clone(),
+        registry: registry.clone(),
+        interactive: interactive.clone(),
+        window: window.clone(),
+        root: root.clone(),
+        screens: Rc::new(screens.clone()),
+        primary: primary_screen,
+        picker: widget_picker.card.clone(),
+        instances: Rc::new(RefCell::new(Vec::new())),
+        recent: Rc::new(Cell::new(None)),
+        scrollers: translate_scrollers.clone(),
+        lookup_new_window: lookup_new_slot.clone(),
+        spawn: Rc::new(RefCell::new(None)),
     };
 
-    // Opening and closing the query panel, including the focus grab that lets
-    // the user start typing the moment it appears.
-    let set_translate_search: Rc<dyn Fn(bool)> = {
-        let translate = translate.clone();
-        let search_open = translate_search_open.clone();
-        let state = state.clone();
-        let window = window.clone();
-        let lookup = translate_lookup.clone();
-        let suggest_generation = translate_suggest_generation.clone();
-        let pending = translate_pending.clone();
-        let recents_open = translate_recents_open.clone();
-        let fit_height = translate_fit_height.clone();
-        Rc::new(move |open: bool| {
-            search_open.set(open);
-            translate.set_search_visible(open);
-            // Whichever way the panel moves, a completion request that has not
-            // fired yet is no longer wanted.
-            if let Some(source) = pending.borrow_mut().take() {
-                source.remove();
-            }
-            suggest_generation.set(suggest_generation.get() + 1);
-            if !open {
-                clear_children(&translate.suggestions);
-                fit_height();
-                return;
-            }
-            // Start empty rather than pre-selecting the last query: selecting
-            // text in a GtkTextView hands it the X11 primary selection, which
-            // would clobber whatever the user had highlighted elsewhere — the
-            // very thing the "LOOK UP" menu item reads.
-            translate.set_query("");
-            render_translate_recents(
-                &translate.suggestions,
-                &state,
-                &lookup,
-                &recents_open,
-                &fit_height,
-            );
-            fit_height();
-            glib::idle_add_local_once({
-                let window = window.clone();
-                let input = translate.input.clone();
-                let search_open = search_open.clone();
-                move || {
-                    // The panel can be closed again before this runs, e.g. when
-                    // a right-click lookup opens the window and immediately
-                    // shows a result.
-                    if !search_open.get() {
-                        return;
-                    }
-                    present_overlay(&window);
-                    input.grab_focus();
-                }
-            });
-        })
-    };
-
-    translate.open_search.connect_clicked({
-        let set_translate_search = set_translate_search.clone();
-        move |_| set_translate_search(true)
-    });
-    translate.close_search.connect_clicked({
-        let set_translate_search = set_translate_search.clone();
-        move |_| set_translate_search(false)
-    });
-
-    // Enter runs the query; Shift+Enter is left alone so a multi-line paste can
-    // still be edited by hand.
-    translate.input.connect_key_press_event({
-        let translate = translate.clone();
-        let translate_lookup = translate_lookup.clone();
-        move |_, event| {
-            let enter = matches!(
-                event.keyval(),
-                gdk::keys::constants::Return | gdk::keys::constants::KP_Enter
-            );
-            if enter && !event.state().contains(gdk::ModifierType::SHIFT_MASK) {
-                translate_lookup(&translate.query());
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        }
-    });
-
-    if let Some(buffer) = translate.input.buffer() {
-        buffer.connect_changed({
-            let translate = translate.clone();
-            let state = state.clone();
-            let generation = translate_suggest_generation.clone();
-            let pending = translate_pending.clone();
-            let tx = translate_tx.clone();
-            let lookup = translate_lookup.clone();
-            let recents_open = translate_recents_open.clone();
-            let fit_height = translate_fit_height.clone();
-            move |_| {
-                if let Some(source) = pending.borrow_mut().take() {
-                    source.remove();
-                }
-                // Retire an in-flight request immediately. Waiting until the
-                // next debounce fires leaves a window where suggestions for
-                // the previous prefix can render under the new text.
-                generation.set(generation.get() + 1);
-                let request_generation = generation.get();
-                let text = translate.query();
-                // Prose has no completions worth offering; an empty box goes
-                // back to showing what was searched before.
-                if text.is_empty() {
-                    render_translate_recents(
-                        &translate.suggestions,
-                        &state,
-                        &lookup,
-                        &recents_open,
-                        &fit_height,
-                    );
-                    fit_height();
-                    return;
-                }
-                clear_children(&translate.suggestions);
-                fit_height();
-                if translate::is_sentence(&text) {
-                    return;
-                }
-                let pending_for_timer = pending.clone();
-                let tx = tx.clone();
-                let source = glib::timeout_add_local_once(TRANSLATE_SUGGEST_DELAY, move || {
-                    pending_for_timer.borrow_mut().take();
-                    translate::spawn_suggest(text, request_generation, tx);
-                });
-                *pending.borrow_mut() = Some(source);
-            }
-        });
+    // Bring back the windows that were open last time, each showing the word it
+    // was left on.
+    for saved in state.borrow().dictionaries.clone() {
+        spawn_translate_window(&translate_ctx, saved.id, false);
     }
 
-    glib::MainContext::default().spawn_local({
-        let suggestions = translate.suggestions.clone();
-        let results = translate.results.clone();
-        let scroller = translate.scroller.clone();
-        let fit_height = translate_fit_height.clone();
-        let lookup_generation = translate_lookup_generation.clone();
-        let suggest_generation = translate_suggest_generation.clone();
-        let audio_buttons = translate_audio.clone();
-        let lookup = translate_lookup.clone();
-        let state = state.clone();
-        let tx = translate_tx.clone();
-        async move {
-            while let Ok(event) = translate_rx.recv().await {
-                match event {
-                    translate::TranslateEvent::Suggestions {
-                        generation: at,
-                        items,
-                    } if at == suggest_generation.get() => {
-                        render_translate_suggestions(&suggestions, &items, &lookup);
-                        fit_height();
-                    }
-                    translate::TranslateEvent::Lookup {
-                        generation: at,
-                        result,
-                    } if at == lookup_generation.get() => {
-                        // Remembered here rather than when the query was sent,
-                        // so a typo that found nothing never enters the list.
-                        if matches!(result.kind, translate::ResultKind::Content(_)) {
-                            remember_search(&state, &result.query);
-                        }
-                        scroller.vadjustment().set_value(0.0);
-                        render_translate_result(
-                            &results,
-                            &fit_height,
-                            &result,
-                            &audio_buttons,
-                            &tx,
-                            &lookup,
-                        );
-                    }
-                    translate::TranslateEvent::AudioReady { url, path } => {
-                        // Only play for a button that is still on screen: a clip
-                        // that finished downloading after the user moved on to
-                        // another word would otherwise speak over the new one.
-                        if let Some(button) = audio_buttons.borrow_mut().remove(&url) {
-                            button.set_sensitive(true);
-                            translate::play_audio(&path);
-                        }
-                    }
-                    translate::TranslateEvent::AudioFailed { url } => {
-                        if let Some(button) = audio_buttons.borrow_mut().remove(&url) {
-                            button.set_sensitive(true);
-                            button.set_tooltip_text(Some("Audio unavailable"));
-                        }
-                    }
-                    // A reply for a query the user has already moved on from.
-                    _ => {}
-                }
-            }
-        }
-    });
-
-    let toggle_translate: Rc<dyn Fn()> = {
-        let translate = translate.clone();
-        let card = translate.card.clone();
-        let chrome = translate.chrome.clone();
-        let search_open = translate_search_open.clone();
-        let set_translate_search = set_translate_search.clone();
-        let state = state.clone();
-        let window = window.clone();
-        let registry = registry.clone();
-        let interactive = interactive.clone();
-        let root = root.clone();
-        let screens = screens.clone();
-        let picker = widget_picker.card.clone();
-        Rc::new(move || {
-            let open = !card.is_visible();
-            if open {
-                reopen_widget(
-                    &card,
-                    "translate",
-                    &root,
-                    &state,
-                    &screens,
-                    primary_screen,
-                    Size {
-                        width: TRANSLATE_WIDTH,
-                        height: TRANSLATE_EMPTY_HEIGHT,
-                    },
-                    Some(&picker),
-                    &registry,
-                );
-                apply_translate_elastic_size(&card, &state);
-                card.show_all();
-                // show_all() reveals the chrome and the query panel regardless
-                // of lock mode; restore both rules.
-                chrome.set_visible(interactive.get());
-                if interactive.get() {
-                    // Opening the window is an intent to look something up, so
-                    // the query panel comes down ready to type into.
-                    set_translate_search(true);
-                } else {
-                    search_open.set(false);
-                    translate.set_search_visible(false);
-                }
-            } else {
-                card.hide();
-            }
-            state.borrow_mut().settings.translate_open = open;
-            let _ = state.borrow().save();
-            refresh_input_shape(&window, &registry, interactive.get());
-            glib::idle_add_local_once({
-                let window = window.clone();
-                let registry = registry.clone();
-                let interactive = interactive.clone();
-                let root = root.clone();
-                let screens = screens.clone();
-                let state = state.clone();
-                move || {
-                    if open {
-                        clamp_registered_widgets(&root, &registry, &screens, &state);
-                    }
-                    refresh_input_shape(&window, &registry, interactive.get());
-                }
-            });
-        })
-    };
-    translate.hide.connect_clicked({
-        let toggle_translate = toggle_translate.clone();
-        move |_| toggle_translate()
-    });
-
-    // Now that both halves exist, the "LOOK UP" context-menu item can bring the
-    // dictionary up and run the query in one go.
-    *lookup_slot.borrow_mut() = Some({
-        let card = translate.card.clone();
-        let toggle_translate = toggle_translate.clone();
-        let translate_lookup = translate_lookup.clone();
-        let interactive = interactive.clone();
+    // Open a brand new dictionary. With a query it goes straight to the answer;
+    // without one it comes up with the entry ready to type into.
+    let translate_spawn: SpawnDictionary = {
+        let ctx = translate_ctx.clone();
         let lock = widget_picker.lock.clone();
-        Rc::new(move |query: &str| {
-            if !interactive.get() {
+        Rc::new(move |query: Option<&str>| {
+            if !ctx.interactive.get() {
                 lock.clicked();
             }
-            if !card.is_visible() {
-                toggle_translate();
+            // Past the cap, reuse the most recent window rather than burying
+            // the desk in cards.
+            if ctx.instances.borrow().len() >= TRANSLATE_WINDOW_LIMIT {
+                let recent = ctx
+                    .recent
+                    .get()
+                    .and_then(|id| {
+                        ctx.instances
+                            .borrow()
+                            .iter()
+                            .find(|instance| instance.id == id)
+                            .cloned()
+                    })
+                    .or_else(|| ctx.instances.borrow().last().cloned());
+                if let Some(instance) = recent {
+                    instance.window.card.show_all();
+                    instance.window.chrome.set_visible(ctx.interactive.get());
+                    (instance.refresh_nav)();
+                    match query {
+                        Some(query) => (instance.lookup)(query),
+                        None => (instance.set_search)(true),
+                    }
+                }
+                return;
             }
-            translate_lookup(query);
+            let id = {
+                let mut data = ctx.state.borrow_mut();
+                let id = data.next_dictionary_id;
+                data.next_dictionary_id += 1;
+                data.dictionaries.push(DictionaryWindow {
+                    id,
+                    history: Vec::new(),
+                    cursor: 0,
+                });
+                data.settings.translate_open = true;
+                let _ = data.save();
+                id
+            };
+            spawn_translate_window(&ctx, id, true);
+            let spawned = ctx
+                .instances
+                .borrow()
+                .iter()
+                .find(|instance| instance.id == id)
+                .cloned();
+            if let Some(instance) = spawned {
+                instance.window.card.show_all();
+                instance.window.chrome.set_visible(ctx.interactive.get());
+                (instance.refresh_nav)();
+                match query {
+                    Some(query) => (instance.lookup)(query),
+                    None => (instance.set_search)(true),
+                }
+            }
+            refresh_input_shape(&ctx.window, &ctx.registry, ctx.interactive.get());
+            glib::idle_add_local_once({
+                let ctx = ctx.clone();
+                move || {
+                    clamp_registered_widgets(&ctx.root, &ctx.registry, &ctx.screens, &ctx.state);
+                    refresh_input_shape(&ctx.window, &ctx.registry, ctx.interactive.get());
+                }
+            });
+        })
+    };
+
+    *translate_ctx.spawn.borrow_mut() = Some(translate_spawn.clone());
+
+    // "LOOK UP IN NEW WINDOW", offered from every widget's right-click menu.
+    *lookup_new_slot.borrow_mut() = Some({
+        let translate_spawn = translate_spawn.clone();
+        Rc::new(move |query: &str| translate_spawn(Some(query))) as Rc<dyn Fn(&str)>
+    });
+
+    // Whether any dictionary is on screen, which is what the panel action and
+    // the picker toggle read.
+    let translate_any_visible: Rc<dyn Fn() -> bool> = {
+        let instances = translate_ctx.instances.clone();
+        Rc::new(move || {
+            instances
+                .borrow()
+                .iter()
+                .any(|instance| instance.window.card.is_visible())
+        })
+    };
+
+    let translate_set_visible: Rc<dyn Fn(bool)> = {
+        let ctx = translate_ctx.clone();
+        Rc::new(move |visible: bool| {
+            let instances: Vec<TranslateInstance> = ctx.instances.borrow().clone();
+            for instance in &instances {
+                if visible {
+                    instance.window.card.show_all();
+                    // show_all() reveals the chrome and the query panel
+                    // regardless of lock mode; restore both rules.
+                    instance
+                        .window
+                        .chrome
+                        .set_visible(ctx.interactive.get());
+                    instance.search_open.set(false);
+                    instance.window.set_search_visible(false);
+                    (instance.refresh_nav)();
+                } else {
+                    instance.window.card.hide();
+                }
+            }
+            {
+                let mut data = ctx.state.borrow_mut();
+                data.settings.translate_open = visible;
+                let _ = data.save();
+            }
+            refresh_input_shape(&ctx.window, &ctx.registry, ctx.interactive.get());
+            glib::idle_add_local_once({
+                let ctx = ctx.clone();
+                move || {
+                    if visible {
+                        clamp_registered_widgets(
+                            &ctx.root,
+                            &ctx.registry,
+                            &ctx.screens,
+                            &ctx.state,
+                        );
+                    }
+                    refresh_input_shape(&ctx.window, &ctx.registry, ctx.interactive.get());
+                }
+            });
+        })
+    };
+
+    // The picker's DICTIONARY button: with nothing open it starts a window,
+    // otherwise it puts the whole set away and brings it back.
+    let toggle_translate: Rc<dyn Fn()> = {
+        let instances = translate_ctx.instances.clone();
+        let set_visible = translate_set_visible.clone();
+        let spawn = translate_spawn.clone();
+        let any_visible = translate_any_visible.clone();
+        Rc::new(move || {
+            if instances.borrow().is_empty() {
+                spawn(None);
+                return;
+            }
+            set_visible(!any_visible());
+        })
+    };
+
+    // Escape closes the query panel of whichever dictionary has one open,
+    // before it is allowed to lock the overlay.
+    let translate_close_search: Rc<dyn Fn() -> bool> = {
+        let instances = translate_ctx.instances.clone();
+        let recent = translate_ctx.recent.clone();
+        Rc::new(move || {
+            let open: Vec<TranslateInstance> = instances
+                .borrow()
+                .iter()
+                .filter(|instance| {
+                    instance.window.card.is_visible() && instance.search_open.get()
+                })
+                .cloned()
+                .collect();
+            let Some(instance) = open
+                .iter()
+                .find(|instance| Some(instance.id) == recent.get())
+                .or_else(|| open.first())
+            else {
+                return false;
+            };
+            (instance.set_search)(false);
+            true
+        })
+    };
+
+    // show_all() on the overlay drops every query panel down; a window restored
+    // from the last session was not asked for just now.
+    let translate_after_show: Rc<dyn Fn()> = {
+        let ctx = translate_ctx.clone();
+        Rc::new(move || {
+            let open = ctx.state.borrow().settings.translate_open;
+            let instances: Vec<TranslateInstance> = ctx.instances.borrow().clone();
+            for instance in &instances {
+                instance.search_open.set(false);
+                instance.window.set_search_visible(false);
+                (instance.refresh_nav)();
+                if !open {
+                    instance.window.card.hide();
+                }
+            }
+        })
+    };
+
+    // A bare "LOOK UP" from a widget that is not itself a dictionary goes to
+    // the window used most recently, or opens one when none are left.
+    *lookup_slot.borrow_mut() = Some({
+        let ctx = translate_ctx.clone();
+        let spawn = translate_spawn.clone();
+        let lock = widget_picker.lock.clone();
+        Rc::new(move |query: &str| {
+            if !ctx.interactive.get() {
+                lock.clicked();
+            }
+            let target = ctx
+                .recent
+                .get()
+                .and_then(|id| {
+                    ctx.instances
+                        .borrow()
+                        .iter()
+                        .find(|instance| instance.id == id)
+                        .cloned()
+                })
+                .or_else(|| ctx.instances.borrow().last().cloned());
+            let Some(instance) = target else {
+                spawn(Some(query));
+                return;
+            };
+            if !instance.window.card.is_visible() {
+                instance.window.card.show_all();
+                instance.window.chrome.set_visible(ctx.interactive.get());
+                (instance.refresh_nav)();
+                let mut data = ctx.state.borrow_mut();
+                data.settings.translate_open = true;
+                let _ = data.save();
+            }
+            (instance.lookup)(query);
         }) as Rc<dyn Fn(&str)>
     });
 
@@ -1059,7 +994,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 note_refresh.clone(),
                 interactive.clone(),
                 window.clone(),
-                lookup_slot.clone(),
+                lookup_actions.clone(),
             );
             refresh_input_shape(&window, &registry, interactive.get());
             glib::idle_add_local_once({
@@ -1465,7 +1400,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let quit = widget_picker.quit.clone();
         let toggle_history = toggle_history.clone();
         let toggle_translate = toggle_translate.clone();
-        let translate_card = translate.card.clone();
+        let translate_any_visible = translate_any_visible.clone();
         let interactive = interactive.clone();
         Rc::new(move || match take_panel_action().as_deref() {
             Some("toggle-system") => system.set_active(!system.is_active()),
@@ -1485,7 +1420,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 // The entry is edit chrome, so a translate window opened while
                 // locked would have nothing to type into; unlock first, the way
                 // a new note does.
-                if !translate_card.is_visible() && !interactive.get() {
+                if !translate_any_visible() && !interactive.get() {
                     lock.clicked();
                 }
                 toggle_translate();
@@ -1502,9 +1437,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let searching = searching.clone();
         let history_card = history.card.clone();
         let close_history_search = close_history_search.clone();
-        let translate_card = translate.card.clone();
-        let translate_search_open = translate_search_open.clone();
-        let set_translate_search = set_translate_search.clone();
+        let translate_close_search = translate_close_search.clone();
         move |_, event| {
             if event.keyval() == gdk::keys::constants::Escape {
                 let open_note_search = registry
@@ -1527,8 +1460,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 // it away, and only a second one locks the overlay. In lock
                 // mode the panel is already hidden as edit chrome, so there is
                 // nothing to put away.
-                if interactive.get() && translate_card.is_visible() && translate_search_open.get() {
-                    set_translate_search(false);
+                if interactive.get() && translate_close_search() {
                     return glib::Propagation::Stop;
                 }
                 if interactive.get() {
@@ -1576,10 +1508,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     }
     // Likewise the dictionary: show_all() dropped its query panel down, but a
     // window restored from the last session was not asked for just now.
-    translate.set_search_visible(false);
-    if !state.borrow().settings.translate_open {
-        translate.card.hide();
-    }
+    translate_after_show();
     if !system_enabled {
         system_card.card.hide();
     }
@@ -1699,10 +1628,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
     }
 
-    track_widget_hover(
-        registry.clone(),
-        vec![history.scroller.clone(), translate.scroller.clone()],
-    );
+    translate_scrollers
+        .borrow_mut()
+        .push(history.scroller.clone());
+    track_widget_hover(registry.clone(), translate_scrollers.clone());
     start_system_updates(system_card, state.clone());
     start_timer_updates(timer_card, state, window, registry, interactive);
 }
@@ -4627,7 +4556,7 @@ fn rebuild_pinned_notes(
     refresh: CallbackSlot,
     interactive: Rc<Cell<bool>>,
     window: gtk::ApplicationWindow,
-    lookup: LookupSlot,
+    lookup: LookupActions,
 ) {
     let old: Vec<gtk::EventBox> = registry
         .borrow()
@@ -4870,7 +4799,7 @@ fn rebuild_pinned_notes(
 
 fn track_widget_hover(
     registry: Rc<RefCell<Vec<RegisteredWidget>>>,
-    scrollers: Vec<gtk::ScrolledWindow>,
+    scrollers: Rc<RefCell<Vec<gtk::ScrolledWindow>>>,
 ) {
     // GTK3 delivers enter/leave to the window under the pointer, so hovering
     // the editor (which owns its own window) never sets :hover on the note
@@ -4906,7 +4835,7 @@ fn track_widget_hover(
                 context.remove_class("note-hover");
             }
         }
-        for scroller in &scrollers {
+        for scroller in scrollers.borrow().iter() {
             let context = scroller.style_context();
             let hovered = scroller.window().is_some_and(|window| {
                 let (_, origin_x, origin_y) = window.origin();
@@ -5141,7 +5070,9 @@ struct TranslateWindow {
     /// instead of leaving a headless card with a live text box in it.
     chrome: gtk::EventBox,
     header: gtk::EventBox,
-    hide: gtk::Button,
+    close: gtk::Button,
+    back: gtk::Button,
+    forward: gtk::Button,
     open_search: gtk::Button,
     close_search: gtk::Button,
     search_panel: gtk::Box,
@@ -5180,6 +5111,612 @@ impl TranslateWindow {
     }
 }
 
+fn dictionary_key(id: u64) -> String {
+    format!("dict:{id}")
+}
+
+/// Write a window's browsing history back to disk. Cheap enough to do on every
+/// move: the list is a handful of short words.
+fn store_dictionary_history(
+    state: &Rc<RefCell<AppState>>,
+    id: u64,
+    history: &[String],
+    cursor: usize,
+) {
+    let mut data = state.borrow_mut();
+    if let Some(entry) = data.dictionaries.iter_mut().find(|entry| entry.id == id) {
+        entry.history = history.to_vec();
+        entry.cursor = cursor;
+    }
+    let _ = data.save();
+}
+
+/// Take a dictionary window off the desk for good. Unlike hiding, this forgets
+/// the window: its place, size and colour go with it, so the next one opens
+/// fresh rather than inheriting a slot the user closed.
+fn close_translate_window(ctx: &TranslateContext, id: u64) {
+    let key = dictionary_key(id);
+    let card = ctx
+        .instances
+        .borrow()
+        .iter()
+        .find(|instance| instance.id == id)
+        .map(|instance| instance.window.card.clone());
+    let Some(card) = card else {
+        return;
+    };
+    ctx.root.remove(&card);
+    // The card's own handlers hold it, the same cycle the note rebuild breaks.
+    // SAFETY: it has just been unparented and nothing reads it again.
+    unsafe { card.destroy() };
+    ctx.registry.borrow_mut().retain(|item| item.key != key);
+    // Emptied rather than left to the instance being dropped: the answers are
+    // the biggest thing a window holds, and closing it should hand that memory
+    // straight back.
+    if let Some(instance) = ctx
+        .instances
+        .borrow()
+        .iter()
+        .find(|instance| instance.id == id)
+    {
+        instance.cache.borrow_mut().clear();
+    }
+    ctx.instances.borrow_mut().retain(|instance| instance.id != id);
+    ctx.scrollers
+        .borrow_mut()
+        .retain(|scroller| scroller.window().is_some());
+    if ctx.recent.get() == Some(id) {
+        ctx.recent.set(None);
+    }
+    {
+        let mut data = ctx.state.borrow_mut();
+        data.dictionaries.retain(|entry| entry.id != id);
+        data.positions.remove(&key);
+        data.sizes.remove(&key);
+        data.widget_color_modes.remove(&key);
+        if data.dictionaries.is_empty() {
+            data.settings.translate_open = false;
+        }
+        let _ = data.save();
+    }
+    refresh_input_shape(&ctx.window, &ctx.registry, ctx.interactive.get());
+}
+
+/// Build one dictionary window and wire it to itself. Every window owns its
+/// query panel, its own in-flight request counters and its own back/forward
+/// history, so a slow lookup started in one can never land in another.
+fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
+    let key = dictionary_key(id);
+    let translate = Rc::new(build_translate_window(saved_color_mode(
+        &ctx.state.borrow(),
+        &key,
+    )));
+    let fit_height: Rc<dyn Fn()> = {
+        let card = translate.card.clone();
+        let chrome = translate.chrome.clone();
+        let results = translate.results.clone();
+        Rc::new(move || fit_translate_height(&card, &chrome, &results))
+    };
+
+    // The card joins the container first, whatever decides its place. Only
+    // gtk_fixed_put() adds a child; gtk_fixed_move(), which reopen_widget uses
+    // to cascade a window out from under the pointer, looks the widget up in
+    // the child list and walks off the end of it -- taking the process with it
+    // -- when handed a card that was never put there.
+    let point = ctx
+        .state
+        .borrow()
+        .positions
+        .get(&key)
+        .copied()
+        .unwrap_or(Point {
+            x: ctx.primary.x + 292,
+            y: ctx.primary.y + 186,
+        });
+    place_card(&ctx.root, &translate.card, point);
+    if near_pointer {
+        // Straight under the hand that asked for it. Deliberately no cascade:
+        // stepping the card clear of the windows already open walks it down and
+        // away from the click, and two dictionaries overlapping is fine -- the
+        // new one is the one being read.
+        let size = card_size(
+            &translate.card,
+            Size {
+                width: TRANSLATE_WIDTH,
+                height: TRANSLATE_EMPTY_HEIGHT,
+            },
+        );
+        let point = reopen_point(
+            pointer_position(),
+            size,
+            &ctx.screens,
+            ctx.primary,
+            widget_rect(&ctx.picker),
+        );
+        ctx.root.move_(&translate.card, point.x, point.y);
+        ctx.state.borrow_mut().positions.insert(key.clone(), point);
+    }
+    apply_translate_elastic_size(&translate.card, &ctx.state);
+    register(
+        &ctx.registry,
+        &key,
+        &translate.card,
+        translate.color_mode.clone(),
+    );
+    if let Some(item) = ctx
+        .registry
+        .borrow_mut()
+        .iter_mut()
+        .find(|item| item.key == key)
+    {
+        item.edit_only = Some(translate.chrome.clone());
+    }
+    attach_drag(
+        &translate.header,
+        &translate.card,
+        &ctx.root,
+        key.clone(),
+        ctx.state.clone(),
+        ctx.registry.clone(),
+        ctx.interactive.clone(),
+        ctx.window.clone(),
+    );
+    attach_resize(
+        &translate.resize,
+        &translate.card,
+        &ctx.root,
+        key.clone(),
+        ctx.state.clone(),
+        ctx.registry.clone(),
+        ctx.interactive.clone(),
+        ctx.window.clone(),
+        ResizeBounds {
+            min_width: 196,
+            min_height: 120,
+            max_width: 680,
+            max_height: 860,
+            aspect_ratio: None,
+            preserve_current_aspect: false,
+        },
+    );
+
+    // Lookups and completions run on worker threads and report back here. One
+    // channel per window, so a reply is delivered to the window that asked for
+    // it and nowhere else.
+    let (tx, rx) = async_channel::unbounded::<translate::TranslateEvent>();
+    // Two counters, not one: a lookup can be in flight for seconds while the
+    // user types the next query, and a shared counter would let those
+    // keystrokes retire the lookup — leaving "Looking it up…" on screen with
+    // nothing left to replace it.
+    let lookup_generation = Rc::new(Cell::new(0u64));
+    let suggest_generation = Rc::new(Cell::new(0u64));
+    // The play buttons currently on screen, keyed by the clip they are waiting
+    // for. Cleared on every rebuild, so a download that outlives its button
+    // finds no one waiting and is neither re-enabled nor played.
+    let audio_buttons: Rc<RefCell<HashMap<String, gtk::Button>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    // Whether the query panel is dropped down. Tracked explicitly because
+    // show_all() on the card would otherwise reveal it along with everything
+    // else, exactly like the history window's search mode.
+    let search_open = Rc::new(Cell::new(false));
+    // The recents start folded away behind their arrow: opening the panel is a
+    // move to type something, not to read the last ten things typed.
+    let recents_open = Rc::new(Cell::new(false));
+
+    let cache: TranslateCache = Rc::new(RefCell::new(HashMap::new()));
+    // Rendering a cached answer needs the very closure that is being built, so
+    // it goes through a slot filled in as soon as that closure exists.
+    let lookup_self: LookupSlot = Rc::new(RefCell::new(None));
+
+    let saved = ctx
+        .state
+        .borrow()
+        .dictionaries
+        .iter()
+        .find(|entry| entry.id == id)
+        .cloned();
+    let history_stack: Rc<RefCell<Vec<String>>> =
+        Rc::new(RefCell::new(saved.as_ref().map(|entry| entry.history.clone()).unwrap_or_default()));
+    let history_cursor = Rc::new(Cell::new(saved.as_ref().map(|entry| entry.cursor).unwrap_or(0)));
+
+    let update_nav: Rc<dyn Fn()> = {
+        let back = translate.back.clone();
+        let forward = translate.forward.clone();
+        let stack = history_stack.clone();
+        let cursor = history_cursor.clone();
+        Rc::new(move || {
+            let len = stack.borrow().len();
+            let at = cursor.get();
+            back.set_visible(at > 0);
+            forward.set_visible(len > 0 && at + 1 < len);
+        })
+    };
+
+    // Run a query. `record` is what separates following a new word from
+    // stepping through words already visited: only the former rewrites history.
+    let run_lookup: RunLookup = {
+        let translate = translate.clone();
+        let state = ctx.state.clone();
+        let recent = ctx.recent.clone();
+        let search_open = search_open.clone();
+        let lookup_generation = lookup_generation.clone();
+        let suggest_generation = suggest_generation.clone();
+        let audio_buttons = audio_buttons.clone();
+        let pending = pending.clone();
+        let tx = tx.clone();
+        let fit_height = fit_height.clone();
+        let stack = history_stack.clone();
+        let cursor = history_cursor.clone();
+        let update_nav = update_nav.clone();
+        let cache = cache.clone();
+        let lookup_self = lookup_self.clone();
+        Rc::new(move |query: &str, record: bool| {
+            let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+            if query.is_empty() {
+                return;
+            }
+            recent.set(Some(id));
+            if record {
+                {
+                    let mut stack = stack.borrow_mut();
+                    // Following a new word from part-way back drops whatever
+                    // was ahead of it, exactly the way a browser does.
+                    if !stack.is_empty() {
+                        let keep = (cursor.get() + 1).min(stack.len());
+                        stack.truncate(keep);
+                    }
+                    if stack.last().map(String::as_str) != Some(query.as_str()) {
+                        stack.push(query.clone());
+                        if stack.len() > TRANSLATE_HISTORY_LIMIT {
+                            stack.remove(0);
+                        }
+                    }
+                    cursor.set(stack.len().saturating_sub(1));
+                }
+                store_dictionary_history(&state, id, &stack.borrow(), cursor.get());
+            }
+            update_nav();
+            // A completion that is still in flight would land on top of the
+            // answer; cancel its timer and retire its generation.
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            suggest_generation.set(suggest_generation.get() + 1);
+            // The answer is what the user wants to see now, so the panel gets
+            // out of the way until they ask for it again.
+            search_open.set(false);
+            translate.set_search_visible(false);
+            clear_children(&translate.suggestions);
+            audio_buttons.borrow_mut().clear();
+            lookup_generation.set(lookup_generation.get() + 1);
+            // A fresh answer chooses its own natural height and starts at the
+            // top even if the previous entry had been scrolled down.
+            apply_translate_elastic_size(&translate.card, &state);
+            translate.scroller.vadjustment().set_value(0.0);
+            clear_children(&translate.results);
+            let cached = cache.borrow().get(&query).cloned();
+            if let Some(content) = cached {
+                let result = translate::LookupResult {
+                    query: query.clone(),
+                    kind: translate::ResultKind::Content(Box::new(content)),
+                };
+                remember_search(&state, &result.query);
+                // Cloned out of the borrow: rendering wires up rows that can
+                // call straight back into this closure.
+                let run = lookup_self.borrow().clone();
+                if let Some(run) = run {
+                    render_translate_result(
+                        &translate.results,
+                        &fit_height,
+                        &result,
+                        &audio_buttons,
+                        &tx,
+                        &run,
+                    );
+                }
+                return;
+            }
+            translate.results.pack_start(
+                &translate_line("Looking it up\u{2026}", "translate-status"),
+                false,
+                false,
+                0,
+            );
+            translate.results.show_all();
+            fit_height();
+            translate::spawn_lookup(query, lookup_generation.get(), tx.clone());
+        })
+    };
+    let lookup: Rc<dyn Fn(&str)> = {
+        let run_lookup = run_lookup.clone();
+        Rc::new(move |query: &str| run_lookup(query, true))
+    };
+    *lookup_self.borrow_mut() = Some(lookup.clone());
+
+    // Opening and closing the query panel, including the focus grab that lets
+    // the user start typing the moment it appears.
+    let set_search: Rc<dyn Fn(bool)> = {
+        let translate = translate.clone();
+        let search_open = search_open.clone();
+        let state = ctx.state.clone();
+        let window = ctx.window.clone();
+        let lookup = lookup.clone();
+        let suggest_generation = suggest_generation.clone();
+        let pending = pending.clone();
+        let recents_open = recents_open.clone();
+        let fit_height = fit_height.clone();
+        Rc::new(move |open: bool| {
+            search_open.set(open);
+            translate.set_search_visible(open);
+            // Whichever way the panel moves, a completion request that has not
+            // fired yet is no longer wanted.
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            suggest_generation.set(suggest_generation.get() + 1);
+            if !open {
+                clear_children(&translate.suggestions);
+                fit_height();
+                return;
+            }
+            // Start empty rather than pre-selecting the last query: selecting
+            // text in a GtkTextView hands it the X11 primary selection, which
+            // would clobber whatever the user had highlighted elsewhere — the
+            // very thing the "LOOK UP" menu item reads.
+            translate.set_query("");
+            render_translate_recents(
+                &translate.suggestions,
+                &state,
+                &lookup,
+                &recents_open,
+                &fit_height,
+            );
+            fit_height();
+            glib::idle_add_local_once({
+                let window = window.clone();
+                let input = translate.input.clone();
+                let search_open = search_open.clone();
+                move || {
+                    // The panel can be closed again before this runs, e.g. when
+                    // a right-click lookup opens the window and immediately
+                    // shows a result.
+                    if !search_open.get() {
+                        return;
+                    }
+                    present_overlay(&window);
+                    input.grab_focus();
+                }
+            });
+        })
+    };
+
+    translate.close.connect_clicked({
+        let ctx = ctx.clone();
+        move |_| close_translate_window(&ctx, id)
+    });
+    translate.open_search.connect_clicked({
+        let set_search = set_search.clone();
+        move |_| set_search(true)
+    });
+    translate.close_search.connect_clicked({
+        let set_search = set_search.clone();
+        move |_| set_search(false)
+    });
+    translate.back.connect_clicked({
+        let stack = history_stack.clone();
+        let cursor = history_cursor.clone();
+        let run_lookup = run_lookup.clone();
+        let state = ctx.state.clone();
+        move |_| {
+            if cursor.get() == 0 {
+                return;
+            }
+            let at = cursor.get() - 1;
+            let Some(query) = stack.borrow().get(at).cloned() else {
+                return;
+            };
+            cursor.set(at);
+            store_dictionary_history(&state, id, &stack.borrow(), at);
+            run_lookup(&query, false);
+        }
+    });
+    translate.forward.connect_clicked({
+        let stack = history_stack.clone();
+        let cursor = history_cursor.clone();
+        let run_lookup = run_lookup.clone();
+        let state = ctx.state.clone();
+        move |_| {
+            let at = cursor.get() + 1;
+            let Some(query) = stack.borrow().get(at).cloned() else {
+                return;
+            };
+            cursor.set(at);
+            store_dictionary_history(&state, id, &stack.borrow(), at);
+            run_lookup(&query, false);
+        }
+    });
+
+    // Enter runs the query; Shift+Enter is left alone so a multi-line paste can
+    // still be edited by hand.
+    translate.input.connect_key_press_event({
+        let translate = translate.clone();
+        let lookup = lookup.clone();
+        move |_, event| {
+            let enter = matches!(
+                event.keyval(),
+                gdk::keys::constants::Return | gdk::keys::constants::KP_Enter
+            );
+            if enter && !event.state().contains(gdk::ModifierType::SHIFT_MASK) {
+                lookup(&translate.query());
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+
+    if let Some(buffer) = translate.input.buffer() {
+        buffer.connect_changed({
+            let translate = translate.clone();
+            let state = ctx.state.clone();
+            let generation = suggest_generation.clone();
+            let pending = pending.clone();
+            let tx = tx.clone();
+            let lookup = lookup.clone();
+            let recents_open = recents_open.clone();
+            let fit_height = fit_height.clone();
+            move |_| {
+                if let Some(source) = pending.borrow_mut().take() {
+                    source.remove();
+                }
+                // Retire an in-flight request immediately. Waiting until the
+                // next debounce fires leaves a window where suggestions for
+                // the previous prefix can render under the new text.
+                generation.set(generation.get() + 1);
+                let request_generation = generation.get();
+                let text = translate.query();
+                // Prose has no completions worth offering; an empty box goes
+                // back to showing what was searched before.
+                if text.is_empty() {
+                    render_translate_recents(
+                        &translate.suggestions,
+                        &state,
+                        &lookup,
+                        &recents_open,
+                        &fit_height,
+                    );
+                    fit_height();
+                    return;
+                }
+                clear_children(&translate.suggestions);
+                fit_height();
+                if translate::is_sentence(&text) {
+                    return;
+                }
+                let pending_for_timer = pending.clone();
+                let tx = tx.clone();
+                let source = glib::timeout_add_local_once(TRANSLATE_SUGGEST_DELAY, move || {
+                    pending_for_timer.borrow_mut().take();
+                    translate::spawn_suggest(text, request_generation, tx);
+                });
+                *pending.borrow_mut() = Some(source);
+            }
+        });
+    }
+
+    glib::MainContext::default().spawn_local({
+        let suggestions = translate.suggestions.clone();
+        let results = translate.results.clone();
+        let scroller = translate.scroller.clone();
+        let fit_height = fit_height.clone();
+        let lookup_generation = lookup_generation.clone();
+        let suggest_generation = suggest_generation.clone();
+        let audio_buttons = audio_buttons.clone();
+        let lookup = lookup.clone();
+        let state = ctx.state.clone();
+        let tx = tx.clone();
+        let cache = cache.clone();
+        let stack = history_stack.clone();
+        async move {
+            while let Ok(event) = rx.recv().await {
+                match event {
+                    translate::TranslateEvent::Suggestions {
+                        generation: at,
+                        items,
+                    } if at == suggest_generation.get() => {
+                        render_translate_suggestions(&suggestions, &items, &lookup);
+                        fit_height();
+                    }
+                    translate::TranslateEvent::Lookup {
+                        generation: at,
+                        result,
+                    } if at == lookup_generation.get() => {
+                        // Remembered here rather than when the query was sent,
+                        // so a typo that found nothing never enters the list.
+                        if let translate::ResultKind::Content(content) = &result.kind {
+                            remember_search(&state, &result.query);
+                            // Only answers are worth keeping. Caching a network
+                            // failure would pin this window to an error page
+                            // every time the user stepped back onto the word.
+                            let mut cache = cache.borrow_mut();
+                            cache.insert(result.query.clone(), (**content).clone());
+                            if cache.len() > TRANSLATE_HISTORY_LIMIT {
+                                // Words no longer reachable by back or forward
+                                // can never be shown from here again.
+                                let stack = stack.borrow();
+                                cache.retain(|query, _| stack.contains(query));
+                            }
+                        }
+                        scroller.vadjustment().set_value(0.0);
+                        render_translate_result(
+                            &results,
+                            &fit_height,
+                            &result,
+                            &audio_buttons,
+                            &tx,
+                            &lookup,
+                        );
+                    }
+                    translate::TranslateEvent::AudioReady { url, path } => {
+                        // Only play for a button that is still on screen: a clip
+                        // that finished downloading after the user moved on to
+                        // another word would otherwise speak over the new one.
+                        if let Some(button) = audio_buttons.borrow_mut().remove(&url) {
+                            button.set_sensitive(true);
+                            translate::play_audio(&path);
+                        }
+                    }
+                    translate::TranslateEvent::AudioFailed { url } => {
+                        if let Some(button) = audio_buttons.borrow_mut().remove(&url) {
+                            button.set_sensitive(true);
+                            button.set_tooltip_text(Some("Audio unavailable"));
+                        }
+                    }
+                    // A reply for a query the user has already moved on from.
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    // A lookup asked for from inside this window stays in this window; only the
+    // separate "new window" item spawns another one.
+    attach_color_mode_menu(
+        &translate.card,
+        key.clone(),
+        ctx.state.clone(),
+        ctx.registry.clone(),
+        ctx.interactive.clone(),
+        None,
+        None,
+        Some(LookupActions {
+            here: Rc::new(RefCell::new(Some(lookup.clone()))),
+            new_window: ctx.lookup_new_window.clone(),
+            open_window: Some(NewWindowAction {
+                spawn: ctx.spawn.clone(),
+                header: translate.header.clone(),
+            }),
+        }),
+        None,
+    );
+
+    ctx.scrollers.borrow_mut().push(translate.scroller.clone());
+    ctx.instances.borrow_mut().push(TranslateInstance {
+        id,
+        window: translate,
+        lookup: lookup.clone(),
+        set_search,
+        search_open,
+        refresh_nav: update_nav.clone(),
+        cache: cache.clone(),
+    });
+    update_nav();
+    // Put back the word this window was showing when Sysi last closed.
+    if let Some(query) = saved.as_ref().and_then(|entry| entry.query()) {
+        run_lookup(query, false);
+    }
+}
+
 fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
     let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
     card.style_context().add_class("pinned-note");
@@ -5202,10 +5739,17 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
     header.style_context().add_class("history-header");
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
     bar.set_hexpand(true);
-    let hide = small_button("\u{2212}");
-    hide.style_context().add_class("note-window-button");
-    hide.style_context().add_class("note-hide");
-    hide.set_tooltip_text(Some("Hide Dictionary"));
+    // A dictionary is a window in its own right, so its title bar carries a
+    // close cross rather than the notes' hide dash: pressing it takes the
+    // window away for good, along with the answers it had cached.
+    let close = small_button("\u{00d7}");
+    close.style_context().add_class("note-window-button");
+    close.style_context().add_class("note-close");
+    close.set_tooltip_text(Some("Close this dictionary"));
+    // Browser-style history for this window, sitting where a browser puts it:
+    // immediately after the button that dismisses the window.
+    let back = nav_button("go-previous-symbolic", "Back");
+    let forward = nav_button("go-next-symbolic", "Forward");
     // The title fills the row so almost all of the header is drag surface.
     let title = gtk::Label::new(Some("DICTIONARY"));
     title.set_xalign(0.0);
@@ -5216,7 +5760,14 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
     close_search.style_context().add_class("note-window-button");
     close_search.style_context().add_class("note-close");
     close_search.set_tooltip_text(Some("Close search"));
-    bar.pack_start(&hide, false, false, 0);
+    // The close cross and the two arrows are one cluster of window controls, so
+    // they sit tight against each other and keep the header's wider spacing
+    // only between the cluster and the title.
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 1);
+    controls.pack_start(&close, false, false, 0);
+    controls.pack_start(&back, false, false, 0);
+    controls.pack_start(&forward, false, false, 0);
+    bar.pack_start(&controls, false, false, 0);
     bar.pack_start(&title, true, true, 0);
     // Packed end-first so both occupants of the trailing slot land in the same
     // spot, whichever one is showing.
@@ -5289,7 +5840,9 @@ fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
         card,
         chrome,
         header,
-        hide,
+        close,
+        back,
+        forward,
         open_search,
         close_search,
         search_panel,
@@ -5718,6 +6271,24 @@ type TranslateSection = (
     TranslateSectionBuilder,
 );
 
+/// Put a caption on a section header. `gtk_button_set_label` rebuilds the
+/// button's child, so everything the old label carried has to go back on each
+/// time -- otherwise the headers, which start left-aligned, all jump to centre
+/// the first time any section is opened and stay there for good.
+fn set_translate_section_caption(header: &gtk::Button, caption: &str) {
+    header.set_label(caption);
+    if let Some(label) = header
+        .child()
+        .and_then(|child| child.downcast::<gtk::Label>().ok())
+    {
+        label.set_xalign(0.0);
+        // Ellipsized for the same reason as the recents fold: with the
+        // letter-spacing this row carries, an un-ellipsized label measures two
+        // lines tall on its first pass and the column is sized around that.
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    }
+}
+
 fn add_translate_section(
     results: &gtk::Box,
     sections: &Rc<RefCell<Vec<TranslateSection>>>,
@@ -5729,15 +6300,10 @@ fn add_translate_section(
 ) {
     let index = sections.borrow().len();
     let caption = format!("{label} · {count}");
-    let button = gtk::Button::with_label(&format!("▸  {caption}"));
+    let button = gtk::Button::new();
     button.set_can_focus(false);
     button.style_context().add_class("translate-section-toggle");
-    if let Some(label) = button
-        .child()
-        .and_then(|child| child.downcast::<gtk::Label>().ok())
-    {
-        label.set_xalign(0.0);
-    }
+    set_translate_section_caption(&button, &format!("▸  {caption}"));
     let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
     content
         .style_context()
@@ -5758,7 +6324,7 @@ fn add_translate_section(
             let closing = open.get() == Some(index);
             for (header, panel, caption, _) in sections.borrow().iter() {
                 if let Some(header) = header.upgrade() {
-                    header.set_label(&format!("▸  {caption}"));
+                    set_translate_section_caption(&header, &format!("▸  {caption}"));
                 }
                 clear_children(panel);
                 panel.hide();
@@ -5777,7 +6343,7 @@ fn add_translate_section(
             panel.set_no_show_all(false);
             panel.show_all();
             panel.set_no_show_all(true);
-            header.set_label(&format!("▾  {caption}"));
+            set_translate_section_caption(&header, &format!("▾  {caption}"));
             open.set(Some(index));
             fit_height();
         }
@@ -6132,7 +6698,7 @@ fn attach_color_mode_menu(
     interactive: Rc<Cell<bool>>,
     timer_style: Option<TimerStylePreview>,
     system_details: Option<SystemDetailsPreview>,
-    lookup: Option<LookupSlot>,
+    lookup: Option<LookupActions>,
     // Pops a menu for whatever the click landed on inside the widget, and says
     // whether it did. Only the history window has one (its note rows).
     row_menu: Option<Rc<dyn Fn() -> bool>>,
@@ -6147,11 +6713,8 @@ fn attach_color_mode_menu(
     // works on a note, on a result, or on text selected in a browser.
     let selected: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     let lookup_item = lookup.map(|lookup| {
-        let item = gtk::MenuItem::with_label("LOOK UP");
-        item.connect_activate({
-            let lookup = lookup.clone();
-            let selected = selected.clone();
-            move |_| {
+        let run_slot = |slot: LookupSlot, selected: Rc<RefCell<String>>| {
+            move |_: &gtk::MenuItem| {
                 let query = selected.borrow().clone();
                 if query.is_empty() {
                     return;
@@ -6159,16 +6722,41 @@ fn attach_color_mode_menu(
                 // Cloned out of the borrow: the callback re-enters the UI, and
                 // holding the slot borrowed across that would be a trap for
                 // whoever next writes to it.
-                let run = lookup.borrow().clone();
+                let run = slot.borrow().clone();
                 if let Some(run) = run {
                     run(&query);
                 }
             }
+        };
+        let item = gtk::MenuItem::with_label("LOOK UP");
+        item.connect_activate(run_slot(lookup.here.clone(), selected.clone()));
+        // A second way out for the same selection: keep the answer already on
+        // screen and put this one beside it.
+        let new_item = gtk::MenuItem::with_label("LOOK UP IN NEW WINDOW");
+        new_item.connect_activate(run_slot(lookup.new_window.clone(), selected.clone()));
+        // Opening an empty window needs no selection; what gates it instead is
+        // where the click landed, decided when the menu pops up.
+        let open_item = lookup.open_window.clone().map(|action| {
+            let open_item = gtk::MenuItem::with_label("NEW WINDOW");
+            open_item.connect_activate({
+                let spawn = action.spawn.clone();
+                move |_| {
+                    let run = spawn.borrow().clone();
+                    if let Some(run) = run {
+                        run(None);
+                    }
+                }
+            });
+            (open_item, action.header.clone())
         });
         let separator = gtk::SeparatorMenuItem::new();
         menu.append(&item);
+        menu.append(&new_item);
+        if let Some((open_item, _)) = &open_item {
+            menu.append(open_item);
+        }
         menu.append(&separator);
-        (item, separator)
+        (item, new_item, open_item, separator)
     });
     for mode in [ColorMode::Light, ColorMode::Gray, ColorMode::Dark] {
         let item = gtk::MenuItem::with_label(mode.label());
@@ -6290,7 +6878,8 @@ fn attach_color_mode_menu(
     let gesture = gtk::GestureMultiPress::new(widget);
     gesture.set_button(3);
     gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
-    gesture.connect_pressed(move |gesture, _, _, _| {
+    let menu_card = widget.clone();
+    gesture.connect_pressed(move |gesture, _, x, y| {
         if !interactive.get() {
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
@@ -6304,12 +6893,29 @@ fn attach_color_mode_menu(
                 return;
             }
         }
-        if let Some((item, separator)) = &lookup_item {
+        if let Some((item, new_item, open_item, separator)) = &lookup_item {
             let query = primary_selection();
-            // The separator belongs to the item; leaving it behind would open
-            // every menu with a stray rule above the colour modes.
-            item.set_visible(!query.is_empty());
-            separator.set_visible(!query.is_empty());
+            let on_header = open_item
+                .as_ref()
+                .map(|(open_item, header)| {
+                    let inside = menu_card
+                        .translate_coordinates(header, x as i32, y as i32)
+                        .is_some_and(|(hx, hy)| {
+                            let area = header.allocation();
+                            hx >= 0 && hy >= 0 && hx < area.width() && hy < area.height()
+                        });
+                    open_item.set_visible(inside);
+                    inside
+                })
+                .unwrap_or(false);
+            // The title bar is not text, so a lookup offered there would be
+            // acting on a selection made somewhere the click never touched.
+            let offer_lookup = !query.is_empty() && !on_header;
+            // The separator belongs to the items above it; leaving it behind
+            // would open every menu with a stray rule above the colour modes.
+            item.set_visible(offer_lookup);
+            new_item.set_visible(offer_lookup);
+            separator.set_visible(offer_lookup || on_header);
             if !query.is_empty() {
                 if let Some(label) = item.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
                     label.set_label(&format!(
@@ -7417,6 +8023,18 @@ fn small_button(label: &str) -> gtk::Button {
     let button = gtk::Button::with_label(label);
     button.style_context().add_class("tiny-button");
     button.set_can_focus(false);
+    button
+}
+
+/// The dictionary header's back and forward arrows. An icon button, trimmed
+/// down so a pair of them fits beside the title, and hidden rather than greyed
+/// out when there is nowhere to go -- an arrow that cannot be used is noise.
+fn nav_button(icon_name: &str, tooltip: &str) -> gtk::Button {
+    let button = icon_button(icon_name, tooltip);
+    button.style_context().add_class("translate-nav");
+    if let Some(image) = button.child().and_then(|c| c.downcast::<gtk::Image>().ok()) {
+        image.set_pixel_size(9);
+    }
     button
 }
 
