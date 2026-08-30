@@ -1267,6 +1267,49 @@ pub fn cached_audio_path(url: &str) -> PathBuf {
         .join(format!("{:016x}.mp3", fnv1a(url)))
 }
 
+/// Keep the pronunciation cache from growing for ever.
+///
+/// Nothing else ever deletes from it, so a few years of looking words up leaves
+/// every clip ever played on disk. Oldest first, down to `limit` bytes.
+pub fn prune_audio_cache(limit: u64) {
+    let dir = crate::state::cache_dir().join("audio");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let mut clips: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            Some((metadata.modified().ok()?, metadata.len(), entry.path()))
+        })
+        .collect();
+    for path in stale_clips(&mut clips, limit) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Which clips have to go for the rest to fit under `limit`, oldest first.
+fn stale_clips(clips: &mut [(std::time::SystemTime, u64, PathBuf)], limit: u64) -> Vec<PathBuf> {
+    let mut total: u64 = clips.iter().map(|(_, size, _)| *size).sum();
+    if total <= limit {
+        return Vec::new();
+    }
+    // Newest last, so draining from the front sheds the stalest clips.
+    clips.sort_by_key(|(modified, _, _)| *modified);
+    let mut dropped = Vec::new();
+    for (_, size, path) in clips.iter() {
+        if total <= limit {
+            break;
+        }
+        total = total.saturating_sub(*size);
+        dropped.push(path.clone());
+    }
+    dropped
+}
+
 fn fnv1a(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in input.as_bytes() {
@@ -1319,11 +1362,16 @@ mod tests {
     use super::{
         cached_audio_path, cambridge_headword_matches, cambridge_slug, em_to_pango_bold,
         escape_markup, fnv1a, is_sentence, parse_cambridge, parse_google, parse_tracau,
-        parse_tracau_fulltext, percent_encode, should_probe_dictionary, strip_tags, Request,
+        parse_tracau_fulltext, percent_encode, should_probe_dictionary, stale_clips, strip_tags,
+        Request,
     };
-    use std::sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+    use std::{
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+        time::Duration,
     };
 
     #[test]
@@ -1690,6 +1738,24 @@ mod tests {
         });
         let (_, definitions) = parse_cambridge(&json, "cat");
         assert_eq!(definitions.len(), 1);
+    }
+
+    #[test]
+    fn the_audio_cache_sheds_its_oldest_clips_until_it_fits() {
+        let at = |seconds: u64| std::time::UNIX_EPOCH + Duration::from_secs(seconds);
+        let mut clips = vec![
+            (at(300), 40, PathBuf::from("newest.mp3")),
+            (at(100), 40, PathBuf::from("oldest.mp3")),
+            (at(200), 40, PathBuf::from("middle.mp3")),
+        ];
+        // 120 bytes in hand, 60 allowed: the two stalest have to go.
+        let dropped = stale_clips(&mut clips, 60);
+        assert_eq!(
+            dropped,
+            [PathBuf::from("oldest.mp3"), PathBuf::from("middle.mp3")]
+        );
+        // Already under the ceiling: nothing is touched, however old it is.
+        assert!(stale_clips(&mut clips, 1_000).is_empty());
     }
 
     #[test]

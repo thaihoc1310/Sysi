@@ -25,6 +25,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// How much disk the pronunciation clips may keep between them. Roughly a
+/// couple of thousand words, and nothing that is dropped costs more than one
+/// re-download.
+const AUDIO_CACHE_LIMIT: u64 = 64 * 1024 * 1024;
 const SYSTEM_WIDTH: i32 = 196;
 const SYSTEM_HEIGHT: i32 = 76;
 const SYSTEM_SINGLE_WIDTH: i32 = 76;
@@ -419,8 +423,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }
     }
     // Image files left behind by a note deleted while Sysi was not running, or
-    // by an image backspaced out of a note, are reclaimed once per launch.
+    // by an image backspaced out of a note, are reclaimed once per launch. So
+    // is anything past the pronunciation cache's ceiling.
     state.borrow().prune_orphan_images();
+    translate::prune_audio_cache(AUDIO_CACHE_LIMIT);
     // The overlay covers the X root window, which always spans every
     // monitor; monitor-derived bounds would double-count Xinerama screens.
     window.set_default_size(screen_width, screen_height);
@@ -1449,31 +1455,35 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let toggle_translate = toggle_translate.clone();
         let translate_any_visible = translate_any_visible.clone();
         let interactive = interactive.clone();
-        Rc::new(move || match take_panel_action().as_deref() {
-            Some("toggle-system") => system.set_active(!system.is_active()),
-            Some("toggle-timer") => timer.set_active(!timer.is_active()),
-            Some("next-color-mode") => mode.clicked(),
-            Some("toggle-lock") => lock.clicked(),
-            Some("new-note") => {
-                // A note created while locked would be read-only; unlock so
-                // the user can type into it right away.
-                if !interactive.get() {
-                    lock.clicked();
+        Rc::new(move || {
+            for action in take_panel_actions() {
+                match action.as_str() {
+                    "toggle-system" => system.set_active(!system.is_active()),
+                    "toggle-timer" => timer.set_active(!timer.is_active()),
+                    "next-color-mode" => mode.clicked(),
+                    "toggle-lock" => lock.clicked(),
+                    "new-note" => {
+                        // A note created while locked would be read-only;
+                        // unlock so the user can type into it right away.
+                        if !interactive.get() {
+                            lock.clicked();
+                        }
+                        new_note.clicked();
+                    }
+                    "toggle-history" => toggle_history(),
+                    "toggle-translate" => {
+                        // The entry is edit chrome, so a translate window
+                        // opened while locked would have nothing to type into;
+                        // unlock first, the way a new note does.
+                        if !translate_any_visible() && !interactive.get() {
+                            lock.clicked();
+                        }
+                        toggle_translate();
+                    }
+                    "quit" => quit.clicked(),
+                    _ => {}
                 }
-                new_note.clicked();
             }
-            Some("toggle-history") => toggle_history(),
-            Some("toggle-translate") => {
-                // The entry is edit chrome, so a translate window opened while
-                // locked would have nothing to type into; unlock first, the way
-                // a new note does.
-                if !translate_any_visible() && !interactive.get() {
-                    lock.clicked();
-                }
-                toggle_translate();
-            }
-            Some("quit") => quit.clicked(),
-            _ => {}
         })
     };
 
@@ -4960,6 +4970,20 @@ fn track_widget_hover(
     // pinned notes and the history list — and toggle classes that fade the
     // scrollbar thumbs in instead of relying on CSS :hover propagation.
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        // Reading the pointer is a round trip to the X server. With no note and
+        // no scrolling window on screen there is nothing that could take a
+        // hover class, so the tick costs nothing at all.
+        let hoverable = registry
+            .borrow()
+            .iter()
+            .any(|item| item.key.starts_with("note:") && item.widget.is_visible())
+            || scrollers
+                .borrow()
+                .iter()
+                .any(|scroller| scroller.is_visible() && scroller.window().is_some());
+        if !hoverable {
+            return glib::ControlFlow::Continue;
+        }
         let Some(device) = gdk::Display::default()
             .and_then(|display| display.default_seat())
             .and_then(|seat| seat.pointer())
@@ -6750,11 +6774,24 @@ fn picker_toggle(label: &str) -> gtk::ToggleButton {
     button
 }
 
-fn take_panel_action() -> Option<String> {
-    let path = crate::state::cache_dir().join("panel-action");
-    let action = fs::read_to_string(&path).ok()?;
-    let _ = fs::remove_file(path);
-    Some(action.trim().to_owned())
+/// Every panel action written since the last signal, oldest first.
+///
+/// Renamed before it is read, so an action the panel appends while this runs
+/// lands in a fresh file and is picked up by its own signal rather than being
+/// deleted unread.
+fn take_panel_actions() -> Vec<String> {
+    let dir = crate::state::cache_dir();
+    let taken = dir.join("panel-action.taken");
+    if fs::rename(dir.join("panel-action"), &taken).is_err() {
+        return Vec::new();
+    }
+    let raw = fs::read_to_string(&taken).unwrap_or_default();
+    let _ = fs::remove_file(&taken);
+    raw.lines()
+        .map(str::trim)
+        .filter(|action| !action.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// One short line for the GNOME panel extension to read: whether the overlay is
@@ -7788,10 +7825,16 @@ fn attach_resize(
 
     let start = Rc::new(Cell::new(None::<(i32, i32, f64, f64)>));
     let latest = Rc::new(Cell::new(Size::default()));
+    // Enumerating the monitors asks the server for each one's geometry and work
+    // area. That is far too much to repeat per motion event, and the answer
+    // cannot change in the middle of a drag, so it is taken once on the press.
+    let gesture_screens: Rc<RefCell<Vec<ScreenRect>>> = Rc::new(RefCell::new(Vec::new()));
     handle.hitbox.connect_button_press_event({
         let start = start.clone();
         let latest = latest.clone();
         let card = card.clone();
+        let root = root.clone();
+        let gesture_screens = gesture_screens.clone();
         let interactive = interactive.clone();
         move |_, event| {
             if !interactive.get() || event.button() != 1 {
@@ -7799,6 +7842,12 @@ fn attach_resize(
             }
             let allocation = card.allocation();
             let (pointer_x, pointer_y) = event.root();
+            let root_allocation = root.allocation();
+            *gesture_screens.borrow_mut() = logical_screen_rects(
+                card.scale_factor(),
+                root_allocation.width(),
+                root_allocation.height(),
+            );
             latest.set(Size {
                 width: allocation.width(),
                 height: allocation.height(),
@@ -7817,6 +7866,7 @@ fn attach_resize(
         let latest = latest.clone();
         let card = card.clone();
         let root = root.clone();
+        let gesture_screens = gesture_screens.clone();
         move |_, event| {
             let Some((start_width, start_height, pointer_start_x, pointer_start_y)) = start.get()
             else {
@@ -7833,12 +7883,7 @@ fn attach_resize(
             let delta_y = pointer_y - pointer_start_y;
 
             let allocation = card.allocation();
-            let root_allocation = root.allocation();
-            let screens = logical_screen_rects(
-                card.scale_factor(),
-                root_allocation.width(),
-                root_allocation.height(),
-            );
+            let screens = gesture_screens.borrow();
             let screen_limit = screens
                 .iter()
                 .find(|screen| {
@@ -7893,10 +7938,19 @@ fn attach_resize(
                 width: next.width.clamp(bounds.min_width, max_width),
                 height: next.height.clamp(bounds.min_height, max_height),
             };
-            latest.set(next);
+            drop(screens);
+            let previous = latest.replace(next);
             card.set_size_request(next.width, next.height);
             card.queue_resize();
-            root.queue_draw();
+            // Only the card's own rectangle changed, and its origin did not
+            // move. Redrawing the whole overlay here meant invalidating every
+            // monitor on every motion event.
+            root.queue_draw_area(
+                allocation.x() - 3,
+                allocation.y() - 3,
+                next.width.max(previous.width) + 6,
+                next.height.max(previous.height) + 6,
+            );
             glib::Propagation::Stop
         }
     });
@@ -7948,9 +8002,15 @@ fn attach_drag(
     // Follow the root pointer instead, so moving the Fixed child never feeds
     // back into the next drag delta.
     let start = Rc::new(Cell::new(None::<(i32, i32, f64, f64)>));
+    // Read once when the drag starts rather than on every motion event: asking
+    // the server for each monitor's geometry and work area is not something to
+    // repeat sixty times a second, and it cannot change mid-drag.
+    let gesture_screens: Rc<RefCell<Vec<ScreenRect>>> = Rc::new(RefCell::new(Vec::new()));
     gesture.connect_drag_begin({
         let start = start.clone();
         let card = card.clone();
+        let root = root.clone();
+        let gesture_screens = gesture_screens.clone();
         let interactive = interactive.clone();
         move |gesture, local_x, local_y| {
             if interactive.get() {
@@ -7965,6 +8025,12 @@ fn attach_drag(
                     f64::from(allocation.x()) + local_x,
                     f64::from(allocation.y()) + local_y,
                 ));
+                let root_allocation = root.allocation();
+                *gesture_screens.borrow_mut() = logical_screen_rects(
+                    card.scale_factor(),
+                    root_allocation.width(),
+                    root_allocation.height(),
+                );
                 start.set(Some((allocation.x(), allocation.y(), pointer_x, pointer_y)));
             } else {
                 gesture.set_state(gtk::EventSequenceState::Denied);
@@ -7975,6 +8041,7 @@ fn attach_drag(
         let start = start.clone();
         let card = card.clone();
         let root = root.clone();
+        let gesture_screens = gesture_screens.clone();
         move |gesture, fallback_x, fallback_y| {
             if let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.get() {
                 let (pointer_x, pointer_y) = pointer_position()
@@ -7985,12 +8052,7 @@ fn attach_drag(
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
                 let allocation = card.allocation();
-                let root_allocation = root.allocation();
-                let screens = logical_screen_rects(
-                    card.scale_factor(),
-                    root_allocation.width(),
-                    root_allocation.height(),
-                );
+                let screens = gesture_screens.borrow();
                 let point = clamp_to_screens(
                     Point {
                         x: ox + offset_x as i32,

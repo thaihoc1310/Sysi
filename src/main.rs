@@ -153,7 +153,14 @@ fn option_value(option: &str) -> Option<String> {
 fn write_panel_action(action: &str) -> io::Result<()> {
     let dir = state::cache_dir();
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("panel-action"), action)
+    // Appended rather than written over. Two panel clicks in quick succession
+    // are two separate processes writing here, and SIGWINCH coalesces, so one
+    // signal may have to carry both — overwriting simply dropped the first.
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("panel-action"))?;
+    writeln!(file, "{action}")
 }
 
 fn acquire_instance_lock() -> Option<File> {

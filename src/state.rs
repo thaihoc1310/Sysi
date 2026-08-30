@@ -307,10 +307,26 @@ pub fn cache_dir() -> PathBuf {
 impl AppState {
     pub fn load() -> Self {
         let path = config_dir().join("state.json");
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+        let Ok(raw) = fs::read_to_string(&path) else {
+            // No file yet, or it cannot be read at all. Either way there is
+            // nothing to lose by starting fresh.
+            return Self::default();
+        };
+        match serde_json::from_str(&raw) {
+            Ok(state) => state,
+            Err(error) => {
+                // Quietly starting from defaults would be silent data loss:
+                // the very first save overwrites the file that still holds
+                // every note. Move it aside and say where it went instead.
+                let kept = path.with_extension("json.unreadable");
+                eprintln!(
+                    "Could not read Sysi state ({error}). The old file has been kept at {}.",
+                    kept.display()
+                );
+                let _ = fs::rename(&path, &kept);
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self) -> io::Result<()> {
