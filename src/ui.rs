@@ -34,6 +34,27 @@ const SYSTEM_HEIGHT: i32 = 76;
 const SYSTEM_SINGLE_WIDTH: i32 = 76;
 /// One meter's share of a row. Two of them make up the classic CPU + RAM card.
 const SYSTEM_METER_CELL: f64 = 94.0;
+/// The ring inside that cell: where its centre sits, how far the arc is swept
+/// from it, and the stroke that straddles the arc. Everything that measures the
+/// card is derived from these, so the box can never drift from the paint.
+const SYSTEM_METER_RING_CENTER_Y: f64 = 35.0;
+const SYSTEM_METER_RING_RADIUS: f64 = 28.0;
+const SYSTEM_METER_RING_STROKE: f64 = 6.5;
+/// How far the painted ring reaches from its centre: the radius, plus the half
+/// of the stroke that falls outside it.
+const SYSTEM_METER_RING_EXTENT: f64 = SYSTEM_METER_RING_RADIUS + SYSTEM_METER_RING_STROKE / 2.0;
+/// The box one ring paints into, stroke included. This is a fixed size: the
+/// card responds to a drag by moving the rings apart, not by growing them.
+const SYSTEM_METER_RING: f64 = 2.0 * SYSTEM_METER_RING_EXTENT;
+/// The space a card left alone puts between its rings — one cell less one
+/// ring, which is exactly how far apart the classic card's rings sit.
+const SYSTEM_METER_GAP: f64 = SYSTEM_METER_CELL - SYSTEM_METER_RING;
+/// How close together the rings may be squeezed before one of them is moved
+/// down to the next row instead.
+const SYSTEM_METER_GAP_MIN: f64 = 10.0;
+const SYSTEM_METER_INK_TOP: f64 = SYSTEM_METER_RING_CENTER_Y - SYSTEM_METER_RING_EXTENT;
+const SYSTEM_METER_INK_BOTTOM: f64 =
+    SYSTEM_HEIGHT as f64 - (SYSTEM_METER_RING_CENTER_Y + SYSTEM_METER_RING_EXTENT);
 /// Rings stay legible at this size, so a row never holds more than three.
 const SYSTEM_METERS_PER_ROW: usize = 3;
 /// Where a caption sits inside its ring, measured from the top of the meter.
@@ -426,6 +447,31 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             data.layout_version = 7;
             let _ = data.save();
         }
+        if data.layout_version < 8 {
+            // The system card used to be measured to the cells its rings sit
+            // in, which left a blank margin all the way round: the widget
+            // stopped short of the left, right, and bottom edges of the screen
+            // even when it was clamped flush against them. It is measured to
+            // the rings themselves now, so a width saved under the old measure
+            // has to hand those margins back — left alone it would keep the
+            // gap it was dragged to.
+            if let Some(size) = data.sizes.get("system").copied() {
+                let columns = ((f64::from(size.width.max(1)) / SYSTEM_METER_CELL).floor()
+                    as usize)
+                    .max(1);
+                data.sizes.insert(
+                    "system".into(),
+                    Size {
+                        width: system_meter_ink_width(columns).ceil() as i32,
+                        // The height follows from the width on its own, so
+                        // whatever is here is replaced on the first layout.
+                        height: size.height,
+                    },
+                );
+            }
+            data.layout_version = 8;
+            let _ = data.save();
+        }
     }
     // Image files left behind by a note deleted while Sysi was not running, or
     // by an image backspaced out of a note, are reclaimed once per launch. So
@@ -551,11 +597,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         window.clone(),
         ResizeBounds {
-            min_width: 72,
-            min_height: 64,
+            min_width: 62,
+            min_height: 62,
             // Room for eight rings side by side, so a card dragged wide really
             // can put every meter on one row.
-            max_width: 8 * SYSTEM_METER_CELL as i32 + (SYSTEM_WIDTH - 188),
+            max_width: system_meter_ink_width(8).ceil() as i32,
             max_height: 640,
             aspect_ratio: None,
             preserve_current_aspect: false,
@@ -1835,9 +1881,13 @@ fn draw_system(
     let width = f64::from(allocation.width().max(1));
     let meters = system_meters(details, values);
     let rows = system_meter_rows(meters.len(), system_meter_columns(meters.len(), width));
-    let layout_width = system_meter_layout_width(rows.iter().copied().max().unwrap_or(0));
-    let scale = (width / layout_width).clamp(0.1, 1.0);
-    let content_width = layout_width * scale;
+    let widest = rows.iter().copied().max().unwrap_or(0);
+    // The rings keep their size and the room left over becomes the space
+    // between them, so dragging the card spreads or tightens the row rather
+    // than resizing it. Only a card too narrow for a single ring scales.
+    let gap = system_meter_gap(widest, width);
+    let content_width = system_meter_row_width(widest, gap);
+    let scale = (width / content_width).clamp(0.1, 1.0);
     let (ink, muted, accent) = match color_mode {
         ColorMode::Light => ((0.97, 0.97, 0.97), (0.72, 0.72, 0.72), (0.9, 0.9, 0.9)),
         ColorMode::Gray => ((0.7, 0.7, 0.7), (0.5, 0.5, 0.5), (0.64, 0.64, 0.64)),
@@ -1845,31 +1895,42 @@ fn draw_system(
     };
     if !meters.is_empty() {
         let _ = ctx.save();
-        ctx.translate((width - content_width) / 2.0, 0.0);
+        ctx.translate(
+            (width - content_width * scale) / 2.0,
+            -SYSTEM_METER_INK_TOP * scale,
+        );
         ctx.scale(scale, scale);
         let mut meters = meters.iter();
         for (row, count) in rows.iter().copied().enumerate() {
             let y = row as f64 * f64::from(SYSTEM_HEIGHT);
             // Every row is centred on the card, so a last row that came up
             // short sits under the middle of the one above it.
-            let left = (layout_width - count as f64 * SYSTEM_METER_CELL) / 2.0;
+            let left = (content_width - system_meter_row_width(count, gap)) / 2.0;
             for column in 0..count {
                 let Some((value, title)) = meters.next() else {
                     break;
                 };
-                let x = left + (column as f64 + 0.5) * SYSTEM_METER_CELL;
-                ctx.set_line_width(6.5);
+                let x = left
+                    + column as f64 * (SYSTEM_METER_RING + gap)
+                    + SYSTEM_METER_RING / 2.0;
+                ctx.set_line_width(SYSTEM_METER_RING_STROKE);
                 ctx.set_line_cap(cairo::LineCap::Round);
                 ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
                 ctx.new_sub_path();
-                ctx.arc(x, y + 35.0, 28.0, -PI * 0.75, PI * 0.75);
+                ctx.arc(
+                    x,
+                    y + SYSTEM_METER_RING_CENTER_Y,
+                    SYSTEM_METER_RING_RADIUS,
+                    -PI * 0.75,
+                    PI * 0.75,
+                );
                 let _ = ctx.stroke();
                 ctx.set_source_rgba(accent.0, accent.1, accent.2, 0.96);
                 ctx.new_sub_path();
                 ctx.arc(
                     x,
-                    y + 35.0,
-                    28.0,
+                    y + SYSTEM_METER_RING_CENTER_Y,
+                    SYSTEM_METER_RING_RADIUS,
                     -PI * 0.75,
                     -PI * 0.75 + PI * 1.5 * (value / 100.0).clamp(0.0, 1.0),
                 );
@@ -1900,7 +1961,7 @@ fn draw_system(
     let mut cursor_y = if rows.is_empty() {
         2.0
     } else {
-        rows.len() as f64 * f64::from(SYSTEM_HEIGHT) * scale
+        (rows.len() as f64 * f64::from(SYSTEM_HEIGHT) - SYSTEM_METER_INK_TOP) * scale
     };
     if details.processes {
         draw_system_processes(ctx, values, width, cursor_y, ink, muted);
@@ -1951,7 +2012,35 @@ fn system_meter_columns(count: usize, card_width: f64) -> usize {
     if count == 0 {
         return 0;
     }
-    ((card_width / SYSTEM_METER_CELL).floor() as usize).clamp(1, count)
+    // Fewest rows first, so the widest row the card can still hold wins. A row
+    // is held as long as its rings fit at their tightest spacing; squeeze the
+    // card past that and the search drops to one more row, which is what moves
+    // a ring down. Widen it back and the same test brings the ring up again.
+    for rows in 1..=count {
+        let widest = count.div_ceil(rows);
+        if system_meter_row_width(widest, SYSTEM_METER_GAP_MIN) <= card_width {
+            return widest;
+        }
+    }
+    1
+}
+
+/// How wide a row of rings is at a given spacing.
+fn system_meter_row_width(columns: usize, gap: f64) -> f64 {
+    let columns = columns.max(1);
+    columns as f64 * SYSTEM_METER_RING + (columns - 1) as f64 * gap
+}
+
+/// The spacing the rings take on a card this wide: whatever is left once the
+/// rings themselves are accounted for, shared equally between them. This is
+/// what lets the card answer a drag smoothly — the row keeps filling the card
+/// until it is too tight to hold, and only then does the layout change.
+fn system_meter_gap(widest: usize, card_width: f64) -> f64 {
+    if widest <= 1 {
+        return 0.0;
+    }
+    ((card_width - widest as f64 * SYSTEM_METER_RING) / (widest - 1) as f64)
+        .max(SYSTEM_METER_GAP_MIN)
 }
 
 /// How many meters go on each row, given how many fit across. Rows divide as
@@ -1971,12 +2060,10 @@ fn system_meter_rows(count: usize, columns: usize) -> Vec<usize> {
 
 /// The width the rings are laid out in, before the card scales them to fit.
 /// `widest` is the busiest row's meter count.
-fn system_meter_layout_width(widest: usize) -> f64 {
-    match widest {
-        // One ring keeps the tight square card it has always had.
-        0 | 1 => f64::from(SYSTEM_SINGLE_WIDTH),
-        columns => columns as f64 * SYSTEM_METER_CELL,
-    }
+/// The width the card wants when nobody has dragged it: its rings at the
+/// spacing they take by default, and no margin beyond the outermost strokes.
+fn system_meter_ink_width(widest: usize) -> f64 {
+    system_meter_row_width(widest, SYSTEM_METER_GAP).max(1.0)
 }
 
 /// The size the card wants.
@@ -2000,7 +2087,16 @@ fn system_content_size(
     let mut height = if rows.is_empty() {
         10
     } else {
-        rows.len() as i32 * SYSTEM_HEIGHT
+        // The margin above the first row is always slack. The one below the
+        // last row is only slack when the rings are what the card ends with;
+        // with a section under them it is the gap that separates the two.
+        let block = rows.len() as f64 * f64::from(SYSTEM_HEIGHT) - SYSTEM_METER_INK_TOP;
+        let block = if details.processes || details.cores {
+            block
+        } else {
+            block - SYSTEM_METER_INK_BOTTOM
+        };
+        block.ceil() as i32
     };
     if details.processes {
         height += 108;
@@ -2013,13 +2109,9 @@ fn system_content_size(
         None if details.processes || details.cores => 318,
         // No meters at all still leaves a strip to right-click on.
         None if meter_count == 0 => SYSTEM_WIDTH,
-        None if meter_count == 1 => SYSTEM_SINGLE_WIDTH,
-        // The classic two-across card is 196 wide; three-across grows to
-        // match, and the eight either side stays the card's own margin.
-        None => {
-            system_meter_layout_width(rows.iter().copied().max().unwrap_or(1)) as i32
-                + (SYSTEM_WIDTH - 188)
-        }
+        // Exactly the rings and nothing else, so the card can go flush against
+        // a screen edge on every side the way it already could against the top.
+        None => system_meter_ink_width(rows.iter().copied().max().unwrap_or(1)).ceil() as i32,
     };
     Size { width, height }
 }
@@ -8578,11 +8670,13 @@ mod timer_input_tests {
         normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
         note_size_for_image, parse_timer_input, push_recent_search, receives_input_when_locked,
         record_note_undo, reopen_point, resize_width_limit, resized_image_size,
-        round_pixbuf_corners, system_content_size, system_meter_columns, system_meter_layout_width,
-        system_meter_rows, timer_style_size, NoteSearchMatch, NoteSearchOptions, NoteSnapshot,
-        NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT,
-        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
-        NOTE_MAX_HEIGHT, NOTE_WIDTH, SYSTEM_METER_CELL,
+        round_pixbuf_corners, system_content_size, system_meter_columns, system_meter_gap,
+        system_meter_ink_width, system_meter_row_width, system_meter_rows, timer_style_size,
+        NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect,
+        HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS,
+        NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT, NOTE_WIDTH,
+        SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
+        SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
     };
     use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
     use crate::system::SystemSnapshot;
@@ -9048,13 +9142,47 @@ mod timer_input_tests {
             &SystemSnapshot::default(),
             None,
         );
+        // The ring plus its stroke, and not a pixel of margin around it.
         assert_eq!(
             size,
             Size {
-                width: 76,
-                height: 76
+                width: 63,
+                height: 63
             }
         );
+    }
+
+    #[test]
+    fn the_card_hugs_its_rings_rather_than_the_cells_around_them() {
+        // What a ring actually paints: the arc plus the half of its stroke that
+        // falls outside. The card has to measure exactly this, on every side.
+        // Measured to the cell instead, the widget kept a blank margin left,
+        // right and below, and could not be pushed flush against a screen edge
+        // the way it already could against the top.
+        let ring = 2.0 * (SYSTEM_METER_RING_RADIUS + SYSTEM_METER_RING_STROKE / 2.0);
+        assert_eq!(system_meter_ink_width(1), ring);
+        // Each further ring adds one whole cell and no margin of its own.
+        for columns in 1..8 {
+            assert_eq!(
+                system_meter_ink_width(columns + 1) - system_meter_ink_width(columns),
+                SYSTEM_METER_CELL
+            );
+        }
+        // A one-ring card is that same square in both directions, and a row of
+        // rings is no taller than one of them.
+        let one_meter = SystemDetails {
+            cpu: true,
+            ram: false,
+            processes: false,
+            cores: false,
+            ..SystemDetails::default()
+        };
+        let size = system_content_size(one_meter, &SystemSnapshot::default(), None);
+        assert_eq!(size.width, ring.ceil() as i32);
+        assert_eq!(size.height, ring.ceil() as i32);
+        // The row still occupies its full cell height internally; only the
+        // slack above and below the outermost rows is given back.
+        assert!(f64::from(size.height) < f64::from(SYSTEM_HEIGHT));
     }
 
     #[test]
@@ -9083,40 +9211,93 @@ mod timer_input_tests {
         assert_eq!(system_meter_columns(6, 290.0), 3);
         // Dragged wide enough for all six, they take one row.
         assert_eq!(system_meter_columns(6, 564.0), 6);
-        // One cell short of six is five, and the even split makes it 3 + 3.
-        assert_eq!(system_meter_columns(6, 500.0), 5);
-        assert_eq!(system_meter_rows(6, 5), [3, 3]);
+        // A row is kept as long as its rings still fit at their tightest
+        // spacing, so the sixth ring comes up well before the card is wide
+        // enough to give it a whole cell of its own.
+        let six_across = system_meter_row_width(6, SYSTEM_METER_GAP_MIN);
+        assert_eq!(system_meter_columns(6, six_across), 6);
+        assert_eq!(system_meter_columns(6, six_across - 1.0), 3);
         // Never more columns than there are rings, however wide it gets.
         assert_eq!(system_meter_columns(2, 900.0), 2);
-        // Narrower than a single cell still draws one ring, scaled down.
+        // Narrower than one ring still draws that ring, scaled down.
         assert_eq!(system_meter_columns(4, 76.0), 1);
         assert_eq!(system_meter_columns(0, 900.0), 0);
     }
 
     #[test]
     fn a_row_of_meters_stays_centred_on_the_card_it_is_drawn_in() {
-        // The two-across card keeps the geometry it has always had: 188 wide,
-        // rings at 47 and 141.
-        assert_eq!(system_meter_layout_width(2), 188.0);
-        let centres = |count: usize, columns: usize| -> Vec<f64> {
+        // Ring centres on an untouched card, measured from its left edge. At
+        // the default spacing they land one cell apart, starting half a ring
+        // in — the geometry the card has always drawn.
+        let centres = |count: usize, columns: usize, gap: f64| -> Vec<f64> {
             let rows = system_meter_rows(count, columns);
-            let width = system_meter_layout_width(rows.iter().copied().max().unwrap_or(0));
+            let widest = rows.iter().copied().max().unwrap_or(0);
+            let content = system_meter_row_width(widest, gap);
             let mut result = Vec::new();
             for row in rows {
-                let left = (width - row as f64 * SYSTEM_METER_CELL) / 2.0;
+                let left = (content - system_meter_row_width(row, gap)) / 2.0;
                 for column in 0..row {
-                    result.push(left + (column as f64 + 0.5) * SYSTEM_METER_CELL);
+                    result.push(
+                        left + column as f64 * (SYSTEM_METER_RING + gap) + SYSTEM_METER_RING / 2.0,
+                    );
                 }
             }
             result
         };
-        assert_eq!(centres(1, 1), [38.0]);
-        assert_eq!(centres(2, 2), [47.0, 141.0]);
-        assert_eq!(centres(3, 3), [47.0, 141.0, 235.0]);
+        let half = SYSTEM_METER_RING / 2.0;
+        let step = SYSTEM_METER_CELL;
+        assert_eq!(centres(1, 1, SYSTEM_METER_GAP), [half]);
+        assert_eq!(centres(2, 2, SYSTEM_METER_GAP), [half, half + step]);
+        assert_eq!(
+            centres(3, 3, SYSTEM_METER_GAP),
+            [half, half + step, half + 2.0 * step]
+        );
         // Five rings: three across, then two centred underneath them.
-        assert_eq!(centres(5, 3), [47.0, 141.0, 235.0, 94.0, 188.0]);
-        // Six across on a widened card: still one centred block, no gaps.
-        assert_eq!(centres(6, 6), [47.0, 141.0, 235.0, 329.0, 423.0, 517.0]);
+        assert_eq!(
+            centres(5, 3, SYSTEM_METER_GAP),
+            [
+                half,
+                half + step,
+                half + 2.0 * step,
+                half + step / 2.0,
+                half + 1.5 * step,
+            ]
+        );
+        // Spread the same three rings over a wider card and only the spacing
+        // changes: the first ring stays flush against the left edge and the
+        // last against the right.
+        let wide = 400.0;
+        let gap = system_meter_gap(3, wide);
+        let spread = centres(3, 3, gap);
+        assert_eq!(spread[0], half);
+        assert_eq!(spread[2], wide - half);
+    }
+
+    #[test]
+    fn dragging_the_card_spreads_the_rings_before_it_reflows_them() {
+        // Widening the card moves the rings apart and leaves them filling it
+        // edge to edge. It never resizes them, and never leaves a margin at
+        // either end for the card to hang off a screen edge by.
+        let natural = system_meter_ink_width(6);
+        for width in [natural, natural + 40.0, natural + 160.0] {
+            let gap = system_meter_gap(6, width);
+            assert_eq!(system_meter_row_width(6, gap), width);
+            assert!(gap >= SYSTEM_METER_GAP_MIN);
+        }
+        // The spacing tracks the width continuously rather than in jumps.
+        assert!(system_meter_gap(6, 560.0) > system_meter_gap(6, 460.0));
+        // Left alone, that spacing is the one the card has always used.
+        assert_eq!(system_meter_gap(6, natural), SYSTEM_METER_GAP);
+
+        // Squeezed past the point where the rings would sit closer than they
+        // are allowed to, the row gives one up instead of overlapping them.
+        let tightest = system_meter_row_width(6, SYSTEM_METER_GAP_MIN);
+        assert_eq!(system_meter_columns(6, tightest), 6);
+        assert_eq!(system_meter_columns(6, tightest - 1.0), 3);
+        // Whatever row takes over fills the card the same way, so the widget
+        // stays flush through the change.
+        let gap = system_meter_gap(3, tightest - 1.0);
+        assert_eq!(system_meter_row_width(3, gap), tightest - 1.0);
     }
 
     #[test]
@@ -9149,8 +9330,8 @@ mod timer_input_tests {
         assert_eq!(
             system_content_size(details, &values, None),
             Size {
-                width: 290,
-                height: 152
+                width: 251,
+                height: 139
             }
         );
         // A machine where nothing answered for the GPUs must not be left
@@ -9166,8 +9347,8 @@ mod timer_input_tests {
                 None
             ),
             Size {
-                width: 196,
-                height: 152
+                width: 157,
+                height: 139
             }
         );
         // Dragged out to six across, the second row has to be handed back
@@ -9176,7 +9357,7 @@ mod timer_input_tests {
             system_content_size(details, &values, Some(572)),
             Size {
                 width: 572,
-                height: 76
+                height: 63
             }
         );
         // And pulled in to one across, the card has to find five more rows.
@@ -9184,7 +9365,7 @@ mod timer_input_tests {
             system_content_size(details, &values, Some(76)),
             Size {
                 width: 76,
-                height: 456
+                height: 443
             }
         );
         // The process table keeps its own 108 on top of whatever the rings need.
@@ -9199,7 +9380,7 @@ mod timer_input_tests {
             ),
             Size {
                 width: 572,
-                height: 184
+                height: 181
             }
         );
     }
