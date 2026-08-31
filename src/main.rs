@@ -24,6 +24,7 @@ const PANEL_EXTENSION_JS: &str = include_str!("../packaging/gnome-shell-extensio
 const PANEL_EXTENSION_CSS: &str = include_str!("../packaging/gnome-shell-extension/stylesheet.css");
 
 fn main() {
+    prefer_x11_backend();
     if std::env::args().any(|arg| arg == "--install-panel-extension") {
         if let Err(error) = install_panel_extension() {
             eprintln!("Could not install the Sysi panel extension: {error}");
@@ -110,6 +111,24 @@ fn main() {
         let _ = fs::remove_file(state::cache_dir().join("panel-state"));
     });
     application.run();
+}
+
+// Ubuntu 26.04 ships a Wayland-only GNOME session, and GDK 3 picks its Wayland
+// backend whenever WAYLAND_DISPLAY is set. That backend has no answer for what
+// this overlay is: keep-above, skip-taskbar, stick, and placing one window
+// across every monitor are all X11 window-management, and on Wayland they are
+// silent no-ops that leave the overlay behaving like an ordinary window.
+// Xwayland is always running in that session, so ask for the X11 backend and
+// keep the full behaviour. An explicit GDK_BACKEND from the user still wins,
+// and a session with no X display at all is left to GDK's own choice.
+fn prefer_x11_backend() {
+    if std::env::var_os("GDK_BACKEND").is_some() {
+        return;
+    }
+    if std::env::var_os("DISPLAY").is_none() {
+        return;
+    }
+    std::env::set_var("GDK_BACKEND", "x11");
 }
 
 fn install_panel_extension() -> io::Result<()> {

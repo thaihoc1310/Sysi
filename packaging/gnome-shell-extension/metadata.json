@@ -2,6 +2,6 @@
   "uuid": "sysi-panel@thaihoc",
   "name": "Sysi Panel Gear",
   "description": "Opens Sysi's lightweight desktop-widget settings from the GNOME panel.",
-  "shell-version": ["46"],
-  "version": 5
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 6
 }

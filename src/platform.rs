@@ -41,7 +41,14 @@ unsafe extern "C" fn ignore_x_io_error(_display: *mut xlib::Display) -> i32 {
 }
 
 pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
-    if std::env::var("XDG_SESSION_TYPE").unwrap_or_default() != "x11" {
+    // What matters is the display this process actually talks to, not what the
+    // session calls itself. Under a Wayland session the overlay still runs on
+    // the X11 backend through Xwayland, where the grab is worth taking: it
+    // fires whenever an X11 window holds focus. Keying off XDG_SESSION_TYPE
+    // instead reported "wayland" there and refused the grab outright.
+    if std::env::var_os("DISPLAY").is_none()
+        || std::env::var("GDK_BACKEND").as_deref() == Ok("wayland")
+    {
         return false;
     }
     thread::Builder::new()

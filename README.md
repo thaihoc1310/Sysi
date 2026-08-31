@@ -32,7 +32,7 @@ In either mode, hovering the timer overlays `START`, `PAUSE`, `RESUME`, or `DISM
 
 ## Build
 
-Ubuntu 24.04 build dependencies:
+Ubuntu 24.04 and 26.04 build dependencies:
 
 ```bash
 sudo apt install build-essential cargo libgtk-3-dev libx11-dev dpkg-dev
@@ -44,7 +44,7 @@ The package is written to `dist/`.
 ## Install
 
 ```bash
-sudo apt install ./dist/sysi-overlay_0.1.41_amd64.deb
+sudo apt install ./dist/sysi-overlay_0.1.48_amd64.deb
 ```
 
 Sysi starts automatically on the next desktop login. It can also be launched immediately from the application menu.
@@ -54,6 +54,7 @@ On Ubuntu GNOME, install the panel extension into your own extension directory, 
 ```bash
 /usr/bin/sysi --install-panel-extension
 # Press Alt+F2, type r, then press Enter (X11 only).
+# A Wayland session has no in-place Shell restart: log out and back in instead.
 gnome-extensions enable sysi-panel@thaihoc
 ```
 
@@ -61,4 +62,8 @@ Sysi refreshes this small per-user copy when it starts, so upgrades stay in sync
 
 ## Display support
 
-X11 provides the complete experience: global hotkeys, always-on-top placement, and click-through input shaping. On Wayland, GTK input regions still work, but the compositor may restrict global hotkeys or always-on-top behavior. `sysi --toggle` can be assigned to a GNOME custom keyboard shortcut as a Wayland fallback.
+Sysi is an X11 overlay: always-on-top placement, sticky multi-monitor coverage, and click-through input shaping are all X11 window management. GDK 3 would otherwise pick its Wayland backend whenever `WAYLAND_DISPLAY` is set, where those calls are silent no-ops and the overlay behaves like an ordinary window. So Sysi asks for the X11 backend itself when a display is available, and runs through Xwayland on a Wayland session. Set `GDK_BACKEND` yourself to override that choice.
+
+Ubuntu 26.04 (GNOME 50) ships no Xorg session at all — `/usr/share/xsessions` is gone — so this is the path every 26.04 desktop takes.
+
+One thing Xwayland cannot give back is a truly global hotkey. `Ctrl+Alt+O` is grabbed on the X server, so it fires only while an X11 window holds focus; a focused Wayland window never delivers it. For a hotkey that works everywhere, bind `sysi --toggle` to a GNOME custom keyboard shortcut in Settings → Keyboard → Custom Shortcuts. The panel strip's `LOCK` / `UNLOCK` button and `Escape` are unaffected.
