@@ -932,6 +932,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let instances: Vec<TranslateInstance> = ctx.instances.borrow().clone();
             for instance in &instances {
                 if visible {
+                    place_translate_near_click(&ctx, instance.id, &instance.window.card);
                     instance.window.card.show_all();
                     // show_all() reveals the chrome and the query panel
                     // regardless of lock mode; restore both rules.
@@ -1245,7 +1246,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         height: HISTORY_HEIGHT,
                     },
                     Some(&picker),
-                    &registry,
                 );
                 card.show_all();
                 // show_all() reveals both slot occupants and the header
@@ -1311,7 +1311,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         height: SYSTEM_HEIGHT,
                     },
                     Some(&picker),
-                    &registry,
                 );
                 target.show_all();
             } else {
@@ -1346,7 +1345,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         height: TIMER_SIZE,
                     },
                     Some(&picker),
-                    &registry,
                 );
                 target.show_all();
             } else {
@@ -1389,42 +1387,30 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             // panel, so this lands just under the menu) instead of a fixed
             // corner; fall back to the picker anchor without a pointer.
             let allocation = picker.allocation();
-            let desired = pointer_position()
-                .map(|(x, y)| Point {
-                    x: x as i32 - NOTE_WIDTH / 2,
-                    y: y as i32 + 24,
-                })
-                .unwrap_or(Point {
-                    x: allocation.x() + 205,
-                    y: allocation.y() + 40,
-                });
-            let mut position = clamp_to_screens(desired, NOTE_WIDTH, NOTE_HEIGHT, &screens);
-            let mut data = state.borrow_mut();
-            // Cascade so back-to-back notes don't stack invisibly on top of
-            // each other.
-            for _ in 0..12 {
-                let occupied = data.notes.iter().any(|note| {
-                    note.pinned
-                        && (note.position.x - position.x).abs() < 12
-                        && (note.position.y - position.y).abs() < 12
-                });
-                if !occupied {
-                    break;
-                }
-                let next = clamp_to_screens(
+            let size = Size {
+                width: NOTE_WIDTH,
+                height: NOTE_HEIGHT,
+            };
+            let position = match reopen_anchor() {
+                Some(pointer) => reopen_point(
+                    Some(pointer),
+                    size,
+                    &screens,
+                    primary_screen,
+                    widget_rect(&picker),
+                ),
+                // No pointer to go on, so anchor to the picker instead.
+                None => clamp_to_screens(
                     Point {
-                        x: position.x + 26,
-                        y: position.y + 26,
+                        x: allocation.x() + 205,
+                        y: allocation.y() + 40,
                     },
                     NOTE_WIDTH,
                     NOTE_HEIGHT,
                     &screens,
-                );
-                if next == position {
-                    break;
-                }
-                position = next;
-            }
+                ),
+            };
+            let mut data = state.borrow_mut();
             let id = data.next_note_id;
             data.next_note_id += 1;
             data.notes.push(Note {
@@ -1519,7 +1505,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let interactive = interactive.clone();
         Rc::new(move || {
             for action in take_panel_actions() {
-                match action.as_str() {
+                // Held only for as long as the action runs, so a widget opened
+                // any other way still goes by the pointer.
+                PANEL_ANCHOR.with(|cell| cell.set(action.anchor));
+                match action.name.as_str() {
                     "toggle-system" => system.set_active(!system.is_active()),
                     "toggle-timer" => timer.set_active(!timer.is_active()),
                     "next-color-mode" => mode.clicked(),
@@ -1545,6 +1534,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     "quit" => quit.clicked(),
                     _ => {}
                 }
+                PANEL_ANCHOR.with(|cell| cell.set(None));
             }
         })
     };
@@ -5510,6 +5500,38 @@ fn close_translate_window(ctx: &TranslateContext, id: u64) {
 /// Build one dictionary window and wire it to itself. Every window owns its
 /// query panel, its own in-flight request counters and its own back/forward
 /// history, so a slow lookup started in one can never land in another.
+/// Put a dictionary window where the click that asked for it happened.
+///
+/// Opening a fresh one and bringing an existing one back both come through
+/// here, so the panel's button lands them the same way either way. Left at its
+/// saved position, a window put away in the corner of another monitor came
+/// straight back to that corner, which is no answer to a click on the panel.
+///
+/// Deliberately no stepping clear of what is already open: that walks the card
+/// down and away from the click, and two dictionaries overlapping is fine --
+/// the new one is the one being read.
+fn place_translate_near_click(ctx: &TranslateContext, id: u64, card: &gtk::EventBox) {
+    let size = card_size(
+        card,
+        Size {
+            width: TRANSLATE_WIDTH,
+            height: TRANSLATE_EMPTY_HEIGHT,
+        },
+    );
+    let point = reopen_point(
+        reopen_anchor(),
+        size,
+        &ctx.screens,
+        ctx.primary,
+        widget_rect(&ctx.picker),
+    );
+    ctx.root.move_(card, point.x, point.y);
+    ctx.state
+        .borrow_mut()
+        .positions
+        .insert(dictionary_key(id), point);
+}
+
 fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
     let key = dictionary_key(id);
     let translate = Rc::new(build_translate_window(saved_color_mode(
@@ -5545,26 +5567,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         });
     place_card(&ctx.root, &translate.card, point);
     if near_pointer {
-        // Straight under the hand that asked for it. Deliberately no cascade:
-        // stepping the card clear of the windows already open walks it down and
-        // away from the click, and two dictionaries overlapping is fine -- the
-        // new one is the one being read.
-        let size = card_size(
-            &translate.card,
-            Size {
-                width: TRANSLATE_WIDTH,
-                height: TRANSLATE_EMPTY_HEIGHT,
-            },
-        );
-        let point = reopen_point(
-            pointer_position(),
-            size,
-            &ctx.screens,
-            ctx.primary,
-            widget_rect(&ctx.picker),
-        );
-        ctx.root.move_(&translate.card, point.x, point.y);
-        ctx.state.borrow_mut().positions.insert(key.clone(), point);
+        place_translate_near_click(ctx, id, &translate.card);
     }
     apply_translate_elastic_size(&translate.card, &ctx.state);
     register(
@@ -6933,7 +6936,14 @@ fn picker_toggle(label: &str) -> gtk::ToggleButton {
 /// Renamed before it is read, so an action the panel appends while this runs
 /// lands in a fresh file and is picked up by its own signal rather than being
 /// deleted unread.
-fn take_panel_actions() -> Vec<String> {
+/// A click on the GNOME panel: what to do, and where the button that asked for
+/// it sits. The anchor is absent for anything that did not come from the panel.
+struct PanelAction {
+    name: String,
+    anchor: Option<Point>,
+}
+
+fn take_panel_actions() -> Vec<PanelAction> {
     let dir = crate::state::cache_dir();
     let taken = dir.join("panel-action.taken");
     if fs::rename(dir.join("panel-action"), &taken).is_err() {
@@ -6943,9 +6953,26 @@ fn take_panel_actions() -> Vec<String> {
     let _ = fs::remove_file(&taken);
     raw.lines()
         .map(str::trim)
-        .filter(|action| !action.is_empty())
-        .map(str::to_owned)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (name, anchor) = match line.split_once('\t') {
+                Some((name, anchor)) => (name, parse_panel_anchor(anchor)),
+                None => (line, None),
+            };
+            PanelAction {
+                name: name.trim().to_owned(),
+                anchor,
+            }
+        })
         .collect()
+}
+
+fn parse_panel_anchor(raw: &str) -> Option<Point> {
+    let (x, y) = raw.trim().split_once(',')?;
+    Some(Point {
+        x: x.trim().parse().ok()?,
+        y: y.trim().parse().ok()?,
+    })
 }
 
 /// One short line for the GNOME panel extension to read: whether the overlay is
@@ -7705,43 +7732,6 @@ fn reopen_point(
     clamp_to_screens(desired, size.width, size.height, screens)
 }
 
-// Two widgets reopened from the same click would land on the same spot, one
-// drawn straight over the other. Step off the occupied rectangles the way a
-// new note cascades, keeping every candidate on a monitor.
-fn cascade_point(
-    point: Point,
-    size: Size,
-    occupied: &[ScreenRect],
-    screens: &[ScreenRect],
-) -> Point {
-    let mut result = point;
-    for _ in 0..12 {
-        let clash = occupied.iter().any(|taken| {
-            result.x < taken.x + taken.width
-                && result.x + size.width > taken.x
-                && result.y < taken.y + taken.height
-                && result.y + size.height > taken.y
-        });
-        if !clash {
-            break;
-        }
-        let next = clamp_to_screens(
-            Point {
-                x: result.x + 26,
-                y: result.y + 26,
-            },
-            size.width,
-            size.height,
-            screens,
-        );
-        if next == result {
-            break;
-        }
-        result = next;
-    }
-    result
-}
-
 // The card's own size request, which every resize and style change keeps
 // current, so a hidden card — whose allocation is stale or never happened —
 // still reopens with its real footprint accounted for.
@@ -7763,23 +7753,15 @@ fn reopen_widget(
     primary: ScreenRect,
     fallback: Size,
     avoid: Option<&gtk::EventBox>,
-    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
 ) {
     let size = card_size(card, fallback);
     let point = reopen_point(
-        pointer_position(),
+        reopen_anchor(),
         size,
         screens,
         primary,
         avoid.and_then(widget_rect),
     );
-    let occupied: Vec<ScreenRect> = registry
-        .borrow()
-        .iter()
-        .filter(|item| item.key != key && item.widget.is_visible())
-        .filter_map(|item| widget_rect(&item.widget))
-        .collect();
-    let point = cascade_point(point, size, &occupied, screens);
     root.move_(card, point.x, point.y);
     state.borrow_mut().positions.insert(key.to_owned(), point);
 }
@@ -8301,6 +8283,26 @@ fn attach_drag(
     }
 }
 
+thread_local! {
+    /// Set while a panel action is being carried out; see `reopen_anchor`.
+    static PANEL_ANCHOR: Cell<Option<Point>> = const { Cell::new(None) };
+}
+
+/// Where a widget being opened should be centred.
+///
+/// A click on the GNOME panel has to say where it happened, because nothing
+/// here can find out. The panel is the compositor's own surface, so the X
+/// server never sees the pointer over it and answers with wherever the mouse
+/// last crossed an X window — which is how a widget asked for from the panel
+/// kept opening on the far side of the screen. Everything else, including the
+/// overlay's own picker, is a real X click and goes by the pointer.
+fn reopen_anchor() -> Option<(f64, f64)> {
+    if let Some(point) = PANEL_ANCHOR.with(|cell| cell.get()) {
+        return Some((f64::from(point.x), f64::from(point.y)));
+    }
+    pointer_position()
+}
+
 fn pointer_position() -> Option<(f64, f64)> {
     let display = gdk::Display::default()?;
     let seat = display.default_seat()?;
@@ -8665,7 +8667,7 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        cascade_point, ellipsize, fit_to_work_area, fit_within_bounds, history_row_budget,
+        ellipsize, fit_to_work_area, fit_within_bounds, history_row_budget, parse_panel_anchor,
         image_room, image_room_after_y, monitor_coordinate_divisor, monitor_root_bounds,
         normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
         note_size_for_image, parse_timer_input, push_recent_search, receives_input_when_locked,
@@ -8705,6 +8707,20 @@ mod timer_input_tests {
     }
 
     #[test]
+    fn a_panel_click_carries_the_place_it_happened() {
+        assert_eq!(parse_panel_anchor("960,42"), Some(Point { x: 960, y: 42 }));
+        assert_eq!(parse_panel_anchor(" 960 , 42 "), Some(Point { x: 960, y: 42 }));
+        // A monitor left of the primary puts the panel at a negative origin.
+        assert_eq!(parse_panel_anchor("-40,42"), Some(Point { x: -40, y: 42 }));
+        // Anything unreadable falls back to the pointer rather than to (0, 0),
+        // which would fling the widget into the top-left corner.
+        assert_eq!(parse_panel_anchor(""), None);
+        assert_eq!(parse_panel_anchor("960"), None);
+        assert_eq!(parse_panel_anchor("960,"), None);
+        assert_eq!(parse_panel_anchor("left,top"), None);
+    }
+
+    #[test]
     fn a_reopened_window_lands_near_the_click_and_fully_on_screen() {
         let point = reopen_point(Some((900.0, 300.0)), HISTORY, &[SCREEN], SCREEN, None);
         assert_eq!(point, Point { x: 782, y: 324 });
@@ -8725,25 +8741,6 @@ mod timer_input_tests {
                 y: (SCREEN.height - HISTORY.height) / 2,
             }
         );
-    }
-
-    #[test]
-    fn two_widgets_reopened_from_one_click_do_not_stack_on_each_other() {
-        let taken = ScreenRect {
-            x: 600,
-            y: 300,
-            width: 200,
-            height: 120,
-        };
-        let stacked = Point { x: 600, y: 300 };
-        let point = cascade_point(stacked, HISTORY, &[taken], &[SCREEN]);
-        assert_ne!(point, stacked);
-        assert!(
-            point.x >= taken.x + taken.width || point.y >= taken.y + taken.height,
-            "the second widget must step clear of the first: {point:?}"
-        );
-        // Nothing in the way leaves the landing spot exactly where it was.
-        assert_eq!(cascade_point(stacked, HISTORY, &[], &[SCREEN]), stacked);
     }
 
     #[test]

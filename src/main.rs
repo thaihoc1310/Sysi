@@ -37,7 +37,10 @@ fn main() {
         return;
     }
     if let Some(action) = option_value("--panel-action") {
-        if let Err(error) = write_panel_action(&action) {
+        // Where the panel button that asked for this sits. The overlay cannot
+        // find that out for itself; see the extension's _runAction.
+        let anchor = option_value("--at");
+        if let Err(error) = write_panel_action(&action, anchor.as_deref()) {
             eprintln!("Could not send the Sysi panel action: {error}");
             process::exit(1);
         }
@@ -169,7 +172,7 @@ fn option_value(option: &str) -> Option<String> {
     None
 }
 
-fn write_panel_action(action: &str) -> io::Result<()> {
+fn write_panel_action(action: &str, anchor: Option<&str>) -> io::Result<()> {
     let dir = state::cache_dir();
     fs::create_dir_all(&dir)?;
     // Appended rather than written over. Two panel clicks in quick succession
@@ -179,7 +182,10 @@ fn write_panel_action(action: &str) -> io::Result<()> {
         .create(true)
         .append(true)
         .open(dir.join("panel-action"))?;
-    writeln!(file, "{action}")
+    match anchor {
+        Some(anchor) => writeln!(file, "{action}\t{anchor}"),
+        None => writeln!(file, "{action}"),
+    }
 }
 
 fn acquire_instance_lock() -> Option<File> {

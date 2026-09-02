@@ -61,7 +61,7 @@ export default class SysiPanelExtension extends Extension {
         this._lock = this._addAction('lock', 'toggle-lock');
         this._addAction('+ note', 'new-note');
         this._addAction('history', 'toggle-history');
-        this._addAction('dict', 'toggle-translate');
+        this._addAction('dictionary', 'toggle-translate');
         this._addAction('quit', 'quit');
 
         this._gear.connect('clicked', () => {
@@ -143,7 +143,7 @@ export default class SysiPanelExtension extends Extension {
             style: 'font-family: Noto Sans, sans-serif; font-size: 11px; font-weight: 500; text-shadow: none;',
         });
         button.add_child(text);
-        button.connect('clicked', () => this._runAction(action));
+        button.connect('clicked', () => this._runAction(action, button));
         this._strip.add_child(button);
         if (action === 'toggle-lock')
             this._lockLabel = text;
@@ -169,17 +169,37 @@ export default class SysiPanelExtension extends Extension {
         }
     }
 
-    _runAction(action) {
+    // The overlay cannot work out where this button is on its own. The panel is
+    // the compositor's own surface, so while the pointer is over it the X server
+    // sees nothing — asking it returns wherever the mouse last crossed an X
+    // window, which is what sent widgets off to the far side of the screen
+    // instead of opening them under the button that asked. Send the button's
+    // own place on the stage, which is already in the logical coordinates the
+    // overlay lays its widgets out in.
+    _runAction(action, button) {
+        const argv = ['sysi', '--panel-action', action];
+        const anchor = this._anchorOf(button);
+        if (anchor)
+            argv.push('--at', anchor);
         try {
-            GLib.spawn_async(
-                null,
-                ['sysi', '--panel-action', action],
-                null,
-                GLib.SpawnFlags.SEARCH_PATH,
-                null,
-            );
+            GLib.spawn_async(null, argv, null, GLib.SpawnFlags.SEARCH_PATH, null);
         } catch (error) {
             logError(error, `Sysi panel action ${action} failed`);
+        }
+    }
+
+    // The middle of the button's bottom edge: the overlay centres the widget on
+    // it and drops it clear of the panel.
+    _anchorOf(button) {
+        try {
+            const [x, y] = button.get_transformed_position();
+            const [width, height] = button.get_transformed_size();
+            if (![x, y, width, height].every(Number.isFinite))
+                return null;
+            return `${Math.round(x + width / 2)},${Math.round(y + height)}`;
+        } catch (error) {
+            logError(error, 'Sysi panel gear could not locate its button');
+            return null;
         }
     }
 
