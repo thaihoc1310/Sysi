@@ -41,7 +41,7 @@ Installed-Size: $installed_kib
 Maintainer: Sysi contributors
 Description: Lightweight transparent desktop widgets for Ubuntu
  A native Rust and GTK overlay with system meters, countdown timers,
- pinned note history, manual color modes, and click-through interaction.
+ pinned note history, automatic foreground contrast, and click-through interaction.
 EOF
 
 output="$project_dir/dist/sysi-overlay_${version}_${architecture}.deb"

@@ -1,6 +1,7 @@
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -8,6 +9,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 
 const UUID = 'sysi-panel@thaihoc';
+
+Gio._promisify(Shell.Screenshot.prototype, 'pick_color');
 
 export default class SysiPanelExtension extends Extension {
     enable() {
@@ -99,8 +102,41 @@ export default class SysiPanelExtension extends Extension {
         } catch (error) {
             logError(error, 'Sysi panel gear could not watch the overlay state');
         }
+        const cacheDir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi']);
+        GLib.mkdir_with_parents(cacheDir, 0o700);
+        this._autoColorRequestFile = Gio.File.new_for_path(
+            GLib.build_filenamev([cacheDir, 'auto-color-request']),
+        );
+        if (!this._autoColorRequestFile.query_exists(null))
+            GLib.file_set_contents(this._autoColorRequestFile.get_path(), '');
+        this._autoColorGeneration = 1;
+        this._autoColorSampling = false;
+        this._autoColorPending = false;
+        try {
+            this._autoColorRequestMonitor = this._autoColorRequestFile.monitor_file(
+                Gio.FileMonitorFlags.NONE,
+                null,
+            );
+            this._autoColorRequestMonitor.connect('changed', () => {
+                this._queueAutoColorSampling();
+            });
+        } catch (error) {
+            logError(error, 'Sysi could not watch auto-colour requests');
+        }
         this._syncPanelState();
         this._syncVisibility();
+        // Sampling before the shell has laid out its monitors makes
+        // Shell.Screenshot paint a 0x0 buffer, and pick_color_finish then
+        // dereferences the missing image and takes the whole shell down.
+        if (Main.layoutManager._startingUp) {
+            this._startupCompleteId = Main.layoutManager.connect('startup-complete', () => {
+                Main.layoutManager.disconnect(this._startupCompleteId);
+                this._startupCompleteId = 0;
+                this._queueAutoColorSampling();
+            });
+        } else {
+            this._queueAutoColorSampling();
+        }
     }
 
     disable() {
@@ -108,6 +144,16 @@ export default class SysiPanelExtension extends Extension {
         this._pidMonitor = null;
         this._panelStateMonitor?.cancel();
         this._panelStateMonitor = null;
+        if (this._startupCompleteId) {
+            Main.layoutManager.disconnect(this._startupCompleteId);
+            this._startupCompleteId = 0;
+        }
+        this._autoColorRequestMonitor?.cancel();
+        this._autoColorRequestMonitor = null;
+        this._autoColorRequestFile = null;
+        this._autoColorGeneration++;
+        this._autoColorSampling = false;
+        this._autoColorPending = false;
         this._indicator?.destroy();
         this._indicator = null;
         this._content = null;
@@ -163,9 +209,9 @@ export default class SysiPanelExtension extends Extension {
             const mode = ok
                 ? JSON.parse(new TextDecoder().decode(contents))?.settings?.color_mode
                 : null;
-            return ['light', 'gray', 'dark'].includes(mode) ? mode : 'gray';
+            return ['auto', 'light', 'dark'].includes(mode) ? mode : 'auto';
         } catch (_) {
-            return 'gray';
+            return 'auto';
         }
     }
 
@@ -216,7 +262,7 @@ export default class SysiPanelExtension extends Extension {
             this._strip.visible = false;
     }
 
-    // `<editing|locked> <light|gray|dark>`, written by Sysi whenever either
+    // `<editing|locked> <auto|light|dark>`, written by Sysi whenever either
     // changes and removed when it exits. With no file to read — Sysi is not
     // running — the labels fall back to what the saved settings say.
     _readPanelState() {
@@ -227,7 +273,7 @@ export default class SysiPanelExtension extends Extension {
             const [interaction, mode] = new TextDecoder().decode(contents).trim().split(/\s+/);
             return [
                 interaction === 'locked' || interaction === 'editing' ? interaction : null,
-                ['light', 'gray', 'dark'].includes(mode) ? mode : null,
+                ['auto', 'light', 'dark'].includes(mode) ? mode : null,
             ];
         } catch (_) {
             return [null, null];
@@ -242,5 +288,109 @@ export default class SysiPanelExtension extends Extension {
             this._lockLabel.text = interaction === 'locked' ? 'unlock' : 'lock';
         if (this._modeLabel)
             this._modeLabel.text = mode ?? this._readColorMode();
+    }
+
+    _queueAutoColorSampling() {
+        if (!this._autoColorRequestFile || Main.layoutManager._startingUp)
+            return;
+        if (this._autoColorSampling) {
+            this._autoColorPending = true;
+            return;
+        }
+        this._autoColorSampling = true;
+        const generation = this._autoColorGeneration;
+        this._sampleAutoColors(generation)
+            .catch(error => logError(error, 'Sysi auto-colour sampling failed'))
+            .finally(() => {
+                if (generation !== this._autoColorGeneration)
+                    return;
+                this._autoColorSampling = false;
+                if (this._autoColorPending) {
+                    this._autoColorPending = false;
+                    this._queueAutoColorSampling();
+                }
+            });
+    }
+
+    async _sampleAutoColors(generation) {
+        let raw;
+        try {
+            const [ok, contents] = GLib.file_get_contents(
+                this._autoColorRequestFile.get_path(),
+            );
+            if (!ok)
+                return;
+            raw = new TextDecoder().decode(contents);
+        } catch (_) {
+            return;
+        }
+
+        const requests = raw.split('\n').flatMap(line => {
+            const [key, geometry] = line.trim().split('\t');
+            const values = geometry?.split(',').map(Number) ?? [];
+            if (!key || values.length !== 4 || !values.every(Number.isFinite))
+                return [];
+            const [x, y, width, height] = values;
+            return width > 0 && height > 0 ? [{key, x, y, width, height}] : [];
+        });
+        const results = [];
+        for (const request of requests) {
+            const luminance = await this._sampleRectLuminance(request);
+            if (Number.isFinite(luminance))
+                results.push(`${request.key}\t${luminance.toFixed(6)}`);
+        }
+        if (generation !== this._autoColorGeneration)
+            return;
+        const path = GLib.build_filenamev([
+            GLib.get_user_cache_dir(),
+            'sysi',
+            'auto-color-result',
+        ]);
+        GLib.file_set_contents(path, `${results.join('\n')}\n`);
+    }
+
+    async _sampleRectLuminance({x, y, width, height}) {
+        // Only pixels that a monitor really shows can be painted to a buffer;
+        // a point in the gap between monitors would fail the grab and crash
+        // the shell inside pick_color_finish.
+        const monitors = Main.layoutManager.monitors;
+        const shown = ([px, py]) => monitors.some(monitor =>
+            px >= monitor.x && py >= monitor.y &&
+            px < monitor.x + monitor.width && py < monitor.y + monitor.height);
+        // Read just outside the transparent widget. That sees the same nearby
+        // browser/wallpaper without accidentally sampling Sysi's own glyphs.
+        const xs = [0.2, 0.5, 0.8].map(fraction => Math.round(x + width * fraction));
+        const above = Math.round(y - 3);
+        const below = Math.round(y + height + 3);
+        const points = [
+            ...xs.map(px => [px, above]),
+            ...xs.map(px => [px, below]),
+        ].filter(shown);
+        if (points.length === 0)
+            return null;
+        // One Shell.Screenshot, one pick at a time: each pick overwrites the
+        // object's single image buffer, so they must not overlap.
+        const screenshot = new Shell.Screenshot();
+        const samples = [];
+        for (const [px, py] of points) {
+            try {
+                const [color] = await screenshot.pick_color(px, py);
+                samples.push(this._relativeLuminance(color.red, color.green, color.blue));
+            } catch (_) {
+                // A failed pick leaves this point out of the median.
+            }
+        }
+        samples.sort((a, b) => a - b);
+        return samples.length > 0 ? samples[Math.floor(samples.length / 2)] : null;
+    }
+
+    _relativeLuminance(red, green, blue) {
+        const linear = channel => {
+            const value = channel / 255;
+            return value <= 0.04045
+                ? value / 12.92
+                : ((value + 0.055) / 1.055) ** 2.4;
+        };
+        return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
     }
 }

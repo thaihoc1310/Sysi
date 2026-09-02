@@ -4,25 +4,28 @@ use std::{collections::HashMap, fs, io, path::PathBuf};
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorMode {
-    Light,
     #[default]
-    Gray,
+    #[serde(alias = "gray")]
+    Auto,
+    Light,
     Dark,
 }
 
 impl ColorMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Light, Self::Dark];
+
     pub fn next(self) -> Self {
         match self {
-            Self::Light => Self::Gray,
-            Self::Gray => Self::Dark,
-            Self::Dark => Self::Light,
+            Self::Auto => Self::Light,
+            Self::Light => Self::Dark,
+            Self::Dark => Self::Auto,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Auto => "AUTO",
             Self::Light => "LIGHT",
-            Self::Gray => "GRAY",
             Self::Dark => "DARK",
         }
     }
@@ -31,17 +34,9 @@ impl ColorMode {
     /// writes into the shared panel-state file.
     pub fn key(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Light => "light",
-            Self::Gray => "gray",
             Self::Dark => "dark",
-        }
-    }
-
-    pub fn css_class(self) -> &'static str {
-        match self {
-            Self::Light => "mode-light",
-            Self::Gray => "mode-gray",
-            Self::Dark => "mode-dark",
         }
     }
 }
@@ -376,19 +371,41 @@ mod tests {
     use super::{AppState, ColorMode, TimerStyle};
 
     #[test]
-    fn old_settings_default_to_gray_mode() {
+    fn old_settings_default_to_auto_mode() {
         let state: AppState = serde_json::from_str(
             r#"{"settings":{"mascot":true,"system":true,"timer":true,"settings_button":true}}"#,
         )
         .expect("legacy state should remain readable");
-        assert_eq!(state.settings.color_mode, ColorMode::Gray);
+        assert_eq!(state.settings.color_mode, ColorMode::Auto);
     }
 
     #[test]
     fn color_mode_cycles_through_all_three_modes() {
-        assert_eq!(ColorMode::Light.next(), ColorMode::Gray);
-        assert_eq!(ColorMode::Gray.next(), ColorMode::Dark);
-        assert_eq!(ColorMode::Dark.next(), ColorMode::Light);
+        assert_eq!(ColorMode::Auto.next(), ColorMode::Light);
+        assert_eq!(ColorMode::Light.next(), ColorMode::Dark);
+        assert_eq!(ColorMode::Dark.next(), ColorMode::Auto);
+    }
+
+    #[test]
+    fn a_widget_color_menu_has_only_the_other_two_modes() {
+        for current in ColorMode::ALL {
+            let options: Vec<_> = ColorMode::ALL
+                .into_iter()
+                .filter(|mode| *mode != current)
+                .collect();
+            assert_eq!(options.len(), 2);
+            assert!(!options.contains(&current));
+        }
+    }
+
+    #[test]
+    fn legacy_gray_mode_migrates_to_auto() {
+        let state: AppState = serde_json::from_str(r#"{"settings":{"color_mode":"gray"}}"#)
+            .expect("the removed gray mode should remain readable");
+        assert_eq!(state.settings.color_mode, ColorMode::Auto);
+        assert!(serde_json::to_string(&state)
+            .expect("migrated state should serialize")
+            .contains(r#""color_mode":"auto""#));
     }
 
     #[test]

@@ -27,13 +27,6 @@
   text-shadow: 0 2px 4px rgba(0, 0, 0, 0.9);
 }
 
-.mode-gray .card,
-.mode-gray.picker-widget {
-  background-color: transparent;
-  color: #aaaaaa;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.72);
-}
-
 .mode-dark .card,
 .mode-dark.picker-widget {
   background-color: transparent;
@@ -257,10 +250,6 @@ textview, textview text {
   background-color: rgba(238, 238, 238, 0.76);
 }
 
-.mode-gray .note-header {
-  background-color: rgba(158, 158, 158, 0.76);
-}
-
 .mode-dark .note-header {
   background-color: rgba(24, 24, 24, 0.82);
 }
@@ -311,10 +300,6 @@ textview, textview text {
   background-color: transparent;
   border: none;
   padding: 2px 1px 0;
-}
-
-.mode-gray .note-search-panel {
-  background-color: transparent;
 }
 
 .mode-dark .note-search-panel {
@@ -572,8 +557,8 @@ popover.note-search-popover > contents,
 }
 
 /* currentColor throughout, like the notes: the card already carries the
-   light/gray/dark mode class, and a fixed colour would go invisible in one of
-   the three. */
+   resolved light/dark mode class, and a fixed colour would disappear against
+   one of the two backgrounds. */
 .translate-headword {
   color: currentColor;
   font-size: 17px;

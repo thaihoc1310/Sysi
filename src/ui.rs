@@ -183,10 +183,38 @@ struct TranslateContext {
     spawn: SpawnSlot,
 }
 
+/// The two foreground palettes that can actually be painted. `ColorMode::Auto`
+/// is a saved preference; it resolves to one of these after the pixels behind a
+/// widget have been sampled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Foreground {
+    Light,
+    Dark,
+}
+
+impl Foreground {
+    fn css_class(self) -> &'static str {
+        match self {
+            Self::Light => "mode-light",
+            Self::Dark => "mode-dark",
+        }
+    }
+}
+
+struct DesktopCapture {
+    root: gdk::Window,
+    /// GTK keeps widget positions in the monitor coordinate space, whose
+    /// origin can be negative when a monitor sits left of or above primary.
+    /// Root-window readback starts at zero, so subtract this origin first.
+    origin: Point,
+    width: i32,
+    height: i32,
+}
+
 struct SystemCard {
     card: gtk::EventBox,
     drag: gtk::EventBox,
-    color_mode: Rc<Cell<ColorMode>>,
+    color_mode: Rc<Cell<Foreground>>,
     canvas: gtk::DrawingArea,
     values: SystemValues,
     details: Rc<Cell<SystemDetails>>,
@@ -213,7 +241,7 @@ struct SystemDetailsPreview {
 #[derive(Clone)]
 struct ResizeHandle {
     hitbox: gtk::EventBox,
-    color_mode: Rc<Cell<ColorMode>>,
+    color_mode: Rc<Cell<Foreground>>,
 }
 
 #[derive(Clone)]
@@ -235,7 +263,7 @@ struct ResizeBounds {
 struct RegisteredWidget {
     key: String,
     widget: gtk::EventBox,
-    color_mode: Rc<Cell<ColorMode>>,
+    color_mode: Rc<Cell<Foreground>>,
     edit_only: Option<gtk::EventBox>,
     editor: Option<gtk::TextView>,
     note_search: Option<NoteSearchControls>,
@@ -456,9 +484,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             // has to hand those margins back — left alone it would keep the
             // gap it was dragged to.
             if let Some(size) = data.sizes.get("system").copied() {
-                let columns = ((f64::from(size.width.max(1)) / SYSTEM_METER_CELL).floor()
-                    as usize)
-                    .max(1);
+                let columns =
+                    ((f64::from(size.width.max(1)) / SYSTEM_METER_CELL).floor() as usize).max(1);
                 data.sizes.insert(
                     "system".into(),
                     Size {
@@ -536,7 +563,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         )
     };
 
-    let system_card = build_system_card(system_color_mode, system_details);
+    let system_card = build_system_card(foreground_for_mode(system_color_mode), system_details);
     apply_widget_size(
         &system_card.card,
         "system",
@@ -615,7 +642,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         },
     );
 
-    let timer_card = build_timer_card(state.clone(), interactive.clone(), timer_color_mode);
+    let timer_card = build_timer_card(
+        state.clone(),
+        interactive.clone(),
+        foreground_for_mode(timer_color_mode),
+    );
     let timer_default_size = timer_card.style.get().default_size();
     let timer_default = Point {
         x: (primary_screen.x + primary_screen.width - timer_default_size.width - 34)
@@ -720,7 +751,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         window.clone(),
     );
-    let history = build_history_window(saved_color_mode(&state.borrow(), "history"));
+    let history = build_history_window(foreground_for_mode(saved_color_mode(
+        &state.borrow(),
+        "history",
+    )));
     let history_position = state
         .borrow()
         .positions
@@ -1723,6 +1757,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             window.set_default_size(width, height);
             window.move_(0, 0);
             clamp_registered_widgets(&root, &registry, &screens, &state);
+            refresh_auto_colors(&registry, &state);
         }
     });
 
@@ -1741,11 +1776,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         .borrow_mut()
         .push(history.scroller.clone());
     track_widget_hover(registry.clone(), translate_scrollers.clone());
+    start_auto_color_updates(registry.clone(), state.clone());
     start_system_updates(system_card, state.clone());
     start_timer_updates(timer_card, state, window, registry, interactive);
 }
 
-fn build_system_card(initial_color_mode: ColorMode, initial_details: SystemDetails) -> SystemCard {
+fn build_system_card(initial_color_mode: Foreground, initial_details: SystemDetails) -> SystemCard {
     let (card, body, _, color_mode, resize) = card_shell("", "", initial_color_mode);
     let values = Rc::new(RefCell::new(SystemSnapshot::default()));
     let details = Rc::new(Cell::new(initial_details));
@@ -1864,7 +1900,7 @@ fn draw_system(
     area: &gtk::DrawingArea,
     ctx: &Context,
     values: &SystemSnapshot,
-    color_mode: ColorMode,
+    color_mode: Foreground,
     details: SystemDetails,
 ) {
     let allocation = area.allocation();
@@ -1879,9 +1915,8 @@ fn draw_system(
     let content_width = system_meter_row_width(widest, gap);
     let scale = (width / content_width).clamp(0.1, 1.0);
     let (ink, muted, accent) = match color_mode {
-        ColorMode::Light => ((0.97, 0.97, 0.97), (0.72, 0.72, 0.72), (0.9, 0.9, 0.9)),
-        ColorMode::Gray => ((0.7, 0.7, 0.7), (0.5, 0.5, 0.5), (0.64, 0.64, 0.64)),
-        ColorMode::Dark => ((0.08, 0.08, 0.08), (0.24, 0.24, 0.24), (0.14, 0.14, 0.14)),
+        Foreground::Light => ((0.97, 0.97, 0.97), (0.72, 0.72, 0.72), (0.9, 0.9, 0.9)),
+        Foreground::Dark => ((0.08, 0.08, 0.08), (0.24, 0.24, 0.24), (0.14, 0.14, 0.14)),
     };
     if !meters.is_empty() {
         let _ = ctx.save();
@@ -1900,9 +1935,7 @@ fn draw_system(
                 let Some((value, title)) = meters.next() else {
                     break;
                 };
-                let x = left
-                    + column as f64 * (SYSTEM_METER_RING + gap)
-                    + SYSTEM_METER_RING / 2.0;
+                let x = left + column as f64 * (SYSTEM_METER_RING + gap) + SYSTEM_METER_RING / 2.0;
                 ctx.set_line_width(SYSTEM_METER_RING_STROKE);
                 ctx.set_line_cap(cairo::LineCap::Round);
                 ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
@@ -2299,7 +2332,7 @@ fn format_memory(kib: u64) -> String {
 struct TimerCard {
     card: gtk::EventBox,
     drag: gtk::EventBox,
-    color_mode: Rc<Cell<ColorMode>>,
+    color_mode: Rc<Cell<Foreground>>,
     style: Rc<Cell<TimerStyle>>,
     style_size: Rc<Cell<Size>>,
     typography: gtk::CssProvider,
@@ -2332,7 +2365,7 @@ struct TimerStylePreview {
 fn build_timer_card(
     state: Rc<RefCell<AppState>>,
     _interactive: Rc<Cell<bool>>,
-    initial_color_mode: ColorMode,
+    initial_color_mode: Foreground,
 ) -> TimerCard {
     let (card, body, drag, color_mode, resize) = card_shell("", "", initial_color_mode);
     card.style_context().add_class("timer-card");
@@ -2767,7 +2800,7 @@ fn draw_timer_style(
     area: &gtk::DrawingArea,
     ctx: &Context,
     timer: &TimerRuntime,
-    color_mode: ColorMode,
+    color_mode: Foreground,
     style: TimerStyle,
 ) {
     match style {
@@ -2778,11 +2811,10 @@ fn draw_timer_style(
     }
 }
 
-fn timer_gray(color_mode: ColorMode) -> f64 {
+fn timer_gray(color_mode: Foreground) -> f64 {
     match color_mode {
-        ColorMode::Light => 0.91,
-        ColorMode::Gray => 0.6,
-        ColorMode::Dark => 0.12,
+        Foreground::Light => 0.91,
+        Foreground::Dark => 0.12,
     }
 }
 
@@ -2801,7 +2833,7 @@ fn draw_timer_ring(
     area: &gtk::DrawingArea,
     ctx: &Context,
     timer: &TimerRuntime,
-    color_mode: ColorMode,
+    color_mode: Foreground,
 ) {
     let (cx, cy, radius) = timer_center(area, 9.0);
     let gray = timer_gray(color_mode);
@@ -2833,7 +2865,7 @@ fn draw_timer_digital_alarm(
     area: &gtk::DrawingArea,
     ctx: &Context,
     timer: &TimerRuntime,
-    color_mode: ColorMode,
+    color_mode: Foreground,
 ) {
     if !timer.alarm {
         return;
@@ -2857,7 +2889,7 @@ fn draw_timer_ticks(
     area: &gtk::DrawingArea,
     ctx: &Context,
     timer: &TimerRuntime,
-    color_mode: ColorMode,
+    color_mode: Foreground,
 ) {
     let (cx, cy, radius) = timer_center(area, 8.0);
     let gray = timer_gray(color_mode);
@@ -2888,7 +2920,7 @@ fn draw_timer_arc(
     area: &gtk::DrawingArea,
     ctx: &Context,
     timer: &TimerRuntime,
-    color_mode: ColorMode,
+    color_mode: Foreground,
 ) {
     let (cx, cy, radius) = timer_center(area, 8.0);
     let gray = timer_gray(color_mode);
@@ -4891,7 +4923,7 @@ fn rebuild_pinned_notes(
         .collect();
     for note in pinned {
         let key = format!("note:{}", note.id);
-        let initial_color_mode = saved_color_mode(&state.borrow(), &key);
+        let initial_color_mode = foreground_for_mode(saved_color_mode(&state.borrow(), &key));
         let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
         // Note rows are intentionally flush: the editor already owns its text
         // padding, and the find bar must not inherit CardBody's generic 4px
@@ -5183,7 +5215,7 @@ struct HistoryWindow {
     hide: gtk::Button,
     list: gtk::Box,
     scroller: gtk::ScrolledWindow,
-    color_mode: Rc<Cell<ColorMode>>,
+    color_mode: Rc<Cell<Foreground>>,
     resize: ResizeHandle,
 }
 
@@ -5211,7 +5243,7 @@ impl HistoryHeader {
 struct WidgetPicker {
     card: gtk::EventBox,
     drag: gtk::EventBox,
-    color_mode: Rc<Cell<ColorMode>>,
+    color_mode: Rc<Cell<Foreground>>,
     plus: gtk::Button,
     revealer: gtk::Revealer,
     system: gtk::ToggleButton,
@@ -5226,7 +5258,7 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let card = gtk::EventBox::new();
     card.set_visible_window(false);
     card.style_context().add_class("picker-widget");
-    let color_mode = Rc::new(Cell::new(initial_color_mode));
+    let color_mode = Rc::new(Cell::new(foreground_for_mode(initial_color_mode)));
     let content = gtk::Box::new(gtk::Orientation::Vertical, 5);
     card.add(&content);
 
@@ -5289,7 +5321,7 @@ fn history_row_budget(card_height: i32) -> usize {
     (visible + 10).clamp(14, 240)
 }
 
-fn build_history_window(initial_color_mode: ColorMode) -> HistoryWindow {
+fn build_history_window(initial_color_mode: Foreground) -> HistoryWindow {
     let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
     // Share the pinned-note look (transparent card, faded scrollbar thumb) so
     // the history window reads as one of the notes.
@@ -5398,7 +5430,7 @@ struct TranslateWindow {
     suggestions: gtk::Box,
     results: gtk::Box,
     scroller: gtk::ScrolledWindow,
-    color_mode: Rc<Cell<ColorMode>>,
+    color_mode: Rc<Cell<Foreground>>,
     resize: ResizeHandle,
 }
 
@@ -5534,9 +5566,8 @@ fn place_translate_near_click(ctx: &TranslateContext, id: u64, card: &gtk::Event
 
 fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
     let key = dictionary_key(id);
-    let translate = Rc::new(build_translate_window(saved_color_mode(
-        &ctx.state.borrow(),
-        &key,
+    let translate = Rc::new(build_translate_window(foreground_for_mode(
+        saved_color_mode(&ctx.state.borrow(), &key),
     )));
     // Closing the receiver wakes its task immediately. The flag also prevents
     // an event already queued before close from touching the destroyed GTK
@@ -6101,7 +6132,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
     }
 }
 
-fn build_translate_window(initial_color_mode: ColorMode) -> TranslateWindow {
+fn build_translate_window(initial_color_mode: Foreground) -> TranslateWindow {
     let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
     card.style_context().add_class("pinned-note");
     card.style_context().add_class("translate-window");
@@ -7004,12 +7035,12 @@ fn publish_panel_state(interactive: bool, mode: ColorMode) {
 fn card_shell(
     title: &str,
     kicker: &str,
-    initial_color_mode: ColorMode,
+    initial_color_mode: Foreground,
 ) -> (
     gtk::EventBox,
     gtk::Box,
     gtk::EventBox,
-    Rc<Cell<ColorMode>>,
+    Rc<Cell<Foreground>>,
     ResizeHandle,
 ) {
     let event = gtk::EventBox::new();
@@ -7082,7 +7113,7 @@ fn register(
     registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
     key: &str,
     widget: &gtk::EventBox,
-    color_mode: Rc<Cell<ColorMode>>,
+    color_mode: Rc<Cell<Foreground>>,
 ) {
     widget
         .style_context()
@@ -7123,6 +7154,15 @@ fn saved_color_mode(state: &AppState, key: &str) -> ColorMode {
         .get(key)
         .copied()
         .unwrap_or(state.settings.color_mode)
+}
+
+fn foreground_for_mode(mode: ColorMode) -> Foreground {
+    match mode {
+        // AUTO starts light and is corrected as soon as the widget is mapped
+        // and the desktop pixels underneath it can be read.
+        ColorMode::Auto | ColorMode::Light => Foreground::Light,
+        ColorMode::Dark => Foreground::Dark,
+    }
 }
 
 fn set_edit_chrome_visibility(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, visible: bool) {
@@ -7207,7 +7247,8 @@ fn attach_color_mode_menu(
         menu.append(&separator);
         (item, new_item, open_item, separator)
     });
-    for mode in [ColorMode::Light, ColorMode::Gray, ColorMode::Dark] {
+    let mut color_items = Vec::new();
+    for mode in ColorMode::ALL {
         let item = gtk::MenuItem::with_label(mode.label());
         item.connect_activate({
             let key = key.clone();
@@ -7223,6 +7264,7 @@ fn attach_color_mode_menu(
             }
         });
         menu.append(&item);
+        color_items.push((mode, item));
     }
 
     if let Some(timer_style) = timer_style {
@@ -7380,6 +7422,12 @@ fn attach_color_mode_menu(
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 return;
             }
+        }
+        // The menu is an action list, not a status list. The mode this widget
+        // already uses would be a no-op, so only offer the other two choices.
+        let current_mode = saved_color_mode(&state.borrow(), &key);
+        for (mode, item) in &color_items {
+            item.set_visible(*mode != current_mode);
         }
         if let Some((item, new_item, open_item, separator)) = &lookup_item {
             let query = primary_selection();
@@ -7944,9 +7992,8 @@ fn attach_resize(
             let width = f64::from(allocation.width());
             let height = f64::from(allocation.height());
             let gray = match color_mode.get() {
-                ColorMode::Light => 0.9,
-                ColorMode::Gray => 0.6,
-                ColorMode::Dark => 0.13,
+                Foreground::Light => 0.9,
+                Foreground::Dark => 0.13,
             };
             ctx.set_source_rgba(gray, gray, gray, 0.82);
             ctx.set_line_width(1.35);
@@ -8115,9 +8162,11 @@ fn attach_resize(
             handle_hitbox.queue_draw();
             let window = window.clone();
             let registry = registry.clone();
+            let state = state.clone();
             let enabled = interactive.get();
             glib::idle_add_local_once(move || {
                 refresh_input_shape(&window, &registry, enabled);
+                refresh_auto_colors(&registry, &state);
             });
             glib::Propagation::Stop
         }
@@ -8272,7 +8321,13 @@ fn attach_drag(
                 data.positions.insert(key.clone(), point);
             }
             let _ = data.save();
+            drop(data);
             refresh_input_shape(&window, &registry, interactive.get());
+            glib::idle_add_local_once({
+                let registry = registry.clone();
+                let state = state.clone();
+                move || refresh_auto_colors(&registry, &state)
+            });
         }
     });
 
@@ -8426,9 +8481,253 @@ fn union_circle_region(region: &Region, x: i32, y: i32, width: i32, height: i32)
     }
 }
 
+/// Describe the root-window image and how monitor coordinates map into it.
+fn desktop_capture() -> Option<DesktopCapture> {
+    // In a Wayland session this process deliberately runs through Xwayland.
+    // Its root window cannot see native Wayland clients, so using it would
+    // choose from the wallpaper while a bright browser sat underneath Sysi.
+    if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
+        return None;
+    }
+    let display = gdk::Display::default()?;
+    let screen = gdk::Screen::default()?;
+    let root = screen.root_window()?;
+    let scale = root.scale_factor().max(1);
+    let width = root.width() / scale;
+    let height = root.height() / scale;
+    if width < 1 || height < 1 {
+        return None;
+    }
+    let fallback = ScreenRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let raw_screens: Vec<_> = (0..display.n_monitors())
+        .filter_map(|index| display.monitor(index))
+        .map(|monitor| screen_rect(monitor.geometry()))
+        .collect();
+    let bounds = if raw_screens.is_empty() {
+        fallback
+    } else {
+        let divisor = monitor_coordinate_divisor(&raw_screens, scale, fallback);
+        monitor_root_bounds(&raw_screens, divisor, fallback)
+    };
+    Some(DesktopCapture {
+        root,
+        origin: Point {
+            x: bounds.x,
+            y: bounds.y,
+        },
+        width,
+        height,
+    })
+}
+
+/// Pick a foreground from the desktop beneath a widget. Three thin horizontal
+/// strips keep the X11 readback small; their median is deliberately insensitive
+/// to the sparse text and rings Sysi itself may contribute to the screenshot.
+fn sample_widget_foreground(
+    widget: &gtk::EventBox,
+    previous: Foreground,
+    capture: &DesktopCapture,
+) -> Option<Foreground> {
+    if !widget.is_visible() || !widget.is_mapped() {
+        return None;
+    }
+    let allocation = widget.allocation();
+    if allocation.width() < 1 || allocation.height() < 1 {
+        return None;
+    }
+    let capture_x = allocation.x().saturating_sub(capture.origin.x);
+    let capture_y = allocation.y().saturating_sub(capture.origin.y);
+    let left = capture_x.max(0);
+    let right = allocation
+        .width()
+        .saturating_add(capture_x)
+        .min(capture.width);
+    let top = capture_y.max(0);
+    let bottom = allocation
+        .height()
+        .saturating_add(capture_y)
+        .min(capture.height);
+    let width = right - left;
+    let height = bottom - top;
+    if width < 1 || height < 1 {
+        return None;
+    }
+
+    let mut luminances = Vec::new();
+    let strip_height = 2.min(height);
+    for numerator in [1, 2, 3] {
+        let y = (top + height * numerator / 4).min(bottom - strip_height);
+        if let Some(pixbuf) = capture.root.pixbuf(left, y, width, strip_height) {
+            append_pixbuf_luminances(&pixbuf, &mut luminances);
+        }
+    }
+    if luminances.is_empty() {
+        return None;
+    }
+    luminances.sort_by(f64::total_cmp);
+    let median = luminances[luminances.len() / 2];
+    Some(foreground_for_luminance(median, previous))
+}
+
+fn append_pixbuf_luminances(pixbuf: &Pixbuf, output: &mut Vec<f64>) {
+    let channels = pixbuf.n_channels() as usize;
+    if channels < 3 {
+        return;
+    }
+    let width = pixbuf.width().max(0) as usize;
+    let height = pixbuf.height().max(0) as usize;
+    let rowstride = pixbuf.rowstride().max(0) as usize;
+    let bytes = pixbuf.read_pixel_bytes();
+    let pixels = bytes.as_ref();
+    // At most a few hundred samples per strip. The server readback has already
+    // happened; this only avoids sorting thousands of effectively identical
+    // neighbouring wallpaper pixels.
+    let step = (width / 192).max(1);
+    for y in 0..height {
+        for x in (0..width).step_by(step) {
+            let offset = y
+                .saturating_mul(rowstride)
+                .saturating_add(x.saturating_mul(channels));
+            if offset + channels > pixels.len() {
+                continue;
+            }
+            if channels >= 4 && pixels[offset + 3] < 224 {
+                continue;
+            }
+            output.push(relative_luminance(
+                pixels[offset],
+                pixels[offset + 1],
+                pixels[offset + 2],
+            ));
+        }
+    }
+}
+
+fn relative_luminance(red: u8, green: u8, blue: u8) -> f64 {
+    fn linear(channel: u8) -> f64 {
+        let value = f64::from(channel) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+}
+
+fn foreground_for_luminance(luminance: f64, previous: Foreground) -> Foreground {
+    // White and near-black have equal WCAG contrast at roughly 0.18 relative
+    // luminance. A margin either side stops patterned backgrounds from making
+    // AUTO flip every time it is sampled.
+    match previous {
+        Foreground::Light if luminance > 0.22 => Foreground::Dark,
+        Foreground::Dark if luminance < 0.14 => Foreground::Light,
+        _ => previous,
+    }
+}
+
+fn compositor_auto_luminances() -> HashMap<String, f64> {
+    let path = crate::state::cache_dir().join("auto-color-result");
+    let fresh = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age <= Duration::from_secs(5));
+    if !fresh {
+        return HashMap::new();
+    }
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (key, raw) = line.split_once('\t')?;
+            let luminance = raw.trim().parse::<f64>().ok()?;
+            luminance
+                .is_finite()
+                .then_some((key.to_owned(), luminance.clamp(0.0, 1.0)))
+        })
+        .collect()
+}
+
+thread_local! {
+    /// The request last handed to the shell; an empty request is only
+    /// written once so an idle desktop with no AUTO widget stays idle.
+    static LAST_AUTO_COLOR_REQUEST: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn publish_auto_color_request(request: &str) {
+    let unchanged = LAST_AUTO_COLOR_REQUEST.with(|last| last.borrow().as_deref() == Some(request));
+    if unchanged && request.is_empty() {
+        return;
+    }
+    LAST_AUTO_COLOR_REQUEST.with(|last| *last.borrow_mut() = Some(request.to_owned()));
+    let dir = crate::state::cache_dir();
+    if let Err(error) =
+        fs::create_dir_all(&dir).and_then(|_| fs::write(dir.join("auto-color-request"), request))
+    {
+        eprintln!("Could not request Sysi auto colours: {error}");
+    }
+}
+
+fn refresh_auto_colors(
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+    state: &Rc<RefCell<AppState>>,
+) {
+    let items = registry.borrow().clone();
+    let (global, overrides) = {
+        let data = state.borrow();
+        (data.settings.color_mode, data.widget_color_modes.clone())
+    };
+    let compositor = compositor_auto_luminances();
+    let capture = desktop_capture();
+    let mut request = String::new();
+    for item in &items {
+        let mode = overrides.get(&item.key).copied().unwrap_or(global);
+        if mode == ColorMode::Auto {
+            if let Some(luminance) = compositor.get(&item.key) {
+                let foreground = foreground_for_luminance(*luminance, item.color_mode.get());
+                set_registered_foreground(item, foreground);
+            } else {
+                apply_registered_color_mode(item, mode, capture.as_ref());
+            }
+            if item.widget.is_visible() && item.widget.is_mapped() {
+                let allocation = item.widget.allocation();
+                if allocation.width() > 0 && allocation.height() > 0 {
+                    request.push_str(&format!(
+                        "{}\t{},{},{},{}\n",
+                        item.key,
+                        allocation.x(),
+                        allocation.y(),
+                        allocation.width(),
+                        allocation.height()
+                    ));
+                }
+            }
+        }
+    }
+    publish_auto_color_request(&request);
+}
+
+fn start_auto_color_updates(
+    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
+    state: Rc<RefCell<AppState>>,
+) {
+    refresh_auto_colors(&registry, &state);
+    glib::timeout_add_local(Duration::from_millis(1200), move || {
+        refresh_auto_colors(&registry, &state);
+        glib::ControlFlow::Continue
+    });
+}
+
 fn apply_color_mode(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, mode: ColorMode) {
+    let capture = (mode == ColorMode::Auto).then(desktop_capture).flatten();
     for item in registry.borrow().iter() {
-        set_registered_color_mode(item, mode);
+        apply_registered_color_mode(item, mode, capture.as_ref());
     }
 }
 
@@ -8438,25 +8737,44 @@ fn apply_widget_color_mode(
     mode: ColorMode,
 ) {
     if let Some(item) = registry.borrow().iter().find(|item| item.key == key) {
-        set_registered_color_mode(item, mode);
+        let capture = (mode == ColorMode::Auto).then(desktop_capture).flatten();
+        apply_registered_color_mode(item, mode, capture.as_ref());
     }
 }
 
-fn set_registered_color_mode(item: &RegisteredWidget, mode: ColorMode) {
-    set_event_box_color_mode(&item.widget, &item.color_mode, mode);
+fn apply_registered_color_mode(
+    item: &RegisteredWidget,
+    mode: ColorMode,
+    capture: Option<&DesktopCapture>,
+) {
+    let foreground = match mode {
+        ColorMode::Auto => capture
+            .and_then(|capture| {
+                sample_widget_foreground(&item.widget, item.color_mode.get(), capture)
+            })
+            .unwrap_or_else(|| item.color_mode.get()),
+        ColorMode::Light => Foreground::Light,
+        ColorMode::Dark => Foreground::Dark,
+    };
+    set_registered_foreground(item, foreground);
 }
 
-fn set_event_box_color_mode(
+fn set_registered_foreground(item: &RegisteredWidget, foreground: Foreground) {
+    set_event_box_foreground(&item.widget, &item.color_mode, foreground);
+}
+
+fn set_event_box_foreground(
     widget: &gtk::EventBox,
-    color_mode: &Rc<Cell<ColorMode>>,
-    mode: ColorMode,
+    color_mode: &Rc<Cell<Foreground>>,
+    foreground: Foreground,
 ) {
-    color_mode.set(mode);
+    if color_mode.replace(foreground) == foreground {
+        return;
+    }
     let context = widget.style_context();
     context.remove_class("mode-light");
-    context.remove_class("mode-gray");
     context.remove_class("mode-dark");
-    context.add_class(mode.css_class());
+    context.add_class(foreground.css_class());
     widget.queue_draw();
 }
 
@@ -8667,18 +8985,19 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        ellipsize, fit_to_work_area, fit_within_bounds, history_row_budget, parse_panel_anchor,
-        image_room, image_room_after_y, monitor_coordinate_divisor, monitor_root_bounds,
-        normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
-        note_size_for_image, parse_timer_input, push_recent_search, receives_input_when_locked,
-        record_note_undo, reopen_point, resize_width_limit, resized_image_size,
-        round_pixbuf_corners, system_content_size, system_meter_columns, system_meter_gap,
-        system_meter_ink_width, system_meter_row_width, system_meter_rows, timer_style_size,
-        NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect,
-        HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS,
-        NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT, NOTE_WIDTH,
-        SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
-        SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
+        ellipsize, fit_to_work_area, fit_within_bounds, foreground_for_luminance,
+        history_row_budget, image_room, image_room_after_y, monitor_coordinate_divisor,
+        monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
+        note_search_matches, note_size_for_image, parse_panel_anchor, parse_timer_input,
+        push_recent_search, receives_input_when_locked, record_note_undo, relative_luminance,
+        reopen_point, resize_width_limit, resized_image_size, round_pixbuf_corners,
+        system_content_size, system_meter_columns, system_meter_gap, system_meter_ink_width,
+        system_meter_row_width, system_meter_rows, timer_style_size, Foreground, NoteSearchMatch,
+        NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT,
+        HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
+        NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT, NOTE_WIDTH, SYSTEM_HEIGHT,
+        SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN, SYSTEM_METER_RING,
+        SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
     };
     use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
     use crate::system::SystemSnapshot;
@@ -8697,6 +9016,28 @@ mod timer_input_tests {
     };
 
     #[test]
+    fn auto_color_uses_relative_luminance_with_a_stable_middle_band() {
+        assert!((relative_luminance(255, 255, 255) - 1.0).abs() < 0.000_001);
+        assert_eq!(relative_luminance(0, 0, 0), 0.0);
+        assert_eq!(
+            foreground_for_luminance(1.0, Foreground::Light),
+            Foreground::Dark
+        );
+        assert_eq!(
+            foreground_for_luminance(0.0, Foreground::Dark),
+            Foreground::Light
+        );
+        assert_eq!(
+            foreground_for_luminance(0.18, Foreground::Light),
+            Foreground::Light
+        );
+        assert_eq!(
+            foreground_for_luminance(0.18, Foreground::Dark),
+            Foreground::Dark
+        );
+    }
+
+    #[test]
     fn dictionary_content_keeps_receiving_input_while_locked() {
         assert!(receives_input_when_locked("dict:1"));
         assert!(receives_input_when_locked("dict:42"));
@@ -8709,7 +9050,10 @@ mod timer_input_tests {
     #[test]
     fn a_panel_click_carries_the_place_it_happened() {
         assert_eq!(parse_panel_anchor("960,42"), Some(Point { x: 960, y: 42 }));
-        assert_eq!(parse_panel_anchor(" 960 , 42 "), Some(Point { x: 960, y: 42 }));
+        assert_eq!(
+            parse_panel_anchor(" 960 , 42 "),
+            Some(Point { x: 960, y: 42 })
+        );
         // A monitor left of the primary puts the panel at a negative origin.
         assert_eq!(parse_panel_anchor("-40,42"), Some(Point { x: -40, y: 42 }));
         // Anything unreadable falls back to the pointer rather than to (0, 0),
