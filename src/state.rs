@@ -137,15 +137,27 @@ pub struct SystemDetails {
     #[serde(default = "default_true")]
     pub ram: bool,
     #[serde(default)]
+    pub swap: bool,
+    #[serde(default)]
     pub processes: bool,
     #[serde(default)]
     pub cores: bool,
     #[serde(default)]
     pub gpus: bool,
     #[serde(default)]
+    pub cpu_temp: bool,
+    #[serde(default)]
+    pub gpu_temp: bool,
+    #[serde(default)]
+    pub ssd_temp: bool,
+    #[serde(default)]
+    pub memory_detail: bool,
+    #[serde(default)]
     pub root_disk: bool,
     #[serde(default)]
     pub home_disk: bool,
+    #[serde(default)]
+    pub network: bool,
 }
 
 impl Default for SystemDetails {
@@ -153,11 +165,17 @@ impl Default for SystemDetails {
         Self {
             cpu: true,
             ram: true,
+            swap: false,
             processes: false,
             cores: false,
             gpus: false,
+            cpu_temp: false,
+            gpu_temp: false,
+            ssd_temp: false,
+            memory_detail: false,
             root_disk: false,
             home_disk: false,
+            network: false,
         }
     }
 }
@@ -462,5 +480,23 @@ mod tests {
         let state: AppState = serde_json::from_str(r#"{"timer_seconds":120}"#)
             .expect("state without a timer style should remain readable");
         assert_eq!(state.timer_style, TimerStyle::Ring);
+    }
+
+    #[test]
+    fn a_state_saved_before_the_new_sensors_keeps_the_sections_it_had() {
+        // What a card with the disk meters on used to save. The sections it
+        // never knew about have to come back off rather than switch themselves
+        // on for someone who never asked.
+        let state: AppState = serde_json::from_str(
+            r#"{"settings":{"system_details":{"cpu":true,"ram":true,"gpus":true,"root_disk":true,"home_disk":true,"processes":false,"cores":false}}}"#,
+        )
+        .expect("settings saved before the new sensors should remain readable");
+        let details = state.settings.system_details;
+        assert!(details.cpu && details.ram && details.gpus);
+        assert!(details.root_disk && details.home_disk);
+        assert!(!details.swap);
+        assert!(!details.cpu_temp && !details.gpu_temp && !details.ssd_temp);
+        assert!(!details.memory_detail);
+        assert!(!details.network);
     }
 }

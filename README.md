@@ -4,7 +4,12 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 
 ## Features
 
-- A compact `SYSTEM` widget with CPU/RAM rings. Its right-click menu can add a fixed five-row top-process list (with CPU, ID, and memory) and compact per-core percentages; the extra `/proc` reads run only while their section is enabled.
+- A compact `SYSTEM` widget with CPU/RAM rings. Its right-click menu adds:
+  - `SWAP` and `GPUS` rings, and a `TEMPERATURE` submenu with `CPU`, `GPU`, and `SSD` rings. A drive ring is captioned with its maker, so `SAMSUNG` and `UMIS` rather than `SSD 1` and `SSD 2`; a drive from nobody recognisable falls back to its product line, then to its size. A temperature ring is filled on a fixed 0-100 degree scale and reads `45C` in the middle, so its caption stays free for the sensor's name; past 85 degrees the ring and its number turn warm, the card's only colour.
+  - `MEMORY DETAIL`, `DISK /`, and `DISK /HOME` capacity rows: a bar, how much of the space is gone, the total, and the percentage. `/home` is omitted when it shares a filesystem with `/`, and swap when the machine has none.
+  - A fixed five-row top-process list (with CPU, ID, and memory), compact per-core percentages, and a `NETWORK` row with the current download and upload rate over the physical interfaces.
+
+  Every sensor, `/proc` walk, and `nvidia-smi` call runs only while its section is enabled, and all of it on a sampler thread rather than the GTK main loop.
 - Focus countdown with four visual styles, hover controls in both modes, and a persistent animated alarm that must be dismissed.
 - A compact gear menu with persistent SYSTEM and timer visibility toggles.
 - Note History: click or drag an old note onto the desktop to pin it again.

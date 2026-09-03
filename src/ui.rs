@@ -4,7 +4,7 @@ use crate::{
         AppState, ColorMode, DictionaryWindow, Note, NoteImage, Point, Size, SystemDetails,
         TimerStyle, IMAGE_PLACEHOLDER,
     },
-    system::{SystemReadOptions, SystemReader, SystemSnapshot},
+    system::{NetworkRates, SystemReadOptions, SystemReader, SystemSnapshot, Usage},
     translate,
 };
 use cairo::{Context, FontSlant, FontWeight, RectangleInt, Region};
@@ -20,7 +20,7 @@ use std::{
     rc::{Rc, Weak},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -65,6 +65,22 @@ const SYSTEM_METER_LABEL_BASELINE: f64 = 52.0;
 /// the ring's inner edge is 18 either side of centre there, and a centred
 /// caption has to clear both.
 const SYSTEM_METER_LABEL_WIDTH: f64 = 34.0;
+/// The widest a ring's own number may be drawn: the clear span inside its
+/// stroke. Only a five-character reading such as "100\u{b0}C" ever comes close,
+/// and shrinking that beats letting it cross the ring it belongs to.
+const SYSTEM_METER_VALUE_WIDTH: f64 = 2.0 * SYSTEM_METER_RING_RADIUS - SYSTEM_METER_RING_STROKE;
+/// Where a temperature stops being worth a glance and starts being worth a
+/// warning. Consumer CPUs throttle somewhere above 95 °C, so this is hot
+/// enough to mean something and cool enough to see it coming.
+const SYSTEM_HOT_CELSIUS: f64 = 85.0;
+/// The one colour on an otherwise monochrome card. Warm enough to read as a
+/// warning against either foreground, and dark enough to stay legible on the
+/// light one.
+const SYSTEM_HOT_INK: (f64, f64, f64) = (0.86, 0.34, 0.24);
+/// A row that is one line of text: a capacity row or the throughput row.
+const SYSTEM_ROW_HEIGHT: f64 = 17.0;
+/// The gap that separates a block of rows from whatever is above it.
+const SYSTEM_ROW_TOP_GAP: f64 = 16.0;
 const TIMER_SIZE: i32 = 116;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
@@ -98,6 +114,16 @@ const TRANSLATE_HISTORY_LIMIT: usize = 50;
 /// rather than burying the desk in cards.
 const TRANSLATE_WINDOW_LIMIT: usize = 8;
 const RESIZE_HIT_SIZE: i32 = 18;
+/// Extra room around every child in the overlay's X11 bounding shape. GTK can
+/// paint antialiasing and text shadows just outside a widget's allocation; a
+/// tight rectangle would shave those pixels off even though the redraw itself
+/// is correct.
+const VISUAL_SHAPE_MARGIN: i32 = 8;
+/// Repainting a transparent Xwayland surface wakes the compositor for a whole
+/// frame. Pointer devices can report far faster than that is useful, especially
+/// on this app's multi-monitor surface, so apply at most roughly 60 moves/s and
+/// always commit the exact pointer position on release.
+const DRAG_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 // The history row the pointer is on, or None. The history window's right-click
@@ -1629,9 +1655,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     window.connect_map({
         let registry = registry.clone();
         let interactive = interactive.clone();
+        let root = root.clone();
         move |window| {
             invalidate_input_shape_cache();
+            invalidate_visual_shape_cache();
             refresh_input_shape(window, &registry, interactive.get());
+            refresh_visual_shape(window, &root, None);
         }
     });
 
@@ -1671,6 +1700,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         move || {
             clamp_registered_widgets(&root, &registry, &screens, &state);
             refresh_input_shape(&window, &registry, interactive.get());
+            refresh_visual_shape(&window, &root, None);
         }
     });
 
@@ -1687,6 +1717,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let window = window.clone();
         let registry = registry.clone();
         let interactive = interactive.clone();
+        let root = root.clone();
         let queued = Rc::new(Cell::new(false));
         move |_, _| {
             // Coalesce a burst of allocations into one refresh, and never
@@ -1698,10 +1729,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 let window = window.clone();
                 let registry = registry.clone();
                 let interactive = interactive.clone();
+                let root = root.clone();
                 let queued = queued.clone();
                 move || {
                     queued.set(false);
                     refresh_input_shape(&window, &registry, interactive.get());
+                    refresh_visual_shape(&window, &root, None);
                 }
             });
         }
@@ -1881,8 +1914,12 @@ fn start_system_updates(system: SystemCard, state: Rc<RefCell<AppState>>) {
                 processes: details.processes,
                 cores: details.cores,
                 gpus: details.gpus,
+                cpu_temp: details.cpu_temp,
+                gpu_temp: details.gpu_temp,
+                ssd_temp: details.ssd_temp,
                 root_disk: details.root_disk,
                 home_disk: details.home_disk,
+                network: details.network,
             });
         }
     });
@@ -1932,7 +1969,7 @@ fn draw_system(
             // short sits under the middle of the one above it.
             let left = (content_width - system_meter_row_width(count, gap)) / 2.0;
             for column in 0..count {
-                let Some((value, title)) = meters.next() else {
+                let Some(meter) = meters.next() else {
                     break;
                 };
                 let x = left + column as f64 * (SYSTEM_METER_RING + gap) + SYSTEM_METER_RING / 2.0;
@@ -1948,30 +1985,34 @@ fn draw_system(
                     PI * 0.75,
                 );
                 let _ = ctx.stroke();
-                ctx.set_source_rgba(accent.0, accent.1, accent.2, 0.96);
+                // The card is monochrome on purpose, so the one colour it has
+                // means one thing: something is running too hot.
+                let fill = if meter.hot { SYSTEM_HOT_INK } else { accent };
+                ctx.set_source_rgba(fill.0, fill.1, fill.2, 0.96);
                 ctx.new_sub_path();
                 ctx.arc(
                     x,
                     y + SYSTEM_METER_RING_CENTER_Y,
                     SYSTEM_METER_RING_RADIUS,
                     -PI * 0.75,
-                    -PI * 0.75 + PI * 1.5 * (value / 100.0).clamp(0.0, 1.0),
+                    -PI * 0.75 + PI * 1.5 * (meter.fill / 100.0).clamp(0.0, 1.0),
                 );
                 let _ = ctx.stroke();
-                center_text(
+                center_text_fitted(
                     ctx,
                     x,
                     y + 37.0,
-                    &format!("{value:.0}%"),
+                    &meter.text,
                     18.0,
+                    SYSTEM_METER_VALUE_WIDTH,
                     FontWeight::Bold,
-                    ink,
+                    if meter.hot { SYSTEM_HOT_INK } else { ink },
                 );
                 center_text_fitted(
                     ctx,
                     x,
                     y + SYSTEM_METER_LABEL_BASELINE,
-                    title,
+                    &meter.title,
                     8.5,
                     SYSTEM_METER_LABEL_WIDTH,
                     FontWeight::Bold,
@@ -1986,45 +2027,163 @@ fn draw_system(
     } else {
         (rows.len() as f64 * f64::from(SYSTEM_HEIGHT) - SYSTEM_METER_INK_TOP) * scale
     };
+    let rows = system_usage_rows(details, values);
+    if !rows.is_empty() {
+        draw_system_usage_rows(ctx, &rows, width, cursor_y, ink, muted, accent);
+        cursor_y += system_usage_block_height(rows.len());
+    }
     if details.processes {
         draw_system_processes(ctx, values, width, cursor_y, ink, muted);
         cursor_y += 108.0;
     }
     if details.cores {
         draw_system_cores(ctx, &values.cores, width, cursor_y, ink, muted, accent);
+        cursor_y += system_cores_height(values.cores.len());
+    }
+    if details.network {
+        draw_system_network(ctx, values.network, width, cursor_y, ink, muted);
+    }
+}
+
+/// How tall a block of capacity rows is: its heading, then a line each.
+fn system_usage_block_height(rows: usize) -> f64 {
+    SYSTEM_ROW_TOP_GAP + rows as f64 * SYSTEM_ROW_HEIGHT
+}
+
+/// How tall the per-core grid is. Four cores to a line, and a machine that
+/// reported none yet still keeps the one line its heading needs.
+fn system_cores_height(cores: usize) -> f64 {
+    SYSTEM_ROW_TOP_GAP + cores.max(1).div_ceil(4) as f64 * SYSTEM_ROW_HEIGHT
+}
+
+fn system_network_height() -> f64 {
+    SYSTEM_ROW_TOP_GAP + SYSTEM_ROW_HEIGHT
+}
+
+/// One ring: how far round it is filled, the reading printed inside it, and
+/// the caption under it. A load is its own percentage, while a temperature is
+/// filled against a fixed scale and printed in degrees, so the fill and the
+/// text cannot be the same number.
+#[derive(Clone, Debug, PartialEq)]
+struct SystemMeter {
+    fill: f64,
+    text: String,
+    title: String,
+    hot: bool,
+}
+
+fn percent_meter(percent: f64, title: &str) -> SystemMeter {
+    SystemMeter {
+        fill: percent,
+        text: format!("{percent:.0}%"),
+        title: title.into(),
+        hot: false,
+    }
+}
+
+/// A temperature ring, filled on a fixed 0–100 °C scale. That covers the range
+/// every part of a desktop machine works in, and it means two temperature
+/// rings can be read against each other at a glance.
+fn temperature_meter(celsius: f64, title: &str) -> SystemMeter {
+    SystemMeter {
+        fill: celsius.clamp(0.0, 100.0),
+        text: format!("{celsius:.0}\u{b0}C"),
+        title: title.into(),
+        hot: celsius >= SYSTEM_HOT_CELSIUS,
     }
 }
 
 /// Every ring the card shows, in the order they are laid out. Both the drawing
 /// and the sizing read this one list, so what is measured is always what ends
 /// up on screen — a machine with no NVIDIA card contributes no ring and no row.
-fn system_meters(details: SystemDetails, values: &SystemSnapshot) -> Vec<(f64, String)> {
+fn system_meters(details: SystemDetails, values: &SystemSnapshot) -> Vec<SystemMeter> {
     let mut meters = Vec::new();
     if details.cpu {
-        meters.push((values.cpu_percent, "CPU".into()));
+        meters.push(percent_meter(values.cpu_percent, "CPU"));
     }
     if details.ram {
-        meters.push((values.memory_percent, "RAM".into()));
+        meters.push(percent_meter(values.memory_percent, "RAM"));
+    }
+    if details.swap {
+        if let Some(swap) = values.swap {
+            meters.push(percent_meter(swap.percent(), "SWAP"));
+        }
     }
     if details.gpus {
         meters.extend(
             values
                 .gpus
                 .iter()
-                .map(|gpu| (gpu.percent, gpu.label.clone())),
+                .map(|gpu| percent_meter(gpu.percent, &gpu.label)),
         );
     }
+    // Temperatures come after every load, so switching them on never moves the
+    // rings the card already had.
+    if details.cpu_temp {
+        if let Some(celsius) = values.cpu_temperature {
+            meters.push(temperature_meter(celsius, "CPU"));
+        }
+    }
+    if details.gpu_temp {
+        meters.extend(values.gpus.iter().filter_map(|gpu| {
+            // One card of each vendor is captioned by vendor; a machine with
+            // a single card has no ambiguity to resolve, so it reads "GPU".
+            let title = if values.gpus.len() > 1 {
+                gpu.label.clone()
+            } else {
+                "GPU".to_owned()
+            };
+            gpu.temperature
+                .map(|celsius| temperature_meter(celsius, &title))
+        }));
+    }
+    if details.ssd_temp {
+        meters.extend(
+            values
+                .storage_temperatures
+                .iter()
+                .map(|(label, celsius)| temperature_meter(*celsius, label)),
+        );
+    }
+    meters
+}
+
+/// One capacity row: what it is, and how full it is. A percentage alone does
+/// not answer the question a disk row is read for, which is whether the next
+/// thing will fit.
+#[derive(Clone, Debug, PartialEq)]
+struct SystemUsageRow {
+    label: String,
+    usage: Usage,
+}
+
+/// The capacity rows under the rings, in the order they are drawn. Memory
+/// comes first because it changes minute to minute; the mounts follow.
+fn system_usage_rows(details: SystemDetails, values: &SystemSnapshot) -> Vec<SystemUsageRow> {
+    let mut rows = Vec::new();
+    let mut push = |label: &str, usage: Usage| {
+        rows.push(SystemUsageRow {
+            label: label.into(),
+            usage,
+        });
+    };
+    if details.memory_detail {
+        push("RAM", values.memory);
+        if let Some(swap) = values.swap {
+            push("SWAP", swap);
+        }
+    }
     if details.root_disk {
-        if let Some(percent) = values.root_disk_percent {
-            meters.push((percent, "ROOT".into()));
+        if let Some(usage) = values.root_disk {
+            push("/", usage);
         }
     }
     if details.home_disk {
-        if let Some(percent) = values.home_disk_percent {
-            meters.push((percent, "HOME".into()));
+        if let Some(usage) = values.home_disk {
+            push("/HOME", usage);
         }
     }
-    meters
+    rows
 }
 
 /// How many rings a card this wide can put side by side. The card reflows: drag
@@ -2101,6 +2260,10 @@ fn system_content_size(
     card_width: Option<i32>,
 ) -> Size {
     let meter_count = system_meters(details, values).len();
+    let usage_rows = system_usage_rows(details, values).len();
+    // Everything that stacks under the rings, and so has to be measured as
+    // well as drawn.
+    let has_sections = usage_rows > 0 || details.processes || details.cores || details.network;
     let columns = match card_width {
         Some(width) => system_meter_columns(meter_count, f64::from(width.max(1))),
         // Nothing to reflow into yet, so fall back to the default shape.
@@ -2114,22 +2277,28 @@ fn system_content_size(
         // last row is only slack when the rings are what the card ends with;
         // with a section under them it is the gap that separates the two.
         let block = rows.len() as f64 * f64::from(SYSTEM_HEIGHT) - SYSTEM_METER_INK_TOP;
-        let block = if details.processes || details.cores {
+        let block = if has_sections {
             block
         } else {
             block - SYSTEM_METER_INK_BOTTOM
         };
         block.ceil() as i32
     };
+    if usage_rows > 0 {
+        height += system_usage_block_height(usage_rows).ceil() as i32;
+    }
     if details.processes {
         height += 108;
     }
     if details.cores {
-        height += 16 + (values.cores.len().max(1).div_ceil(4) as i32 * 17);
+        height += system_cores_height(values.cores.len()).ceil() as i32;
+    }
+    if details.network {
+        height += system_network_height().ceil() as i32;
     }
     let width = match card_width {
         Some(width) => width,
-        None if details.processes || details.cores => 318,
+        None if has_sections => 318,
         // No meters at all still leaves a strip to right-click on.
         None if meter_count == 0 => SYSTEM_WIDTH,
         // Exactly the rings and nothing else, so the card can go flush against
@@ -2279,6 +2448,110 @@ fn draw_system_cores(
     }
 }
 
+/// The capacity rows: a label, a bar, how much of the space is gone, and the
+/// percentage that works out to. Same line height and bar as the core grid, so
+/// the two sections read as one list when both are on.
+#[allow(clippy::too_many_arguments)]
+fn draw_system_usage_rows(
+    ctx: &Context,
+    rows: &[SystemUsageRow],
+    width: f64,
+    top: f64,
+    ink: (f64, f64, f64),
+    muted: (f64, f64, f64),
+    accent: (f64, f64, f64),
+) {
+    // The bar gives up whatever the two number columns on its right need, and
+    // never shrinks past the point where a fill would be invisible.
+    let bar_left = 46.0;
+    let bar_right = (width - 116.0).max(bar_left + 12.0);
+    for (index, row) in rows.iter().enumerate() {
+        let baseline = top + 11.0 + index as f64 * SYSTEM_ROW_HEIGHT;
+        draw_left_text(ctx, 5.0, baseline, &row.label, 8.0, FontWeight::Bold, muted);
+        if bar_right > bar_left {
+            ctx.set_line_width(2.3);
+            ctx.set_line_cap(cairo::LineCap::Round);
+            ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
+            ctx.move_to(bar_left, baseline - 3.0);
+            ctx.line_to(bar_right, baseline - 3.0);
+            let _ = ctx.stroke();
+            let filled = (bar_right - bar_left) * (row.usage.percent() / 100.0);
+            if filled > 0.0 {
+                ctx.set_source_rgb(accent.0, accent.1, accent.2);
+                ctx.move_to(bar_left, baseline - 3.0);
+                ctx.line_to(bar_left + filled, baseline - 3.0);
+                let _ = ctx.stroke();
+            }
+        }
+        draw_right_text(
+            ctx,
+            width - 42.0,
+            baseline,
+            &format!(
+                "{} / {}",
+                format_memory(row.usage.used_kib),
+                format_memory(row.usage.total_kib)
+            ),
+            9.0,
+            FontWeight::Normal,
+            ink,
+        );
+        draw_right_text(
+            ctx,
+            width - 5.0,
+            baseline,
+            &format!("{:.0}%", row.usage.percent()),
+            8.0,
+            FontWeight::Bold,
+            ink,
+        );
+    }
+}
+
+/// What the network is carrying right now, down on the left and up on the
+/// right. Before the second sample there is no rate to state yet, and a zero
+/// there would be a claim rather than a blank.
+///
+/// The directions are spelt out rather than drawn as arrows: the card asks
+/// Cairo for "Sans", which on a bare Ubuntu install has no glyph for
+/// `\u{2193}` and would put an empty box where the arrow should be.
+fn draw_system_network(
+    ctx: &Context,
+    rates: Option<NetworkRates>,
+    width: f64,
+    top: f64,
+    ink: (f64, f64, f64),
+    muted: (f64, f64, f64),
+) {
+    let baseline = top + 11.0;
+    draw_left_text(ctx, 5.0, baseline, "NET", 8.0, FontWeight::Bold, muted);
+    let (down, up) = match rates {
+        Some(rates) => (
+            format_rate(rates.down_bytes_per_sec),
+            format_rate(rates.up_bytes_per_sec),
+        ),
+        None => ("--".to_owned(), "--".to_owned()),
+    };
+    draw_left_text(
+        ctx,
+        46.0,
+        baseline,
+        &format!("DOWN {down}"),
+        9.0,
+        FontWeight::Normal,
+        ink,
+    );
+    draw_right_text(
+        ctx,
+        width - 5.0,
+        baseline,
+        &format!("UP {up}"),
+        9.0,
+        FontWeight::Normal,
+        ink,
+    );
+}
+
 fn draw_left_text(
     ctx: &Context,
     x: f64,
@@ -2326,6 +2599,19 @@ fn format_memory(kib: u64) -> String {
         format!("{:.1}G", kib as f64 / 1_048_576.0)
     } else {
         format!("{:.0}M", kib as f64 / 1024.0)
+    }
+}
+
+/// A throughput, in as few characters as the row can spare. A decimal is worth
+/// it once the number is small enough to lose meaning without one.
+fn format_rate(bytes_per_sec: f64) -> String {
+    let rate = bytes_per_sec.max(0.0);
+    if rate >= 1_048_576.0 {
+        format!("{:.1} MB/s", rate / 1_048_576.0)
+    } else if rate >= 1024.0 {
+        format!("{:.0} KB/s", rate / 1024.0)
+    } else {
+        format!("{rate:.0} B/s")
     }
 }
 
@@ -7312,96 +7598,66 @@ fn attach_color_mode_menu(
     if let Some(system_details) = system_details {
         menu.set_reserve_toggle_size(true);
         menu.append(&gtk::SeparatorMenuItem::new());
-        let cpu = gtk::CheckMenuItem::with_label("CPU");
-        cpu.set_active(system_details.details.get().cpu);
-        cpu.connect_toggled({
-            let preview = system_details.clone();
-            let state = state.clone();
-            move |item| {
-                let mut details = preview.details.get();
-                details.cpu = item.is_active();
-                apply_system_details(&preview, &state, details);
-            }
-        });
-        menu.append(&cpu);
+        // Every one of these does the same thing to a different flag, so they
+        // are built from one description rather than a dozen copies.
+        let toggle = |target: &gtk::Menu,
+                      label: &str,
+                      read: fn(&SystemDetails) -> bool,
+                      write: fn(&mut SystemDetails, bool)| {
+            let item = gtk::CheckMenuItem::with_label(label);
+            item.set_active(read(&system_details.details.get()));
+            item.connect_toggled({
+                let preview = system_details.clone();
+                let state = state.clone();
+                move |item| {
+                    let mut details = preview.details.get();
+                    write(&mut details, item.is_active());
+                    apply_system_details(&preview, &state, details);
+                }
+            });
+            target.append(&item);
+        };
 
-        let ram = gtk::CheckMenuItem::with_label("RAM");
-        ram.set_active(system_details.details.get().ram);
-        ram.connect_toggled({
-            let preview = system_details.clone();
-            let state = state.clone();
-            move |item| {
-                let mut details = preview.details.get();
-                details.ram = item.is_active();
-                apply_system_details(&preview, &state, details);
-            }
-        });
-        menu.append(&ram);
+        toggle(&menu, "CPU", |d| d.cpu, |d, on| d.cpu = on);
+        toggle(&menu, "RAM", |d| d.ram, |d, on| d.ram = on);
+        toggle(&menu, "SWAP", |d| d.swap, |d, on| d.swap = on);
+        toggle(&menu, "GPUS", |d| d.gpus, |d, on| d.gpus = on);
 
-        let processes = gtk::CheckMenuItem::with_label("TOP PROCESSES");
-        processes.set_active(system_details.details.get().processes);
-        processes.connect_toggled({
-            let preview = system_details.clone();
-            let state = state.clone();
-            move |item| {
-                let mut details = preview.details.get();
-                details.processes = item.is_active();
-                apply_system_details(&preview, &state, details);
-            }
-        });
-        menu.append(&processes);
+        // Three sensors of one kind, so they fold into a submenu rather than
+        // taking a third of the menu for themselves.
+        let temperature = gtk::MenuItem::with_label("TEMPERATURE");
+        let sensors = context_menu();
+        sensors.set_reserve_toggle_size(true);
+        toggle(&sensors, "CPU", |d| d.cpu_temp, |d, on| d.cpu_temp = on);
+        toggle(&sensors, "GPU", |d| d.gpu_temp, |d, on| d.gpu_temp = on);
+        toggle(&sensors, "SSD", |d| d.ssd_temp, |d, on| d.ssd_temp = on);
+        temperature.set_submenu(Some(&sensors));
+        menu.append(&temperature);
 
-        let cores = gtk::CheckMenuItem::with_label("CPU CORES");
-        cores.set_active(system_details.details.get().cores);
-        cores.connect_toggled({
-            let preview = system_details.clone();
-            let state = state.clone();
-            move |item| {
-                let mut details = preview.details.get();
-                details.cores = item.is_active();
-                apply_system_details(&preview, &state, details);
-            }
-        });
-        menu.append(&cores);
-
-        let gpus = gtk::CheckMenuItem::with_label("GPUS");
-        gpus.set_active(system_details.details.get().gpus);
-        gpus.connect_toggled({
-            let preview = system_details.clone();
-            let state = state.clone();
-            move |item| {
-                let mut details = preview.details.get();
-                details.gpus = item.is_active();
-                apply_system_details(&preview, &state, details);
-            }
-        });
-        menu.append(&gpus);
-
-        let root_disk = gtk::CheckMenuItem::with_label("DISK /");
-        root_disk.set_active(system_details.details.get().root_disk);
-        root_disk.connect_toggled({
-            let preview = system_details.clone();
-            let state = state.clone();
-            move |item| {
-                let mut details = preview.details.get();
-                details.root_disk = item.is_active();
-                apply_system_details(&preview, &state, details);
-            }
-        });
-        menu.append(&root_disk);
-
-        let home_disk = gtk::CheckMenuItem::with_label("DISK /HOME");
-        home_disk.set_active(system_details.details.get().home_disk);
-        home_disk.connect_toggled({
-            let preview = system_details.clone();
-            let state = state.clone();
-            move |item| {
-                let mut details = preview.details.get();
-                details.home_disk = item.is_active();
-                apply_system_details(&preview, &state, details);
-            }
-        });
-        menu.append(&home_disk);
+        // Above this line are rings; below it are the rows that stack under
+        // them.
+        menu.append(&gtk::SeparatorMenuItem::new());
+        toggle(
+            &menu,
+            "MEMORY DETAIL",
+            |d| d.memory_detail,
+            |d, on| d.memory_detail = on,
+        );
+        toggle(&menu, "DISK /", |d| d.root_disk, |d, on| d.root_disk = on);
+        toggle(
+            &menu,
+            "DISK /HOME",
+            |d| d.home_disk,
+            |d, on| d.home_disk = on,
+        );
+        toggle(
+            &menu,
+            "TOP PROCESSES",
+            |d| d.processes,
+            |d, on| d.processes = on,
+        );
+        toggle(&menu, "CPU CORES", |d| d.cores, |d, on| d.cores = on);
+        toggle(&menu, "NETWORK", |d| d.network, |d, on| d.network = on);
     }
     menu.show_all();
 
@@ -8047,7 +8303,9 @@ fn attach_resize(
         let start = start.clone();
         let latest = latest.clone();
         let card = card.clone();
+        let card_widget = card.clone().upcast::<gtk::Widget>();
         let root = root.clone();
+        let window = window.clone();
         let gesture_screens = gesture_screens.clone();
         move |_, event| {
             let Some((start_width, start_height, pointer_start_x, pointer_start_y)) = start.get()
@@ -8127,6 +8385,19 @@ fn attach_resize(
             }
             drop(screens);
             let previous = latest.replace(next);
+            refresh_visual_shape(
+                &window,
+                &root,
+                Some((
+                    &card_widget,
+                    ScreenRect {
+                        x: allocation.x(),
+                        y: allocation.y(),
+                        width: next.width,
+                        height: next.height,
+                    },
+                )),
+            );
             card.set_size_request(next.width, next.height);
             card.queue_resize();
             // Only the card's own rectangle changed, and its origin did not
@@ -8173,6 +8444,52 @@ fn attach_resize(
     });
 }
 
+fn drag_frame_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= DRAG_REDRAW_INTERVAL)
+}
+
+fn move_overlay_card(
+    window: &gtk::ApplicationWindow,
+    root: &gtk::Fixed,
+    card: &gtk::EventBox,
+    card_widget: &gtk::Widget,
+    point: Point,
+) {
+    let allocation = card.allocation();
+    if point.x == allocation.x() && point.y == allocation.y() {
+        return;
+    }
+    // Change the X11 bounding shape before painting at the new position.
+    // Otherwise the old shape clips the first frame there and the card briefly
+    // disappears while moving.
+    refresh_visual_shape(
+        window,
+        root,
+        Some((
+            card_widget,
+            ScreenRect {
+                x: point.x,
+                y: point.y,
+                width: allocation.width(),
+                height: allocation.height(),
+            },
+        )),
+    );
+    root.queue_draw_area(
+        allocation.x() - 3,
+        allocation.y() - 3,
+        allocation.width() + 6,
+        allocation.height() + 6,
+    );
+    root.move_(card, point.x, point.y);
+    root.queue_draw_area(
+        point.x - 3,
+        point.y - 3,
+        allocation.width() + 6,
+        allocation.height() + 6,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attach_drag(
     handle: &gtk::EventBox,
@@ -8195,8 +8512,10 @@ fn attach_drag(
     // the server for each monitor's geometry and work area is not something to
     // repeat sixty times a second, and it cannot change mid-drag.
     let gesture_screens: Rc<RefCell<Vec<ScreenRect>>> = Rc::new(RefCell::new(Vec::new()));
+    let last_redraw = Rc::new(Cell::new(None::<Instant>));
     gesture.connect_drag_begin({
         let start = start.clone();
+        let last_redraw = last_redraw.clone();
         let card = card.clone();
         let root = root.clone();
         let gesture_screens = gesture_screens.clone();
@@ -8221,6 +8540,7 @@ fn attach_drag(
                     root_allocation.height(),
                 );
                 start.set(Some((allocation.x(), allocation.y(), pointer_x, pointer_y)));
+                last_redraw.set(None);
             } else {
                 gesture.set_state(gtk::EventSequenceState::Denied);
             }
@@ -8229,17 +8549,25 @@ fn attach_drag(
     gesture.connect_drag_update({
         let start = start.clone();
         let card = card.clone();
+        let card_widget = card.clone().upcast::<gtk::Widget>();
         let root = root.clone();
+        let window = window.clone();
         let gesture_screens = gesture_screens.clone();
+        let last_redraw = last_redraw.clone();
         move |gesture, fallback_x, fallback_y| {
             if let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.get() {
+                if fallback_x.abs() + fallback_y.abs() > 4.0 {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+                let now = Instant::now();
+                if !drag_frame_due(last_redraw.get(), now) {
+                    return;
+                }
+                last_redraw.set(Some(now));
                 let (pointer_x, pointer_y) = pointer_position()
                     .unwrap_or((pointer_start_x + fallback_x, pointer_start_y + fallback_y));
                 let offset_x = pointer_x - pointer_start_x;
                 let offset_y = pointer_y - pointer_start_y;
-                if offset_x.abs() + offset_y.abs() > 4.0 {
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                }
                 let allocation = card.allocation();
                 let screens = gesture_screens.borrow();
                 let point = clamp_to_screens(
@@ -8251,21 +8579,7 @@ fn attach_drag(
                     allocation.height(),
                     &screens,
                 );
-                if point.x != allocation.x() || point.y != allocation.y() {
-                    root.queue_draw_area(
-                        allocation.x() - 3,
-                        allocation.y() - 3,
-                        allocation.width() + 6,
-                        allocation.height() + 6,
-                    );
-                    root.move_(&card, point.x, point.y);
-                    root.queue_draw_area(
-                        point.x - 3,
-                        point.y - 3,
-                        allocation.width() + 6,
-                        allocation.height() + 6,
-                    );
-                }
+                move_overlay_card(&window, &root, &card, &card_widget, point);
             }
         }
     });
@@ -8276,16 +8590,30 @@ fn attach_drag(
         let registry = registry.clone();
         let window = window.clone();
         let interactive = interactive.clone();
-        move |_, _, _| {
-            if start.get().is_none() {
+        let card_widget = card.clone().upcast::<gtk::Widget>();
+        let gesture_screens = gesture_screens.clone();
+        move |_, fallback_x, fallback_y| {
+            let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.replace(None) else {
                 return;
-            }
-            start.set(None);
-            let allocation = card.allocation();
-            let origin = Point {
-                x: allocation.x(),
-                y: allocation.y(),
             };
+            let allocation = card.allocation();
+            // A throttled motion may still be waiting when the button comes
+            // up. Commit the exact final pointer position so rate limiting
+            // never changes where the user actually dropped the card.
+            let (pointer_x, pointer_y) = pointer_position()
+                .unwrap_or((pointer_start_x + fallback_x, pointer_start_y + fallback_y));
+            let gesture_screens = gesture_screens.borrow();
+            let origin = clamp_to_screens(
+                Point {
+                    x: ox + (pointer_x - pointer_start_x) as i32,
+                    y: oy + (pointer_y - pointer_start_y) as i32,
+                },
+                allocation.width(),
+                allocation.height(),
+                &gesture_screens,
+            );
+            drop(gesture_screens);
+            move_overlay_card(&window, &root, &card, &card_widget, origin);
             // The widget may have just landed on a shorter monitor than the one
             // it was sized on. Left oversized it would be stuck there: the
             // position clamp collapses that axis to a single point, so it could
@@ -8403,6 +8731,123 @@ thread_local! {
 // click-through.
 fn invalidate_input_shape_cache() {
     LAST_INPUT_SHAPE.with(|last| *last.borrow_mut() = None);
+}
+
+/// Whether to bound the compositor-visible part of the overlay to its widgets.
+///
+/// Off by default, because on GNOME it costs a black outline around every
+/// widget. Mutter skips its drop shadow for an ARGB32 window — which this
+/// overlay is — unless that window carries an X11 bounding shape, and a shaped
+/// one gets a shadow traced around every rectangle of the shape. The shadow is
+/// the compositor's own pixels, not the window's, so it never shows up in a
+/// screenshot of the overlay and only the person looking at the desk sees it.
+///
+/// Set `SYSI_VISUAL_SHAPE=1` to shape the window anyway. That is worth trying
+/// on a desktop whose compositor draws no shadow, where it keeps the
+/// compositor from processing the whole desktop-sized surface.
+fn visual_shape_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var_os("SYSI_VISUAL_SHAPE")
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "on"
+        )
+    })
+}
+
+thread_local! {
+    static LAST_VISUAL_SHAPE: RefCell<Option<Vec<ScreenRect>>> = const { RefCell::new(None) };
+}
+
+fn invalidate_visual_shape_cache() {
+    LAST_VISUAL_SHAPE.with(|last| *last.borrow_mut() = None);
+}
+
+/// Pad one visible child for shadows, then clip it to the overlay. Keeping this
+/// arithmetic separate makes the mixed-scale and off-screen edge cases cheap
+/// to test without a graphical session.
+fn padded_visual_rect(
+    rect: ScreenRect,
+    overlay_width: i32,
+    overlay_height: i32,
+    margin: i32,
+) -> Option<ScreenRect> {
+    let margin = margin.max(0);
+    let overlay_width = overlay_width.max(0);
+    let overlay_height = overlay_height.max(0);
+    let left = rect.x.saturating_sub(margin).clamp(0, overlay_width);
+    let top = rect.y.saturating_sub(margin).clamp(0, overlay_height);
+    let right = rect
+        .x
+        .saturating_add(rect.width)
+        .saturating_add(margin)
+        .clamp(0, overlay_width);
+    let bottom = rect
+        .y
+        .saturating_add(rect.height)
+        .saturating_add(margin)
+        .clamp(0, overlay_height);
+    (right > left && bottom > top).then_some(ScreenRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+/// Bound the compositor-visible part of the otherwise full-desktop RGBA
+/// window to the handful of rectangles that can actually paint anything.
+///
+/// `moving` overrides one child's allocation before GTK has completed its next
+/// layout. This is important during a drag or resize: expanding the X shape
+/// first ensures the new pixels are not clipped out of the window.
+fn refresh_visual_shape(
+    window: &gtk::ApplicationWindow,
+    root: &gtk::Fixed,
+    moving: Option<(&gtk::Widget, ScreenRect)>,
+) {
+    if !visual_shape_enabled() {
+        return;
+    }
+    let Some(gdk_window) = window.window() else {
+        invalidate_visual_shape_cache();
+        return;
+    };
+    let overlay = root.allocation();
+    let mut parts = Vec::new();
+    for child in root.children() {
+        if !child.is_visible() || !child.is_mapped() {
+            continue;
+        }
+        let allocation = child.allocation();
+        let rect = moving
+            .filter(|(widget, _)| child == **widget)
+            .map(|(_, rect)| rect)
+            .unwrap_or(ScreenRect {
+                x: allocation.x(),
+                y: allocation.y(),
+                width: allocation.width(),
+                height: allocation.height(),
+            });
+        if let Some(rect) =
+            padded_visual_rect(rect, overlay.width(), overlay.height(), VISUAL_SHAPE_MARGIN)
+        {
+            parts.push(rect);
+        }
+    }
+    if LAST_VISUAL_SHAPE.with(|last| last.borrow().as_deref() == Some(parts.as_slice())) {
+        return;
+    }
+    let region = Region::create();
+    for part in &parts {
+        let _ = region.union_rectangle(&RectangleInt::new(part.x, part.y, part.width, part.height));
+    }
+    gdk_window.shape_combine_region(Some(&region), 0, 0);
+    LAST_VISUAL_SHAPE.with(|last| *last.borrow_mut() = Some(parts));
 }
 
 fn refresh_input_shape(
@@ -8985,22 +9430,23 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        ellipsize, fit_to_work_area, fit_within_bounds, foreground_for_luminance,
-        history_row_budget, image_room, image_room_after_y, monitor_coordinate_divisor,
-        monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
-        note_search_matches, note_size_for_image, parse_panel_anchor, parse_timer_input,
-        push_recent_search, receives_input_when_locked, record_note_undo, relative_luminance,
-        reopen_point, resize_width_limit, resized_image_size, round_pixbuf_corners,
-        system_content_size, system_meter_columns, system_meter_gap, system_meter_ink_width,
-        system_meter_row_width, system_meter_rows, timer_style_size, Foreground, NoteSearchMatch,
-        NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, HISTORY_HEIGHT,
-        HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
-        NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT, NOTE_WIDTH, SYSTEM_HEIGHT,
-        SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN, SYSTEM_METER_RING,
-        SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
+        drag_frame_due, ellipsize, fit_to_work_area, fit_within_bounds, foreground_for_luminance,
+        format_rate, history_row_budget, image_room, image_room_after_y,
+        monitor_coordinate_divisor, monitor_root_bounds, normalize_monitor_rect, note_headline,
+        note_image_cap, note_search_matches, note_size_for_image, padded_visual_rect,
+        parse_panel_anchor, parse_timer_input, push_recent_search, receives_input_when_locked,
+        record_note_undo, relative_luminance, reopen_point, resize_width_limit, resized_image_size,
+        round_pixbuf_corners, system_content_size, system_meter_columns, system_meter_gap,
+        system_meter_ink_width, system_meter_row_width, system_meter_rows, system_meters,
+        system_usage_rows, temperature_meter, timer_style_size, Foreground, NoteSearchMatch,
+        NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, DRAG_REDRAW_INTERVAL,
+        HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS,
+        NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT, NOTE_WIDTH,
+        SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
+        SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
     };
     use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
-    use crate::system::SystemSnapshot;
+    use crate::system::{SystemSnapshot, Usage};
     use gdk_pixbuf::{Colorspace, Pixbuf};
     use std::{cell::RefCell, rc::Rc};
 
@@ -9014,6 +9460,77 @@ mod timer_input_tests {
         width: HISTORY_WIDTH,
         height: HISTORY_HEIGHT,
     };
+
+    #[test]
+    fn drag_redraws_are_limited_but_the_first_frame_is_immediate() {
+        let start = std::time::Instant::now();
+        assert!(drag_frame_due(None, start));
+        assert!(!drag_frame_due(
+            Some(start),
+            start + DRAG_REDRAW_INTERVAL - std::time::Duration::from_millis(1)
+        ));
+        assert!(drag_frame_due(Some(start), start + DRAG_REDRAW_INTERVAL));
+    }
+
+    #[test]
+    fn visual_shape_padding_keeps_shadows_and_stays_inside_the_overlay() {
+        assert_eq!(
+            padded_visual_rect(
+                ScreenRect {
+                    x: 20,
+                    y: 30,
+                    width: 100,
+                    height: 60,
+                },
+                400,
+                300,
+                8,
+            ),
+            Some(ScreenRect {
+                x: 12,
+                y: 22,
+                width: 116,
+                height: 76,
+            })
+        );
+        assert_eq!(
+            padded_visual_rect(
+                ScreenRect {
+                    x: -4,
+                    y: 275,
+                    width: 30,
+                    height: 40,
+                },
+                400,
+                300,
+                8,
+            ),
+            Some(ScreenRect {
+                x: 0,
+                y: 267,
+                width: 34,
+                height: 33,
+            })
+        );
+    }
+
+    #[test]
+    fn visual_shape_drops_rectangles_wholly_outside_the_overlay() {
+        assert_eq!(
+            padded_visual_rect(
+                ScreenRect {
+                    x: 500,
+                    y: 400,
+                    width: 20,
+                    height: 20,
+                },
+                400,
+                300,
+                8,
+            ),
+            None
+        );
+    }
 
     #[test]
     fn auto_color_uses_relative_luminance_with_a_stable_middle_band() {
@@ -9646,25 +10163,29 @@ mod timer_input_tests {
         let details = SystemDetails {
             cpu: true,
             ram: true,
+            swap: true,
             gpus: true,
-            root_disk: true,
-            home_disk: true,
-            processes: false,
-            cores: false,
+            cpu_temp: true,
+            ..SystemDetails::default()
         };
         let values = SystemSnapshot {
             gpus: vec![
                 crate::system::GpuSnapshot {
                     label: "RTX 4060".into(),
                     percent: 12.0,
+                    temperature: Some(43.0),
                 },
                 crate::system::GpuSnapshot {
                     label: "AMD GPU".into(),
                     percent: 4.0,
+                    temperature: Some(44.0),
                 },
             ],
-            root_disk_percent: Some(66.0),
-            home_disk_percent: Some(63.0),
+            swap: Some(Usage {
+                used_kib: 5_427_360,
+                total_kib: 16_777_212,
+            }),
+            cpu_temperature: Some(45.0),
             ..SystemSnapshot::default()
         };
         // Six meters, untouched card: two rows of three, wide enough for three.
@@ -9681,8 +10202,8 @@ mod timer_input_tests {
             system_content_size(
                 details,
                 &SystemSnapshot {
-                    root_disk_percent: Some(66.0),
-                    home_disk_percent: Some(63.0),
+                    swap: values.swap,
+                    cpu_temperature: values.cpu_temperature,
                     ..SystemSnapshot::default()
                 },
                 None
@@ -9724,6 +10245,160 @@ mod timer_input_tests {
                 height: 181
             }
         );
+    }
+
+    #[test]
+    fn the_capacity_rows_and_the_network_row_each_add_their_own_block() {
+        let values = SystemSnapshot {
+            memory: Usage {
+                used_kib: 6_000_000,
+                total_kib: 16_777_216,
+            },
+            swap: Some(Usage {
+                used_kib: 5_427_360,
+                total_kib: 16_777_212,
+            }),
+            root_disk: Some(Usage {
+                used_kib: 327_155_712,
+                total_kib: 499_122_176,
+            }),
+            ..SystemSnapshot::default()
+        };
+        let rings = SystemDetails::default();
+        let bare = system_content_size(rings, &values, Some(318)).height;
+
+        // RAM and SWAP are two rows behind one menu item.
+        let memory = SystemDetails {
+            memory_detail: true,
+            ..rings
+        };
+        assert_eq!(
+            system_usage_rows(memory, &values)
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            ["RAM", "SWAP"]
+        );
+        // The block is a gap plus a line each, and the rings give back the
+        // slack under them once something sits there.
+        assert_eq!(
+            system_content_size(memory, &values, Some(318)).height,
+            bare + 10 + 50
+        );
+
+        // A mount that answered gets a row; one that did not is not a blank.
+        let disks = SystemDetails {
+            root_disk: true,
+            home_disk: true,
+            ..rings
+        };
+        assert_eq!(
+            system_usage_rows(disks, &values)
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            ["/"]
+        );
+        assert_eq!(
+            system_content_size(disks, &values, Some(318)).height,
+            bare + 10 + 33
+        );
+
+        let network = SystemDetails {
+            network: true,
+            ..rings
+        };
+        assert_eq!(
+            system_content_size(network, &values, Some(318)).height,
+            bare + 10 + 33
+        );
+    }
+
+    #[test]
+    fn a_temperature_ring_is_filled_on_its_own_scale_and_reads_in_degrees() {
+        let meter = temperature_meter(45.0, "CPU");
+        // The unit rides on the reading rather than being repeated in every
+        // caption, where it would shrink a name such as "SAMSUNG" to fit.
+        assert_eq!(meter.text, "45\u{b0}C");
+        assert_eq!(meter.fill, 45.0);
+        assert!(!meter.hot);
+        // A sensor past the warning point colours its ring, and one past the
+        // top of the scale still stops at a full ring.
+        assert!(temperature_meter(85.0, "CPU").hot);
+        assert_eq!(temperature_meter(112.0, "CPU").fill, 100.0);
+    }
+
+    #[test]
+    fn a_machine_with_no_swap_gets_neither_a_swap_ring_nor_a_swap_row() {
+        let details = SystemDetails {
+            swap: true,
+            memory_detail: true,
+            ..SystemDetails::default()
+        };
+        let values = SystemSnapshot {
+            memory: Usage {
+                used_kib: 6_000_000,
+                total_kib: 16_777_216,
+            },
+            swap: None,
+            ..SystemSnapshot::default()
+        };
+        assert_eq!(
+            system_meters(details, &values)
+                .iter()
+                .map(|meter| meter.title.as_str())
+                .collect::<Vec<_>>(),
+            ["CPU", "RAM"]
+        );
+        assert_eq!(
+            system_usage_rows(details, &values)
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            ["RAM"]
+        );
+    }
+
+    #[test]
+    fn a_single_card_is_captioned_gpu_and_a_pair_is_captioned_by_vendor() {
+        let details = SystemDetails {
+            cpu: false,
+            ram: false,
+            gpu_temp: true,
+            ..SystemDetails::default()
+        };
+        let gpu = |label: &str, temperature| crate::system::GpuSnapshot {
+            label: label.into(),
+            percent: 0.0,
+            temperature,
+        };
+        let one = SystemSnapshot {
+            gpus: vec![gpu("NVIDIA", Some(43.0))],
+            ..SystemSnapshot::default()
+        };
+        assert_eq!(system_meters(details, &one)[0].title, "GPU");
+        let two = SystemSnapshot {
+            gpus: vec![gpu("NVIDIA", Some(43.0)), gpu("AMD", Some(44.0))],
+            ..SystemSnapshot::default()
+        };
+        let meters = system_meters(details, &two);
+        let titles: Vec<&str> = meters.iter().map(|meter| meter.title.as_str()).collect();
+        assert_eq!(titles, ["NVIDIA", "AMD"]);
+        // A card whose driver reports no temperature contributes no ring.
+        let quiet = SystemSnapshot {
+            gpus: vec![gpu("NVIDIA", None)],
+            ..SystemSnapshot::default()
+        };
+        assert!(system_meters(details, &quiet).is_empty());
+    }
+
+    #[test]
+    fn a_throughput_reads_in_the_largest_unit_that_keeps_it_meaningful() {
+        assert_eq!(format_rate(0.0), "0 B/s");
+        assert_eq!(format_rate(900.0), "900 B/s");
+        assert_eq!(format_rate(1024.0), "1 KB/s");
+        assert_eq!(format_rate(49_152.0), "48 KB/s");
+        assert_eq!(format_rate(1_258_291.2), "1.2 MB/s");
     }
 
     #[test]

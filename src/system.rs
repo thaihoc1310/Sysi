@@ -1,8 +1,10 @@
 use std::{
     collections::HashMap,
     fs, io,
-    path::Path,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Instant,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -10,25 +12,63 @@ pub struct SystemReadOptions {
     pub processes: bool,
     pub cores: bool,
     pub gpus: bool,
+    pub cpu_temp: bool,
+    pub gpu_temp: bool,
+    pub ssd_temp: bool,
     pub root_disk: bool,
     pub home_disk: bool,
+    pub network: bool,
+}
+
+/// How much of something is in use, in KiB. Both halves are kept rather than
+/// only the percentage they work out to, because "312G of 476G" is what tells
+/// the user whether there is room for one more thing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub used_kib: u64,
+    pub total_kib: u64,
+}
+
+impl Usage {
+    pub fn percent(self) -> f64 {
+        if self.total_kib == 0 {
+            return 0.0;
+        }
+        self.used_kib.min(self.total_kib) as f64 * 100.0 / self.total_kib as f64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NetworkRates {
+    pub down_bytes_per_sec: f64,
+    pub up_bytes_per_sec: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GpuSnapshot {
     pub label: String,
     pub percent: f64,
+    pub temperature: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct SystemSnapshot {
     pub cpu_percent: f64,
     pub memory_percent: f64,
+    pub memory: Usage,
+    /// `None` on a machine with no swap configured at all.
+    pub swap: Option<Usage>,
     pub gpus: Vec<GpuSnapshot>,
-    pub root_disk_percent: Option<f64>,
-    pub home_disk_percent: Option<f64>,
+    pub cpu_temperature: Option<f64>,
+    /// Drive temperatures, labelled the way they are captioned: "SSD", or
+    /// "SSD 1" and "SSD 2" once the machine has more than one.
+    pub storage_temperatures: Vec<(String, f64)>,
+    pub root_disk: Option<Usage>,
+    pub home_disk: Option<Usage>,
     pub cores: Vec<f64>,
     pub processes: Vec<ProcessSnapshot>,
+    /// `None` until a second sample exists, since a rate needs two counters.
+    pub network: Option<NetworkRates>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -49,6 +89,13 @@ pub struct SystemReader {
     /// machine with no NVIDIA driver pays for spawning a missing process every
     /// two seconds for as long as the GPU meters are on.
     nvidia_missing: bool,
+    /// The last interface counters and when they were read, which is what a
+    /// throughput rate is measured against.
+    previous_network: Option<(Instant, u64, u64)>,
+    /// Where the CPU package temperature is read from, resolved on first use.
+    /// The outer `None` means the search has not run yet; the inner one means
+    /// it ran and this machine exposes no such sensor.
+    cpu_temp_path: Option<Option<PathBuf>>,
 }
 
 impl SystemReader {
@@ -65,13 +112,8 @@ impl SystemReader {
         self.previous_total = total;
         self.previous_idle = idle;
 
-        let (total_kib, available_kib) = read_memory().unwrap_or((0, 0));
-        let used_kib = total_kib.saturating_sub(available_kib);
-        let memory_percent = if total_kib == 0 {
-            0.0
-        } else {
-            used_kib as f64 * 100.0 / total_kib as f64
-        };
+        let memory_info = read_memory().unwrap_or_default();
+        let memory_percent = memory_info.memory.percent();
         let cores = if options.cores {
             let mut result = Vec::with_capacity(cpu_lines.len().saturating_sub(1));
             for (index, (core_total, core_idle)) in cpu_lines.iter().skip(1).copied().enumerate() {
@@ -102,22 +144,75 @@ impl SystemReader {
             Vec::new()
         };
 
+        // The temperature of a card is read from the same place its load is,
+        // so the GPU readers run for either meter.
+        let gpus = if options.gpus || options.gpu_temp {
+            self.read_gpus()
+        } else {
+            Vec::new()
+        };
+        let cpu_temperature = if options.cpu_temp {
+            self.read_cpu_temperature()
+        } else {
+            None
+        };
+        let storage_temperatures = if options.ssd_temp {
+            read_storage_temperatures()
+        } else {
+            Vec::new()
+        };
+        let network = if options.network {
+            self.read_network()
+        } else {
+            // Stale counters would make the first rate after switching the row
+            // back on cover the whole time it was off.
+            self.previous_network = None;
+            None
+        };
+
         SystemSnapshot {
             cpu_percent,
             memory_percent,
-            gpus: if options.gpus {
-                self.read_gpus()
-            } else {
-                Vec::new()
-            },
-            root_disk_percent: options.root_disk.then(|| read_disk_percent("/")).flatten(),
-            home_disk_percent: options
-                .home_disk
-                .then(|| read_disk_percent("/home"))
-                .flatten(),
+            memory: memory_info.memory,
+            swap: memory_info.swap,
+            gpus,
+            cpu_temperature,
+            storage_temperatures,
+            root_disk: options.root_disk.then(|| read_disk_usage("/")).flatten(),
+            home_disk: options.home_disk.then(read_home_disk).flatten(),
             cores,
             processes,
+            network,
         }
+    }
+
+    fn read_cpu_temperature(&mut self) -> Option<f64> {
+        // Walking every hwmon chip to find the CPU is a directory scan and a
+        // handful of reads, and the answer cannot change while the machine is
+        // up. Pay for it once rather than every two seconds.
+        let path = self
+            .cpu_temp_path
+            .get_or_insert_with(find_cpu_temperature_path)
+            .clone()?;
+        read_millidegrees(&path)
+    }
+
+    fn read_network(&mut self) -> Option<NetworkRates> {
+        let (received, transmitted) = read_network_counters()?;
+        let now = Instant::now();
+        let (then, previous_received, previous_transmitted) =
+            self.previous_network
+                .replace((now, received, transmitted))?;
+        let elapsed = now.saturating_duration_since(then).as_secs_f64();
+        // Two readings from the same instant say nothing about a rate.
+        if elapsed <= 0.0 {
+            return None;
+        }
+        Some(network_rates(
+            (previous_received, previous_transmitted),
+            (received, transmitted),
+            elapsed,
+        ))
     }
 
     fn read_processes(&mut self, total_delta: u64) -> Vec<ProcessSnapshot> {
@@ -179,7 +274,7 @@ impl SystemReader {
     fn read_gpus(&mut self) -> Vec<GpuSnapshot> {
         let mut gpus = self.read_nvidia_gpus();
         gpus.extend(read_amd_gpus());
-        number_repeated_labels(&mut gpus);
+        number_repeated_labels(&mut gpus, |gpu| &mut gpu.label);
         gpus
     }
 
@@ -189,7 +284,7 @@ impl SystemReader {
         }
         let output = Command::new("nvidia-smi")
             .args([
-                "--query-gpu=index,name,utilization.gpu",
+                "--query-gpu=index,name,utilization.gpu,temperature.gpu",
                 "--format=csv,noheader,nounits",
             ])
             .stdin(Stdio::null())
@@ -214,12 +309,20 @@ impl SystemReader {
 fn parse_nvidia_gpus(raw: &str) -> Vec<GpuSnapshot> {
     raw.lines()
         .filter_map(|line| {
-            let mut fields = line.split(',').map(str::trim);
-            let _index = fields.next()?.parse::<usize>().ok()?;
-            let percent = fields.next_back()?.parse::<f64>().ok()?;
+            // Counted from the right, because a card whose name has a comma in
+            // it would otherwise shift every column along.
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            let _index = fields.first()?.parse::<usize>().ok()?;
+            let (percent, temperature) = match fields.len() {
+                0..=2 => return None,
+                3 => (fields[2], None),
+                length => (fields[length - 2], Some(fields[length - 1])),
+            };
+            let percent = percent.parse::<f64>().ok()?;
             Some(GpuSnapshot {
                 label: "NVIDIA".into(),
                 percent: percent.clamp(0.0, 100.0),
+                temperature: temperature.and_then(|value| value.parse::<f64>().ok()),
             })
         })
         .collect()
@@ -229,21 +332,24 @@ fn parse_nvidia_gpus(raw: &str) -> Vec<GpuSnapshot> {
 /// "NVIDIA GeForce RTX 4060 Laptop GPU" is no use. The vendor is what tells the
 /// two cards of a hybrid laptop apart; only a machine with two from the same
 /// vendor needs them numbered.
-fn number_repeated_labels(gpus: &mut [GpuSnapshot]) {
-    let mut totals: HashMap<&str, usize> = HashMap::new();
-    for gpu in gpus.iter() {
-        *totals.entry(gpu.label.as_str()).or_default() += 1;
+fn number_repeated_labels<T>(items: &mut [T], label: fn(&mut T) -> &mut String) {
+    let mut totals: HashMap<String, usize> = HashMap::new();
+    for item in items.iter_mut() {
+        *totals.entry(label(item).clone()).or_default() += 1;
     }
     let repeated: Vec<String> = totals
         .into_iter()
         .filter(|(_, total)| *total > 1)
-        .map(|(label, _)| label.to_owned())
+        .map(|(name, _)| name)
         .collect();
-    for label in repeated {
+    for name in repeated {
         let mut nth = 0;
-        for gpu in gpus.iter_mut().filter(|gpu| gpu.label == label) {
+        for item in items.iter_mut() {
+            if *label(item) != name {
+                continue;
+            }
             nth += 1;
-            gpu.label = format!("{label} {nth}");
+            *label(item) = format!("{name} {nth}");
         }
     }
 }
@@ -280,19 +386,44 @@ fn read_amd_gpus() -> Vec<GpuSnapshot> {
         values.push(GpuSnapshot {
             label: "AMD".into(),
             percent: percent.clamp(0.0, 100.0),
+            temperature: amd_gpu_temperature(&device),
         });
     }
     values
 }
 
-fn read_disk_percent(path: impl AsRef<Path>) -> Option<f64> {
+/// The temperature of an AMD card, read from the hwmon chip the driver hangs
+/// off the same PCI device the load percentage comes from.
+fn amd_gpu_temperature(device: &Path) -> Option<f64> {
+    sorted_dirs(&device.join("hwmon"))
+        .iter()
+        // "edge" is the die's outside; "junction" is its hottest spot, which is
+        // what a card without an edge sensor reports instead.
+        .find_map(|dir| hwmon_temperature_path(dir, &["edge", "junction"]))
+        .as_deref()
+        .and_then(read_millidegrees)
+}
+
+fn read_disk_usage(path: impl AsRef<Path>) -> Option<Usage> {
     let path = path.as_ref();
     let total = fs2::total_space(path).ok()?;
     let available = fs2::available_space(path).ok()?;
     if total == 0 {
         return None;
     }
-    Some((total.saturating_sub(available)) as f64 * 100.0 / total as f64)
+    Some(Usage {
+        used_kib: total.saturating_sub(available) / 1024,
+        total_kib: total / 1024,
+    })
+}
+
+fn read_home_disk() -> Option<Usage> {
+    // A single-partition install keeps /home inside /, where a second row
+    // would repeat the first one byte for byte.
+    if fs::metadata("/home").ok()?.dev() == fs::metadata("/").ok()?.dev() {
+        return None;
+    }
+    read_disk_usage("/home")
 }
 
 fn read_cpu_lines() -> Option<Vec<(u64, u64)>> {
@@ -316,19 +447,337 @@ fn read_cpu_lines() -> Option<Vec<(u64, u64)>> {
     (!result.is_empty()).then_some(result)
 }
 
-fn read_memory() -> Option<(u64, u64)> {
-    let raw = fs::read_to_string("/proc/meminfo").ok()?;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MemoryInfo {
+    memory: Usage,
+    swap: Option<Usage>,
+}
+
+fn read_memory() -> Option<MemoryInfo> {
+    parse_memory(&fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+fn parse_memory(raw: &str) -> Option<MemoryInfo> {
     let mut total = None;
     let mut available = None;
+    let mut swap_total: Option<u64> = None;
+    let mut swap_free: Option<u64> = None;
     for line in raw.lines() {
         let mut bits = line.split_whitespace();
-        match bits.next()? {
+        let Some(key) = bits.next() else {
+            continue;
+        };
+        match key {
             "MemTotal:" => total = bits.next().and_then(|v| v.parse().ok()),
             "MemAvailable:" => available = bits.next().and_then(|v| v.parse().ok()),
+            "SwapTotal:" => swap_total = bits.next().and_then(|v| v.parse().ok()),
+            "SwapFree:" => swap_free = bits.next().and_then(|v| v.parse().ok()),
             _ => {}
         }
     }
-    Some((total?, available?))
+    let total: u64 = total?;
+    let available: u64 = available?;
+    Some(MemoryInfo {
+        memory: Usage {
+            used_kib: total.saturating_sub(available),
+            total_kib: total,
+        },
+        // A machine with swap turned off reports a zero rather than nothing at
+        // all, and "0% of nothing" is not a meter worth the room.
+        swap: match (swap_total, swap_free) {
+            (Some(swap_total), Some(swap_free)) if swap_total > 0 => Some(Usage {
+                used_kib: swap_total.saturating_sub(swap_free),
+                total_kib: swap_total,
+            }),
+            _ => None,
+        },
+    })
+}
+
+/// The chips that speak for the CPU package, in the order they are preferred,
+/// with the sensor label to look for on each. Intel exposes `coretemp` and AMD
+/// `k10temp`, so at most one of these is present on a given machine.
+const CPU_TEMP_CHIPS: [(&str, &[&str]); 3] = [
+    ("coretemp", &["Package id 0"]),
+    ("k10temp", &["Tctl", "Tdie"]),
+    ("zenpower", &["Tdie"]),
+];
+
+fn find_cpu_temperature_path() -> Option<PathBuf> {
+    let chips = sorted_dirs(Path::new("/sys/class/hwmon"));
+    for (name, labels) in CPU_TEMP_CHIPS {
+        for chip in &chips {
+            if hwmon_name(chip).as_deref() != Some(name) {
+                continue;
+            }
+            if let Some(path) = hwmon_temperature_path(chip, labels) {
+                return Some(path);
+            }
+        }
+    }
+    // No chip of the CPU's own: fall back to whichever ACPI thermal zone
+    // speaks for the package, which is all a virtual machine tends to offer.
+    thermal_zone_path(&["x86_pkg_temp", "acpitz"])
+}
+
+fn read_storage_temperatures() -> Vec<(String, f64)> {
+    let mut values = Vec::new();
+    for chip in sorted_dirs(Path::new("/sys/class/hwmon")) {
+        // `nvme` is the drive's own sensor; `drivetemp` is SATA SMART.
+        if !matches!(hwmon_name(&chip).as_deref(), Some("nvme" | "drivetemp")) {
+            continue;
+        }
+        let Some(value) = hwmon_temperature_path(&chip, &["Composite"])
+            .as_deref()
+            .and_then(read_millidegrees)
+        else {
+            continue;
+        };
+        // "SSD 1" and "SSD 2" say nothing about which drive is which. The
+        // vendor is what the owner of the machine knows them by, and it fits
+        // in a caption where a full model name never would. A drive whose
+        // maker cannot be named still gets its size, which at least tells two
+        // drives apart.
+        let model = fs::read_to_string(chip.join("device/model")).unwrap_or_default();
+        let label = drive_vendor(&model)
+            .or_else(|| drive_capacity_bytes(&chip).map(format_drive_capacity))
+            .unwrap_or_else(|| "SSD".to_owned());
+        values.push((label, value));
+    }
+    number_repeated_labels(&mut values, |value| &mut value.0);
+    values
+}
+
+/// The maker of a drive, out of the free-form model string its firmware
+/// reports. The name can sit anywhere in there — "UMIS RPJYJ512MKN1QWY" leads
+/// with it, "PM981a NVMe Samsung 1024GB" buries it in the middle — so the
+/// vendors worth naming are looked for wherever they appear. A drive from
+/// anyone else falls back to the first word of its model that is not
+/// boilerplate, which is usually its product line.
+fn drive_vendor(model: &str) -> Option<String> {
+    // Left of each pair is what firmware writes, right is what goes in a
+    // caption 34 pixels wide.
+    const VENDORS: &[(&str, &str)] = &[
+        ("SAMSUNG", "SAMSUNG"),
+        ("WESTERN DIGITAL", "WD"),
+        ("WDC", "WD"),
+        ("SANDISK", "SANDISK"),
+        ("SEAGATE", "SEAGATE"),
+        ("KINGSTON", "KINGSTON"),
+        ("CRUCIAL", "CRUCIAL"),
+        ("MICRON", "MICRON"),
+        ("SOLIDIGM", "SOLIDIGM"),
+        ("INTEL", "INTEL"),
+        ("SK HYNIX", "HYNIX"),
+        ("HYNIX", "HYNIX"),
+        ("KIOXIA", "KIOXIA"),
+        ("TOSHIBA", "TOSHIBA"),
+        ("UMIS", "UMIS"),
+        ("ADATA", "ADATA"),
+        ("LEXAR", "LEXAR"),
+        ("TRANSCEND", "TRANSCEND"),
+        ("CORSAIR", "CORSAIR"),
+        ("SABRENT", "SABRENT"),
+        ("NETAC", "NETAC"),
+        ("PATRIOT", "PATRIOT"),
+        ("TEAMGROUP", "TEAM"),
+        ("SILICON POWER", "SILICON"),
+        ("APACER", "APACER"),
+        ("KIMTIGO", "KIMTIGO"),
+        ("HIKVISION", "HIKVISION"),
+        ("PNY", "PNY"),
+        ("HGST", "HGST"),
+    ];
+    let upper = model.trim().to_ascii_uppercase();
+    if upper.is_empty() {
+        return None;
+    }
+    if let Some((_, label)) = VENDORS.iter().find(|(pattern, _)| upper.contains(pattern)) {
+        return Some((*label).to_owned());
+    }
+    // Words that describe the interface rather than the drive, and bare
+    // capacities, are no use as a name.
+    const BOILERPLATE: &[&str] = &[
+        "NVME", "SSD", "HDD", "SATA", "PCIE", "DISK", "DRIVE", "SOLID", "STATE", "M.2",
+    ];
+    upper
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphanumeric()))
+        .find(|word| {
+            word.len() >= 3
+                && !BOILERPLATE.contains(word)
+                && !word.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        // A product line can run long enough to be unreadable once the caption
+        // shrinks to fit; the first characters are the recognisable part.
+        .map(|word| word.chars().take(8).collect())
+}
+
+/// How big the drive behind a temperature sensor is. SATA hangs its block
+/// device off a `block` directory, while an NVMe namespace sits directly
+/// inside the controller, so both places are searched.
+fn drive_capacity_bytes(chip: &Path) -> Option<u64> {
+    let device = chip.join("device");
+    let namespace = sorted_dirs(&device.join("block"))
+        .into_iter()
+        .chain(sorted_dirs(&device))
+        .find(|dir| dir.join("size").is_file())?;
+    // `size` counts 512-byte sectors whatever block size the drive itself
+    // reports, which is the one part of this that never varies.
+    let sectors: u64 = fs::read_to_string(namespace.join("size"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (sectors > 0).then(|| sectors.saturating_mul(512))
+}
+
+/// A drive's size the way it was sold, in as few characters as a ring caption
+/// can hold. Decimal units on purpose: the 1024GB NVMe on the desk this was
+/// written for holds 1.02e12 bytes, which is "1TB" to its owner and a
+/// meaningless "954G" in the binary units memory is measured in.
+fn format_drive_capacity(bytes: u64) -> String {
+    let terabytes = bytes as f64 / 1e12;
+    if terabytes >= 1.0 {
+        let rounded = (terabytes * 10.0).round() / 10.0;
+        if rounded.fract() == 0.0 {
+            format!("{rounded:.0}TB")
+        } else {
+            format!("{rounded:.1}TB")
+        }
+    } else {
+        format!("{:.0}G", bytes as f64 / 1e9)
+    }
+}
+
+/// Every directory inside `parent`, ordered by the number their name ends in
+/// so `hwmon2` comes before `hwmon10`. The kernel hands them over in whatever
+/// order the drivers loaded, which would otherwise let the two NVMe drives of
+/// a laptop swap captions between one sample and the next.
+fn sorted_dirs(parent: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    dirs.sort_by_key(|dir| {
+        let name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let number = name
+            .trim_start_matches(|character: char| !character.is_ascii_digit())
+            .parse::<u64>()
+            .unwrap_or(u64::MAX);
+        (number, name)
+    });
+    dirs
+}
+
+fn hwmon_name(chip: &Path) -> Option<String> {
+    Some(
+        fs::read_to_string(chip.join("name"))
+            .ok()?
+            .trim()
+            .to_owned(),
+    )
+}
+
+/// The `tempN_input` this chip labels as one of `labels`, or its first sensor
+/// when it labels nothing the caller asked for. `k10temp` files the package
+/// reading under "Tctl" and an NVMe drive calls the one that matters
+/// "Composite"; both also happen to be `temp1`, but only by convention.
+fn hwmon_temperature_path(chip: &Path, labels: &[&str]) -> Option<PathBuf> {
+    for index in 1..=MAX_HWMON_SENSORS {
+        let Ok(label) = fs::read_to_string(chip.join(format!("temp{index}_label"))) else {
+            continue;
+        };
+        if labels
+            .iter()
+            .any(|wanted| wanted.eq_ignore_ascii_case(label.trim()))
+        {
+            let input = chip.join(format!("temp{index}_input"));
+            if input.exists() {
+                return Some(input);
+            }
+        }
+    }
+    let first = chip.join("temp1_input");
+    first.exists().then_some(first)
+}
+
+/// How many sensors one chip is searched for. Well past what any consumer chip
+/// exposes, and it costs a failed `open` per miss rather than a directory scan.
+const MAX_HWMON_SENSORS: u32 = 16;
+
+fn thermal_zone_path(types: &[&str]) -> Option<PathBuf> {
+    let zones = sorted_dirs(Path::new("/sys/class/thermal"));
+    for wanted in types {
+        for zone in &zones {
+            let matches = fs::read_to_string(zone.join("type"))
+                .is_ok_and(|found| found.trim().eq_ignore_ascii_case(wanted));
+            if matches {
+                return Some(zone.join("temp"));
+            }
+        }
+    }
+    None
+}
+
+fn read_millidegrees(path: &Path) -> Option<f64> {
+    let raw = fs::read_to_string(path).ok()?;
+    let millidegrees = raw.trim().parse::<f64>().ok()?;
+    // Sensors report thousandths of a degree. A zero is a driver that has not
+    // taken a reading yet rather than a component at freezing point.
+    (millidegrees > 0.0).then_some(millidegrees / 1000.0)
+}
+
+fn read_network_counters() -> Option<(u64, u64)> {
+    let raw = fs::read_to_string("/proc/net/dev").ok()?;
+    Some(parse_network_counters(&raw, |name| {
+        // Only a real device has one. Loopback, bridges, and the interfaces
+        // Docker and a VPN put up all carry bytes that a physical interface is
+        // already counting.
+        Path::new("/sys/class/net")
+            .join(name)
+            .join("device")
+            .exists()
+    }))
+}
+
+fn parse_network_counters(raw: &str, is_physical: impl Fn(&str) -> bool) -> (u64, u64) {
+    let mut received = 0u64;
+    let mut transmitted = 0u64;
+    for line in raw.lines() {
+        let Some((name, counters)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || !is_physical(name) {
+            continue;
+        }
+        let fields: Vec<u64> = counters
+            .split_whitespace()
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        // Received bytes is the first column of the row, transmitted the ninth.
+        let (Some(rx), Some(tx)) = (fields.first(), fields.get(8)) else {
+            continue;
+        };
+        received = received.saturating_add(*rx);
+        transmitted = transmitted.saturating_add(*tx);
+    }
+    (received, transmitted)
+}
+
+fn network_rates(previous: (u64, u64), current: (u64, u64), elapsed_seconds: f64) -> NetworkRates {
+    // An interface that went away takes its share of the total with it, so a
+    // counter can fall. That is a gap in the measurement, not negative
+    // traffic.
+    NetworkRates {
+        down_bytes_per_sec: current.0.saturating_sub(previous.0) as f64 / elapsed_seconds,
+        up_bytes_per_sec: current.1.saturating_sub(previous.1) as f64 / elapsed_seconds,
+    }
 }
 
 fn read_process_stat(pid: u32) -> Option<(String, u64)> {
@@ -402,8 +851,9 @@ fn parse_process_memory_statm(raw: &str, page_kib: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        number_repeated_labels, parse_nvidia_gpus, parse_process_memory_statm,
-        process_name_from_cmdline, sort_processes, GpuSnapshot, ProcessSnapshot,
+        drive_vendor, format_drive_capacity, network_rates, number_repeated_labels, parse_memory,
+        parse_network_counters, parse_nvidia_gpus, parse_process_memory_statm,
+        process_name_from_cmdline, sort_processes, GpuSnapshot, ProcessSnapshot, Usage,
     };
 
     #[test]
@@ -503,13 +953,107 @@ mod tests {
     #[test]
     fn nvidia_csv_keeps_every_gpu_and_clamps_what_the_driver_reports() {
         let values = parse_nvidia_gpus(
-            "0, NVIDIA GeForce RTX 4060 Laptop GPU, 57\n1, NVIDIA GTX 1080, 101\n",
+            "0, NVIDIA GeForce RTX 4060 Laptop GPU, 57, 43\n1, NVIDIA GTX 1080, 101, 62\n",
         );
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].percent, 57.0);
+        assert_eq!(values[0].temperature, Some(43.0));
         assert_eq!(values[1].percent, 100.0);
+        assert_eq!(values[1].temperature, Some(62.0));
+        // A driver too old to answer for the temperature still reports a load.
+        let older = parse_nvidia_gpus("0, NVIDIA GTX 1080, 12\n");
+        assert_eq!(older[0].percent, 12.0);
+        assert_eq!(older[0].temperature, None);
         // A line the driver mangled is skipped rather than shown as zero.
         assert!(parse_nvidia_gpus("nvidia-smi: command failed\n").is_empty());
+    }
+
+    #[test]
+    fn meminfo_gives_both_halves_of_memory_and_swap() {
+        let raw = "MemTotal:       16777216 kB\n\
+                   MemFree:         1000000 kB\n\
+                   MemAvailable:   10777216 kB\n\
+                   SwapTotal:      16777212 kB\n\
+                   SwapFree:       11349852 kB\n";
+        let info = parse_memory(raw).expect("meminfo should parse");
+        assert_eq!(
+            info.memory,
+            Usage {
+                used_kib: 6_000_000,
+                total_kib: 16_777_216
+            }
+        );
+        assert_eq!(
+            info.swap,
+            Some(Usage {
+                used_kib: 5_427_360,
+                total_kib: 16_777_212
+            })
+        );
+    }
+
+    #[test]
+    fn a_machine_with_swap_turned_off_reports_no_swap_at_all() {
+        // Zero of zero would draw a full-looking meter out of nothing.
+        let raw = "MemTotal:       16777216 kB\n\
+                   MemAvailable:   10777216 kB\n\
+                   SwapTotal:             0 kB\n\
+                   SwapFree:              0 kB\n";
+        assert_eq!(parse_memory(raw).expect("meminfo should parse").swap, None);
+        // An old kernel that lists no swap lines at all is the same answer.
+        let raw = "MemTotal: 16777216 kB\nMemAvailable: 10777216 kB\n";
+        assert_eq!(parse_memory(raw).expect("meminfo should parse").swap, None);
+    }
+
+    #[test]
+    fn usage_percent_never_exceeds_a_full_meter() {
+        assert_eq!(
+            Usage {
+                used_kib: 50,
+                total_kib: 200
+            }
+            .percent(),
+            25.0
+        );
+        // A filesystem whose reserved blocks are in use reports more used than
+        // there is room for; the ring still stops at full.
+        assert_eq!(
+            Usage {
+                used_kib: 300,
+                total_kib: 200
+            }
+            .percent(),
+            100.0
+        );
+        assert_eq!(Usage::default().percent(), 0.0);
+    }
+
+    #[test]
+    fn network_counters_come_from_the_physical_interfaces_only() {
+        // Verbatim shape of /proc/net/dev: the two header lines, then one row
+        // per interface with sixteen counters.
+        let raw = "Inter-|   Receive                    |  Transmit\n\
+                    face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n\
+                        lo: 4605869 17104 0 0 0 0 0 0 4605869 17104 0 0 0 0 0 0\n\
+                    wlp3s0: 1000 10 0 0 0 0 0 0 2000 20 0 0 0 0 0 0\n\
+                   docker0: 9999 99 0 0 0 0 0 0 9999 99 0 0 0 0 0 0\n\
+                    enp2s0: 300 3 0 0 0 0 0 0 400 4 0 0 0 0 0 0\n";
+        // Loopback and the Docker bridge carry bytes a real interface already
+        // counted, so counting them would report a download as twice its size.
+        let physical = |name: &str| name == "wlp3s0" || name == "enp2s0";
+        assert_eq!(parse_network_counters(raw, physical), (1300, 2400));
+    }
+
+    #[test]
+    fn a_throughput_rate_is_the_change_over_the_time_between_samples() {
+        let rates = network_rates((1_000, 2_000), (3_048, 2_512), 2.0);
+        assert_eq!(rates.down_bytes_per_sec, 1024.0);
+        assert_eq!(rates.up_bytes_per_sec, 256.0);
+        // An interface that was unplugged between samples takes its bytes out
+        // of the total. That is a gap in the measurement, not negative traffic.
+        let rates = network_rates((9_000, 9_000), (1_000, 1_000), 2.0);
+        assert_eq!(rates.down_bytes_per_sec, 0.0);
+        assert_eq!(rates.up_bytes_per_sec, 0.0);
     }
 
     #[test]
@@ -517,17 +1061,71 @@ mod tests {
         let gpu = |label: &str| GpuSnapshot {
             label: label.into(),
             percent: 0.0,
+            temperature: None,
         };
         // The hybrid laptop this was written for: one of each, no numbering.
         let mut mixed = vec![gpu("NVIDIA"), gpu("AMD")];
-        number_repeated_labels(&mut mixed);
+        number_repeated_labels(&mut mixed, |gpu| &mut gpu.label);
         assert_eq!(mixed[0].label, "NVIDIA");
         assert_eq!(mixed[1].label, "AMD");
 
         let mut alike = vec![gpu("NVIDIA"), gpu("NVIDIA"), gpu("AMD")];
-        number_repeated_labels(&mut alike);
+        number_repeated_labels(&mut alike, |gpu| &mut gpu.label);
         assert_eq!(alike[0].label, "NVIDIA 1");
         assert_eq!(alike[1].label, "NVIDIA 2");
         assert_eq!(alike[2].label, "AMD");
+
+        // Two drives from the same maker are told apart the same way, and a
+        // mixed pair needs no numbering at all.
+        let mut alike = vec![("SAMSUNG".to_owned(), 45.0), ("SAMSUNG".to_owned(), 39.0)];
+        number_repeated_labels(&mut alike, |drive| &mut drive.0);
+        assert_eq!(alike[0].0, "SAMSUNG 1");
+        assert_eq!(alike[1].0, "SAMSUNG 2");
+
+        let mut different = vec![("SAMSUNG".to_owned(), 45.0), ("UMIS".to_owned(), 39.0)];
+        number_repeated_labels(&mut different, |drive| &mut drive.0);
+        assert_eq!(different[0].0, "SAMSUNG");
+        assert_eq!(different[1].0, "UMIS");
+    }
+
+    #[test]
+    fn a_drive_is_captioned_with_the_maker_named_anywhere_in_its_model() {
+        // Both drives on the desk this was written for, verbatim including the
+        // padding the firmware reports.
+        assert_eq!(
+            drive_vendor("PM981a NVMe Samsung 1024GB              ").as_deref(),
+            Some("SAMSUNG")
+        );
+        assert_eq!(
+            drive_vendor("UMIS RPJYJ512MKN1QWY                    ").as_deref(),
+            Some("UMIS")
+        );
+        // A name too long for the caption is the one place a shorter form is
+        // worth keeping.
+        assert_eq!(
+            drive_vendor("WDC WDS500G2B0A-00SM50").as_deref(),
+            Some("WD")
+        );
+        // Nobody recognisable: the product line is still better than "SSD".
+        assert_eq!(drive_vendor("T-FORCE Z440 1TB").as_deref(), Some("T-FORCE"));
+        // The interface is not a name, so it is skipped in favour of what
+        // follows it.
+        assert_eq!(drive_vendor("NVMe BC711 512GB").as_deref(), Some("BC711"));
+        // Nothing to go on falls through to the size instead.
+        assert_eq!(drive_vendor("   "), None);
+        assert_eq!(drive_vendor("SSD 256"), None);
+    }
+
+    #[test]
+    fn a_drive_is_captioned_with_the_size_it_was_sold_as() {
+        // Both drives on the desk this was written for, in the sectors their
+        // `size` files report.
+        assert_eq!(format_drive_capacity(2_000_409_264 * 512), "1TB");
+        assert_eq!(format_drive_capacity(1_000_215_216 * 512), "512G");
+        // A drive whose size lands between the round numbers keeps one decimal
+        // rather than rounding away half a terabyte.
+        assert_eq!(format_drive_capacity(1_500_000_000_000), "1.5TB");
+        assert_eq!(format_drive_capacity(2_048_408_248_320), "2TB");
+        assert_eq!(format_drive_capacity(250_059_350_016), "250G");
     }
 }
