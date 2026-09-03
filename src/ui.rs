@@ -2110,12 +2110,10 @@ fn system_meters(details: SystemDetails, values: &SystemSnapshot) -> Vec<SystemM
         }
     }
     if details.gpus {
-        meters.extend(
-            values
-                .gpus
-                .iter()
-                .map(|gpu| percent_meter(gpu.percent, &gpu.label)),
-        );
+        meters.extend(values.gpus.iter().filter_map(|gpu| {
+            gpu.percent
+                .map(|percent| percent_meter(percent, &gpu.label))
+        }));
     }
     // Temperatures come after every load, so switching them on never moves the
     // rings the card already had.
@@ -10172,12 +10170,12 @@ mod timer_input_tests {
             gpus: vec![
                 crate::system::GpuSnapshot {
                     label: "RTX 4060".into(),
-                    percent: 12.0,
+                    percent: Some(12.0),
                     temperature: Some(43.0),
                 },
                 crate::system::GpuSnapshot {
                     label: "AMD GPU".into(),
-                    percent: 4.0,
+                    percent: Some(4.0),
                     temperature: Some(44.0),
                 },
             ],
@@ -10369,7 +10367,7 @@ mod timer_input_tests {
         };
         let gpu = |label: &str, temperature| crate::system::GpuSnapshot {
             label: label.into(),
-            percent: 0.0,
+            percent: Some(0.0),
             temperature,
         };
         let one = SystemSnapshot {
@@ -10390,6 +10388,27 @@ mod timer_input_tests {
             ..SystemSnapshot::default()
         };
         assert!(system_meters(details, &quiet).is_empty());
+        // Nor does a card with no load contribute a load ring, which is the
+        // same card from the other side.
+        let loadless = SystemSnapshot {
+            gpus: vec![crate::system::GpuSnapshot {
+                label: "NVIDIA".into(),
+                percent: None,
+                temperature: Some(43.0),
+            }],
+            ..SystemSnapshot::default()
+        };
+        assert_eq!(
+            system_meters(
+                SystemDetails {
+                    gpus: true,
+                    ..details
+                },
+                &loadless
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]

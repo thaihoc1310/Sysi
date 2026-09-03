@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     fs, io,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Instant,
@@ -47,7 +46,9 @@ pub struct NetworkRates {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GpuSnapshot {
     pub label: String,
-    pub percent: f64,
+    /// `None` on a card whose driver answers for its temperature but not its
+    /// load, which is all a passthrough card or an older AMD driver offers.
+    pub percent: Option<f64>,
     pub temperature: Option<f64>,
 }
 
@@ -96,6 +97,20 @@ pub struct SystemReader {
     /// The outer `None` means the search has not run yet; the inner one means
     /// it ran and this machine exposes no such sensor.
     cpu_temp_path: Option<Option<PathBuf>>,
+    /// The drive sensors and the caption each one earned, resolved on first
+    /// use. Kept for the same reason as `cpu_temp_path`, and for one more: a
+    /// caption worked out afresh every two seconds would renumber a pair of
+    /// same-vendor drives the moment one of their sensors missed a read.
+    /// `None` means the search has not run, and an empty list means it ran and
+    /// found nothing worth watching.
+    drive_sensors: Option<Vec<DriveSensor>>,
+}
+
+/// One drive's temperature sensor: where to read it, and what to call it.
+#[derive(Clone, Debug)]
+struct DriveSensor {
+    label: String,
+    path: PathBuf,
 }
 
 impl SystemReader {
@@ -157,7 +172,7 @@ impl SystemReader {
             None
         };
         let storage_temperatures = if options.ssd_temp {
-            read_storage_temperatures()
+            self.read_storage_temperatures()
         } else {
             Vec::new()
         };
@@ -195,6 +210,23 @@ impl SystemReader {
             .get_or_insert_with(find_cpu_temperature_path)
             .clone()?;
         read_millidegrees(&path)
+    }
+
+    fn read_storage_temperatures(&mut self) -> Vec<(String, f64)> {
+        // Cheap enough to retry while nothing has turned up: a machine with no
+        // drive sensor at all is also a machine where this walk finds nothing
+        // to open. Once a sensor exists it is remembered, so each sample after
+        // that is one file read per drive.
+        let sensors = match &self.drive_sensors {
+            Some(sensors) if !sensors.is_empty() => sensors,
+            _ => self.drive_sensors.insert(find_drive_sensors()),
+        };
+        sensors
+            .iter()
+            .filter_map(|sensor| {
+                read_millidegrees(&sensor.path).map(|value| (sensor.label.clone(), value))
+            })
+            .collect()
     }
 
     fn read_network(&mut self) -> Option<NetworkRates> {
@@ -318,11 +350,15 @@ fn parse_nvidia_gpus(raw: &str) -> Vec<GpuSnapshot> {
                 3 => (fields[2], None),
                 length => (fields[length - 2], Some(fields[length - 1])),
             };
-            let percent = percent.parse::<f64>().ok()?;
-            Some(GpuSnapshot {
+            // A driver that answers "[N/A]" for one column still means what it
+            // says in the other, so neither reading is allowed to take the
+            // card's whole row down with it.
+            let percent = percent.parse::<f64>().ok().map(clamp_percent);
+            let temperature = temperature.and_then(|value| value.parse::<f64>().ok());
+            (percent.is_some() || temperature.is_some()).then(|| GpuSnapshot {
                 label: "NVIDIA".into(),
-                percent: percent.clamp(0.0, 100.0),
-                temperature: temperature.and_then(|value| value.parse::<f64>().ok()),
+                percent,
+                temperature,
             })
         })
         .collect()
@@ -354,6 +390,10 @@ fn number_repeated_labels<T>(items: &mut [T], label: fn(&mut T) -> &mut String) 
     }
 }
 
+fn clamp_percent(value: f64) -> f64 {
+    value.clamp(0.0, 100.0)
+}
+
 fn read_amd_gpus() -> Vec<GpuSnapshot> {
     let Ok(entries) = fs::read_dir("/sys/class/drm") else {
         return Vec::new();
@@ -377,16 +417,20 @@ fn read_amd_gpus() -> Vec<GpuSnapshot> {
         {
             continue;
         }
-        let Some(percent) = fs::read_to_string(device.join("gpu_busy_percent"))
+        // `gpu_busy_percent` is missing on the older drivers and on some
+        // APUs; the card's temperature is still worth a ring on its own.
+        let percent = fs::read_to_string(device.join("gpu_busy_percent"))
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
-        else {
+            .map(clamp_percent);
+        let temperature = amd_gpu_temperature(&device);
+        if percent.is_none() && temperature.is_none() {
             continue;
-        };
+        }
         values.push(GpuSnapshot {
             label: "AMD".into(),
-            percent: percent.clamp(0.0, 100.0),
-            temperature: amd_gpu_temperature(&device),
+            percent,
+            temperature,
         });
     }
     values
@@ -418,12 +462,21 @@ fn read_disk_usage(path: impl AsRef<Path>) -> Option<Usage> {
 }
 
 fn read_home_disk() -> Option<Usage> {
-    // A single-partition install keeps /home inside /, where a second row
-    // would repeat the first one byte for byte.
-    if fs::metadata("/home").ok()?.dev() == fs::metadata("/").ok()?.dev() {
-        return None;
-    }
-    read_disk_usage("/home")
+    home_disk_row(read_disk_usage("/"), read_disk_usage("/home")?)
+}
+
+/// Whether /home has earned a row of its own.
+///
+/// A single-partition install keeps /home inside /, where a second row would
+/// repeat the first one byte for byte. The device number cannot answer this:
+/// btrfs hands every subvolume its own, so the root and home subvolumes of a
+/// stock Fedora or openSUSE install look like two filesystems while reporting
+/// one pool of space. What they cannot disguise is being the same pool, so
+/// that is what gets compared. Two genuinely separate mounts agreeing on both
+/// their total and their free space down to the kibibyte is not a case worth
+/// planning around.
+fn home_disk_row(root: Option<Usage>, home: Usage) -> Option<Usage> {
+    (root != Some(home)).then_some(home)
 }
 
 fn read_cpu_lines() -> Option<Vec<(u64, u64)>> {
@@ -520,17 +573,14 @@ fn find_cpu_temperature_path() -> Option<PathBuf> {
     thermal_zone_path(&["x86_pkg_temp", "acpitz"])
 }
 
-fn read_storage_temperatures() -> Vec<(String, f64)> {
-    let mut values = Vec::new();
+fn find_drive_sensors() -> Vec<DriveSensor> {
+    let mut sensors = Vec::new();
     for chip in sorted_dirs(Path::new("/sys/class/hwmon")) {
         // `nvme` is the drive's own sensor; `drivetemp` is SATA SMART.
         if !matches!(hwmon_name(&chip).as_deref(), Some("nvme" | "drivetemp")) {
             continue;
         }
-        let Some(value) = hwmon_temperature_path(&chip, &["Composite"])
-            .as_deref()
-            .and_then(read_millidegrees)
-        else {
+        let Some(path) = hwmon_temperature_path(&chip, &["Composite"]) else {
             continue;
         };
         // "SSD 1" and "SSD 2" say nothing about which drive is which. The
@@ -542,10 +592,10 @@ fn read_storage_temperatures() -> Vec<(String, f64)> {
         let label = drive_vendor(&model)
             .or_else(|| drive_capacity_bytes(&chip).map(format_drive_capacity))
             .unwrap_or_else(|| "SSD".to_owned());
-        values.push((label, value));
+        sensors.push(DriveSensor { label, path });
     }
-    number_repeated_labels(&mut values, |value| &mut value.0);
-    values
+    number_repeated_labels(&mut sensors, |sensor| &mut sensor.label);
+    sensors
 }
 
 /// The maker of a drive, out of the free-form model string its firmware
@@ -851,8 +901,8 @@ fn parse_process_memory_statm(raw: &str, page_kib: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        drive_vendor, format_drive_capacity, network_rates, number_repeated_labels, parse_memory,
-        parse_network_counters, parse_nvidia_gpus, parse_process_memory_statm,
+        drive_vendor, format_drive_capacity, home_disk_row, network_rates, number_repeated_labels,
+        parse_memory, parse_network_counters, parse_nvidia_gpus, parse_process_memory_statm,
         process_name_from_cmdline, sort_processes, GpuSnapshot, ProcessSnapshot, Usage,
     };
 
@@ -956,16 +1006,45 @@ mod tests {
             "0, NVIDIA GeForce RTX 4060 Laptop GPU, 57, 43\n1, NVIDIA GTX 1080, 101, 62\n",
         );
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0].percent, 57.0);
+        assert_eq!(values[0].percent, Some(57.0));
         assert_eq!(values[0].temperature, Some(43.0));
-        assert_eq!(values[1].percent, 100.0);
+        assert_eq!(values[1].percent, Some(100.0));
         assert_eq!(values[1].temperature, Some(62.0));
         // A driver too old to answer for the temperature still reports a load.
         let older = parse_nvidia_gpus("0, NVIDIA GTX 1080, 12\n");
-        assert_eq!(older[0].percent, 12.0);
+        assert_eq!(older[0].percent, Some(12.0));
         assert_eq!(older[0].temperature, None);
-        // A line the driver mangled is skipped rather than shown as zero.
+        // "[N/A]" in one column does not take the other one down with it: a
+        // card that knows its temperature and not its load keeps the reading
+        // it has, and vice versa.
+        let hot = parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], 51\n");
+        assert_eq!(hot[0].percent, None);
+        assert_eq!(hot[0].temperature, Some(51.0));
+        let busy = parse_nvidia_gpus("0, NVIDIA RTX A2000, 34, [N/A]\n");
+        assert_eq!(busy[0].percent, Some(34.0));
+        assert_eq!(busy[0].temperature, None);
+        // A line with nothing usable in either column is skipped rather than
+        // shown as zero.
+        assert!(parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], [N/A]\n").is_empty());
         assert!(parse_nvidia_gpus("nvidia-smi: command failed\n").is_empty());
+    }
+
+    #[test]
+    fn home_earns_a_row_only_when_it_is_not_the_same_pool_of_space_as_root() {
+        let root = Usage {
+            used_kib: 40_000_000,
+            total_kib: 192_000_000,
+        };
+        // The stock Fedora layout: two btrfs subvolumes, two device numbers,
+        // one pool. It reports itself twice and must be shown once.
+        assert_eq!(home_disk_row(Some(root), root), None);
+        let home = Usage {
+            used_kib: 97_000_000,
+            total_kib: 915_000_000,
+        };
+        assert_eq!(home_disk_row(Some(root), home), Some(home));
+        // Nothing to compare against is no reason to drop the row.
+        assert_eq!(home_disk_row(None, home), Some(home));
     }
 
     #[test]
@@ -1060,7 +1139,7 @@ mod tests {
     fn two_cards_from_the_same_vendor_are_numbered_and_a_mixed_pair_is_not() {
         let gpu = |label: &str| GpuSnapshot {
             label: label.into(),
-            percent: 0.0,
+            percent: Some(0.0),
             temperature: None,
         };
         // The hybrid laptop this was written for: one of each, no numbering.
