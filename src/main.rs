@@ -3,6 +3,7 @@ mod state;
 mod system;
 mod translate;
 mod ui;
+mod usage;
 
 use fs2::FileExt;
 use gtk::prelude::*;

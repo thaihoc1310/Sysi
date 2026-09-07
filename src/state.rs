@@ -111,6 +111,10 @@ pub struct Settings {
     #[serde(default)]
     pub translate_open: bool,
     #[serde(default)]
+    pub usage_open: bool,
+    #[serde(default = "default_usage_source")]
+    pub usage_source: String,
+    #[serde(default)]
     pub color_mode: ColorMode,
     #[serde(default)]
     pub system_details: SystemDetails,
@@ -124,6 +128,8 @@ impl Default for Settings {
             settings_button: true,
             history_open: false,
             translate_open: false,
+            usage_open: false,
+            usage_source: default_usage_source(),
             color_mode: ColorMode::default(),
             system_details: SystemDetails::default(),
         }
@@ -280,6 +286,10 @@ impl Default for AppState {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_usage_source() -> String {
+    "codex".to_owned()
 }
 
 fn default_timer() -> i64 {
@@ -445,6 +455,14 @@ mod tests {
         let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
             .expect("state without a translate flag should remain readable");
         assert!(!state.settings.translate_open);
+    }
+
+    #[test]
+    fn old_state_defaults_to_a_closed_usage_window() {
+        let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
+            .expect("state without a usage flag should remain readable");
+        assert!(!state.settings.usage_open);
+        assert_eq!(state.settings.usage_source, "codex");
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::{
     },
     system::{NetworkRates, SystemReadOptions, SystemReader, SystemSnapshot, Usage},
     translate,
+    usage::{self, Source as UsageSource},
 };
 use cairo::{Context, FontSlant, FontWeight, RectangleInt, Region};
 use gdk::prelude::*;
@@ -88,6 +89,8 @@ const NOTE_MAX_WIDTH: i32 = 540;
 const NOTE_MAX_HEIGHT: i32 = 440;
 const HISTORY_WIDTH: i32 = 236;
 const HISTORY_HEIGHT: i32 = 252;
+const USAGE_WIDTH: i32 = 292;
+const USAGE_HEIGHT: i32 = 188;
 // One rendered row (.note-preview padding + the inherited note font) plus the
 // list spacing, and the header + list padding above it. Used to scale how many
 // rows the window renders to how tall the user dragged it.
@@ -252,6 +255,29 @@ struct SystemCard {
     /// which runs after the details menu has already been attached.
     resample: CallbackSlot,
     resize: ResizeHandle,
+}
+
+#[derive(Clone)]
+struct UsageCard {
+    card: gtk::EventBox,
+    chrome: gtk::EventBox,
+    header: gtk::EventBox,
+    hide: gtk::Button,
+    refresh: gtk::Button,
+    tabs: Vec<(UsageSource, gtk::Button)>,
+    rows: gtk::Box,
+    status: gtk::Label,
+    updated: gtk::Label,
+    color_mode: Rc<Cell<Foreground>>,
+    resize: ResizeHandle,
+}
+
+#[derive(Clone)]
+struct UsageController {
+    source: Rc<Cell<UsageSource>>,
+    request: Rc<dyn Fn()>,
+    refresh: Rc<dyn Fn()>,
+    show: Rc<dyn Fn(UsageSource)>,
 }
 
 #[derive(Clone)]
@@ -523,6 +549,16 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 );
             }
             data.layout_version = 8;
+            let _ = data.save();
+        }
+        if data.layout_version < 9 {
+            // Usage is a new card. Give it a quiet place near the other
+            // utility windows without disturbing any existing widget.
+            data.positions.entry("usage".into()).or_insert(Point {
+                x: primary_screen.x + 28,
+                y: primary_screen.y + 460,
+            });
+            data.layout_version = 9;
             let _ = data.save();
         }
     }
@@ -853,6 +889,164 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             height_for_width: None,
         },
     );
+
+    let usage = build_usage_window(foreground_for_mode(saved_color_mode(
+        &state.borrow(),
+        "usage",
+    )));
+    let initial_usage_source = UsageSource::from_key(&state.borrow().settings.usage_source);
+    let usage_position = state
+        .borrow()
+        .positions
+        .get("usage")
+        .copied()
+        .unwrap_or(Point {
+            x: primary_screen.x + 28,
+            y: primary_screen.y + 460,
+        });
+    apply_widget_size(
+        &usage.card,
+        "usage",
+        &state,
+        Size {
+            width: USAGE_WIDTH,
+            height: USAGE_HEIGHT,
+        },
+    );
+    place_card(&root, &usage.card, usage_position);
+    register(&registry, "usage", &usage.card, usage.color_mode.clone());
+    if let Some(item) = registry
+        .borrow_mut()
+        .iter_mut()
+        .find(|item| item.key == "usage")
+    {
+        item.edit_only = Some(usage.chrome.clone());
+    }
+    attach_color_mode_menu(
+        &usage.card,
+        "usage".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
+    attach_drag(
+        &usage.header,
+        &usage.card,
+        &root,
+        "usage".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+    );
+    attach_resize(
+        &usage.resize,
+        &usage.card,
+        &root,
+        "usage".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+        ResizeBounds {
+            min_width: 220,
+            min_height: 128,
+            max_width: 640,
+            max_height: 720,
+            aspect_ratio: None,
+            preserve_current_aspect: false,
+            height_for_width: None,
+        },
+    );
+    let usage_controller = start_usage_updates(usage.clone(), initial_usage_source);
+
+    let toggle_usage: Rc<dyn Fn()> = {
+        let card = usage.card.clone();
+        let chrome = usage.chrome.clone();
+        let state = state.clone();
+        let window = window.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let root = root.clone();
+        let screens = screens.clone();
+        let picker = widget_picker.card.clone();
+        let request = usage_controller.refresh.clone();
+        let invalidate = usage_controller.show.clone();
+        let selected = usage_controller.source.clone();
+        Rc::new(move || {
+            let open = !card.is_visible();
+            invalidate(selected.get());
+            if open {
+                reopen_widget(
+                    &card,
+                    "usage",
+                    &root,
+                    &state,
+                    &screens,
+                    primary_screen,
+                    Size {
+                        width: USAGE_WIDTH,
+                        height: USAGE_HEIGHT,
+                    },
+                    Some(&picker),
+                );
+                card.show_all();
+                chrome.set_visible(interactive.get());
+                request();
+            } else {
+                card.hide();
+            }
+            state.borrow_mut().settings.usage_open = open;
+            let _ = state.borrow().save();
+            refresh_input_shape(&window, &registry, interactive.get());
+            glib::idle_add_local_once({
+                let window = window.clone();
+                let registry = registry.clone();
+                let interactive = interactive.clone();
+                let root = root.clone();
+                let screens = screens.clone();
+                let state = state.clone();
+                move || {
+                    if open {
+                        clamp_registered_widgets(&root, &registry, &screens, &state);
+                    }
+                    refresh_input_shape(&window, &registry, interactive.get());
+                }
+            });
+        })
+    };
+
+    for (source, button) in usage.tabs.clone() {
+        let selected = usage_controller.source.clone();
+        let refresh = usage_controller.refresh.clone();
+        let show = usage_controller.show.clone();
+        let tabs = usage.tabs.clone();
+        let state = state.clone();
+        button.connect_clicked(move |_| {
+            selected.set(source);
+            set_usage_tab_active(&tabs, source);
+            state.borrow_mut().settings.usage_source = source.key().to_owned();
+            let _ = state.borrow().save();
+            show(source);
+            refresh();
+        });
+    }
+    usage.refresh.connect_clicked({
+        let refresh = usage_controller.refresh.clone();
+        move |_| refresh()
+    });
+    usage.hide.connect_clicked({
+        let toggle_usage = toggle_usage.clone();
+        move |_| toggle_usage()
+    });
+    widget_picker.usage.connect_clicked({
+        let toggle_usage = toggle_usage.clone();
+        move |_| toggle_usage()
+    });
 
     // Each dictionary is a window of its own, the way notes are, so several
     // words can sit open side by side. What a window needs from the rest of
@@ -1560,6 +1754,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let new_note = widget_picker.new_note.clone();
         let quit = widget_picker.quit.clone();
         let toggle_history = toggle_history.clone();
+        let toggle_usage = toggle_usage.clone();
         let toggle_translate = toggle_translate.clone();
         let translate_any_visible = translate_any_visible.clone();
         let interactive = interactive.clone();
@@ -1582,6 +1777,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         new_note.clicked();
                     }
                     "toggle-history" => toggle_history(),
+                    "toggle-usage" => toggle_usage(),
                     "toggle-translate" => {
                         // The entry is edit chrome, so a translate window
                         // opened while locked would have nothing to type into;
@@ -1677,6 +1873,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     history.bar.set_search_mode(false);
     if !state.borrow().settings.history_open {
         history.card.hide();
+    }
+    if !state.borrow().settings.usage_open {
+        usage.card.hide();
+    } else {
+        usage.chrome.set_visible(interactive.get());
+        (usage_controller.request)();
     }
     // Likewise the dictionary: show_all() dropped its query panel down, but a
     // window restored from the last session was not asked for just now.
@@ -1812,6 +2014,446 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     start_auto_color_updates(registry.clone(), state.clone());
     start_system_updates(system_card, state.clone());
     start_timer_updates(timer_card, state, window, registry, interactive);
+}
+
+fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
+    let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
+    card.set_visible_window(true);
+    card.style_context().add_class("pinned-note");
+    card.style_context().add_class("usage-window");
+
+    let chrome = gtk::EventBox::new();
+    chrome.set_visible_window(false);
+    let chrome_body = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    chrome.add(&chrome_body);
+
+    let header = gtk::EventBox::new();
+    header.set_visible_window(true);
+    header.set_hexpand(true);
+    header.style_context().add_class("note-header");
+    header.style_context().add_class("usage-header");
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    bar.set_hexpand(true);
+    let hide = small_button("\u{2212}");
+    hide.style_context().add_class("note-window-button");
+    hide.style_context().add_class("note-hide");
+    hide.set_tooltip_text(Some("Hide Usage"));
+    let title = gtk::Label::new(Some("USAGE"));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    title.style_context().add_class("history-title");
+    let refresh = small_button("\u{21bb}");
+    refresh.style_context().add_class("note-window-button");
+    refresh.set_tooltip_text(Some("Refresh usage"));
+    bar.pack_start(&hide, false, false, 0);
+    bar.pack_start(&title, true, true, 0);
+    bar.pack_end(&refresh, false, false, 0);
+    header.add(&bar);
+    chrome_body.pack_start(&header, false, false, 0);
+
+    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    tab_bar.style_context().add_class("usage-tabs");
+    let mut tabs = Vec::new();
+    for source in UsageSource::ALL {
+        let button = picker_button(source.label());
+        button.style_context().add_class("usage-tab");
+        tab_bar.pack_start(&button, true, true, 0);
+        tabs.push((source, button));
+    }
+    chrome_body.pack_start(&tab_bar, false, false, 0);
+    chrome_body.show_all();
+    body.pack_start(&chrome, false, false, 0);
+
+    let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroller.set_overlay_scrolling(true);
+    scroller.set_shadow_type(gtk::ShadowType::None);
+    scroller.set_propagate_natural_width(false);
+    scroller.set_propagate_natural_height(false);
+    scroller.set_size_request(1, 82);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.style_context().add_class("usage-scroller");
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    rows.style_context().add_class("usage-rows");
+    scroller.add(&rows);
+    body.pack_start(&scroller, true, true, 0);
+
+    let status = gtk::Label::new(Some("Loading usage…"));
+    status.set_xalign(0.0);
+    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status.style_context().add_class("usage-status");
+    body.pack_start(&status, false, false, 0);
+    let updated = gtk::Label::new(None);
+    updated.set_xalign(0.0);
+    updated.style_context().add_class("usage-updated");
+    body.pack_start(&updated, false, false, 0);
+
+    UsageCard {
+        card,
+        chrome,
+        header,
+        hide,
+        refresh,
+        tabs,
+        rows,
+        status,
+        updated,
+        color_mode,
+        resize,
+    }
+}
+
+fn usage_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn usage_percent_label(value: Option<f64>) -> String {
+    let Some(value) = value.filter(|value| value.is_finite()) else {
+        return "—".into();
+    };
+    let value = value.clamp(0.0, 100.0);
+    if value > 0.0 && value < 1.0 {
+        "<1%".into()
+    } else {
+        format!("{value:.0}%")
+    }
+}
+
+fn usage_reset_label(reset_at_ms: Option<i64>, now_ms: i64) -> (String, Option<String>) {
+    let Some(reset_at_ms) = reset_at_ms else {
+        return ("—".into(), None);
+    };
+    let delta = reset_at_ms.saturating_sub(now_ms);
+    if delta <= 0 {
+        return (
+            "Updating…".into(),
+            Some("Usage window has reached its reset time".into()),
+        );
+    }
+    let total_seconds = (delta / 1000).max(1);
+    let days = total_seconds / 86_400;
+    let hours = (total_seconds % 86_400) / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let countdown = if days > 0 {
+        format!("in {days}d {hours}h")
+    } else if hours > 0 {
+        format!("in {hours}h {minutes}m")
+    } else {
+        format!("in {}m", minutes.max(1))
+    };
+    let local = glib::DateTime::from_unix_utc(reset_at_ms / 1000)
+        .ok()
+        .and_then(|datetime| datetime.to_local().ok());
+    let now_local = glib::DateTime::from_unix_utc(now_ms / 1000)
+        .ok()
+        .and_then(|datetime| datetime.to_local().ok());
+    let display = local
+        .map(|datetime| {
+            let hour = match datetime.hour() % 12 {
+                0 => 12,
+                hour => hour,
+            };
+            let meridiem = if datetime.hour() >= 12 { "PM" } else { "AM" };
+            if now_local.as_ref().is_some_and(|current| {
+                current.year() == datetime.year() && current.day_of_year() == datetime.day_of_year()
+            }) {
+                format!("{hour}:{:02} {meridiem}", datetime.minute())
+            } else {
+                let month = [
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                    "Dec",
+                ][datetime.month().saturating_sub(1) as usize];
+                format!("{month} {}", datetime.day_of_month())
+            }
+        })
+        .unwrap_or_else(|| countdown.clone());
+    (display, Some(format!("Resets {countdown}")))
+}
+
+fn usage_age_label(fetched_at_ms: i64, now_ms: i64) -> String {
+    let age = now_ms.saturating_sub(fetched_at_ms).max(0) / 1000;
+    if age < 60 {
+        format!("Updated {age}s ago")
+    } else if age < 3_600 {
+        format!("Updated {}m ago", age / 60)
+    } else {
+        format!("Updated {}h ago", age / 3_600)
+    }
+}
+
+fn clear_usage_rows(rows: &gtk::Box) {
+    for child in rows.children() {
+        rows.remove(&child);
+    }
+}
+
+fn set_usage_tab_active(tabs: &[(UsageSource, gtk::Button)], source: UsageSource) {
+    for (candidate, button) in tabs {
+        let context = button.style_context();
+        if *candidate == source {
+            context.add_class("usage-tab-active");
+        } else {
+            context.remove_class("usage-tab-active");
+        }
+    }
+}
+
+fn render_usage_card(
+    card: &UsageCard,
+    source: UsageSource,
+    snapshot: Option<&usage::Snapshot>,
+    error: Option<&str>,
+) {
+    set_usage_tab_active(&card.tabs, source);
+    clear_usage_rows(&card.rows);
+    let now = usage_now_ms();
+    let Some(snapshot) = snapshot else {
+        card.status.set_label(error.unwrap_or("Loading usage…"));
+        card.updated.set_label("");
+        return;
+    };
+    if snapshot.windows.is_empty() {
+        card.status.set_label("No usage reported");
+    } else if let Some(error) = error {
+        card.status.set_label(&format!("Offline · {error}"));
+    } else if let Some(account) = &snapshot.account {
+        card.status.set_label(account);
+    } else {
+        card.status.set_label("Remaining allowance");
+    }
+    card.status.set_tooltip_text(snapshot.account.as_deref());
+    card.updated
+        .set_label(&usage_age_label(snapshot.fetched_at_ms, now));
+
+    for window in &snapshot.windows {
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        row.style_context().add_class("usage-row");
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let label = gtk::Label::new(Some(&window.label));
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_tooltip_text(Some(&window.label));
+        label.set_hexpand(true);
+        label.style_context().add_class("usage-row-label");
+        let remaining = gtk::Label::new(Some(&usage_percent_label(window.remaining_percent)));
+        remaining.set_xalign(1.0);
+        remaining.style_context().add_class("usage-row-percent");
+        let (reset, tooltip) = usage_reset_label(window.reset_at_ms, now);
+        let reset_label = gtk::Label::new(Some(&reset));
+        reset_label.set_xalign(1.0);
+        reset_label.set_width_chars(8);
+        reset_label.style_context().add_class("usage-row-reset");
+        if let Some(tooltip) = tooltip {
+            reset_label.set_tooltip_text(Some(&tooltip));
+        }
+        top.pack_start(&label, true, true, 0);
+        top.pack_end(&reset_label, false, false, 0);
+        top.pack_end(&remaining, false, false, 0);
+        row.pack_start(&top, false, false, 0);
+        let progress = gtk::ProgressBar::new();
+        progress.set_show_text(false);
+        progress.set_fraction(window.remaining_percent.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0);
+        progress.style_context().add_class("usage-progress");
+        if window.remaining_percent.is_some() {
+            row.pack_start(&progress, false, false, 0);
+        }
+        card.rows.pack_start(&row, false, false, 0);
+    }
+    card.rows.show_all();
+}
+
+fn update_usage_refresh(card: &UsageCard, schedule: &usage::Schedule, now: i64) {
+    let seconds = schedule.retry_seconds(now);
+    let (enabled, icon, hint) = if schedule.busy {
+        (false, "…", "Refreshing usage…".to_owned())
+    } else if seconds > 0 {
+        (
+            false,
+            "↻",
+            format!("Retry in {}:{:02}", seconds / 60, seconds % 60),
+        )
+    } else {
+        (true, "↻", "Refresh usage".to_owned())
+    };
+    card.refresh.set_sensitive(enabled);
+    card.refresh.set_label(icon);
+    card.refresh.set_tooltip_text(Some(&hint));
+    if !enabled {
+        card.updated.set_label(&hint);
+    }
+}
+
+fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageController {
+    let source = Rc::new(Cell::new(initial_source));
+    let generation = Rc::new(Cell::new(0u64));
+    let schedules = Rc::new(RefCell::new(HashMap::<UsageSource, usage::Schedule>::new()));
+    let snapshots = Rc::new(RefCell::new(HashMap::<UsageSource, usage::Snapshot>::new()));
+    let errors = Rc::new(RefCell::new(HashMap::<UsageSource, String>::new()));
+    let (tx, rx) =
+        async_channel::bounded::<(UsageSource, u64, Result<usage::Snapshot, usage::FetchError>)>(3);
+    let render = {
+        let card = card.clone();
+        let schedules = schedules.clone();
+        let snapshots = snapshots.clone();
+        let errors = errors.clone();
+        Rc::new(move |which: UsageSource| {
+            render_usage_card(
+                &card,
+                which,
+                snapshots.borrow().get(&which),
+                errors.borrow().get(&which).map(String::as_str),
+            );
+            update_usage_refresh(
+                &card,
+                schedules
+                    .borrow()
+                    .get(&which)
+                    .unwrap_or(&usage::Schedule::default()),
+                usage_now_ms(),
+            );
+        }) as Rc<dyn Fn(UsageSource)>
+    };
+    let send = {
+        let source = source.clone();
+        let card = card.clone();
+        let schedules = schedules.clone();
+        let snapshots = snapshots.clone();
+        let generation = generation.clone();
+        Rc::new(move |manual: bool| {
+            let which = source.get();
+            let now = usage_now_ms();
+            let reset = snapshots.borrow().get(&which).and_then(|snapshot| {
+                snapshot
+                    .windows
+                    .iter()
+                    .filter_map(|window| window.reset_at_ms)
+                    .filter(|reset| *reset <= now)
+                    .max()
+            });
+            let mut schedules = schedules.borrow_mut();
+            let schedule = schedules.entry(which).or_default();
+            let started = schedule.start(now, manual, reset);
+            update_usage_refresh(&card, schedule, now);
+            if !started {
+                return;
+            }
+            drop(schedules);
+            let tx = tx.clone();
+            let current = generation.get();
+            // One independent, bounded task per source: a slow CLI cannot block another tab.
+            std::thread::spawn(move || {
+                let result = usage::fetch(which, manual);
+                let _ = tx.send_blocking((which, current, result));
+            });
+        }) as Rc<dyn Fn(bool)>
+    };
+    {
+        let source = source.clone();
+        let generation = generation.clone();
+        let schedules = schedules.clone();
+        let snapshots = snapshots.clone();
+        let errors = errors.clone();
+        let render = render.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok((which, requested_generation, result)) = rx.recv().await {
+                let current = requested_generation == generation.get() && source.get() == which;
+                let mut schedules = schedules.borrow_mut();
+                let schedule = schedules.entry(which).or_default();
+                schedule.finish(usage_now_ms(), which, result.as_ref().err());
+                if !current {
+                    if let Err(error) = &result {
+                        errors.borrow_mut().insert(which, error.message.clone());
+                    }
+                    // Preserve error cooldowns, but do not let an old successful response
+                    // postpone a request for the newly selected account/source.
+                    if result.is_ok() {
+                        *schedule = usage::Schedule::default();
+                    }
+                    continue;
+                }
+                drop(schedules);
+                match result {
+                    Ok(snapshot) => {
+                        snapshots.borrow_mut().insert(which, snapshot);
+                        errors.borrow_mut().remove(&which);
+                    }
+                    Err(error) => {
+                        // No verified account identity is available on failure. Never
+                        // present another login's cached quota as the current allowance.
+                        snapshots.borrow_mut().remove(&which);
+                        errors.borrow_mut().insert(which, error.message);
+                    }
+                }
+                render(which);
+            }
+        });
+    }
+    let show = {
+        let generation = generation.clone();
+        let snapshots = snapshots.clone();
+        let render = render.clone();
+        Rc::new(move |which| {
+            generation.set(generation.get().wrapping_add(1));
+            snapshots.borrow_mut().clear();
+            render(which);
+        }) as Rc<dyn Fn(UsageSource)>
+    };
+    let request = {
+        let send = send.clone();
+        Rc::new(move || send(false)) as Rc<dyn Fn()>
+    };
+    let refresh = {
+        let send = send.clone();
+        Rc::new(move || send(true)) as Rc<dyn Fn()>
+    };
+    let request_for_timer = request.clone();
+    let card_for_timer = card.clone();
+    let source_for_timer = source.clone();
+    glib::timeout_add_local(Duration::from_secs(1), move || {
+        if card_for_timer.card.is_visible() {
+            let now = usage_now_ms();
+            if let Some(snapshot) = snapshots.borrow().get(&source_for_timer.get()) {
+                card_for_timer
+                    .updated
+                    .set_label(&usage_age_label(snapshot.fetched_at_ms, now));
+                // Update only reset labels/tooltips; keep rows and scroll position intact.
+                for (row, window) in card_for_timer.rows.children().iter().zip(&snapshot.windows) {
+                    if let Some(row) = row.downcast_ref::<gtk::Box>() {
+                        if let Some(top) = row
+                            .children()
+                            .first()
+                            .and_then(|widget| widget.downcast_ref::<gtk::Box>())
+                        {
+                            for child in top.children() {
+                                if child.style_context().has_class("usage-row-reset") {
+                                    if let Some(label) = child.downcast_ref::<gtk::Label>() {
+                                        let (text, tooltip) =
+                                            usage_reset_label(window.reset_at_ms, now);
+                                        label.set_label(&text);
+                                        label.set_tooltip_text(tooltip.as_deref());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            request_for_timer();
+        }
+        glib::ControlFlow::Continue
+    });
+    render_usage_card(&card, source.get(), None, None);
+    UsageController {
+        source,
+        request,
+        refresh,
+        show,
+    }
 }
 
 fn build_system_card(initial_color_mode: Foreground, initial_details: SystemDetails) -> SystemCard {
@@ -5535,6 +6177,7 @@ struct WidgetPicker {
     mode: gtk::Button,
     lock: gtk::Button,
     new_note: gtk::Button,
+    usage: gtk::Button,
     quit: gtk::Button,
 }
 
@@ -5571,12 +6214,14 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let mode = picker_button(initial_color_mode.label());
     let lock = picker_button("LOCK");
     let new_note = picker_button("＋  NOTE");
+    let usage = picker_button("USAGE");
     let quit = picker_button("QUIT");
     choices.pack_start(&system, false, false, 0);
     choices.pack_start(&timer, false, false, 0);
     choices.pack_start(&mode, false, false, 0);
     choices.pack_start(&lock, false, false, 0);
     choices.pack_start(&new_note, false, false, 0);
+    choices.pack_start(&usage, false, false, 0);
     choices.pack_start(&quit, false, false, 0);
     revealer.add(&choices);
     top.pack_start(&revealer, false, false, 0);
@@ -5592,6 +6237,7 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
         mode,
         lock,
         new_note,
+        usage,
         quit,
     }
 }
@@ -8911,7 +9557,7 @@ fn refresh_input_shape(
 }
 
 fn receives_input_when_locked(key: &str) -> bool {
-    key.starts_with("note:") || key.starts_with("dict:") || key == "history"
+    key.starts_with("note:") || key.starts_with("dict:") || key == "history" || key == "usage"
 }
 
 fn union_circle_region(region: &Region, x: i32, y: i32, width: i32, height: i32) {
@@ -10526,5 +11172,71 @@ mod timer_input_tests {
         // Counted in characters, so Vietnamese is never cut mid-codepoint.
         assert_eq!(ellipsize("nền tảng cho khách", 8), "nền tảng\u{2026}");
         assert_eq!(ellipsize("ab cdef", 3), "ab\u{2026}");
+    }
+}
+
+#[cfg(test)]
+mod usage_ui_tests {
+    use super::*;
+
+    #[test]
+    fn reset_label_changes_at_deadline() {
+        assert_eq!(usage_reset_label(Some(1000), 1000).0, "Updating…");
+        assert_eq!(usage_reset_label(None, 1000).0, "—");
+        assert_ne!(usage_reset_label(Some(2000), 1000).0, "Updating…");
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; run under xvfb-run"]
+    fn usage_card_keeps_all_rows_and_clears_previous_account() {
+        gtk::init().unwrap();
+        let card = build_usage_window(Foreground::Light);
+        let snapshot = usage::Snapshot {
+            source: UsageSource::Omp,
+            account: Some("user@example.com".into()),
+            fetched_at_ms: usage_now_ms(),
+            windows: (0..20)
+                .map(|i| usage::Window {
+                    label: format!("account-{i}"),
+                    used_percent: Some(34.0),
+                    remaining_percent: Some(66.0),
+                    reset_at_ms: None,
+                    duration_ms: None,
+                })
+                .collect(),
+        };
+        render_usage_card(&card, UsageSource::Omp, Some(&snapshot), None);
+        assert_eq!(card.rows.children().len(), 20);
+        assert_eq!(card.status.text(), "user@example.com");
+        render_usage_card(
+            &card,
+            UsageSource::Omp,
+            Some(&usage::Snapshot {
+                account: None,
+                ..snapshot.clone()
+            }),
+            None,
+        );
+        assert_eq!(card.status.text(), "Remaining allowance");
+        let mut schedule = usage::Schedule::default();
+        assert!(schedule.start(1000, true, None));
+        update_usage_refresh(&card, &schedule, 1000);
+        assert!(!card.refresh.is_sensitive());
+        assert_eq!(card.updated.text(), "Refreshing usage…");
+        schedule.finish(
+            1000,
+            UsageSource::Codex,
+            Some(&usage::FetchError::from("offline".to_owned())),
+        );
+        update_usage_refresh(&card, &schedule, 1000);
+        assert_eq!(card.updated.text(), "Retry in 2:00");
+        update_usage_refresh(&card, &schedule, 121000);
+        assert!(card.refresh.is_sensitive());
+        render_usage_card(&card, UsageSource::Omp, None, Some("Sign in again"));
+        assert!(card.rows.children().is_empty());
+        assert_eq!(card.status.text(), "Sign in again");
+        assert_eq!(card.updated.text(), "");
+        render_usage_card(&card, UsageSource::Claude, None, None);
+        assert_eq!(card.status.text(), "Loading usage…");
     }
 }

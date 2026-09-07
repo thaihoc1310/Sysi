@@ -13,6 +13,10 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 - Focus countdown with four visual styles, hover controls in both modes, and a persistent animated alarm that must be dismissed.
 - A compact gear menu with persistent SYSTEM and timer visibility toggles.
 - Note History: click or drag an old note onto the desktop to pin it again.
+- A small transparent `USAGE` card for Codex, Claude Code, and Oh My Pi (OMP). It
+  shows the remaining percentage, the server-provided reset time, and the age
+  of the last snapshot. The card polls only while visible and keeps the last
+  known values when a provider is temporarily offline.
 - Create multiple independent notes from the `NOTE` action.
 - Click-through lock mode. Mouse events pass through everywhere except the timer circle, which keeps its hover and click control.
 - `AUTO` samples the background beneath each widget and chooses a contrasting `LIGHT` or `DARK` foreground. In Edit Mode, right-click any widget to override it; its current mode is omitted from the menu. Using the Settings mode button resets every widget to the selected global mode.
@@ -32,7 +36,9 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 - `sysi --toggle` — toggle interaction from a terminal or a custom desktop shortcut.
 - `sysi --quit` — stop the running overlay.
 
-Sysi opens in Edit Mode. Drag a widget to move it or drag the small bottom-right arc to resize it. Notes show their title bar only in Edit Mode and use it as the move handle. A short click still activates buttons and note editing. While Sysi is running, the gear in the GNOME panel expands to `SYSTEM`, `TIMER`, `AUTO` / `LIGHT` / `DARK`, `LOCK` / `UNLOCK`, `NOTE`, `HISTORY`, `DICTIONARY`, and `QUIT` directly in the panel.
+Sysi opens in Edit Mode. Drag a widget to move it or drag the small bottom-right arc to resize it. Notes show their title bar only in Edit Mode and use it as the move handle. A short click still activates buttons and note editing. While Sysi is running, the gear in the GNOME panel expands to `SYSTEM`, `TIMER`, `AUTO` / `LIGHT` / `DARK`, `LOCK` / `UNLOCK`, `NOTE`, `HISTORY`, `USAGE`, `DICTIONARY`, and `QUIT` directly in the panel.
+
+The Usage card uses `codex app-server` for Codex's `account/rateLimits/read`, the read-only Claude Code OAuth credential at `~/.claude/.credentials.json` for Anthropic's OAuth usage endpoint, and `omp usage --json` for OMP. Sysi never writes or refreshes provider credentials. Each source has its own in-flight guard and retry cooldown (2, 4, 8, then 15 minutes on errors); HTTP Retry-After can extend that cooldown, including for manual refresh. Switching sources or reopening discards cached rows; failed reads clear quota because account ownership cannot be verified. OMP rows retain per-limit account identifiers in RAM and all rows are scrollable; no raw JSON is saved. Reset labels update locally and each elapsed reset triggers one fetch, subject to cooldown. The card names the signed-in account by the address each CLI stores locally (`~/.codex/auth.json`, `~/.claude.json`, the OMP report metadata) rather than an opaque account id, and a manual refresh runs `omp usage invalidate` first so OMP re-reads the providers instead of replaying its cached report. A missing login, unsupported plan, or provider without quota data is shown as a status message instead of being converted to a fake percentage.
 
 In either mode, hovering the timer overlays `START`, `PAUSE`, `RESUME`, or `DISMISS` over the time; click to perform that action. In Edit Mode, right-click the timer and choose `EDIT TIME` to enter `MM:SS`, `HH:MM:SS`, or a plain number of minutes. Four consecutive digits such as `1050` are automatically formatted and accepted as `10:50`.
 

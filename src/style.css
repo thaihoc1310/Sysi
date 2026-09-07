@@ -800,3 +800,116 @@ popover.note-search-popover > contents,
   background-color: #f4f4f4;
   border-color: #f4f4f4;
 }
+
+/* Usage is a compact note-style card. The trough and progress are deliberately
+ * flat and translucent so the desktop remains visible through the widget. */
+.usage-header {
+  min-height: 20px;
+  padding-right: 5px;
+}
+
+.usage-tabs {
+  padding: 1px 2px 0;
+}
+
+.usage-tab {
+  color: alpha(currentColor, 0.54);
+  font-size: 9px;
+  letter-spacing: 0.9px;
+  min-height: 17px;
+  padding: 0 3px;
+}
+
+.usage-tab-active {
+  color: currentColor;
+  background-color: alpha(currentColor, 0.14);
+}
+
+.usage-scroller,
+.usage-scroller viewport,
+.usage-rows,
+.usage-row {
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.usage-rows {
+  padding: 2px 4px 1px;
+}
+
+.usage-row {
+  padding: 1px 0;
+}
+
+.usage-row-label {
+  color: currentColor;
+  font-size: 12px;
+  text-shadow: none;
+}
+
+.usage-row-percent {
+  color: currentColor;
+  font-size: 12px;
+  font-weight: 700;
+  min-width: 32px;
+  text-shadow: none;
+}
+
+.usage-row-reset {
+  color: alpha(currentColor, 0.58);
+  font-size: 11px;
+  min-width: 58px;
+  text-shadow: none;
+}
+
+.usage-progress {
+  min-height: 4px;
+  padding: 0;
+}
+
+.usage-progress trough {
+  background-color: rgba(128, 128, 128, 0.28);
+  border: none;
+  border-radius: 3px;
+  min-height: 4px;
+}
+
+/* The filled bar wears the header bar's own colour in each mode, so the card
+ * reads as one surface instead of a bright stripe. */
+.usage-progress progress {
+  background-color: rgba(222, 222, 222, 0.72);
+  border: none;
+  border-radius: 3px;
+  min-height: 4px;
+}
+
+.mode-light .usage-progress progress {
+  background-color: rgba(238, 238, 238, 0.76);
+}
+
+.mode-dark .usage-progress progress {
+  background-color: rgba(24, 24, 24, 0.82);
+}
+
+.usage-status {
+  color: alpha(currentColor, 0.55);
+  font-size: 9px;
+  padding: 2px 5px 0;
+  text-shadow: none;
+}
+
+.usage-updated {
+  color: alpha(currentColor, 0.40);
+  font-size: 9px;
+  padding: 0 5px 2px;
+  text-shadow: none;
+}
+
+.mode-light .usage-tab-active {
+  background-color: rgba(20, 20, 20, 0.13);
+}
+
+.mode-dark .usage-tab-active {
+  background-color: rgba(255, 255, 255, 0.16);
+}
