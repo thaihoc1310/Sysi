@@ -980,7 +980,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let interactive = interactive.clone();
         let root = root.clone();
         let picker = widget_picker.card.clone();
-        let request = usage_controller.refresh.clone();
+        let request = usage_controller.request.clone();
         let invalidate = usage_controller.show.clone();
         let selected = usage_controller.source.clone();
         Rc::new(move || {
@@ -1025,7 +1025,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     for (source, button) in usage.tabs.clone() {
         let selected = usage_controller.source.clone();
-        let refresh = usage_controller.refresh.clone();
+        let request = usage_controller.request.clone();
         let show = usage_controller.show.clone();
         let tabs = usage.tabs.clone();
         let state = state.clone();
@@ -1035,7 +1035,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             state.borrow_mut().settings.usage_source = source.key().to_owned();
             let _ = state.borrow().save();
             show(source);
-            refresh();
+            request();
         });
     }
     usage.refresh.connect_clicked({

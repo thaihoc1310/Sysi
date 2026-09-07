@@ -158,7 +158,6 @@ export default class SysiPanelExtension extends Extension {
         this._autoColorPending = false;
         this._settingsMenu?.destroy();
         this._settingsMenu = null;
-        this._settingsManager = null;
         this._fontLabel = null;
         this._indicator?.destroy();
         this._indicator = null;
@@ -179,8 +178,7 @@ export default class SysiPanelExtension extends Extension {
         this._settingsMenu.actor.add_style_class_name('sysi-settings-menu');
         Main.uiGroup.add_child(this._settingsMenu.actor);
         this._settingsMenu.actor.hide();
-        this._settingsManager = new PopupMenu.PopupMenuManager(this._indicator);
-        this._settingsManager.addMenu(this._settingsMenu);
+        Main.panel.menuManager.addMenu(this._settingsMenu);
         button.connect('clicked', () => {
             this._syncPanelState();
             this._settingsMenu.toggle();
@@ -336,8 +334,8 @@ export default class SysiPanelExtension extends Extension {
         if (!this._panelStateFile)
             return;
         const [interaction, mode, fontSize] = this._readPanelState();
-        if (this._fontLabel)
-            this._fontLabel.text = String(fontSize ?? 13);
+        if (this._fontLabel && fontSize !== null)
+            this._fontLabel.text = String(fontSize);
         if (this._lockLabel)
             this._lockLabel.text = interaction === 'locked' ? 'unlock' : 'lock';
         if (this._modeLabel)
@@ -387,6 +385,8 @@ export default class SysiPanelExtension extends Extension {
             const [x, y, width, height] = values;
             return width > 0 && height > 0 ? [{key, x, y, width, height}] : [];
         });
+        if (requests.length === 0)
+            return;
         const results = [];
         for (const request of requests) {
             const luminance = await this._sampleRectLuminance(request);
@@ -395,7 +395,7 @@ export default class SysiPanelExtension extends Extension {
         }
         if (generation !== this._autoColorGeneration)
             return;
-        if (requests.length > 0 && results.length === 0)
+        if (results.length === 0)
             return;
         const path = GLib.build_filenamev([
             GLib.get_user_cache_dir(),

@@ -58,7 +58,7 @@ The package is written to `dist/`.
 ## Install
 
 ```bash
-sudo apt install ./dist/sysi-overlay_0.1.63_amd64.deb
+sudo apt install ./dist/sysi-overlay_0.1.64_amd64.deb
 ```
 
 Sysi starts automatically on the next desktop login. It can also be launched immediately from the application menu.
