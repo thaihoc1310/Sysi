@@ -16,7 +16,7 @@ use regex::RegexBuilder;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    f64::consts::{PI, TAU},
+    f64::consts::{FRAC_PI_2, PI, TAU},
     fs,
     rc::{Rc, Weak},
     sync::{
@@ -262,9 +262,14 @@ struct UsageCard {
     header: gtk::EventBox,
     hide: gtk::Button,
     refresh: gtk::Button,
-    tabs: Vec<(UsageSource, gtk::Button)>,
+    tabs: Vec<(UsageTab, gtk::Button)>,
     scroller: gtk::ScrolledWindow,
     rows: gtk::Box,
+    tokens_pane: gtk::Box,
+    tokens_canvas: gtk::DrawingArea,
+    periods: Vec<(TokenPeriod, gtk::Button)>,
+    tokens: Rc<RefCell<TokenState>>,
+    token_hover: Rc<Cell<Option<usize>>>,
     status: gtk::Label,
     updated: gtk::Label,
     color_mode: Rc<Cell<Foreground>>,
@@ -273,10 +278,10 @@ struct UsageCard {
 
 #[derive(Clone)]
 struct UsageController {
-    source: Rc<Cell<UsageSource>>,
+    tab: Rc<Cell<UsageTab>>,
     request: Rc<dyn Fn()>,
     refresh: Rc<dyn Fn()>,
-    show: Rc<dyn Fn(UsageSource)>,
+    show: Rc<dyn Fn(UsageTab)>,
 }
 
 #[derive(Clone)]
@@ -901,7 +906,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         &state.borrow(),
         "usage",
     )));
-    let initial_usage_source = UsageSource::from_key(&state.borrow().settings.usage_source);
+    let initial_usage_tab = UsageTab::from_key(&state.borrow().settings.usage_source);
     let usage_position = state
         .borrow()
         .positions
@@ -969,7 +974,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             height_for_width: None,
         },
     );
-    let usage_controller = start_usage_updates(usage.clone(), initial_usage_source);
+    usage.tokens.borrow_mut().period = TokenPeriod::from_key(&state.borrow().settings.usage_period);
+    let usage_controller = start_usage_updates(usage.clone(), initial_usage_tab);
 
     let toggle_usage: Rc<dyn Fn()> = {
         let card = usage.card.clone();
@@ -982,7 +988,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let picker = widget_picker.card.clone();
         let request = usage_controller.request.clone();
         let invalidate = usage_controller.show.clone();
-        let selected = usage_controller.source.clone();
+        let selected = usage_controller.tab.clone();
         Rc::new(move || {
             let open = !card.is_visible();
             invalidate(selected.get());
@@ -1023,19 +1029,32 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         })
     };
 
-    for (source, button) in usage.tabs.clone() {
-        let selected = usage_controller.source.clone();
+    for (tab, button) in usage.tabs.clone() {
+        let selected = usage_controller.tab.clone();
         let request = usage_controller.request.clone();
         let show = usage_controller.show.clone();
         let tabs = usage.tabs.clone();
         let state = state.clone();
         button.connect_clicked(move |_| {
-            selected.set(source);
-            set_usage_tab_active(&tabs, source);
-            state.borrow_mut().settings.usage_source = source.key().to_owned();
+            selected.set(tab);
+            set_usage_tab_active(&tabs, tab);
+            state.borrow_mut().settings.usage_source = tab.key().to_owned();
             let _ = state.borrow().save();
-            show(source);
+            show(tab);
             request();
+        });
+    }
+    // Changing the window only re-reads numbers the card already holds, so it
+    // never has to touch the disk.
+    for (period, button) in usage.periods.clone() {
+        let card = usage.clone();
+        let show = usage_controller.show.clone();
+        let state = state.clone();
+        button.connect_clicked(move |_| {
+            card.tokens.borrow_mut().period = period;
+            state.borrow_mut().settings.usage_period = period.key().to_owned();
+            let _ = state.borrow().save();
+            show(UsageTab::Tokens);
         });
     }
     usage.refresh.connect_clicked({
@@ -2075,11 +2094,11 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     tab_bar.style_context().add_class("usage-tabs");
     let mut tabs = Vec::new();
-    for source in UsageSource::ALL {
-        let button = picker_button(source.label());
+    for tab in UsageTab::ALL {
+        let button = picker_button(tab.label());
         button.style_context().add_class("usage-tab");
         tab_bar.pack_start(&button, true, true, 0);
-        tabs.push((source, button));
+        tabs.push((tab, button));
     }
     chrome_body.pack_start(&tab_bar, false, false, 0);
     chrome_body.show_all();
@@ -2100,6 +2119,78 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     scroller.add(&rows);
     body.pack_start(&scroller, true, true, 0);
 
+    let tokens = Rc::new(RefCell::new(TokenState::default()));
+    let token_hits = Rc::new(RefCell::new(Vec::<TokenHit>::new()));
+    let token_hover = Rc::new(Cell::new(None::<usize>));
+    let tokens_pane = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    let period_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    period_bar.style_context().add_class("usage-tabs");
+    let mut periods = Vec::new();
+    for period in TokenPeriod::ALL {
+        let button = picker_button(period.label());
+        button.style_context().add_class("usage-tab");
+        period_bar.pack_start(&button, true, true, 0);
+        periods.push((period, button));
+    }
+    tokens_pane.pack_start(&period_bar, false, false, 0);
+    let tokens_canvas = gtk::DrawingArea::new();
+    tokens_canvas.set_size_request(1, 60);
+    tokens_canvas.set_hexpand(true);
+    tokens_canvas.set_vexpand(true);
+    tokens_canvas
+        .add_events(gdk::EventMask::POINTER_MOTION_MASK | gdk::EventMask::LEAVE_NOTIFY_MASK);
+    tokens_canvas.connect_draw({
+        let tokens = tokens.clone();
+        let hits = token_hits.clone();
+        let color_mode = color_mode.clone();
+        move |area, ctx| {
+            draw_tokens(
+                area,
+                ctx,
+                &tokens.borrow(),
+                color_mode.get(),
+                &mut hits.borrow_mut(),
+            );
+            glib::Propagation::Proceed
+        }
+    });
+    tokens_canvas.connect_motion_notify_event({
+        let hits = token_hits.clone();
+        let hover = token_hover.clone();
+        move |area, event| {
+            let (x, y) = event.position();
+            let found = token_hit_at(&hits.borrow(), x, y);
+            // Rewriting the text on every motion event restarts GTK's tooltip
+            // timer, so the tooltip would never get the chance to appear.
+            if hover.get() != found {
+                hover.set(found);
+                let tip =
+                    found.and_then(|index| hits.borrow().get(index).map(|hit| hit.tip.clone()));
+                area.set_tooltip_text(tip.as_deref());
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    tokens_canvas.connect_leave_notify_event({
+        let hover = token_hover.clone();
+        move |area, _| {
+            hover.set(None);
+            area.set_tooltip_text(None);
+            glib::Propagation::Proceed
+        }
+    });
+    tokens_pane.pack_start(&tokens_canvas, true, true, 0);
+    body.pack_start(&tokens_pane, true, true, 0);
+    // Both panes take turns in the same slot, so the card keeps one height
+    // whichever tab is up. They are shown once here to mark their children
+    // visible, then taken out of the card's show_all so that from now on only
+    // the selected tab decides which of the two is on screen.
+    scroller.show_all();
+    tokens_pane.show_all();
+    scroller.set_no_show_all(true);
+    tokens_pane.set_no_show_all(true);
+    tokens_pane.hide();
+
     let status = gtk::Label::new(Some("Loading usage…"));
     status.set_xalign(0.0);
     status.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -2119,6 +2210,11 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
         tabs,
         scroller,
         rows,
+        tokens_pane,
+        tokens_canvas,
+        periods,
+        tokens,
+        token_hover,
         status,
         updated,
         color_mode,
@@ -2214,10 +2310,12 @@ fn clear_usage_rows(rows: &gtk::Box) {
     }
 }
 
-fn set_usage_tab_active(tabs: &[(UsageSource, gtk::Button)], source: UsageSource) {
-    for (candidate, button) in tabs {
+/// Marks one button in a strip as the chosen one. Shared by the tab row and by
+/// the token tab's period chips, which look and behave the same way.
+fn set_usage_tab_active<T: Copy + PartialEq>(choices: &[(T, gtk::Button)], active: T) {
+    for (candidate, button) in choices {
         let context = button.style_context();
-        if *candidate == source {
+        if *candidate == active {
             context.add_class("usage-tab-active");
         } else {
             context.remove_class("usage-tab-active");
@@ -2225,19 +2323,545 @@ fn set_usage_tab_active(tabs: &[(UsageSource, gtk::Button)], source: UsageSource
     }
 }
 
+/// The usage card's tabs: one per quota source, plus the token tab, which is
+/// counted from session logs already on this machine rather than fetched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UsageTab {
+    Source(UsageSource),
+    Tokens,
+}
+
+impl UsageTab {
+    const ALL: [Self; 4] = [
+        Self::Source(UsageSource::Codex),
+        Self::Source(UsageSource::Claude),
+        Self::Source(UsageSource::Omp),
+        Self::Tokens,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Source(source) => source.label(),
+            Self::Tokens => "TOKENS",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Source(source) => source.key(),
+            Self::Tokens => "tokens",
+        }
+    }
+
+    /// Anything that is not the token tab is a quota source, which keeps a
+    /// settings file written before this tab existed pointing somewhere real.
+    fn from_key(value: &str) -> Self {
+        match value {
+            "tokens" => Self::Tokens,
+            other => Self::Source(UsageSource::from_key(other)),
+        }
+    }
+}
+
+/// How far back the token tab counts. Nothing longer than a month is offered:
+/// the CLIs rotate their own logs, so "All" is however much they happen to
+/// have kept rather than a promise of history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TokenPeriod {
+    Today,
+    Week,
+    #[default]
+    Month,
+    All,
+}
+
+impl TokenPeriod {
+    const ALL: [Self; 4] = [Self::Today, Self::Week, Self::Month, Self::All];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Today => "TODAY",
+            Self::Week => "7D",
+            Self::Month => "30D",
+            Self::All => "ALL",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::Week => "7d",
+            Self::Month => "30d",
+            Self::All => "all",
+        }
+    }
+
+    fn from_key(value: &str) -> Self {
+        match value {
+            "today" => Self::Today,
+            "7d" => Self::Week,
+            "all" => Self::All,
+            _ => Self::Month,
+        }
+    }
+
+    fn caption(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::Week => "last 7 days",
+            Self::Month => "last 30 days",
+            Self::All => "all recorded",
+        }
+    }
+
+    /// The first local day counted, or `None` for everything on record.
+    fn since_day(self, today: i64) -> Option<i64> {
+        match self {
+            Self::Today => Some(today),
+            Self::Week => Some(today - 6),
+            Self::Month => Some(today - 29),
+            Self::All => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TokenState {
+    report: usage::TokenReport,
+    period: TokenPeriod,
+    scanning: bool,
+}
+
+/// A shape that was drawn and what hovering it should say. Filled while
+/// painting, so the pointer is tested against the geometry that actually
+/// reached the screen rather than a second copy of the layout that could
+/// drift away from it.
+struct TokenHit {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    tip: String,
+}
+
+/// One shade per source, held in `Source::ALL` order so a source keeps its
+/// weight in the split bar and in its own row even when another source falls
+/// to nothing. Each is labelled as well: a step of the card's own ink is a
+/// hint, never an identity on its own.
+const TOKEN_SHADES: [f64; 3] = [0.88, 0.58, 0.34];
+const TOKEN_MARGIN: f64 = 5.0;
+const TOKEN_LABEL_WIDTH: f64 = 46.0;
+const TOKEN_VALUE_WIDTH: f64 = 50.0;
+/// How long a token count is reused before the logs are read again. They only
+/// move when a CLI is mid-turn, and a scan walks every transcript on the disk.
+const TOKEN_RESCAN_MS: i64 = 120_000;
+
+/// A token count at a glance. This trades digits for something readable at
+/// eight pixels; the exact figure is one hover away.
+fn format_tokens(value: u64) -> String {
+    let value = value as f64;
+    if value >= 1e9 {
+        format!("{:.2}B", value / 1e9)
+    } else if value >= 1e6 {
+        format!("{:.1}M", value / 1e6)
+    } else if value >= 1e3 {
+        format!("{:.1}K", value / 1e3)
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.char_indices() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+fn token_tooltip(title: &str, totals: usage::TokenTotals) -> String {
+    format!(
+        "{title}\n{} tokens\ninput {} · output {} · cache read {} · cache write {}",
+        group_digits(totals.total()),
+        format_tokens(totals.input),
+        format_tokens(totals.output),
+        format_tokens(totals.cache_read),
+        format_tokens(totals.cache_write),
+    )
+}
+
+fn token_text_width(ctx: &Context, text: &str, size: f64, weight: FontWeight) -> f64 {
+    ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
+    ctx.set_font_size(size);
+    ctx.text_extents(text)
+        .map(|metrics| metrics.x_advance())
+        .unwrap_or(0.0)
+}
+
+/// The card's text is the card's ink at some opacity, never a series colour, so
+/// a chart label reads as label rather than as another mark.
+#[allow(clippy::too_many_arguments)]
+fn draw_token_text(
+    ctx: &Context,
+    x: f64,
+    baseline: f64,
+    text: &str,
+    size: f64,
+    weight: FontWeight,
+    ink: (f64, f64, f64),
+    alpha: f64,
+) {
+    ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
+    ctx.set_font_size(size);
+    ctx.set_source_rgba(ink.0, ink.1, ink.2, alpha);
+    ctx.move_to(x, baseline);
+    let _ = ctx.show_text(text);
+}
+
+/// A bar with rounded ends, the shape the rest of the card already uses for a
+/// progress trough.
+fn token_bar_path(ctx: &Context, x: f64, y: f64, width: f64, height: f64) {
+    let width = width.max(0.0);
+    let radius = (height / 2.0).min(3.0).min(width / 2.0);
+    if radius <= 0.4 {
+        ctx.rectangle(x, y, width, height);
+        return;
+    }
+    ctx.new_sub_path();
+    ctx.arc(x + width - radius, y + radius, radius, -FRAC_PI_2, 0.0);
+    ctx.arc(
+        x + width - radius,
+        y + height - radius,
+        radius,
+        0.0,
+        FRAC_PI_2,
+    );
+    ctx.arc(x + radius, y + height - radius, radius, FRAC_PI_2, PI);
+    ctx.arc(x + radius, y + radius, radius, PI, PI + FRAC_PI_2);
+    ctx.close_path();
+}
+
+fn fill_token_bar(
+    ctx: &Context,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    ink: (f64, f64, f64),
+    alpha: f64,
+) {
+    if width <= 0.0 {
+        return;
+    }
+    ctx.set_source_rgba(ink.0, ink.1, ink.2, alpha);
+    token_bar_path(ctx, x, y, width, height);
+    let _ = ctx.fill();
+}
+
+fn token_hit_at(hits: &[TokenHit], x: f64, y: f64) -> Option<usize> {
+    hits.iter()
+        .position(|hit| x >= hit.x && x < hit.x + hit.width && y >= hit.y && y < hit.y + hit.height)
+}
+
+/// Total tokens over the selected window: one headline, one bar splitting it
+/// between the three CLIs, and a row per CLI. Nothing here carries a number the
+/// eye has to read off an axis — the hover layer holds the exact figures.
+fn draw_tokens(
+    area: &gtk::DrawingArea,
+    ctx: &Context,
+    state: &TokenState,
+    color_mode: Foreground,
+    hits: &mut Vec<TokenHit>,
+) {
+    let allocation = area.allocation();
+    paint_tokens(
+        ctx,
+        state,
+        color_mode,
+        widget_font_scale(area),
+        f64::from(allocation.width().max(1)),
+        f64::from(allocation.height().max(1)),
+        hits,
+    );
+}
+
+/// Split out from the widget so the layout can be exercised at a known size:
+/// an unrealised `DrawingArea` reports a one-pixel allocation, which would
+/// leave nothing on screen to check.
+#[allow(clippy::too_many_arguments)]
+fn paint_tokens(
+    ctx: &Context,
+    state: &TokenState,
+    color_mode: Foreground,
+    scale: f64,
+    allocated_width: f64,
+    allocated_height: f64,
+    hits: &mut Vec<TokenHit>,
+) {
+    hits.clear();
+    ctx.scale(scale, scale);
+    let height = allocated_height / scale;
+    let left = TOKEN_MARGIN;
+    let right = (allocated_width / scale - TOKEN_MARGIN).max(left + 8.0);
+    let width = right - left;
+    let ink = match color_mode {
+        Foreground::Light => (0.97, 0.97, 0.97),
+        Foreground::Dark => (0.08, 0.08, 0.08),
+    };
+    // Widget coordinates, so a hit rect can be compared straight against a
+    // pointer position without repeating the scaling.
+    let mut record = |x: f64, y: f64, width: f64, height: f64, tip: String| {
+        hits.push(TokenHit {
+            x: x * scale,
+            y: y * scale,
+            width: width * scale,
+            height: height * scale,
+            tip,
+        });
+    };
+
+    let totals = state
+        .report
+        .totals(state.period.since_day(usage::local_day_now()));
+    let grand: u64 = totals
+        .iter()
+        .fold(0u64, |sum, (_, spent)| sum.saturating_add(spent.total()));
+    if grand == 0 {
+        let message = if state.scanning {
+            "Reading session logs…"
+        } else {
+            "No tokens recorded in this window"
+        };
+        draw_token_text(
+            ctx,
+            left,
+            height / 2.0 + 3.0,
+            message,
+            9.0,
+            FontWeight::Normal,
+            ink,
+            0.5,
+        );
+        return;
+    }
+
+    let mut summed = usage::TokenTotals::default();
+    for (_, spent) in &totals {
+        summed.merge(*spent);
+    }
+    let hero_block = 18.0;
+    draw_token_text(
+        ctx,
+        left,
+        14.0,
+        &format_tokens(grand),
+        16.0,
+        FontWeight::Bold,
+        ink,
+        0.95,
+    );
+    let caption = format!("tokens · {}", state.period.caption());
+    draw_token_text(
+        ctx,
+        right - token_text_width(ctx, &caption, 8.5, FontWeight::Normal),
+        14.0,
+        &caption,
+        8.5,
+        FontWeight::Normal,
+        ink,
+        0.5,
+    );
+    record(
+        left,
+        0.0,
+        width,
+        hero_block,
+        token_tooltip(&format!("All sources · {}", state.period.caption()), summed),
+    );
+
+    // The rows below tighten before anything else, and only a card squeezed
+    // past the point of reading loses the split bar entirely.
+    let split_height = 7.0;
+    let split_gap = 4.0;
+    let count = totals.len().max(1) as f64;
+    let split_shown = height >= hero_block + split_height + split_gap + 9.0 * count;
+    if split_shown {
+        let gap = 2.0;
+        let spent_sources = totals.iter().filter(|(_, spent)| spent.total() > 0).count();
+        let usable = (width - gap * spent_sources.saturating_sub(1) as f64).max(1.0);
+        let mut x = left;
+        for (index, (source, spent)) in totals.iter().enumerate() {
+            if spent.total() == 0 {
+                continue;
+            }
+            let share = spent.total() as f64 * 100.0 / grand as f64;
+            let segment = (usable * spent.total() as f64 / grand as f64).max(2.0);
+            fill_token_bar(
+                ctx,
+                x,
+                hero_block,
+                segment,
+                split_height,
+                ink,
+                TOKEN_SHADES[index.min(TOKEN_SHADES.len() - 1)],
+            );
+            record(
+                x,
+                hero_block,
+                segment,
+                split_height,
+                token_tooltip(
+                    &format!(
+                        "{} · {} of {}",
+                        source.label(),
+                        usage_percent_label(Some(share)),
+                        state.period.caption()
+                    ),
+                    *spent,
+                ),
+            );
+            x += segment + gap;
+        }
+    }
+
+    // Every source keeps a row, so one that spent nothing this window reads as
+    // an empty bar rather than disappearing from the list.
+    let rows_top = hero_block
+        + if split_shown {
+            split_height + split_gap
+        } else {
+            0.0
+        };
+    let row_height = ((height - rows_top) / count).clamp(9.0, 20.0);
+    let peak = totals
+        .iter()
+        .map(|(_, spent)| spent.total())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let text_size = (row_height * 0.6).clamp(7.5, 10.0);
+    for (index, (source, spent)) in totals.iter().enumerate() {
+        let top = rows_top + row_height * index as f64;
+        let baseline = top + row_height / 2.0 + text_size / 2.5;
+        let shade = TOKEN_SHADES[index.min(TOKEN_SHADES.len() - 1)];
+        draw_token_text(
+            ctx,
+            left,
+            baseline,
+            source.label(),
+            text_size,
+            FontWeight::Bold,
+            ink,
+            0.74,
+        );
+        let value = format_tokens(spent.total());
+        draw_token_text(
+            ctx,
+            right - token_text_width(ctx, &value, text_size, FontWeight::Normal),
+            baseline,
+            &value,
+            text_size,
+            FontWeight::Normal,
+            ink,
+            0.62,
+        );
+        let bar_left = left + TOKEN_LABEL_WIDTH;
+        let bar_width = (right - TOKEN_VALUE_WIDTH - bar_left).max(4.0);
+        let bar_height = (row_height - 5.0).clamp(3.0, 8.0);
+        let bar_top = top + (row_height - bar_height) / 2.0;
+        fill_token_bar(ctx, bar_left, bar_top, bar_width, bar_height, ink, 0.09);
+        if spent.total() > 0 {
+            // Bars are read against the largest source rather than the total,
+            // so a small source still has a bar to see.
+            let filled = bar_width * spent.total() as f64 / peak as f64;
+            let live = spent.input.saturating_add(spent.output);
+            // Held well clear of the empty track: the faintest source still has
+            // to look filled rather than look like nothing was drawn.
+            fill_token_bar(
+                ctx,
+                bar_left,
+                bar_top,
+                filled,
+                bar_height,
+                ink,
+                0.22 + shade * 0.28,
+            );
+            // The solid part is what was generated or sent fresh; the faint
+            // remainder is prompt cache, which is most of an agent's traffic.
+            let solid = filled * live as f64 / spent.total() as f64;
+            fill_token_bar(ctx, bar_left, bar_top, solid, bar_height, ink, shade);
+        }
+        let share = spent.total() as f64 * 100.0 / grand as f64;
+        record(
+            left,
+            top,
+            width,
+            row_height,
+            token_tooltip(
+                &format!(
+                    "{} · {} of {}",
+                    source.label(),
+                    usage_percent_label(Some(share)),
+                    state.period.caption()
+                ),
+                *spent,
+            ),
+        );
+    }
+}
+
+fn render_token_tab(card: &UsageCard) {
+    let state = card.tokens.borrow();
+    set_usage_tab_active(&card.periods, state.period);
+    card.status.set_label(if state.scanning {
+        "Reading session logs…"
+    } else {
+        "Counted from this machine's session logs"
+    });
+    card.status.set_tooltip_text(Some(
+        "Tokens the Codex, Claude Code and OMP CLIs recorded in their own session logs. Nothing is fetched from a provider.",
+    ));
+    card.updated.set_label(&if state.report.scanned_at_ms > 0 {
+        usage_age_label(state.report.scanned_at_ms, usage_now_ms())
+    } else {
+        String::new()
+    });
+    card.refresh.set_sensitive(!state.scanning);
+    card.refresh
+        .set_label(if state.scanning { "…" } else { "↻" });
+    card.refresh.set_tooltip_text(Some("Rescan session logs"));
+    // The rects the last paint left behind are about to be replaced, so the
+    // pointer has to be re-tested rather than trusted to still be over the
+    // same one.
+    card.token_hover.set(None);
+    card.tokens_canvas.set_tooltip_text(None);
+    card.tokens_canvas.queue_draw();
+}
+
 fn render_usage_card(
     card: &UsageCard,
-    source: UsageSource,
+    tab: UsageTab,
     snapshot: Option<&usage::Snapshot>,
     error: Option<&str>,
 ) {
     let scroll = card
         .tabs
         .iter()
-        .find(|(candidate, _)| *candidate == source)
+        .find(|(candidate, _)| *candidate == tab)
         .filter(|(_, button)| button.style_context().has_class("usage-tab-active"))
         .map(|_| card.scroller.vadjustment().value());
-    set_usage_tab_active(&card.tabs, source);
+    let tokens = matches!(tab, UsageTab::Tokens);
+    card.scroller.set_visible(!tokens);
+    card.tokens_pane.set_visible(tokens);
+    set_usage_tab_active(&card.tabs, tab);
+    if tokens {
+        render_token_tab(card);
+        return;
+    }
     clear_usage_rows(&card.rows);
     let now = usage_now_ms();
     let Some(snapshot) = snapshot else {
@@ -2324,42 +2948,78 @@ fn update_usage_refresh(card: &UsageCard, schedule: &usage::Schedule, now: i64) 
     }
 }
 
-fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageController {
-    let source = Rc::new(Cell::new(initial_source));
+fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageController {
+    let tab = Rc::new(Cell::new(initial_tab));
     let schedules = Rc::new(RefCell::new(HashMap::<UsageSource, usage::Schedule>::new()));
     let errors = Rc::new(RefCell::new(HashMap::<UsageSource, String>::new()));
     let snapshots = Rc::new(RefCell::new(HashMap::<UsageSource, usage::Snapshot>::new()));
     let (tx, rx) =
         async_channel::bounded::<(UsageSource, Result<usage::Snapshot, usage::FetchError>)>(3);
+    let (token_tx, token_rx) = async_channel::bounded::<usage::TokenReport>(1);
     let render = {
         let card = card.clone();
         let schedules = schedules.clone();
         let snapshots = snapshots.clone();
         let errors = errors.clone();
-        Rc::new(move |which: UsageSource| {
+        Rc::new(move |which: UsageTab| {
+            let UsageTab::Source(source) = which else {
+                // The token tab draws itself from state the card already holds.
+                render_usage_card(&card, which, None, None);
+                return;
+            };
             render_usage_card(
                 &card,
                 which,
-                snapshots.borrow().get(&which),
-                errors.borrow().get(&which).map(String::as_str),
+                snapshots.borrow().get(&source),
+                errors.borrow().get(&source).map(String::as_str),
             );
             update_usage_refresh(
                 &card,
                 schedules
                     .borrow()
-                    .get(&which)
+                    .get(&source)
                     .unwrap_or(&usage::Schedule::default()),
                 usage_now_ms(),
             );
-        }) as Rc<dyn Fn(UsageSource)>
+        }) as Rc<dyn Fn(UsageTab)>
+    };
+    // Walking every transcript on the disk is disk-bound, so it runs on a
+    // thread of its own and only once what is on screen has gone stale.
+    let scan = {
+        let card = card.clone();
+        let tab = tab.clone();
+        Rc::new(move |manual: bool| {
+            if !matches!(tab.get(), UsageTab::Tokens) {
+                return;
+            }
+            {
+                let state = card.tokens.borrow();
+                let age = usage_now_ms().saturating_sub(state.report.scanned_at_ms);
+                if state.scanning
+                    || (!manual && state.report.scanned_at_ms > 0 && age < TOKEN_RESCAN_MS)
+                {
+                    return;
+                }
+            }
+            card.tokens.borrow_mut().scanning = true;
+            render_token_tab(&card);
+            let token_tx = token_tx.clone();
+            std::thread::spawn(move || {
+                let _ = token_tx.send_blocking(usage::scan_tokens());
+            });
+        }) as Rc<dyn Fn(bool)>
     };
     let send = {
-        let source = source.clone();
+        let tab = tab.clone();
         let card = card.clone();
         let schedules = schedules.clone();
         let snapshots = snapshots.clone();
+        let scan = scan.clone();
         Rc::new(move |manual: bool| {
-            let which = source.get();
+            let UsageTab::Source(which) = tab.get() else {
+                scan(manual);
+                return;
+            };
             let now = usage_now_ms();
             let reset = snapshots.borrow().get(&which).and_then(|snapshot| {
                 snapshot
@@ -2386,14 +3046,14 @@ fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageCon
         }) as Rc<dyn Fn(bool)>
     };
     {
-        let source = source.clone();
+        let tab = tab.clone();
         let schedules = schedules.clone();
         let snapshots = snapshots.clone();
         let errors = errors.clone();
         let render = render.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok((which, result)) = rx.recv().await {
-                let selected = source.get() == which;
+                let selected = tab.get() == UsageTab::Source(which);
                 let mut schedules = schedules.borrow_mut();
                 let schedule = schedules.entry(which).or_default();
                 schedule.finish(usage_now_ms(), which, result.as_ref().err());
@@ -2409,7 +3069,24 @@ fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageCon
                     }
                 }
                 if selected {
-                    render(which);
+                    render(UsageTab::Source(which));
+                }
+            }
+        });
+    }
+    {
+        let card = card.clone();
+        let tab = tab.clone();
+        let render = render.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(report) = token_rx.recv().await {
+                {
+                    let mut state = card.tokens.borrow_mut();
+                    state.report = report;
+                    state.scanning = false;
+                }
+                if matches!(tab.get(), UsageTab::Tokens) {
+                    render(UsageTab::Tokens);
                 }
             }
         });
@@ -2418,7 +3095,7 @@ fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageCon
         let render = render.clone();
         Rc::new(move |which| {
             render(which);
-        }) as Rc<dyn Fn(UsageSource)>
+        }) as Rc<dyn Fn(UsageTab)>
     };
     let request = {
         let send = send.clone();
@@ -2430,11 +3107,25 @@ fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageCon
     };
     let request_for_timer = request.clone();
     let card_for_timer = card.clone();
-    let source_for_timer = source.clone();
+    let tab_for_timer = tab.clone();
     glib::timeout_add_local(Duration::from_secs(1), move || {
         if card_for_timer.card.is_visible() {
             let now = usage_now_ms();
-            if let Some(snapshot) = snapshots.borrow().get(&source_for_timer.get()) {
+            let selected = match tab_for_timer.get() {
+                UsageTab::Source(source) => Some(source),
+                UsageTab::Tokens => {
+                    let state = card_for_timer.tokens.borrow();
+                    if state.report.scanned_at_ms > 0 && !state.scanning {
+                        card_for_timer
+                            .updated
+                            .set_label(&usage_age_label(state.report.scanned_at_ms, now));
+                    }
+                    None
+                }
+            };
+            if let Some(snapshot) =
+                selected.and_then(|source| snapshots.borrow().get(&source).cloned())
+            {
                 card_for_timer
                     .updated
                     .set_label(&usage_age_label(snapshot.fetched_at_ms, now));
@@ -2464,9 +3155,9 @@ fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageCon
         }
         glib::ControlFlow::Continue
     });
-    render_usage_card(&card, source.get(), None, None);
+    render(tab.get());
     UsageController {
-        source,
+        tab,
         request,
         refresh,
         show,
@@ -11714,12 +12405,17 @@ mod usage_ui_tests {
                 })
                 .collect(),
         };
-        render_usage_card(&card, UsageSource::Omp, Some(&snapshot), None);
+        render_usage_card(
+            &card,
+            UsageTab::Source(UsageSource::Omp),
+            Some(&snapshot),
+            None,
+        );
         assert_eq!(card.rows.children().len(), 20);
         assert_eq!(card.status.text(), "user@example.com");
         render_usage_card(
             &card,
-            UsageSource::Omp,
+            UsageTab::Source(UsageSource::Omp),
             Some(&usage::Snapshot {
                 account: None,
                 ..snapshot.clone()
@@ -11741,11 +12437,164 @@ mod usage_ui_tests {
         assert_eq!(card.updated.text(), "Retry in 2:00");
         update_usage_refresh(&card, &schedule, 121000);
         assert!(card.refresh.is_sensitive());
-        render_usage_card(&card, UsageSource::Omp, None, Some("Sign in again"));
+        render_usage_card(
+            &card,
+            UsageTab::Source(UsageSource::Omp),
+            None,
+            Some("Sign in again"),
+        );
         assert!(card.rows.children().is_empty());
         assert_eq!(card.status.text(), "Sign in again");
         assert_eq!(card.updated.text(), "");
-        render_usage_card(&card, UsageSource::Claude, None, None);
+        render_usage_card(&card, UsageTab::Source(UsageSource::Claude), None, None);
         assert_eq!(card.status.text(), "Loading usage…");
+        assert!(card.scroller.get_visible());
+        assert!(!card.tokens_pane.get_visible());
+    }
+
+    #[test]
+    fn token_amounts_are_readable_short_and_exact_long() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(12_345), "12.3K");
+        assert_eq!(format_tokens(1_234_567), "1.2M");
+        assert_eq!(format_tokens(2_806_478_873), "2.81B");
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1_000), "1,000");
+        assert_eq!(group_digits(2_806_478_873), "2,806,478,873");
+    }
+
+    #[test]
+    fn a_token_window_reaches_back_from_today_and_all_reaches_further() {
+        assert_eq!(TokenPeriod::Today.since_day(20_703), Some(20_703));
+        assert_eq!(TokenPeriod::Week.since_day(20_703), Some(20_697));
+        assert_eq!(TokenPeriod::Month.since_day(20_703), Some(20_674));
+        assert_eq!(TokenPeriod::All.since_day(20_703), None);
+        for period in TokenPeriod::ALL {
+            assert_eq!(TokenPeriod::from_key(period.key()), period);
+        }
+        // A settings file written before the token tab existed still opens.
+        assert_eq!(TokenPeriod::from_key(""), TokenPeriod::Month);
+    }
+
+    /// The token tab has to survive the two shapes a first run takes — nothing
+    /// scanned yet, and a scan that came back empty — and then hand every mark
+    /// it draws a hover target, because the chart carries no printed figures.
+    #[test]
+    fn the_token_tab_swaps_in_and_hands_every_mark_a_tooltip() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let card = build_usage_window(Foreground::Light);
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 280, 96)
+            .expect("a surface to draw the token tab into");
+        let ctx = Context::new(&surface).expect("a cairo context");
+        let mut hits = Vec::new();
+
+        card.tokens.borrow_mut().scanning = true;
+        render_usage_card(&card, UsageTab::Tokens, None, None);
+        assert!(card.tokens_pane.get_visible());
+        assert!(!card.scroller.get_visible());
+        assert_eq!(card.status.text(), "Reading session logs…");
+        assert!(!card.refresh.is_sensitive());
+        // Without this mask the canvas is painted but never hovered, and the
+        // exact figures only exist in the tooltips.
+        assert!(card
+            .tokens_canvas
+            .events()
+            .contains(gdk::EventMask::POINTER_MOTION_MASK));
+        paint_tokens(
+            &ctx,
+            &card.tokens.borrow(),
+            Foreground::Light,
+            1.0,
+            280.0,
+            96.0,
+            &mut hits,
+        );
+        assert!(hits.is_empty(), "nothing to hover before a scan lands");
+
+        let mut report = usage::TokenReport {
+            scanned_at_ms: usage_now_ms(),
+            ..usage::TokenReport::default()
+        };
+        let today = usage::local_day_now();
+        for (index, source) in UsageSource::ALL.into_iter().enumerate() {
+            let mut days = usage::TokenDays::new();
+            days.insert(
+                today,
+                usage::TokenTotals {
+                    input: 1_000 * (index as u64 + 1),
+                    output: 2_000 * (index as u64 + 1),
+                    cache_read: 4_000_000 * (index as u64 + 1),
+                    cache_write: 500,
+                },
+            );
+            // A day outside every window but "All", so the periods differ.
+            days.insert(
+                today - 90,
+                usage::TokenTotals {
+                    input: 7_777,
+                    ..usage::TokenTotals::default()
+                },
+            );
+            report.days.insert(source, days);
+        }
+        {
+            let mut state = card.tokens.borrow_mut();
+            state.report = report;
+            state.scanning = false;
+            state.period = TokenPeriod::Today;
+        }
+        render_usage_card(&card, UsageTab::Tokens, None, None);
+        assert!(card.refresh.is_sensitive());
+        assert_eq!(
+            card.status.text(),
+            "Counted from this machine's session logs"
+        );
+        paint_tokens(
+            &ctx,
+            &card.tokens.borrow(),
+            Foreground::Light,
+            1.0,
+            280.0,
+            96.0,
+            &mut hits,
+        );
+        // One headline, one split segment and one row per source.
+        assert_eq!(hits.len(), 1 + UsageSource::ALL.len() * 2);
+        for hit in &hits {
+            assert!(
+                hit.width > 0.0 && hit.height > 0.0,
+                "a mark with no hit area"
+            );
+            assert!(hit.tip.contains("tokens"), "{}", hit.tip);
+            assert!(hit.tip.contains("cache read"), "{}", hit.tip);
+        }
+        assert!(
+            hits[0].tip.contains("All sources · today"),
+            "{}",
+            hits[0].tip
+        );
+        assert_eq!(
+            token_hit_at(&hits, hits[0].x + 1.0, hits[0].y + 1.0),
+            Some(0)
+        );
+        assert_eq!(token_hit_at(&hits, -5.0, -5.0), None);
+        // The headline counts every source in the window and nothing outside it.
+        assert!(hits[0].tip.contains("24,019,500"), "{}", hits[0].tip);
+        card.tokens.borrow_mut().period = TokenPeriod::All;
+        render_usage_card(&card, UsageTab::Tokens, None, None);
+        paint_tokens(
+            &ctx,
+            &card.tokens.borrow(),
+            Foreground::Light,
+            1.0,
+            280.0,
+            96.0,
+            &mut hits,
+        );
+        assert!(hits[0].tip.contains("24,042,831"), "{}", hits[0].tip);
     }
 }

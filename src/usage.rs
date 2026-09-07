@@ -7,12 +7,13 @@
 
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet},
     env, fs,
+    hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{mpsc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -949,9 +950,642 @@ fn fetch_omp(force: bool) -> Result<Snapshot, String> {
     })
 }
 
+// ------------------------------------------------------------------- tokens
+//
+// Every one of these CLIs already writes its own token accounting to a session
+// log under $HOME, so the token tab reads those files rather than asking a
+// provider for numbers it would then have to authenticate for. Nothing here
+// leaves the machine.
+
+/// Tokens spent, split the way all three providers report them. Cache reads
+/// dominate an agent workload and cost a fraction of fresh input, so they are
+/// kept apart from the input the user paid full price for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl TokenTotals {
+    pub fn total(self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+    }
+
+    /// What this reading added on top of the previous one, for a source that
+    /// reports a running session total instead of a per-turn figure. A counter
+    /// that goes backwards has been restarted rather than rewound, so the whole
+    /// new reading counts.
+    fn since(self, previous: Self) -> Self {
+        fn step(current: u64, previous: u64) -> u64 {
+            if current >= previous {
+                current - previous
+            } else {
+                current
+            }
+        }
+        Self {
+            input: step(self.input, previous.input),
+            output: step(self.output, previous.output),
+            cache_read: step(self.cache_read, previous.cache_read),
+            cache_write: step(self.cache_write, previous.cache_write),
+        }
+    }
+}
+
+/// Local calendar day (days since the Unix epoch) mapped to what was spent on
+/// it. Buckets rather than raw events: a month of logs is a few dozen entries
+/// instead of thousands, and every window the card offers is a range sum.
+pub type TokenDays = BTreeMap<i64, TokenTotals>;
+
+#[derive(Clone, Debug, Default)]
+pub struct TokenReport {
+    pub days: HashMap<Source, TokenDays>,
+    pub scanned_at_ms: i64,
+}
+
+impl TokenReport {
+    /// Per-source totals over `since_day..`, or over everything on record when
+    /// no first day is given. Sources come back in `Source::ALL` order so one
+    /// keeps its place in the chart when another drops to zero.
+    pub fn totals(&self, since_day: Option<i64>) -> Vec<(Source, TokenTotals)> {
+        Source::ALL
+            .into_iter()
+            .map(|source| {
+                let mut totals = TokenTotals::default();
+                if let Some(days) = self.days.get(&source) {
+                    let spent: Box<dyn Iterator<Item = &TokenTotals>> = match since_day {
+                        Some(since) => Box::new(days.range(since..).map(|(_, spent)| spent)),
+                        None => Box::new(days.values()),
+                    };
+                    for day in spent {
+                        totals.merge(*day);
+                    }
+                }
+                (source, totals)
+            })
+            .collect()
+    }
+}
+
+/// Seconds to add to a UTC timestamp to land on the local wall clock. Read once
+/// per scan: a DST change mid-scan would move a handful of records by an hour,
+/// which no token count cares about.
+fn local_offset_seconds() -> i64 {
+    glib::DateTime::now_local()
+        .map(|now| now.utc_offset().as_microseconds() / 1_000_000)
+        .unwrap_or(0)
+}
+
+pub fn local_day_now() -> i64 {
+    (now_ms() / 1000 + local_offset_seconds()).div_euclid(86_400)
+}
+
+/// Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
+/// The local day an RFC 3339 UTC timestamp such as `2026-08-29T04:35:43.839Z`
+/// falls on. Only the fields that decide the day are read, so this stays
+/// allocation-free across the whole corpus of transcripts.
+fn iso_local_day(text: &str, offset_seconds: i64) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    let field = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let seconds = days_from_civil(field(0..4)?, field(5..7)?, field(8..10)?)? * 86_400
+        + field(11..13)? * 3_600
+        + field(14..16)? * 60
+        + field(17..19)?;
+    Some((seconds + offset_seconds).div_euclid(86_400))
+}
+
+fn record_day(value: &Value, offset: i64) -> Option<i64> {
+    iso_local_day(value.get("timestamp")?.as_str()?, offset)
+}
+
+fn json_u64(value: Option<&Value>) -> u64 {
+    value
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite() && *number > 0.0)
+        .map(|number| number.min(u64::MAX as f64) as u64)
+        .unwrap_or(0)
+}
+
+/// One accounting entry from a transcript.
+#[derive(Clone, Copy, Debug)]
+struct TokenRecord {
+    /// Identifies the API response this came from, for the sources whose logs
+    /// repeat one. `None` marks a record that is already a per-file daily
+    /// aggregate and so cannot collide with anything.
+    key: Option<u64>,
+    day: i64,
+    totals: TokenTotals,
+}
+
+fn record_key(id: &str, request: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    (id, request).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Turns a per-day map into the keyless records the combine step expects.
+fn daily_records(days: TokenDays) -> Vec<TokenRecord> {
+    days.into_iter()
+        .map(|(day, totals)| TokenRecord {
+            key: None,
+            day,
+            totals,
+        })
+        .collect()
+}
+
+/// A log line long enough to be a pasted file rather than an accounting record.
+/// Skipping the JSON parse on those is what keeps a scan of a few hundred
+/// megabytes of transcripts under a second.
+// ponytail: fixed cap, revisit if a provider ever writes a fat usage record.
+const MAX_RECORD_BYTES: usize = 256 * 1024;
+
+/// Runs `record` over every line of `path` that contains `marker`.
+fn for_each_record(path: &Path, marker: &str, mut record: impl FnMut(&Value)) {
+    let Ok(file) = fs::File::open(path) else {
+        return;
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        // A transcript can hold a stray invalid UTF-8 byte; that costs the rest
+        // of one file, not the scan.
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        if line.len() > MAX_RECORD_BYTES || !line.contains(marker) {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
+            record(&value);
+        }
+    }
+}
+
+/// Claude Code writes one line per streaming update, each repeating the same
+/// final usage, and copies the whole transcript into a new file when a session
+/// is forked or resumed. Both are answered by keying on the response, here
+/// within the file and again across every file in `scan_tokens`.
+fn scan_claude_file(path: &Path, offset: i64) -> Vec<TokenRecord> {
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for_each_record(path, "\"usage\"", |value| {
+        let Some(usage) = value.pointer("/message/usage") else {
+            return;
+        };
+        let Some(day) = record_day(value, offset) else {
+            return;
+        };
+        let key = record_key(
+            value
+                .pointer("/message/id")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            value
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if !seen.insert(key) {
+            return;
+        }
+        records.push(TokenRecord {
+            key: Some(key),
+            day,
+            totals: TokenTotals {
+                input: json_u64(usage.get("input_tokens")),
+                output: json_u64(usage.get("output_tokens")),
+                cache_read: json_u64(usage.get("cache_read_input_tokens")),
+                cache_write: json_u64(usage.get("cache_creation_input_tokens")),
+            },
+        });
+    });
+    records
+}
+
+/// A single turn cannot spend more than a full context window of input plus a
+/// reply, so a jump past this is a counter that was inherited rather than
+/// earned. Codex forks start their rollout at the parent's running total, and
+/// without this the fork's first reading would be billed all over again.
+fn codex_turn_ceiling(info: &Value) -> u64 {
+    match json_u64(info.get("model_context_window")) {
+        0 => 2_000_000,
+        window => window.saturating_mul(2),
+    }
+}
+
+/// Codex reports a running session total rather than a per-turn figure, and
+/// older rollouts carry no per-turn record at all, so the tab is built from the
+/// growth of that total. Its `input_tokens` counts the cached prompt too, which
+/// is split back out here so every source means the same thing by "input".
+fn scan_codex_file(path: &Path, offset: i64) -> Vec<TokenRecord> {
+    let mut days = TokenDays::new();
+    let mut previous = TokenTotals::default();
+    for_each_record(path, "total_token_usage", |value| {
+        let Some(info) = value.pointer("/payload/info") else {
+            return;
+        };
+        let Some(usage) = info.get("total_token_usage") else {
+            return;
+        };
+        let current = TokenTotals {
+            input: json_u64(usage.get("input_tokens")),
+            output: json_u64(usage.get("output_tokens")),
+            cache_read: json_u64(usage.get("cached_input_tokens")),
+            cache_write: json_u64(usage.get("cache_write_input_tokens")),
+        };
+        let mut spent = current.since(previous);
+        previous = current;
+        if spent.total() > codex_turn_ceiling(info) {
+            return;
+        }
+        spent.input = spent.input.saturating_sub(spent.cache_read);
+        let Some(day) = record_day(value, offset) else {
+            return;
+        };
+        days.entry(day).or_default().merge(spent);
+    });
+    daily_records(days)
+}
+
+/// OMP writes one usage object per assistant message, already per-turn.
+fn scan_omp_file(path: &Path, offset: i64) -> Vec<TokenRecord> {
+    let mut days = TokenDays::new();
+    for_each_record(path, "totalTokens", |value| {
+        let Some(usage) = value.pointer("/message/usage") else {
+            return;
+        };
+        let Some(day) = record_day(value, offset) else {
+            return;
+        };
+        days.entry(day).or_default().merge(TokenTotals {
+            input: json_u64(usage.get("input")),
+            output: json_u64(usage.get("output")),
+            cache_read: json_u64(usage.get("cacheRead")),
+            cache_write: json_u64(usage.get("cacheWrite")),
+        });
+    });
+    daily_records(days)
+}
+
+fn scan_session_file(source: Source, path: &Path, offset: i64) -> Vec<TokenRecord> {
+    match source {
+        Source::Claude => scan_claude_file(path, offset),
+        Source::Codex => scan_codex_file(path, offset),
+        Source::Omp => scan_omp_file(path, offset),
+    }
+}
+
+fn session_root(source: Source) -> Option<PathBuf> {
+    let under_home = |suffix: &str| {
+        env::var_os("HOME").map(|home| {
+            suffix
+                .split('/')
+                .fold(PathBuf::from(home), |path, part| path.join(part))
+        })
+    };
+    match source {
+        Source::Claude => env::var_os("CLAUDE_CONFIG_DIR")
+            .map(|dir| PathBuf::from(dir).join("projects"))
+            .or_else(|| under_home(".claude/projects")),
+        Source::Codex => env::var_os("CODEX_HOME")
+            .map(|dir| PathBuf::from(dir).join("sessions"))
+            .or_else(|| under_home(".codex/sessions")),
+        Source::Omp => under_home(".omp/agent/sessions"),
+    }
+}
+
+/// Deep enough for every layout in play: Codex nests a rollout under year,
+/// month and day, and Claude Code keeps a session's subagent transcripts in a
+/// folder beside it. Those subagents spend real tokens and belong in the total.
+const SESSION_DEPTH: usize = 3;
+
+fn session_files(root: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {
+                if depth > 0 {
+                    session_files(&path, depth - 1, found);
+                }
+            }
+            Ok(_)
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl") =>
+            {
+                found.push(path);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What a file held last time it was read. Only the open session is rewritten
+/// between scans, so re-reading the rest of the transcripts is wasted work.
+struct CachedFile {
+    modified: Option<SystemTime>,
+    len: u64,
+    records: Vec<TokenRecord>,
+}
+
+type TokenCache = HashMap<PathBuf, CachedFile>;
+
+fn token_cache() -> &'static Mutex<TokenCache> {
+    static CACHE: OnceLock<Mutex<TokenCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(TokenCache::new()))
+}
+
+/// Reads every session log the three CLIs have kept and buckets what they spent
+/// by local day. Blocking and disk-bound — call it off the main thread.
+pub fn scan_tokens() -> TokenReport {
+    let offset = local_offset_seconds();
+    // A poisoned cache is a scan that panicked; drop what it left and rebuild.
+    let mut stale = match token_cache().lock() {
+        Ok(mut cache) => std::mem::take(&mut *cache),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    };
+    let mut fresh = TokenCache::new();
+    let mut days = HashMap::new();
+    for source in Source::ALL {
+        let mut totals = TokenDays::new();
+        let mut seen = HashSet::new();
+        let mut files = Vec::new();
+        if let Some(root) = session_root(source) {
+            session_files(&root, SESSION_DEPTH, &mut files);
+        }
+        for path in files {
+            let metadata = fs::metadata(&path).ok();
+            let modified = metadata.as_ref().and_then(|data| data.modified().ok());
+            let len = metadata.as_ref().map(fs::Metadata::len).unwrap_or(0);
+            let entry = match stale.remove(&path) {
+                // Same size and mtime as last time: an append would have moved
+                // both. Without a readable mtime there is nothing to trust.
+                Some(entry)
+                    if modified.is_some() && entry.modified == modified && entry.len == len =>
+                {
+                    entry
+                }
+                _ => CachedFile {
+                    modified,
+                    len,
+                    records: scan_session_file(source, &path, offset),
+                },
+            };
+            for record in &entry.records {
+                // One response can appear in several files once a session has
+                // been forked or resumed, and it was only ever billed once.
+                if record.key.is_some_and(|key| !seen.insert(key)) {
+                    continue;
+                }
+                totals.entry(record.day).or_default().merge(record.totals);
+            }
+            fresh.insert(path, entry);
+        }
+        totals.retain(|_, spent| spent.total() > 0);
+        days.insert(source, totals);
+    }
+    // Rebuilding the map rather than updating it drops files the CLIs rotated away.
+    if let Ok(mut cache) = token_cache().lock() {
+        *cache = fresh;
+    }
+    TokenReport {
+        days,
+        scanned_at_ms: now_ms(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture(name: &str, body: &str) -> PathBuf {
+        let dir = env::temp_dir().join("sysi-token-scan-tests");
+        fs::create_dir_all(&dir).expect("a temp dir for the fixture");
+        let path = dir.join(name);
+        fs::write(&path, body).expect("the fixture to be written");
+        path
+    }
+
+    fn summed(records: &[TokenRecord]) -> TokenTotals {
+        let mut totals = TokenTotals::default();
+        for record in records {
+            totals.merge(record.totals);
+        }
+        totals
+    }
+
+    #[test]
+    fn a_timestamp_lands_on_the_local_day_not_the_utc_one() {
+        assert_eq!(days_from_civil(1970, 1, 1), Some(0));
+        assert_eq!(days_from_civil(2026, 8, 29), Some(20_694));
+        assert_eq!(days_from_civil(2026, 2, 29), Some(20_513));
+        assert_eq!(days_from_civil(2026, 13, 1), None);
+        // Late evening in Hanoi is still the previous day in UTC, and the card
+        // is read against the wall clock in the room.
+        assert_eq!(iso_local_day("2026-08-29T18:30:00.000Z", 0), Some(20_694));
+        assert_eq!(
+            iso_local_day("2026-08-29T18:30:00.000Z", 7 * 3_600),
+            Some(20_695)
+        );
+        assert_eq!(
+            iso_local_day("2026-08-29T02:30:00.000Z", -5 * 3_600),
+            Some(20_693)
+        );
+        assert_eq!(iso_local_day("not a timestamp", 0), None);
+        assert_eq!(iso_local_day("", 0), None);
+    }
+
+    /// Claude Code repeats a message once per streaming update, and copies the
+    /// whole transcript into a new file when a session is forked. Both have to
+    /// end up billed once, which is what the record key is for.
+    #[test]
+    fn a_claude_message_counts_once_however_many_times_it_is_written_down() {
+        let turn = |request: &str, id: &str, output: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-08-29T04:35:43.839Z\",\"requestId\":\"{request}\",\
+                 \"message\":{{\"id\":\"{id}\",\"usage\":{{\"input_tokens\":2,\
+                 \"output_tokens\":{output},\"cache_read_input_tokens\":100,\
+                 \"cache_creation_input_tokens\":50}}}}}}\n"
+            )
+        };
+        let first = turn("req_a", "msg_a", 172);
+        let second = turn("req_b", "msg_b", 871);
+        let path = fixture(
+            "claude.jsonl",
+            &format!(
+                "{first}{first}{second}\
+                 {{\"timestamp\":\"2026-08-29T04:36:00.000Z\",\"type\":\"user\",\
+                 \"message\":{{\"role\":\"user\",\"content\":\"no usage here\"}}}}\n"
+            ),
+        );
+        let records = scan_claude_file(&path, 0);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.day == 20_694));
+        assert_eq!(
+            summed(&records),
+            TokenTotals {
+                input: 4,
+                output: 1_043,
+                cache_read: 200,
+                cache_write: 100
+            }
+        );
+        // The fork: the same message, written into a second file. Its key has
+        // to match so the combine step can throw the copy away.
+        let forked = fixture("claude-fork.jsonl", &first);
+        assert_eq!(
+            scan_claude_file(&forked, 0)[0].key,
+            records[0].key,
+            "a forked transcript must not be billed twice"
+        );
+    }
+
+    /// Codex logs a running session total, so the tab reads its growth. A fork
+    /// starts its rollout at the parent's total, which is inherited rather than
+    /// spent, and a resumed session restarts the counter from near zero.
+    #[test]
+    fn codex_counts_the_growth_of_its_total_and_never_an_inherited_one() {
+        let reading = |input: u64, cached: u64, output: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-09-05T07:55:25.160Z\",\"type\":\"event_msg\",\
+                 \"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":\
+                 {{\"input_tokens\":{input},\"cached_input_tokens\":{cached},\
+                 \"cache_write_input_tokens\":0,\"output_tokens\":{output}}},\
+                 \"model_context_window\":258400}}}}}}\n"
+            )
+        };
+        let path = fixture(
+            "codex.jsonl",
+            &format!(
+                "{}{}",
+                reading(25_538, 18_688, 153),
+                reading(30_000, 20_000, 200)
+            ),
+        );
+        assert_eq!(
+            summed(&scan_codex_file(&path, 0)),
+            TokenTotals {
+                input: 10_000,
+                output: 200,
+                cache_read: 20_000,
+                cache_write: 0
+            },
+            "input has the cached prompt taken back out of it"
+        );
+
+        let forked = fixture(
+            "codex-fork.jsonl",
+            &format!(
+                "{}{}{}",
+                // Far past a context window in one turn: a counter carried over
+                // from the session this one was forked from.
+                reading(900_000, 800_000, 5_000),
+                reading(910_000, 805_000, 5_100),
+                // And a counter that went backwards has been restarted.
+                reading(100, 50, 10),
+            ),
+        );
+        assert_eq!(
+            summed(&scan_codex_file(&forked, 0)),
+            TokenTotals {
+                input: 5_050,
+                output: 110,
+                cache_read: 5_050,
+                cache_write: 0
+            }
+        );
+    }
+
+    #[test]
+    fn omp_records_one_usage_object_per_reply() {
+        let path = fixture(
+            "omp.jsonl",
+            "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-09-07T13:51:52.953Z\",\
+             \"message\":{\"usage\":{\"input\":10,\"output\":18322,\"cacheRead\":40,\
+             \"cacheWrite\":5,\"totalTokens\":18377}}}\n\
+             {\"type\":\"message\",\"id\":\"m2\",\"timestamp\":\"2026-09-08T01:00:00.000Z\",\
+             \"message\":{\"usage\":{\"input\":1,\"output\":2,\"cacheRead\":3,\
+             \"cacheWrite\":4,\"totalTokens\":10}}}\n",
+        );
+        let records = scan_omp_file(&path, 0);
+        // Two local days, so the two replies cannot share a bucket.
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            summed(&records),
+            TokenTotals {
+                input: 11,
+                output: 18_324,
+                cache_read: 43,
+                cache_write: 9
+            }
+        );
+        assert!(records.iter().all(|record| record.key.is_none()));
+    }
+
+    #[test]
+    fn a_report_sums_only_the_days_inside_the_window() {
+        let mut days = TokenDays::new();
+        for day in [20_700, 20_701, 20_703] {
+            days.insert(
+                day,
+                TokenTotals {
+                    input: 100,
+                    output: 10,
+                    cache_read: 1_000,
+                    cache_write: 1,
+                },
+            );
+        }
+        let report = TokenReport {
+            days: HashMap::from([(Source::Codex, days)]),
+            scanned_at_ms: 1,
+        };
+        let total = |since| {
+            report
+                .totals(since)
+                .into_iter()
+                .fold(0, |sum, (_, spent)| sum + spent.total())
+        };
+        assert_eq!(total(None), 3_333);
+        assert_eq!(total(Some(20_701)), 2_222);
+        assert_eq!(total(Some(20_704)), 0);
+        // Every source keeps its place in the list even with nothing to show.
+        assert_eq!(report.totals(None).len(), Source::ALL.len());
+    }
 
     #[test]
     fn jwt_payload_reads_the_signed_in_email() {

@@ -112,6 +112,8 @@ pub struct Settings {
     pub usage_open: bool,
     #[serde(default = "default_usage_source")]
     pub usage_source: String,
+    #[serde(default = "default_usage_period")]
+    pub usage_period: String,
     #[serde(default)]
     pub color_mode: ColorMode,
     #[serde(default = "default_font_size")]
@@ -130,6 +132,7 @@ impl Default for Settings {
             translate_open: false,
             usage_open: false,
             usage_source: default_usage_source(),
+            usage_period: default_usage_period(),
             color_mode: ColorMode::default(),
             font_size: default_font_size(),
             system_details: SystemDetails::default(),
@@ -294,6 +297,10 @@ fn default_true() -> bool {
 
 fn default_usage_source() -> String {
     "codex".to_owned()
+}
+
+fn default_usage_period() -> String {
+    "30d".to_owned()
 }
 
 fn default_timer() -> i64 {
@@ -517,6 +524,7 @@ mod tests {
             .expect("state without a usage flag should remain readable");
         assert!(!state.settings.usage_open);
         assert_eq!(state.settings.usage_source, "codex");
+        assert_eq!(state.settings.usage_period, "30d");
     }
 
     #[test]
