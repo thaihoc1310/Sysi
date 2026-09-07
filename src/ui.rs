@@ -199,8 +199,6 @@ struct TranslateContext {
     interactive: Rc<Cell<bool>>,
     window: gtk::ApplicationWindow,
     root: gtk::Fixed,
-    screens: Rc<Vec<ScreenRect>>,
-    primary: ScreenRect,
     /// Kept out from under a freshly placed card, like any reopened widget.
     picker: gtk::EventBox,
     instances: Rc<RefCell<Vec<TranslateInstance>>>,
@@ -265,6 +263,7 @@ struct UsageCard {
     hide: gtk::Button,
     refresh: gtk::Button,
     tabs: Vec<(UsageSource, gtk::Button)>,
+    scroller: gtk::ScrolledWindow,
     rows: gtk::Box,
     status: gtk::Label,
     updated: gtk::Label,
@@ -590,7 +589,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     let registry: Rc<RefCell<Vec<RegisteredWidget>>> = Rc::new(RefCell::new(Vec::new()));
     let interactive = Rc::new(Cell::new(true));
-    publish_panel_state(true, state.borrow().settings.color_mode);
+    publish_panel_state(true, &state.borrow());
     // Context menus are attached while their windows are built, well before the
     // dictionary lookup they call into exists; the slot is filled once both do.
     let lookup_slot: LookupSlot = Rc::new(RefCell::new(None));
@@ -648,6 +647,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         &system_card.card,
         system_card.color_mode.clone(),
     );
+    let system_preview = SystemDetailsPreview {
+        card: system_card.card.clone(),
+        canvas: system_card.canvas.clone(),
+        values: system_card.values.clone(),
+        details: system_card.details.clone(),
+        auto_size: system_card.auto_size.clone(),
+        resample: system_card.resample.clone(),
+    };
     attach_color_mode_menu(
         &system_card.card,
         "system".into(),
@@ -655,14 +662,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         registry.clone(),
         interactive.clone(),
         None,
-        Some(SystemDetailsPreview {
-            card: system_card.card.clone(),
-            canvas: system_card.canvas.clone(),
-            values: system_card.values.clone(),
-            details: system_card.details.clone(),
-            auto_size: system_card.auto_size.clone(),
-            resample: system_card.resample.clone(),
-        }),
+        Some(system_preview.clone()),
         None,
         None,
     );
@@ -697,8 +697,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             height_for_width: Some(Rc::new({
                 let details = system_card.details.clone();
                 let values = system_card.values.clone();
+                let state = state.clone();
                 move |width| {
-                    system_content_size(details.get(), &values.borrow(), Some(width)).height
+                    scaled_system_content_size(
+                        details.get(),
+                        &values.borrow(),
+                        Some(width),
+                        state.borrow().font_size("system"),
+                    )
+                    .height
                 }
             })),
         },
@@ -972,7 +979,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let interactive = interactive.clone();
         let root = root.clone();
-        let screens = screens.clone();
         let picker = widget_picker.card.clone();
         let request = usage_controller.refresh.clone();
         let invalidate = usage_controller.show.clone();
@@ -986,8 +992,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     "usage",
                     &root,
                     &state,
-                    &screens,
-                    primary_screen,
                     Size {
                         width: USAGE_WIDTH,
                         height: USAGE_HEIGHT,
@@ -1008,11 +1012,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 let registry = registry.clone();
                 let interactive = interactive.clone();
                 let root = root.clone();
-                let screens = screens.clone();
                 let state = state.clone();
                 move || {
                     if open {
-                        clamp_registered_widgets(&root, &registry, &screens, &state);
+                        clamp_registered_widgets(&root, &registry, &state);
                     }
                     refresh_input_shape(&window, &registry, interactive.get());
                 }
@@ -1058,8 +1061,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive: interactive.clone(),
         window: window.clone(),
         root: root.clone(),
-        screens: Rc::new(screens.clone()),
-        primary: primary_screen,
         picker: widget_picker.card.clone(),
         instances: Rc::new(RefCell::new(Vec::new())),
         recent: Rc::new(Cell::new(None)),
@@ -1153,7 +1154,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             glib::idle_add_local_once({
                 let ctx = ctx.clone();
                 move || {
-                    clamp_registered_widgets(&ctx.root, &ctx.registry, &ctx.screens, &ctx.state);
+                    clamp_registered_widgets(&ctx.root, &ctx.registry, &ctx.state);
                     refresh_input_shape(&ctx.window, &ctx.registry, ctx.interactive.get());
                 }
             });
@@ -1208,12 +1209,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 let ctx = ctx.clone();
                 move || {
                     if visible {
-                        clamp_registered_widgets(
-                            &ctx.root,
-                            &ctx.registry,
-                            &ctx.screens,
-                            &ctx.state,
-                        );
+                        clamp_registered_widgets(&ctx.root, &ctx.registry, &ctx.state);
                     }
                     refresh_input_shape(&ctx.window, &ctx.registry, ctx.interactive.get());
                 }
@@ -1481,7 +1477,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let interactive = interactive.clone();
         let root = root.clone();
-        let screens = screens.clone();
         let picker = widget_picker.card.clone();
         Rc::new(move || {
             let open = !card.is_visible();
@@ -1493,8 +1488,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     "history",
                     &root,
                     &state,
-                    &screens,
-                    primary_screen,
                     Size {
                         width: HISTORY_WIDTH,
                         height: HISTORY_HEIGHT,
@@ -1517,11 +1510,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 let registry = registry.clone();
                 let interactive = interactive.clone();
                 let root = root.clone();
-                let screens = screens.clone();
                 let state = state.clone();
                 move || {
                     if open {
-                        clamp_registered_widgets(&root, &registry, &screens, &state);
+                        clamp_registered_widgets(&root, &registry, &state);
                     }
                     refresh_input_shape(&window, &registry, interactive.get());
                 }
@@ -1548,7 +1540,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let interactive = interactive.clone();
         let root = root.clone();
-        let screens = screens.clone();
         let picker = widget_picker.card.clone();
         move |button| {
             let enabled = button.is_active();
@@ -1558,8 +1549,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     "system",
                     &root,
                     &state,
-                    &screens,
-                    primary_screen,
                     Size {
                         width: SYSTEM_WIDTH,
                         height: SYSTEM_HEIGHT,
@@ -1582,7 +1571,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let interactive = interactive.clone();
         let root = root.clone();
-        let screens = screens.clone();
         let picker = widget_picker.card.clone();
         move |button| {
             let enabled = button.is_active();
@@ -1592,8 +1580,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     "timer",
                     &root,
                     &state,
-                    &screens,
-                    primary_screen,
                     Size {
                         width: TIMER_SIZE,
                         height: TIMER_SIZE,
@@ -1623,7 +1609,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let _ = state.borrow().save();
             button.set_label(next.label());
             apply_color_mode(&registry, next);
-            publish_panel_state(interactive.get(), next);
+            publish_panel_state(interactive.get(), &state.borrow());
         }
     });
 
@@ -1633,7 +1619,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let picker = widget_picker.card.clone();
         let state = state.clone();
         let refresh = refresh_closure.clone();
-        let screens = screens.clone();
         let registry = registry.clone();
         let window = window.clone();
         move |_| {
@@ -1645,12 +1630,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 width: NOTE_WIDTH,
                 height: NOTE_HEIGHT,
             };
-            let position = match reopen_anchor() {
+            let screens = overlay_screen_rects(&root);
+            let position = match reopen_anchor(&root) {
                 Some(pointer) => reopen_point(
                     Some(pointer),
                     size,
                     &screens,
-                    primary_screen,
+                    overlay_primary_screen(&root),
                     widget_rect(&picker),
                 ),
                 // No pointer to go on, so anchor to the picker instead.
@@ -1732,7 +1718,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 window.style_context().remove_class("editing");
             }
             lock.set_label(if enabled { "LOCK" } else { "UNLOCK" });
-            publish_panel_state(enabled, state.borrow().settings.color_mode);
+            publish_panel_state(enabled, &state.borrow());
             set_edit_chrome_visibility(&registry, enabled);
             for item in registry.borrow().iter() {
                 item.widget.queue_draw();
@@ -1758,6 +1744,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let toggle_translate = toggle_translate.clone();
         let translate_any_visible = translate_any_visible.clone();
         let interactive = interactive.clone();
+        let state = state.clone();
+        let registry = registry.clone();
+        let system_preview = system_preview.clone();
         Rc::new(move || {
             for action in take_panel_actions() {
                 // Held only for as long as the action runs, so a widget opened
@@ -1767,6 +1756,16 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     "toggle-system" => system.set_active(!system.is_active()),
                     "toggle-timer" => timer.set_active(!timer.is_active()),
                     "next-color-mode" => mode.clicked(),
+                    "font-smaller" | "font-larger" => {
+                        let delta = if action.name == "font-larger" { 1 } else { -1 };
+                        state.borrow_mut().change_font_size(None, delta);
+                        for item in registry.borrow().iter() {
+                            apply_widget_font(&item.widget, state.borrow().font_size(&item.key));
+                        }
+                        refit_system_font(&system_preview, &state);
+                        let _ = state.borrow().save();
+                        publish_panel_state(interactive.get(), &state.borrow());
+                    }
                     "toggle-lock" => lock.clicked(),
                     "new-note" => {
                         // A note created while locked would be read-only;
@@ -1897,12 +1896,35 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let state = state.clone();
         let root = root.clone();
-        let screens = screens.clone();
         let interactive = interactive.clone();
         move || {
-            clamp_registered_widgets(&root, &registry, &screens, &state);
+            clamp_registered_widgets(&root, &registry, &state);
             refresh_input_shape(&window, &registry, interactive.get());
             refresh_visual_shape(&window, &root, None);
+        }
+    });
+
+    // Placement is asynchronous: re-clamp after the WM has applied its actual
+    // origin/size, including when unplugging a monitor changes the primary.
+    window.connect_configure_event({
+        let root = root.clone();
+        let registry = registry.clone();
+        let state = state.clone();
+        let queued = Rc::new(Cell::new(false));
+        move |_, _| {
+            if !queued.replace(true) {
+                glib::idle_add_local_once({
+                    let root = root.clone();
+                    let registry = registry.clone();
+                    let state = state.clone();
+                    let queued = queued.clone();
+                    move || {
+                        queued.set(false);
+                        clamp_registered_widgets(&root, &registry, &state);
+                    }
+                });
+            }
+            false
         }
     });
 
@@ -1988,10 +2010,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let scale = root_window.scale_factor().max(1);
             let width = root_window.width() / scale;
             let height = root_window.height() / scale;
-            let screens = logical_screen_rects(scale, width, height);
-            window.set_default_size(width, height);
+            window.resize(width, height);
             window.move_(0, 0);
-            clamp_registered_widgets(&root, &registry, &screens, &state);
+            clamp_registered_widgets(&root, &registry, &state);
             refresh_auto_colors(&registry, &state);
         }
     });
@@ -2096,6 +2117,7 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
         hide,
         refresh,
         tabs,
+        scroller,
         rows,
         status,
         updated,
@@ -2209,11 +2231,18 @@ fn render_usage_card(
     snapshot: Option<&usage::Snapshot>,
     error: Option<&str>,
 ) {
+    let scroll = card
+        .tabs
+        .iter()
+        .find(|(candidate, _)| *candidate == source)
+        .filter(|(_, button)| button.style_context().has_class("usage-tab-active"))
+        .map(|_| card.scroller.vadjustment().value());
     set_usage_tab_active(&card.tabs, source);
     clear_usage_rows(&card.rows);
     let now = usage_now_ms();
     let Some(snapshot) = snapshot else {
         card.status.set_label(error.unwrap_or("Loading usage…"));
+        card.status.set_tooltip_text(None);
         card.updated.set_label("");
         return;
     };
@@ -2265,6 +2294,13 @@ fn render_usage_card(
         card.rows.pack_start(&row, false, false, 0);
     }
     card.rows.show_all();
+    if let Some(value) = scroll {
+        let adjustment = card.scroller.vadjustment();
+        glib::idle_add_local_once(move || {
+            let maximum = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+            adjustment.set_value(value.clamp(adjustment.lower(), maximum));
+        });
+    }
 }
 
 fn update_usage_refresh(card: &UsageCard, schedule: &usage::Schedule, now: i64) {
@@ -2290,12 +2326,11 @@ fn update_usage_refresh(card: &UsageCard, schedule: &usage::Schedule, now: i64) 
 
 fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageController {
     let source = Rc::new(Cell::new(initial_source));
-    let generation = Rc::new(Cell::new(0u64));
     let schedules = Rc::new(RefCell::new(HashMap::<UsageSource, usage::Schedule>::new()));
-    let snapshots = Rc::new(RefCell::new(HashMap::<UsageSource, usage::Snapshot>::new()));
     let errors = Rc::new(RefCell::new(HashMap::<UsageSource, String>::new()));
+    let snapshots = Rc::new(RefCell::new(HashMap::<UsageSource, usage::Snapshot>::new()));
     let (tx, rx) =
-        async_channel::bounded::<(UsageSource, u64, Result<usage::Snapshot, usage::FetchError>)>(3);
+        async_channel::bounded::<(UsageSource, Result<usage::Snapshot, usage::FetchError>)>(3);
     let render = {
         let card = card.clone();
         let schedules = schedules.clone();
@@ -2323,7 +2358,6 @@ fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageCon
         let card = card.clone();
         let schedules = schedules.clone();
         let snapshots = snapshots.clone();
-        let generation = generation.clone();
         Rc::new(move |manual: bool| {
             let which = source.get();
             let now = usage_now_ms();
@@ -2344,38 +2378,25 @@ fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageCon
             }
             drop(schedules);
             let tx = tx.clone();
-            let current = generation.get();
             // One independent, bounded task per source: a slow CLI cannot block another tab.
             std::thread::spawn(move || {
                 let result = usage::fetch(which, manual);
-                let _ = tx.send_blocking((which, current, result));
+                let _ = tx.send_blocking((which, result));
             });
         }) as Rc<dyn Fn(bool)>
     };
     {
         let source = source.clone();
-        let generation = generation.clone();
         let schedules = schedules.clone();
         let snapshots = snapshots.clone();
         let errors = errors.clone();
         let render = render.clone();
         glib::MainContext::default().spawn_local(async move {
-            while let Ok((which, requested_generation, result)) = rx.recv().await {
-                let current = requested_generation == generation.get() && source.get() == which;
+            while let Ok((which, result)) = rx.recv().await {
+                let selected = source.get() == which;
                 let mut schedules = schedules.borrow_mut();
                 let schedule = schedules.entry(which).or_default();
                 schedule.finish(usage_now_ms(), which, result.as_ref().err());
-                if !current {
-                    if let Err(error) = &result {
-                        errors.borrow_mut().insert(which, error.message.clone());
-                    }
-                    // Preserve error cooldowns, but do not let an old successful response
-                    // postpone a request for the newly selected account/source.
-                    if result.is_ok() {
-                        *schedule = usage::Schedule::default();
-                    }
-                    continue;
-                }
                 drop(schedules);
                 match result {
                     Ok(snapshot) => {
@@ -2383,23 +2404,19 @@ fn start_usage_updates(card: UsageCard, initial_source: UsageSource) -> UsageCon
                         errors.borrow_mut().remove(&which);
                     }
                     Err(error) => {
-                        // No verified account identity is available on failure. Never
-                        // present another login's cached quota as the current allowance.
                         snapshots.borrow_mut().remove(&which);
                         errors.borrow_mut().insert(which, error.message);
                     }
                 }
-                render(which);
+                if selected {
+                    render(which);
+                }
             }
         });
     }
     let show = {
-        let generation = generation.clone();
-        let snapshots = snapshots.clone();
         let render = render.clone();
         Rc::new(move |which| {
-            generation.set(generation.get().wrapping_add(1));
-            snapshots.borrow_mut().clear();
             render(which);
         }) as Rc<dyn Fn(UsageSource)>
     };
@@ -2583,7 +2600,9 @@ fn draw_system(
     details: SystemDetails,
 ) {
     let allocation = area.allocation();
-    let width = f64::from(allocation.width().max(1));
+    let font_scale = widget_font_scale(area);
+    ctx.scale(font_scale, font_scale);
+    let width = f64::from(allocation.width().max(1)) / font_scale;
     let meters = system_meters(details, values);
     let rows = system_meter_rows(meters.len(), system_meter_columns(meters.len(), width));
     let widest = rows.iter().copied().max().unwrap_or(0);
@@ -2948,13 +2967,32 @@ fn system_content_size(
     Size { width, height }
 }
 
+fn scaled_system_content_size(
+    details: SystemDetails,
+    values: &SystemSnapshot,
+    card_width: Option<i32>,
+    font_size: i32,
+) -> Size {
+    let scale = f64::from(font_size.clamp(8, 26)) / 13.0;
+    let size = system_content_size(
+        details,
+        values,
+        card_width.map(|width| (f64::from(width) / scale).round() as i32),
+    );
+    Size {
+        width: (f64::from(size.width) * scale).round() as i32,
+        height: (f64::from(size.height) * scale).round() as i32,
+    }
+}
+
 /// What the card should measure right now: the width the user chose if they
 /// chose one, and a height that follows from how the rings reflow into it.
 fn system_card_size(details: SystemDetails, values: &SystemSnapshot, state: &AppState) -> Size {
-    system_content_size(
+    scaled_system_content_size(
         details,
         values,
         state.sizes.get("system").map(|size| size.width),
+        state.font_size("system"),
     )
 }
 
@@ -3378,20 +3416,20 @@ fn build_timer_card(
     ] {
         widget
             .style_context()
-            .add_provider(&typography, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+            .add_provider(&typography, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 3);
     }
-    apply_timer_typography(&typography, style.get(), style_size.get());
+    apply_timer_typography(&typography, style.get(), style_size.get(), 1.0);
     card.connect_size_allocate({
         let style_size = style_size.clone();
         let style = style.clone();
         let typography = typography.clone();
-        move |_, allocation| {
+        move |card, allocation| {
             let size = Size {
                 width: allocation.width().max(1),
                 height: allocation.height().max(1),
             };
             style_size.set(size);
-            apply_timer_typography(&typography, style.get(), size);
+            apply_timer_typography(&typography, style.get(), size, widget_font_scale(card));
         }
     });
 
@@ -3971,6 +4009,7 @@ fn delete_note(state: &Rc<RefCell<AppState>>, id: u64) {
     data.notes.retain(|note| note.id != id);
     data.sizes.remove(&format!("note:{id}"));
     data.widget_color_modes.remove(&format!("note:{id}"));
+    data.widget_font_sizes.remove(&format!("note:{id}"));
     drop(data);
     let _ = state.borrow().save();
     state.borrow().prune_orphan_images();
@@ -4180,15 +4219,17 @@ fn draggable_note_preview(
                 return glib::Propagation::Proceed;
             }
             let (x, y) = event.root();
+            let origin = overlay_origin(&root);
+            let (local_x, local_y) = (x as i32 - origin.x, y as i32 - origin.y);
             if ghost.borrow().is_none() && ((x - sx).abs() > 5.0 || (y - sy).abs() > 5.0) {
                 let floating = gtk::Label::new(Some(&truncate_chars(&text, 34)));
                 floating.style_context().add_class("note-ghost");
-                root.put(&floating, x as i32 - 72, y as i32 - 18);
+                root.put(&floating, local_x - 72, local_y - 18);
                 floating.show();
                 *ghost.borrow_mut() = Some(floating);
             }
             if let Some(floating) = ghost.borrow().as_ref() {
-                root.move_(floating, x as i32 - 72, y as i32 - 18);
+                root.move_(floating, local_x - 72, local_y - 18);
             }
             glib::Propagation::Stop
         }
@@ -4202,25 +4243,22 @@ fn draggable_note_preview(
             let floating = ghost.borrow_mut().take();
             let dragged = floating.is_some();
             let (x, y) = event.root();
+            let origin = overlay_origin(&root);
+            let (x, y) = (x as i32 - origin.x, y as i32 - origin.y);
             let desired = if let Some(floating) = floating {
                 root.remove(&floating);
                 // Pin the note exactly where the ghost preview was dropped.
                 Point {
-                    x: (x as i32 - 72).max(0),
-                    y: (y as i32 - 18).max(0),
+                    x: (x - 72).max(0),
+                    y: (y - 18).max(0),
                 }
             } else {
                 Point {
-                    x: (x as i32 + 18).max(0),
-                    y: (y as i32 + 18).max(0),
+                    x: (x + 18).max(0),
+                    y: (y + 18).max(0),
                 }
             };
-            let root_allocation = root.allocation();
-            let screens = logical_screen_rects(
-                root.scale_factor(),
-                root_allocation.width(),
-                root_allocation.height(),
-            );
+            let screens = overlay_screen_rects(&root);
             let point = clamp_to_screens(desired, NOTE_WIDTH, NOTE_HEIGHT, &screens);
             let mut data = state.borrow_mut();
             if let Some(note) = data.notes.iter_mut().find(|note| note.id == note_id) {
@@ -4340,11 +4378,7 @@ fn note_image_chrome(editor: &gtk::TextView, card: &gtk::EventBox) -> Size {
 // note cannot push its own resize handle off-screen.
 fn note_growth_limit(card: &gtk::EventBox) -> Size {
     let allocation = card.allocation();
-    let root = card
-        .parent()
-        .map(|parent| parent.allocation())
-        .unwrap_or_else(|| card.allocation());
-    let screens = logical_screen_rects(card.scale_factor(), root.width(), root.height());
+    let screens = overlay_screen_rects(card);
     let screen = screens.iter().find(|screen| {
         allocation.x() >= screen.x
             && allocation.x() < screen.x + screen.width
@@ -6045,7 +6079,15 @@ fn rebuild_pinned_notes(
             let refresh = refresh.clone();
             let id = note.id;
             move |_| {
-                if let Some(note) = state.borrow_mut().notes.iter_mut().find(|n| n.id == id) {
+                let empty = state
+                    .borrow()
+                    .notes
+                    .iter()
+                    .any(|note| note.id == id && note.is_empty());
+                if empty {
+                    delete_note(&state, id);
+                } else if let Some(note) = state.borrow_mut().notes.iter_mut().find(|n| n.id == id)
+                {
                     note.pinned = false;
                 }
                 let _ = state.borrow().save();
@@ -6451,6 +6493,7 @@ fn close_translate_window(ctx: &TranslateContext, id: u64) {
         data.positions.remove(&key);
         data.sizes.remove(&key);
         data.widget_color_modes.remove(&key);
+        data.widget_font_sizes.remove(&key);
         if data.dictionaries.is_empty() {
             data.settings.translate_open = false;
         }
@@ -6481,10 +6524,10 @@ fn place_translate_near_click(ctx: &TranslateContext, id: u64, card: &gtk::Event
         },
     );
     let point = reopen_point(
-        reopen_anchor(),
+        reopen_anchor(&ctx.root),
         size,
-        &ctx.screens,
-        ctx.primary,
+        &overlay_screen_rects(&ctx.root),
+        overlay_primary_screen(&ctx.root),
         widget_rect(&ctx.picker),
     );
     ctx.root.move_(card, point.x, point.y);
@@ -6522,9 +6565,12 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         .positions
         .get(&key)
         .copied()
-        .unwrap_or(Point {
-            x: ctx.primary.x + 292,
-            y: ctx.primary.y + 186,
+        .unwrap_or_else(|| {
+            let primary = overlay_primary_screen(&ctx.root);
+            Point {
+                x: primary.x + 292,
+                y: primary.y + 186,
+            }
         });
     place_card(&ctx.root, &translate.card, point);
     if near_pointer {
@@ -7945,15 +7991,16 @@ fn parse_panel_anchor(raw: &str) -> Option<Point> {
 /// so it publishes them and the panel just reads. A tiny file of its own rather
 /// than state.json: the shell would otherwise re-parse every note on the
 /// overlay's every save.
-fn publish_panel_state(interactive: bool, mode: ColorMode) {
+fn publish_panel_state(interactive: bool, state: &AppState) {
     let dir = crate::state::cache_dir();
     let result = fs::create_dir_all(&dir).and_then(|_| {
         fs::write(
             dir.join("panel-state"),
             format!(
-                "{} {}\n",
+                "{} {} {}\n",
                 if interactive { "editing" } else { "locked" },
-                mode.key()
+                state.settings.color_mode.key(),
+                state.settings.font_size.clamp(8, 26)
             ),
         )
     });
@@ -8078,6 +8125,81 @@ fn ellipsize(text: &str, limit: usize) -> String {
     format!("{}\u{2026}", kept.trim_end())
 }
 
+// Keep each label's original hierarchy while changing the widget's base size.
+// One scoped provider per size also covers children created after a lookup.
+thread_local! {
+    static FONT_PROVIDERS: RefCell<HashMap<i32, gtk::CssProvider>> = RefCell::new(HashMap::new());
+}
+
+fn font_css(size: i32) -> String {
+    let factor = f64::from(size.clamp(8, 26)) / 13.0;
+    let comments = regex::Regex::new(r"(?s)/\*.*?\*/").unwrap();
+    let source = comments.replace_all(include_str!("style.css"), "");
+    let blocks = regex::Regex::new(r"([^{}]+)\{([^{}]*)\}").unwrap();
+    let font = regex::Regex::new(r"font-size:\s*([0-9.]+)px").unwrap();
+    let mut css = format!(".sysi-font-{size} {{ font-size: {size}px; }}\n");
+    for block in blocks.captures_iter(&source) {
+        if let Some(value) = font.captures(&block[2]) {
+            let pixels: f64 = value[1].parse().unwrap();
+            let selectors = block[1]
+                .split(',')
+                .map(|selector| format!(".sysi-font-{size} {}", selector.trim()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            css.push_str(&format!(
+                "{selectors} {{ font-size: {}px; }}\n",
+                pixels * factor
+            ));
+        }
+    }
+    css
+}
+
+fn apply_widget_font(widget: &gtk::EventBox, size: i32) {
+    let size = size.clamp(8, 26);
+    FONT_PROVIDERS.with(|providers| {
+        providers.borrow_mut().entry(size).or_insert_with(|| {
+            let provider = gtk::CssProvider::new();
+            provider
+                .load_from_data(font_css(size).as_bytes())
+                .expect("font CSS");
+            if let Some(screen) = gtk::prelude::WidgetExt::screen(widget) {
+                gtk::StyleContext::add_provider_for_screen(
+                    &screen,
+                    &provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
+                );
+            }
+            provider
+        });
+    });
+    let context = widget.style_context();
+    for class in context.list_classes() {
+        if class.starts_with("sysi-font-") {
+            context.remove_class(&class);
+        }
+    }
+    context.add_class(&format!("sysi-font-{size}"));
+    widget.queue_resize();
+    widget.queue_draw();
+}
+
+fn widget_font_scale(widget: &impl IsA<gtk::Widget>) -> f64 {
+    let mut current = Some(widget.as_ref().clone());
+    while let Some(widget) = current {
+        for class in widget.style_context().list_classes() {
+            if let Some(size) = class
+                .strip_prefix("sysi-font-")
+                .and_then(|size| size.parse::<f64>().ok())
+            {
+                return size / 13.0;
+            }
+        }
+        current = widget.parent();
+    }
+    1.0
+}
+
 fn saved_color_mode(state: &AppState, key: &str) -> ColorMode {
     state
         .widget_color_modes
@@ -8106,6 +8228,87 @@ fn set_edit_chrome_visibility(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, vis
             editor.set_editable(visible);
         }
     }
+}
+
+// GtkMenuShell grabs pointer events itself, so embedded buttons cannot rely
+// on GtkButton's release handler. Handle only our controls; outside clicks
+// still reach the native menu grab and dismiss it anywhere on the desktop.
+fn keep_menu_controls_open(
+    menu: &gtk::Menu,
+    color: &gtk::MenuItem,
+    font_row: &gtk::MenuItem,
+    buttons: &[gtk::Button],
+) {
+    let contains = |menu: &gtk::Menu, widget: &gtk::Widget, x: f64, y: f64| {
+        widget
+            .translate_coordinates(menu, 0, 0)
+            .is_some_and(|(left, top)| {
+                x >= f64::from(left)
+                    && y >= f64::from(top)
+                    && x < f64::from(left + widget.allocated_width())
+                    && y < f64::from(top + widget.allocated_height())
+            })
+    };
+    menu.connect_button_release_event({
+        let color = color.clone();
+        let font_row = font_row.clone();
+        let buttons = buttons.to_vec();
+        move |menu, event| {
+            if event.button() != 1 {
+                return glib::Propagation::Proceed;
+            }
+            let (_, ox, oy) = menu.window().unwrap().origin();
+            let (x, y) = event.root();
+            let (x, y) = (x - f64::from(ox), y - f64::from(oy));
+            if contains(menu, color.upcast_ref(), x, y) {
+                color.activate();
+                return glib::Propagation::Stop;
+            }
+            if contains(menu, font_row.upcast_ref(), x, y) {
+                for button in &buttons {
+                    if contains(menu, button.upcast_ref(), x, y) {
+                        button.clicked();
+                    }
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    menu.connect_motion_notify_event({
+        let buttons = buttons.to_vec();
+        move |menu, event| {
+            let (_, ox, oy) = menu.window().unwrap().origin();
+            let (x, y) = event.root();
+            for button in &buttons {
+                if contains(
+                    menu,
+                    button.upcast_ref(),
+                    x - f64::from(ox),
+                    y - f64::from(oy),
+                ) {
+                    button.set_state_flags(gtk::StateFlags::PRELIGHT, false);
+                } else {
+                    button.unset_state_flags(gtk::StateFlags::PRELIGHT);
+                }
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    menu.connect_key_press_event({
+        let color = color.clone();
+        move |menu, event| {
+            if matches!(
+                event.keyval(),
+                gdk::keys::constants::Return | gdk::keys::constants::space
+            ) && menu.selected_item().as_ref() == Some(color.upcast_ref())
+            {
+                color.activate();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8177,25 +8380,63 @@ fn attach_color_mode_menu(
         menu.append(&separator);
         (item, new_item, open_item, separator)
     });
-    let mut color_items = Vec::new();
-    for mode in ColorMode::ALL {
-        let item = gtk::MenuItem::with_label(mode.label());
-        item.connect_activate({
-            let key = key.clone();
+    apply_widget_font(widget, state.borrow().font_size(&key));
+    let color_item = gtk::MenuItem::with_label("LIGHT");
+    color_item.connect_activate({
+        let state = state.clone();
+        let registry = registry.clone();
+        let key = key.clone();
+        move |item| {
+            let next = saved_color_mode(&state.borrow(), &key).next();
+            state
+                .borrow_mut()
+                .widget_color_modes
+                .insert(key.clone(), next);
+            let _ = state.borrow().save();
+            apply_widget_color_mode(&registry, &key, next);
+            item.set_label(next.next().label());
+        }
+    });
+    menu.append(&color_item);
+    let font_item = gtk::MenuItem::new();
+    font_item.style_context().add_class("font-controls");
+    let font_row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    let mut font_buttons = Vec::new();
+    let font_value = gtk::Label::new(None);
+    for (label, delta) in [("−", -1), ("+", 1)] {
+        let button = gtk::Button::with_label(label);
+        button.style_context().add_class("font-step");
+        button.set_tooltip_text(Some(if delta < 0 {
+            "Decrease font size"
+        } else {
+            "Increase font size"
+        }));
+        button.connect_clicked({
             let state = state.clone();
-            let registry = registry.clone();
+            let widget = widget.clone();
+            let key = key.clone();
+            let system_preview = system_details.clone();
+            let font_value = font_value.clone();
             move |_| {
-                state
-                    .borrow_mut()
-                    .widget_color_modes
-                    .insert(key.clone(), mode);
+                state.borrow_mut().change_font_size(Some(&key), delta);
+                let size = state.borrow().font_size(&key);
+                apply_widget_font(&widget, size);
+                if let Some(preview) = &system_preview {
+                    refit_system_font(preview, &state);
+                }
+                font_value.set_text(&size.to_string());
                 let _ = state.borrow().save();
-                apply_widget_color_mode(&registry, &key, mode);
             }
         });
-        menu.append(&item);
-        color_items.push((mode, item));
+        font_row.pack_start(&button, false, false, 0);
+        font_buttons.push(button);
+        if delta == -1 {
+            font_row.pack_start(&font_value, false, false, 0);
+        }
     }
+    font_item.add(&font_row);
+    menu.append(&font_item);
+    keep_menu_controls_open(&menu, &color_item, &font_item, &font_buttons);
 
     if let Some(timer_style) = timer_style {
         let parent = gtk::MenuItem::with_label("STYLE");
@@ -8323,12 +8564,8 @@ fn attach_color_mode_menu(
                 return;
             }
         }
-        // The menu is an action list, not a status list. The mode this widget
-        // already uses would be a no-op, so only offer the other two choices.
-        let current_mode = saved_color_mode(&state.borrow(), &key);
-        for (mode, item) in &color_items {
-            item.set_visible(*mode != current_mode);
-        }
+        color_item.set_label(saved_color_mode(&state.borrow(), &key).next().label());
+        font_value.set_text(&state.borrow().font_size(&key).to_string());
         if let Some((item, new_item, open_item, separator)) = &lookup_item {
             let query = primary_selection();
             let on_header = open_item
@@ -8401,8 +8638,100 @@ fn apply_system_details(
     let _ = data.save();
 }
 
+fn refit_system_font(preview: &SystemDetailsPreview, state: &Rc<RefCell<AppState>>) {
+    let size = system_card_size(
+        preview.details.get(),
+        &preview.values.borrow(),
+        &state.borrow(),
+    );
+    preview.auto_size.set(Some(size));
+    preview.card.set_size_request(size.width, size.height);
+    preview.card.queue_resize();
+    preview.canvas.queue_draw();
+    if let Some(stored) = state.borrow_mut().sizes.get_mut("system") {
+        *stored = size;
+    }
+}
+
 fn place_card(root: &gtk::Fixed, card: &gtk::EventBox, point: Point) {
     root.put(card, point.x, point.y);
+}
+
+// Mutter may place our managed Utility window below the panel even after
+// move_(0, 0). Monitor/pointer coordinates are global; GtkFixed children are
+// local. Read the actual GDK origin (already logical pixels), never a bar size.
+fn overlay_origin(widget: &impl IsA<gtk::Widget>) -> Point {
+    widget
+        .toplevel()
+        .and_then(|top| top.window())
+        .map_or(Point::default(), |window| {
+            let (_, x, y) = window.origin();
+            Point { x, y }
+        })
+}
+
+fn screen_in_overlay(screen: ScreenRect, origin: Point) -> ScreenRect {
+    ScreenRect {
+        x: screen.x - origin.x,
+        y: screen.y - origin.y,
+        ..screen
+    }
+}
+fn clip_screen_to_overlay(screen: ScreenRect, size: Size) -> Option<ScreenRect> {
+    let left = screen.x.max(0);
+    let top = screen.y.max(0);
+    let right = screen.x.saturating_add(screen.width).min(size.width.max(0));
+    let bottom = screen
+        .y
+        .saturating_add(screen.height)
+        .min(size.height.max(0));
+    (right > left && bottom > top).then_some(ScreenRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+fn overlay_display_size(widget: &impl IsA<gtk::Widget>) -> Size {
+    // The overlay's allocation can still describe the previous monitor setup
+    // while its resize request is waiting for the WM.
+    let root = gtk::prelude::WidgetExt::screen(widget)
+        .and_then(|screen| screen.root_window())
+        .expect("display root window");
+    let scale = root.scale_factor().max(1);
+    Size {
+        width: root.width() / scale,
+        height: root.height() / scale,
+    }
+}
+
+fn overlay_screen_rects(widget: &impl IsA<gtk::Widget>) -> Vec<ScreenRect> {
+    let size = overlay_display_size(widget);
+    let origin = overlay_origin(widget);
+    let screens: Vec<_> = logical_screen_rects(widget.scale_factor(), size.width, size.height)
+        .into_iter()
+        .filter_map(|screen| clip_screen_to_overlay(screen_in_overlay(screen, origin), size))
+        .collect();
+    if screens.is_empty() {
+        vec![ScreenRect {
+            x: 0,
+            y: 0,
+            width: size.width.max(1),
+            height: size.height.max(1),
+        }]
+    } else {
+        screens
+    }
+}
+
+fn overlay_primary_screen(root: &gtk::Fixed) -> ScreenRect {
+    let size = overlay_display_size(root);
+    logical_primary_screen(root.scale_factor(), size.width, size.height)
+        .and_then(|screen| {
+            clip_screen_to_overlay(screen_in_overlay(screen, overlay_origin(root)), size)
+        })
+        .unwrap_or_else(|| overlay_screen_rects(root)[0])
 }
 
 fn logical_screen_rects(scale: i32, fallback_width: i32, fallback_height: i32) -> Vec<ScreenRect> {
@@ -8697,17 +9026,15 @@ fn reopen_widget(
     key: &str,
     root: &gtk::Fixed,
     state: &Rc<RefCell<AppState>>,
-    screens: &[ScreenRect],
-    primary: ScreenRect,
     fallback: Size,
     avoid: Option<&gtk::EventBox>,
 ) {
     let size = card_size(card, fallback);
     let point = reopen_point(
-        reopen_anchor(),
+        reopen_anchor(root),
         size,
-        screens,
-        primary,
+        &overlay_screen_rects(root),
+        overlay_primary_screen(root),
         avoid.and_then(widget_rect),
     );
     root.move_(card, point.x, point.y);
@@ -8727,9 +9054,9 @@ fn widget_rect(widget: &gtk::EventBox) -> Option<ScreenRect> {
 fn clamp_registered_widgets(
     root: &gtk::Fixed,
     registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
-    screens: &[ScreenRect],
     state: &Rc<RefCell<AppState>>,
 ) {
+    let screens = &overlay_screen_rects(root);
     let mut data = state.borrow_mut();
     for item in registry.borrow().iter() {
         let allocation = item.widget.allocation();
@@ -8924,12 +9251,7 @@ fn attach_resize(
             }
             let allocation = card.allocation();
             let (pointer_x, pointer_y) = event.root();
-            let root_allocation = root.allocation();
-            *gesture_screens.borrow_mut() = logical_screen_rects(
-                card.scale_factor(),
-                root_allocation.width(),
-                root_allocation.height(),
-            );
+            *gesture_screens.borrow_mut() = overlay_screen_rects(&root);
             latest.set(Size {
                 width: allocation.width(),
                 height: allocation.height(),
@@ -9177,12 +9499,7 @@ fn attach_drag(
                     f64::from(allocation.x()) + local_x,
                     f64::from(allocation.y()) + local_y,
                 ));
-                let root_allocation = root.allocation();
-                *gesture_screens.borrow_mut() = logical_screen_rects(
-                    card.scale_factor(),
-                    root_allocation.width(),
-                    root_allocation.height(),
-                );
+                *gesture_screens.borrow_mut() = overlay_screen_rects(&root);
                 start.set(Some((allocation.x(), allocation.y(), pointer_x, pointer_y)));
                 last_redraw.set(None);
             } else {
@@ -9262,12 +9579,7 @@ fn attach_drag(
             // it was sized on. Left oversized it would be stuck there: the
             // position clamp collapses that axis to a single point, so it could
             // slide sideways but never up or down again.
-            let root_allocation = root.allocation();
-            let screens = logical_screen_rects(
-                card.scale_factor(),
-                root_allocation.width(),
-                root_allocation.height(),
-            );
+            let screens = overlay_screen_rects(&root);
             let (width, height) =
                 fit_to_work_area(origin, allocation.width(), allocation.height(), &screens);
             let resized = width != allocation.width() || height != allocation.height();
@@ -9323,11 +9635,13 @@ thread_local! {
 /// last crossed an X window — which is how a widget asked for from the panel
 /// kept opening on the far side of the screen. Everything else, including the
 /// overlay's own picker, is a real X click and goes by the pointer.
-fn reopen_anchor() -> Option<(f64, f64)> {
-    if let Some(point) = PANEL_ANCHOR.with(|cell| cell.get()) {
-        return Some((f64::from(point.x), f64::from(point.y)));
-    }
-    pointer_position()
+fn reopen_anchor(root: &gtk::Fixed) -> Option<(f64, f64)> {
+    let point = PANEL_ANCHOR
+        .with(|cell| cell.get())
+        .map(|point| (f64::from(point.x), f64::from(point.y)))
+        .or_else(pointer_position)?;
+    let origin = overlay_origin(root);
+    Some((point.0 - f64::from(origin.x), point.1 - f64::from(origin.y)))
 }
 
 fn pointer_position() -> Option<(f64, f64)> {
@@ -9629,8 +9943,9 @@ fn sample_widget_foreground(
     if allocation.width() < 1 || allocation.height() < 1 {
         return None;
     }
-    let capture_x = allocation.x().saturating_sub(capture.origin.x);
-    let capture_y = allocation.y().saturating_sub(capture.origin.y);
+    let origin = overlay_origin(widget);
+    let capture_x = (allocation.x() + origin.x).saturating_sub(capture.origin.x);
+    let capture_y = (allocation.y() + origin.y).saturating_sub(capture.origin.y);
     let left = capture_x.max(0);
     let right = allocation
         .width()
@@ -9787,11 +10102,12 @@ fn refresh_auto_colors(
             if item.widget.is_visible() && item.widget.is_mapped() {
                 let allocation = item.widget.allocation();
                 if allocation.width() > 0 && allocation.height() > 0 {
+                    let origin = overlay_origin(&item.widget);
                     request.push_str(&format!(
                         "{}\t{},{},{},{}\n",
                         item.key,
-                        allocation.x(),
-                        allocation.y(),
+                        allocation.x() + origin.x,
+                        allocation.y() + origin.y,
                         allocation.width(),
                         allocation.height()
                     ));
@@ -9881,7 +10197,12 @@ fn apply_timer_style(preview: &TimerStylePreview, style: TimerStyle) {
         context.remove_class(style.css_class());
     }
     context.add_class(style.css_class());
-    apply_timer_typography(&preview.typography, style, preview.size.get());
+    apply_timer_typography(
+        &preview.typography,
+        style,
+        preview.size.get(),
+        widget_font_scale(&preview.card),
+    );
     preview.canvas.queue_draw();
     glib::idle_add_local_once({
         let window = preview.window.clone();
@@ -9891,11 +10212,17 @@ fn apply_timer_style(preview: &TimerStylePreview, style: TimerStyle) {
     });
 }
 
-fn apply_timer_typography(provider: &gtk::CssProvider, style: TimerStyle, size: Size) {
+fn apply_timer_typography(
+    provider: &gtk::CssProvider,
+    style: TimerStyle,
+    size: Size,
+    font_scale: f64,
+) {
     let reference = style.default_size();
     let scale = (f64::from(size.width.max(1)) / f64::from(reference.width))
         .min(f64::from(size.height.max(1)) / f64::from(reference.height))
-        .clamp(0.45, 3.2);
+        .clamp(0.45, 3.2)
+        * font_scale;
     let (value_base, action_base, editor_base) = match style {
         TimerStyle::Digital => (25.0, 9.0, 17.0),
         TimerStyle::Ring | TimerStyle::Ticks | TimerStyle::Arc => (25.0, 11.0, 18.0),
@@ -10074,13 +10401,14 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        drag_frame_due, ellipsize, fit_to_work_area, fit_within_bounds, foreground_for_luminance,
-        format_rate, history_row_budget, image_room, image_room_after_y,
-        monitor_coordinate_divisor, monitor_root_bounds, normalize_monitor_rect, note_headline,
-        note_image_cap, note_search_matches, note_size_for_image, padded_visual_rect,
-        parse_panel_anchor, parse_timer_input, push_recent_search, receives_input_when_locked,
-        record_note_undo, relative_luminance, reopen_point, resize_width_limit, resized_image_size,
-        round_pixbuf_corners, system_content_size, system_meter_columns, system_meter_gap,
+        clamp_to_screens, clip_screen_to_overlay, drag_frame_due, ellipsize, fit_to_work_area,
+        fit_within_bounds, foreground_for_luminance, format_rate, history_row_budget, image_room,
+        image_room_after_y, monitor_coordinate_divisor, monitor_root_bounds,
+        normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
+        note_size_for_image, padded_visual_rect, parse_panel_anchor, parse_timer_input,
+        push_recent_search, receives_input_when_locked, record_note_undo, relative_luminance,
+        reopen_point, resize_width_limit, resized_image_size, round_pixbuf_corners,
+        screen_in_overlay, system_content_size, system_meter_columns, system_meter_gap,
         system_meter_ink_width, system_meter_row_width, system_meter_rows, system_meters,
         system_usage_rows, temperature_meter, timer_style_size, Foreground, NoteSearchMatch,
         NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, DRAG_REDRAW_INTERVAL,
@@ -10560,6 +10888,64 @@ mod timer_input_tests {
         assert_eq!(parse_timer_input("0"), None);
         assert_eq!(parse_timer_input("10:99"), None);
         assert_eq!(parse_timer_input("hello"), None);
+    }
+
+    #[test]
+    fn shifted_overlay_clamps_to_real_monitor_edges() {
+        // Both GDK origins and normalized work areas are logical pixels.
+        // 29 logical pixels is the reported 58px panel at 200% scaling.
+        for divisor in [1, 2] {
+            let bounds = ScreenRect {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 720,
+            };
+            let raw = ScreenRect {
+                x: 0,
+                y: 29 * divisor,
+                width: 1280 * divisor,
+                height: 691 * divisor,
+            };
+            let work = normalize_monitor_rect(raw, divisor, bounds).unwrap();
+            for origin in [
+                Point::default(),
+                Point { x: 0, y: 29 },
+                Point { x: 100, y: 29 },
+            ] {
+                let size = Size {
+                    width: bounds.width,
+                    height: bounds.height,
+                };
+                let local = clip_screen_to_overlay(screen_in_overlay(work, origin), size).unwrap();
+                let top = clamp_to_screens(Point { x: 200, y: -1000 }, 300, 100, &[local]);
+                let bottom = clamp_to_screens(Point { x: 200, y: 2000 }, 300, 100, &[local]);
+                assert_eq!(top.y + origin.y, 29);
+                assert_eq!(bottom.y + origin.y + 100, 720);
+                let right = clamp_to_screens(Point { x: 9999, y: 100 }, 300, 100, &[local]);
+                assert_eq!(right.x + origin.x + 300, 1280);
+                // If the managed overlay itself starts below a secondary monitor's
+                // top edge, never place a child at a negative local coordinate:
+                // GTK would clip its header outside the parent window.
+                let secondary = clip_screen_to_overlay(
+                    screen_in_overlay(
+                        ScreenRect {
+                            x: 1280,
+                            y: 0,
+                            width: 1280,
+                            height: 720,
+                        },
+                        origin,
+                    ),
+                    size,
+                )
+                .unwrap();
+                let top =
+                    clamp_to_screens(Point { x: 1500, y: -1000 }, 300, 100, &[local, secondary]);
+                assert_eq!(top.y, 0);
+                assert_eq!(top.y + origin.y, origin.y);
+            }
+        }
     }
 
     #[test]
@@ -11180,6 +11566,90 @@ mod usage_ui_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires an X11 desktop session with a window manager and xdotool"]
+    fn menu_controls_stay_open_and_outside_click_dismisses() {
+        gtk::init().unwrap();
+        let host = gtk::Window::new(gtk::WindowType::Toplevel);
+        host.set_default_size(200, 200);
+        host.show_all();
+        let menu = context_menu();
+        let color = gtk::MenuItem::with_label("LIGHT");
+        let cycles = Rc::new(Cell::new(0));
+        color.connect_activate({
+            let cycles = cycles.clone();
+            move |_| cycles.set(cycles.get() + 1)
+        });
+        menu.append(&color);
+        let row = gtk::MenuItem::new();
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+        let minus = gtk::Button::with_label("−");
+        let plus = gtk::Button::with_label("+");
+        let value = Rc::new(Cell::new(13));
+        for (button, delta) in [(&minus, -1), (&plus, 1)] {
+            button.connect_clicked({
+                let value = value.clone();
+                move |_| value.set(value.get() + delta)
+            });
+            content.add(button);
+        }
+        row.add(&content);
+        menu.append(&row);
+        keep_menu_controls_open(&menu, &color, &row, &[minus.clone(), plus.clone()]);
+        menu.show_all();
+        let pump = || {
+            for _ in 0..10 {
+                while gtk::events_pending() {
+                    gtk::main_iteration();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        pump();
+        menu.popup_at_rect(
+            &host.window().unwrap(),
+            &gdk::Rectangle::new(20, 20, 1, 1),
+            gdk::Gravity::SouthWest,
+            gdk::Gravity::NorthWest,
+            None::<&gdk::Event>,
+        );
+        pump();
+        let click = |widget: &gtk::Widget| {
+            let (_, ox, oy) = menu.window().unwrap().origin();
+            let (x, y) = widget.translate_coordinates(&menu, 0, 0).unwrap();
+            assert!(std::process::Command::new("xdotool")
+                .args([
+                    "mousemove",
+                    &(ox + x + widget.allocated_width() / 2).to_string(),
+                    &(oy + y + widget.allocated_height() / 2).to_string(),
+                    "click",
+                    "1"
+                ])
+                .status()
+                .unwrap()
+                .success());
+            pump();
+        };
+        click(color.upcast_ref());
+        click(color.upcast_ref());
+        assert_eq!(cycles.get(), 2);
+        assert!(menu.is_visible());
+        click(plus.upcast_ref());
+        assert_eq!(value.get(), 14);
+        click(minus.upcast_ref());
+        assert_eq!(value.get(), 13);
+        assert!(menu.is_visible());
+        // Far outside both the popup and the widget's toplevel window.
+        assert!(std::process::Command::new("xdotool")
+            .args(["mousemove", "900", "650", "click", "1"])
+            .status()
+            .unwrap()
+            .success());
+        pump();
+        assert!(!menu.is_visible());
+        host.close();
+    }
+
+    #[test]
     fn reset_label_changes_at_deadline() {
         assert_eq!(usage_reset_label(Some(1000), 1000).0, "Updating…");
         assert_eq!(usage_reset_label(None, 1000).0, "—");
@@ -11190,6 +11660,45 @@ mod usage_ui_tests {
     #[ignore = "requires GTK display; run under xvfb-run"]
     fn usage_card_keeps_all_rows_and_clears_previous_account() {
         gtk::init().unwrap();
+        let host = gtk::Window::new(gtk::WindowType::Toplevel);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        host.add(&row);
+        let first = gtk::EventBox::new();
+        let second = gtk::EventBox::new();
+        row.add(&first);
+        row.add(&second);
+        let label = gtk::Label::new(Some("font test"));
+        label.style_context().add_class("card-title");
+        first.add(&label);
+        let other = gtk::Label::new(Some("other"));
+        other.style_context().add_class("card-title");
+        second.add(&other);
+        apply_widget_font(&first, 13);
+        apply_widget_font(&second, 13);
+        host.show_all();
+        while gtk::events_pending() {
+            gtk::main_iteration();
+        }
+        let font_size = |label: &gtk::Label| {
+            label
+                .style_context()
+                .style_property_for_state("font-size", gtk::StateFlags::NORMAL)
+                .get::<f64>()
+                .unwrap()
+        };
+        assert_eq!(font_size(&label), 13.0);
+        apply_widget_font(&first, 26);
+        while gtk::events_pending() {
+            gtk::main_iteration();
+        }
+        assert_eq!(font_size(&label), 26.0);
+        assert_eq!(font_size(&other), 13.0);
+        apply_widget_font(&first, 8);
+        while gtk::events_pending() {
+            gtk::main_iteration();
+        }
+        assert_eq!(font_size(&label), 8.0);
+        host.close();
         let card = build_usage_window(Foreground::Light);
         let snapshot = usage::Snapshot {
             source: UsageSource::Omp,

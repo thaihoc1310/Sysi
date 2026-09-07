@@ -12,8 +12,6 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
-    pub const ALL: [Self; 3] = [Self::Auto, Self::Light, Self::Dark];
-
     pub fn next(self) -> Self {
         match self {
             Self::Auto => Self::Light,
@@ -116,6 +114,8 @@ pub struct Settings {
     pub usage_source: String,
     #[serde(default)]
     pub color_mode: ColorMode,
+    #[serde(default = "default_font_size")]
+    pub font_size: i32,
     #[serde(default)]
     pub system_details: SystemDetails,
 }
@@ -131,6 +131,7 @@ impl Default for Settings {
             usage_open: false,
             usage_source: default_usage_source(),
             color_mode: ColorMode::default(),
+            font_size: default_font_size(),
             system_details: SystemDetails::default(),
         }
     }
@@ -242,6 +243,8 @@ pub struct AppState {
     #[serde(default)]
     pub widget_color_modes: HashMap<String, ColorMode>,
     #[serde(default)]
+    pub widget_font_sizes: HashMap<String, i32>,
+    #[serde(default)]
     pub notes: Vec<Note>,
     /// The dictionary windows that exist, in the order they were opened.
     #[serde(default)]
@@ -272,6 +275,7 @@ impl Default for AppState {
             positions,
             sizes: HashMap::new(),
             widget_color_modes: HashMap::new(),
+            widget_font_sizes: HashMap::new(),
             notes: Vec::new(),
             dictionaries: Vec::new(),
             recent_searches: Vec::new(),
@@ -327,7 +331,35 @@ pub fn cache_dir() -> PathBuf {
         .join("sysi")
 }
 
+pub fn default_font_size() -> i32 {
+    13
+}
+
+impl Note {
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.images.is_empty()
+    }
+}
+
 impl AppState {
+    pub fn font_size(&self, key: &str) -> i32 {
+        self.widget_font_sizes
+            .get(key)
+            .copied()
+            .unwrap_or(self.settings.font_size)
+            .clamp(8, 26)
+    }
+
+    pub fn change_font_size(&mut self, key: Option<&str>, delta: i32) {
+        if let Some(key) = key {
+            self.widget_font_sizes
+                .insert(key.to_owned(), (self.font_size(key) + delta).clamp(8, 26));
+        } else {
+            self.settings.font_size = (self.settings.font_size.clamp(8, 26) + delta).clamp(8, 26);
+            self.widget_font_sizes.clear();
+        }
+    }
+
     pub fn load() -> Self {
         let path = config_dir().join("state.json");
         let Ok(raw) = fs::read_to_string(&path) else {
@@ -399,6 +431,40 @@ mod tests {
     use super::{AppState, ColorMode, TimerStyle};
 
     #[test]
+    fn font_overrides_reset_on_global_change_and_survive_save() {
+        let mut state: AppState = serde_json::from_str("{}").unwrap();
+        assert_eq!(state.font_size("note:1"), 13);
+        state.change_font_size(Some("note:1"), 2);
+        assert_eq!(state.font_size("note:1"), 15);
+        assert_eq!(state.font_size("timer"), 13);
+        let mut state: AppState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(state.font_size("note:1"), 15);
+        state.change_font_size(None, -1);
+        assert_eq!(state.font_size("note:1"), 12);
+        assert!(state.widget_font_sizes.is_empty());
+        state.change_font_size(None, -100);
+        assert_eq!(state.font_size("timer"), 8);
+        state.change_font_size(Some("timer"), 100);
+        assert_eq!(state.font_size("timer"), 26);
+    }
+
+    #[test]
+    fn only_contentless_notes_are_empty() {
+        let mut note: super::Note = serde_json::from_str(r#"{"id":1,"text":" \n \t "}"#).unwrap();
+        assert!(note.is_empty());
+        note.text = "Untitled".into();
+        assert!(!note.is_empty());
+        note.text.clear();
+        note.images.push(super::NoteImage {
+            file: "image.png".into(),
+            width: 1,
+            height: 1,
+        });
+        assert!(!note.is_empty());
+    }
+
+    #[test]
     fn old_settings_default_to_auto_mode() {
         let state: AppState = serde_json::from_str(
             r#"{"settings":{"mascot":true,"system":true,"timer":true,"settings_button":true}}"#,
@@ -412,18 +478,6 @@ mod tests {
         assert_eq!(ColorMode::Auto.next(), ColorMode::Light);
         assert_eq!(ColorMode::Light.next(), ColorMode::Dark);
         assert_eq!(ColorMode::Dark.next(), ColorMode::Auto);
-    }
-
-    #[test]
-    fn a_widget_color_menu_has_only_the_other_two_modes() {
-        for current in ColorMode::ALL {
-            let options: Vec<_> = ColorMode::ALL
-                .into_iter()
-                .filter(|mode| *mode != current)
-                .collect();
-            assert_eq!(options.len(), 2);
-            assert!(!options.contains(&current));
-        }
     }
 
     #[test]

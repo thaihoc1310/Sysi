@@ -7,6 +7,11 @@ architecture="$(dpkg --print-architecture)"
 package_root="$(mktemp -d)"
 trap 'rm -rf "$package_root"' EXIT
 
+if command -v node >/dev/null; then
+  node --check --input-type=module \
+    <"$project_dir/packaging/gnome-shell-extension/extension.js"
+fi
+
 cargo build --manifest-path "$project_dir/Cargo.toml" --release --locked
 
 install -Dm755 "$project_dir/target/release/sysi" "$package_root/usr/bin/sysi"

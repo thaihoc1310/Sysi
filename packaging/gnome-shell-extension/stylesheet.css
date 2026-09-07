@@ -30,13 +30,6 @@
   transition-duration: 0ms;
 }
 
-/* A 12px icon plus 9px either side comes out about as wide as the panel is
-   tall, which is what makes the cell read as a square. With no padding it
-   collapses to the width of the bare icon. */
-#panel .sysi-panel-gear {
-  padding: 0 9px;
-}
-
 /* Small enough to sit within the cap height of the words beside it. */
 #panel .sysi-panel-gear-icon {
   icon-size: 12px;
@@ -67,4 +60,58 @@
   border-radius: 0;
   background-color: rgba(242, 242, 242, 0.22);
   color: #ffffff;
+}
+
+/* Match the translucent GTK context menus instead of the Shell's solid card. */
+.sysi-settings-menu {
+  min-width: 0;
+  -arrow-background-color: transparent;
+  -arrow-border-color: rgba(255, 255, 255, 0.08);
+  -arrow-border-width: 0px;
+  -arrow-border-radius: 8px;
+  -arrow-rise: 0px;
+  color: #f4f4f4;
+  font-size: 11px;
+}
+
+.sysi-settings-menu .popup-menu-content {
+  background-color: rgba(22, 22, 24, 0.90);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 3px 1px;
+  box-shadow: none;
+  min-width: 0;
+}
+
+.sysi-settings-menu .popup-menu-item {
+  min-height: 0;
+  min-width: 0;
+  padding: 6px 5px;
+  spacing: 2px;
+  border-radius: 5px;
+  color: #f4f4f4;
+}
+
+.sysi-settings-menu .sysi-font-control {
+  background-color: transparent;
+  background-gradient-direction: none;
+  border: none;
+  border-radius: 8px;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+  min-height: 16px;
+  min-width: 16px;
+  color: #f4f4f4;
+}
+
+.sysi-settings-menu .sysi-font-control:hover,
+.sysi-settings-menu .sysi-font-control:focus {
+  background-color: rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+  text-shadow: 0 0 2px rgba(255, 255, 255, 0.6);
+}
+
+.sysi-settings-menu .sysi-font-row {
+  spacing: 2px;
 }

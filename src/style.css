@@ -913,3 +913,24 @@ popover.note-search-popover > contents,
 .mode-dark .usage-tab-active {
   background-color: rgba(255, 255, 255, 0.16);
 }
+
+.sysi-menu menuitem.font-controls:hover {
+  background-color: transparent;
+}
+
+.sysi-menu button.font-step {
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+  min-height: 16px;
+  min-width: 16px;
+  color: inherit;
+}
+
+.sysi-menu button.font-step:hover,
+.sysi-menu button.font-step:focus {
+  background-color: rgba(255, 255, 255, 0.18);
+}

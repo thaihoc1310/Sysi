@@ -7,6 +7,7 @@ import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 const UUID = 'sysi-panel@thaihoc';
 
@@ -60,17 +61,17 @@ export default class SysiPanelExtension extends Extension {
 
         this._system = this._addAction('system', 'toggle-system');
         this._timer = this._addAction('timer', 'toggle-timer');
-        this._mode = this._addAction(this._readColorMode(), 'next-color-mode');
-        this._lock = this._addAction('lock', 'toggle-lock');
         this._addAction('+ note', 'new-note');
         this._addAction('history', 'toggle-history');
         this._addAction('usage', 'toggle-usage');
         this._addAction('dictionary', 'toggle-translate');
-        this._addAction('quit', 'quit');
+        this._buildSettings();
 
         this._gear.connect('clicked', () => {
             this._syncPanelState();
             this._strip.visible = !this._strip.visible;
+            if (!this._strip.visible)
+                this._settingsMenu.close();
         });
 
         // Append after Ubuntu's left-side indicator instead of prepending it.
@@ -110,7 +111,7 @@ export default class SysiPanelExtension extends Extension {
         );
         if (!this._autoColorRequestFile.query_exists(null))
             GLib.file_set_contents(this._autoColorRequestFile.get_path(), '');
-        this._autoColorGeneration = 1;
+        this._autoColorGeneration = (this._autoColorGeneration ?? 0) + 1;
         this._autoColorSampling = false;
         this._autoColorPending = false;
         try {
@@ -155,6 +156,10 @@ export default class SysiPanelExtension extends Extension {
         this._autoColorGeneration++;
         this._autoColorSampling = false;
         this._autoColorPending = false;
+        this._settingsMenu?.destroy();
+        this._settingsMenu = null;
+        this._settingsManager = null;
+        this._fontLabel = null;
         this._indicator?.destroy();
         this._indicator = null;
         this._content = null;
@@ -162,15 +167,59 @@ export default class SysiPanelExtension extends Extension {
         this._gear = null;
         this._system = null;
         this._timer = null;
-        this._mode = null;
         this._modeLabel = null;
-        this._lock = null;
         this._lockLabel = null;
         this._pidFile = null;
         this._panelStateFile = null;
     }
 
-    _addAction(label, action) {
+    _buildSettings() {
+        const button = this._buildPanelButton('settings');
+        this._settingsMenu = new PopupMenu.PopupMenu(button, 0.5, St.Side.TOP);
+        this._settingsMenu.actor.add_style_class_name('sysi-settings-menu');
+        Main.uiGroup.add_child(this._settingsMenu.actor);
+        this._settingsMenu.actor.hide();
+        this._settingsManager = new PopupMenu.PopupMenuManager(this._indicator);
+        this._settingsManager.addMenu(this._settingsMenu);
+        button.connect('clicked', () => {
+            this._syncPanelState();
+            this._settingsMenu.toggle();
+        });
+        const mode = new PopupMenu.PopupMenuItem(this._readColorMode());
+        this._modeLabel = mode.label;
+        mode.label.x_align = Clutter.ActorAlign.CENTER;
+        mode.label.x_expand = true;
+        // Do not emit PopupMenuItem's activate signal: it closes the menu.
+        mode.activate = () => this._runAction('next-color-mode', button);
+        this._settingsMenu.addMenuItem(mode);
+
+        const row = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        row.add_style_class_name('sysi-font-row');
+        row.add_child(new St.Widget({x_expand: true}));
+        this._fontLabel = new St.Label({text: '13', y_align: Clutter.ActorAlign.CENTER});
+        for (const [label, action] of [['−', 'font-smaller'], ['+', 'font-larger']]) {
+            const control = new St.Button({label, style_class: 'sysi-font-control', can_focus: true, accessible_name: action === 'font-smaller' ? 'Decrease font size' : 'Increase font size'});
+            control.connect('clicked', () => this._runAction(action, button));
+            row.add_child(control);
+            if (action === 'font-smaller')
+                row.add_child(this._fontLabel);
+        }
+        row.add_child(new St.Widget({x_expand: true}));
+        this._settingsMenu.addMenuItem(row);
+        const lock = new PopupMenu.PopupMenuItem('lock');
+        this._lockLabel = lock.label;
+        lock.label.x_align = Clutter.ActorAlign.CENTER;
+        lock.label.x_expand = true;
+        lock.connect('activate', () => this._runAction('toggle-lock', button));
+        this._settingsMenu.addMenuItem(lock);
+        const quit = new PopupMenu.PopupMenuItem('quit');
+        quit.label.x_align = Clutter.ActorAlign.CENTER;
+        quit.label.x_expand = true;
+        quit.connect('activate', () => this._runAction('quit', button));
+        this._settingsMenu.addMenuItem(quit);
+    }
+
+    _buildPanelButton(label) {
         const button = new St.Button({
             style_class: 'sysi-panel-action',
             reactive: true,
@@ -179,23 +228,21 @@ export default class SysiPanelExtension extends Extension {
             y_expand: true,
             y_align: Clutter.ActorAlign.FILL,
         });
-        // The font is set here so the label measures itself with the same face
-        // it is painted in — inheriting it left every word ellipsized down to a
-        // couple of characters. Colour is deliberately left out: an inline
-        // colour would outrank the stylesheet and the text would stay pale
-        // against the inverted hover block.
+        // Set the font on the label too so it measures with the same face it
+        // paints in; inheriting it makes Shell ellipsize otherwise-wide words.
         const text = new St.Label({
             text: label,
             y_align: Clutter.ActorAlign.CENTER,
             style: 'font-family: Noto Sans, sans-serif; font-size: 11px; font-weight: 500; text-shadow: none;',
         });
         button.add_child(text);
-        button.connect('clicked', () => this._runAction(action, button));
         this._strip.add_child(button);
-        if (action === 'toggle-lock')
-            this._lockLabel = text;
-        if (action === 'next-color-mode')
-            this._modeLabel = text;
+        return button;
+    }
+
+    _addAction(label, action) {
+        const button = this._buildPanelButton(label);
+        button.connect('clicked', () => this._runAction(action, button));
         return button;
     }
 
@@ -259,32 +306,38 @@ export default class SysiPanelExtension extends Extension {
             running = false;
         }
         this._indicator.visible = running;
-        if (!running)
+        if (!running) {
             this._strip.visible = false;
+            this._settingsMenu?.close();
+        }
     }
 
-    // `<editing|locked> <auto|light|dark>`, written by Sysi whenever either
-    // changes and removed when it exits. With no file to read — Sysi is not
-    // running — the labels fall back to what the saved settings say.
+    // `<editing|locked> <auto|light|dark> <font-size>`, written by Sysi whenever
+    // one changes and removed when it exits. With no file to read — Sysi is not
+    // running — labels fall back to saved settings or defaults.
     _readPanelState() {
         try {
             const [ok, contents] = GLib.file_get_contents(this._panelStateFile.get_path());
             if (!ok)
-                return [null, null];
-            const [interaction, mode] = new TextDecoder().decode(contents).trim().split(/\s+/);
+                return [null, null, null];
+            const [interaction, mode, fontSize] =
+                new TextDecoder().decode(contents).trim().split(/\s+/);
             return [
                 interaction === 'locked' || interaction === 'editing' ? interaction : null,
                 ['auto', 'light', 'dark'].includes(mode) ? mode : null,
+                Math.min(26, Math.max(8, Number(fontSize) || 13)),
             ];
         } catch (_) {
-            return [null, null];
+            return [null, null, null];
         }
     }
 
     _syncPanelState() {
         if (!this._panelStateFile)
             return;
-        const [interaction, mode] = this._readPanelState();
+        const [interaction, mode, fontSize] = this._readPanelState();
+        if (this._fontLabel)
+            this._fontLabel.text = String(fontSize ?? 13);
         if (this._lockLabel)
             this._lockLabel.text = interaction === 'locked' ? 'unlock' : 'lock';
         if (this._modeLabel)
@@ -341,6 +394,8 @@ export default class SysiPanelExtension extends Extension {
                 results.push(`${request.key}\t${luminance.toFixed(6)}`);
         }
         if (generation !== this._autoColorGeneration)
+            return;
+        if (requests.length > 0 && results.length === 0)
             return;
         const path = GLib.build_filenamev([
             GLib.get_user_cache_dir(),
