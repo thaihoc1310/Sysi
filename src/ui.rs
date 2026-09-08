@@ -85,8 +85,6 @@ const SYSTEM_ROW_TOP_GAP: f64 = 16.0;
 const TIMER_SIZE: i32 = 116;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
-const NOTE_MAX_WIDTH: i32 = 540;
-const NOTE_MAX_HEIGHT: i32 = 440;
 const HISTORY_WIDTH: i32 = 236;
 const HISTORY_HEIGHT: i32 = 252;
 const USAGE_WIDTH: i32 = 292;
@@ -304,8 +302,13 @@ struct ResizeHandle {
 struct ResizeBounds {
     min_width: i32,
     min_height: i32,
-    max_width: i32,
-    max_height: i32,
+    /// The largest this card may be dragged, or `None` to let it grow into
+    /// whatever room the monitor under it has left. A fixed ceiling suits a
+    /// card whose drawing stops improving past a size; a window showing text
+    /// the user wrote or looked up has no such size, and a number picked in
+    /// advance only ever gets in the way of reading it.
+    max_width: Option<i32>,
+    max_height: Option<i32>,
     aspect_ratio: Option<f64>,
     preserve_current_aspect: bool,
     /// The height a card of this width must have. Set on cards whose content
@@ -695,8 +698,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             min_height: 62,
             // Room for eight rings side by side, so a card dragged wide really
             // can put every meter on one row.
-            max_width: system_meter_ink_width(8).ceil() as i32,
-            max_height: 640,
+            max_width: Some(system_meter_ink_width(8).ceil() as i32),
+            max_height: Some(640),
             aspect_ratio: None,
             preserve_current_aspect: false,
             height_for_width: Some(Rc::new({
@@ -784,8 +787,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         ResizeBounds {
             min_width: 72,
             min_height: 36,
-            max_width: 320,
-            max_height: 320,
+            max_width: Some(320),
+            max_height: Some(320),
             aspect_ratio: Some(1.0),
             preserve_current_aspect: true,
             height_for_width: None,
@@ -894,8 +897,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         ResizeBounds {
             min_width: 132,
             min_height: 92,
-            max_width: 620,
-            max_height: 760,
+            max_width: Some(620),
+            max_height: Some(760),
             aspect_ratio: None,
             preserve_current_aspect: false,
             height_for_width: None,
@@ -967,8 +970,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         ResizeBounds {
             min_width: 220,
             min_height: 128,
-            max_width: 640,
-            max_height: 720,
+            max_width: Some(640),
+            max_height: Some(720),
             aspect_ratio: None,
             preserve_current_aspect: false,
             height_for_width: None,
@@ -5064,33 +5067,54 @@ fn note_image_chrome(editor: &gtk::TextView, card: &gtk::EventBox) -> Size {
     }
 }
 
-// How far a note may grow to fit a pasted image: never past what a resize drag
-// allows, and never past the edge of the monitor it sits on, so growing the
-// note cannot push its own resize handle off-screen.
+/// How much room a card sitting at `origin` has to grow into. Measured from
+/// the card's own top-left corner rather than from the screen edge, so a card
+/// can never grow past the bottom or right of its monitor and take its own
+/// resize handle off the screen with it.
+fn room_on_screen(origin: Point, screens: &[ScreenRect]) -> Size {
+    let host = screens.iter().find(|screen| {
+        origin.x >= screen.x
+            && origin.x < screen.x + screen.width
+            && origin.y >= screen.y
+            && origin.y < screen.y + screen.height
+    });
+    match host {
+        Some(screen) => Size {
+            width: screen.x + screen.width - origin.x,
+            height: screen.y + screen.height - origin.y,
+        },
+        // Sitting off every monitor, which happens when one is unplugged with a
+        // card on it. The largest monitor is the most room it could ever have.
+        None => Size {
+            width: screens.iter().map(|screen| screen.width).max().unwrap_or(1),
+            height: screens
+                .iter()
+                .map(|screen| screen.height)
+                .max()
+                .unwrap_or(1),
+        },
+    }
+}
+
+fn card_room_on_screen(card: &gtk::EventBox) -> Size {
+    let allocation = card.allocation();
+    room_on_screen(
+        Point {
+            x: allocation.x(),
+            y: allocation.y(),
+        },
+        &overlay_screen_rects(card),
+    )
+}
+
+// How far a note may grow to fit a pasted image: to the edge of the monitor it
+// sits on, the same ceiling a resize drag stops at.
 fn note_growth_limit(card: &gtk::EventBox) -> Size {
     let allocation = card.allocation();
-    let screens = overlay_screen_rects(card);
-    let screen = screens.iter().find(|screen| {
-        allocation.x() >= screen.x
-            && allocation.x() < screen.x + screen.width
-            && allocation.y() >= screen.y
-            && allocation.y() < screen.y + screen.height
-    });
-    let (available_width, available_height) = screen
-        .map(|screen| {
-            (
-                screen.x + screen.width - allocation.x(),
-                screen.y + screen.height - allocation.y(),
-            )
-        })
-        .unwrap_or((NOTE_MAX_WIDTH, NOTE_MAX_HEIGHT));
+    let room = card_room_on_screen(card);
     Size {
-        width: NOTE_MAX_WIDTH
-            .min(available_width)
-            .max(allocation.width().max(1)),
-        height: NOTE_MAX_HEIGHT
-            .min(available_height)
-            .max(allocation.height().max(1)),
+        width: room.width.max(allocation.width().max(1)),
+        height: room.height.max(allocation.height().max(1)),
     }
 }
 
@@ -6711,8 +6735,8 @@ fn rebuild_pinned_notes(
             ResizeBounds {
                 min_width: 75,
                 min_height: 92,
-                max_width: NOTE_MAX_WIDTH,
-                max_height: NOTE_MAX_HEIGHT,
+                max_width: None,
+                max_height: None,
                 aspect_ratio: None,
                 preserve_current_aspect: false,
                 height_for_width: None,
@@ -7304,8 +7328,8 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         ResizeBounds {
             min_width: 196,
             min_height: 120,
-            max_width: 680,
-            max_height: 860,
+            max_width: None,
+            max_height: None,
             aspect_ratio: None,
             preserve_current_aspect: false,
             height_for_width: None,
@@ -9850,11 +9874,16 @@ fn fit_translate_height(
         } else {
             0
         };
+        // The results column stops where the monitor does rather than at a
+        // height chosen in advance: a long entry is meant to be read in the
+        // window instead of through a scrollbar. Only the room below the card
+        // counts, so growing it cannot push its own resize handle off-screen.
+        let results_room = (card_room_on_screen(&card).height - chrome_height - 5).max(1);
         let results_height = if results.is_visible() {
             results
                 .preferred_height_for_width(content_width)
                 .1
-                .min(TRANSLATE_RESULTS_MAX_HEIGHT)
+                .min(results_room)
         } else {
             0
         };
@@ -9863,6 +9892,14 @@ fn fit_translate_height(
         card.set_size_request(width, height);
         card.queue_resize();
     });
+}
+
+/// The largest a card may be dragged where it currently sits: its own ceiling
+/// if it has one, never past the room its monitor has left, and never below
+/// its own floor — a card wider than the screen it was dropped on still has to
+/// stay draggable.
+fn resize_ceiling(ceiling: Option<i32>, room: i32, floor: i32) -> i32 {
+    ceiling.unwrap_or(room).min(room).max(floor)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9981,26 +10018,15 @@ fn attach_resize(
 
             let allocation = card.allocation();
             let screens = gesture_screens.borrow();
-            let screen_limit = screens
-                .iter()
-                .find(|screen| {
-                    allocation.x() >= screen.x
-                        && allocation.x() < screen.x + screen.width
-                        && allocation.y() >= screen.y
-                        && allocation.y() < screen.y + screen.height
-                })
-                .copied();
-            let available_width = screen_limit
-                .map(|screen| screen.x + screen.width - allocation.x())
-                .unwrap_or(bounds.max_width);
-            let available_height = screen_limit
-                .map(|screen| screen.y + screen.height - allocation.y())
-                .unwrap_or(bounds.max_height);
-            let max_width = bounds.max_width.min(available_width).max(bounds.min_width);
-            let max_height = bounds
-                .max_height
-                .min(available_height)
-                .max(bounds.min_height);
+            let room = room_on_screen(
+                Point {
+                    x: allocation.x(),
+                    y: allocation.y(),
+                },
+                &screens,
+            );
+            let max_width = resize_ceiling(bounds.max_width, room.width, bounds.min_width);
+            let max_height = resize_ceiling(bounds.max_height, room.height, bounds.min_height);
 
             let aspect_ratio = if bounds.preserve_current_aspect {
                 Some(f64::from(start_width) / f64::from(start_height.max(1)))
@@ -11098,15 +11124,15 @@ mod timer_input_tests {
         normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
         note_size_for_image, padded_visual_rect, parse_panel_anchor, parse_timer_input,
         push_recent_search, receives_input_when_locked, record_note_undo, relative_luminance,
-        reopen_point, resize_width_limit, resized_image_size, round_pixbuf_corners,
-        screen_in_overlay, system_content_size, system_meter_columns, system_meter_gap,
-        system_meter_ink_width, system_meter_row_width, system_meter_rows, system_meters,
-        system_usage_rows, temperature_meter, timer_style_size, Foreground, NoteSearchMatch,
-        NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, DRAG_REDRAW_INTERVAL,
-        HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS,
-        NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_MAX_HEIGHT, NOTE_WIDTH,
-        SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
-        SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
+        reopen_point, resize_ceiling, resize_width_limit, resized_image_size, room_on_screen,
+        round_pixbuf_corners, screen_in_overlay, system_content_size, system_meter_columns,
+        system_meter_gap, system_meter_ink_width, system_meter_row_width, system_meter_rows,
+        system_meters, system_usage_rows, temperature_meter, timer_style_size, Foreground,
+        NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect,
+        DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS,
+        NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_WIDTH, SYSTEM_HEIGHT,
+        SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN, SYSTEM_METER_RING,
+        SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
     };
     use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
     use crate::system::{SystemSnapshot, Usage};
@@ -11426,8 +11452,8 @@ mod timer_input_tests {
             height: 117,
         };
         let limit = Size {
-            width: NOTE_MAX_HEIGHT,
-            height: NOTE_MAX_HEIGHT,
+            width: 440,
+            height: 440,
         };
         let grown = note_size_for_image(current, chrome, image, limit);
         assert!(grown.height >= image.height + chrome.height);
@@ -12240,6 +12266,76 @@ mod timer_input_tests {
         // Left behind on a monitor that has since been unplugged.
         let stranded = Point { x: 5000, y: 5000 };
         assert_eq!(fit_to_work_area(stranded, 900, 700, &screens), (800, 600));
+    }
+
+    /// A note or a dictionary entry is as long as it is; capping either at a
+    /// number chosen in advance is what made a long entry unreadable. The
+    /// monitor under the card is the only thing that may stop it.
+    #[test]
+    fn a_card_without_a_ceiling_of_its_own_may_be_dragged_to_the_edge_of_its_monitor() {
+        // Room measured from the card's own corner, so the drag can never take
+        // the resize handle past the bottom-right of the screen.
+        assert_eq!(resize_ceiling(None, 940, 92), 940);
+        assert_eq!(resize_ceiling(None, 1440, 92), 1440);
+        // A card that does have a ceiling still keeps it.
+        assert_eq!(resize_ceiling(Some(440), 940, 92), 440);
+        // Neither one may grow past the monitor.
+        assert_eq!(resize_ceiling(Some(860), 300, 92), 300);
+        // A card dropped on a monitor too small for even its floor stays
+        // draggable rather than collapsing to nothing.
+        assert_eq!(resize_ceiling(None, 40, 92), 92);
+        assert_eq!(resize_ceiling(Some(440), 40, 92), 92);
+    }
+
+    #[test]
+    fn growth_room_is_measured_from_the_card_to_the_corner_of_its_own_monitor() {
+        let screens = [
+            ScreenRect {
+                x: 0,
+                y: 0,
+                width: 540,
+                height: 809,
+            },
+            ScreenRect {
+                x: 540,
+                y: 151,
+                width: 1280,
+                height: 691,
+            },
+        ];
+        // On the landscape screen: room to its bottom-right corner, not the
+        // taller portrait one next to it.
+        assert_eq!(
+            room_on_screen(Point { x: 756, y: 300 }, &screens),
+            Size {
+                width: 1064,
+                height: 542
+            }
+        );
+        // Flush with a corner leaves the whole screen to grow into.
+        assert_eq!(
+            room_on_screen(Point { x: 0, y: 0 }, &screens),
+            Size {
+                width: 540,
+                height: 809
+            }
+        );
+        // Stranded where a monitor used to be: the largest one is the most room
+        // it could possibly have.
+        assert_eq!(
+            room_on_screen(Point { x: 5000, y: 5000 }, &screens),
+            Size {
+                width: 1280,
+                height: 809
+            }
+        );
+        assert_eq!(
+            room_on_screen(Point { x: 0, y: 0 }, &[]),
+            Size {
+                width: 1,
+                height: 1
+            }
+        );
     }
 
     #[test]
