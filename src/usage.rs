@@ -18,9 +18,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const CODEX_TIMEOUT: Duration = Duration::from_secs(20);
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// Every usage source is a local CLI, so this is how long any of them may take
+/// before it is killed and reported as unavailable.
+const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Source {
@@ -145,35 +145,12 @@ impl Schedule {
     }
 }
 
-// Retry-After allows either delta seconds or an IMF-fixdate (RFC 9110).
-fn retry_after(value: Option<&str>, now: i64) -> Duration {
-    let Some(value) = value else {
-        return Duration::ZERO;
-    };
-    if let Ok(seconds) = value.trim().parse::<u64>() {
-        return Duration::from_secs(seconds);
-    }
-    let parts: Vec<_> = value.split_whitespace().collect();
-    if parts.len() != 6 || parts[5] != "GMT" {
-        return Duration::ZERO;
-    }
-    let months = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let Some(month) = months.iter().position(|month| *month == parts[2]) else {
-        return Duration::ZERO;
-    };
-    let iso = format!("{}-{:02}-{}T{}Z", parts[3], month + 1, parts[1], parts[4]);
-    let reset = parse_iso_reset(Some(&Value::String(iso))).unwrap_or(now);
-    Duration::from_millis(reset.saturating_sub(now).max(0) as u64)
-}
-
 /// `force` marks a refresh the user asked for: OMP answers from a cache, so
 /// without clearing it the card shows the same numbers with the same age.
 pub fn fetch(source: Source, force: bool) -> Result<Snapshot, FetchError> {
     match source {
         Source::Codex => fetch_codex().map_err(Into::into),
-        Source::Claude => fetch_claude(),
+        Source::Claude => fetch_claude().map_err(Into::into),
         Source::Omp => fetch_omp(force).map_err(Into::into),
     }
 }
@@ -204,15 +181,6 @@ fn normalize_reset(value: Option<&Value>) -> Option<i64> {
     millis
         .is_finite()
         .then_some(millis.min(i64::MAX as f64) as i64)
-}
-
-fn parse_iso_reset(value: Option<&Value>) -> Option<i64> {
-    let text = value?.as_str()?.trim();
-    // GLib is already a Sysi dependency and understands offsets, fractional
-    // seconds and the UTC `Z` spelling used by Anthropic.
-    glib::DateTime::from_iso8601(text, None)
-        .ok()
-        .map(|datetime| datetime.to_unix().saturating_mul(1000))
 }
 
 fn window_from_percent(
@@ -393,6 +361,58 @@ fn terminate_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// Runs a CLI to completion and hands back its stdout, killing it if it
+/// outruns the timeout. stdout is drained on a thread of its own: a child that
+/// fills the pipe while this side waits on its exit status would deadlock
+/// against us. stdin is closed so a CLI that would otherwise wait for input
+/// gives up immediately instead of hanging until the timeout.
+fn run_cli(
+    label: &str,
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut child = Command::new(resolve_executable(program))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| command_start_error(label, error))?;
+    let Some(stdout) = child.stdout.take() else {
+        terminate_child(&mut child);
+        return Err(format!("{label} has no stdout"));
+    };
+    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = BufReader::new(stdout).read_to_end(&mut output);
+        let _ = output_tx.send(output);
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(format!("Could not read {label} status: {error}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            terminate_child(&mut child);
+            return Err(format!("Timed out waiting for {label} usage"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    if !status.success() {
+        return Err(format!("{label} usage exited with {status}"));
+    }
+    output_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| format!("Timed out reading {label} usage output"))
+}
+
 fn run_codex_request() -> Result<Value, String> {
     let mut child = Command::new(resolve_executable("codex"))
         .args(["app-server", "--stdio"])
@@ -456,7 +476,7 @@ fn run_codex_request() -> Result<Value, String> {
     // Keeping stdin alive lets app-server finish its asynchronous request. The
     // child is killed immediately after response id 2, so no process survives
     // a refresh.
-    let deadline = Instant::now() + CODEX_TIMEOUT;
+    let deadline = Instant::now() + CLI_TIMEOUT;
     let mut response = None;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -547,202 +567,153 @@ fn claude_email() -> Option<String> {
     email(config.pointer("/oauthAccount/emailAddress"))
 }
 
-fn claude_credentials_path() -> PathBuf {
-    env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
-        .unwrap_or_else(|| PathBuf::from(".claude"))
-        .join(".credentials.json")
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `1:10pm`, `3am`, or the bare `13:10` some locales print instead.
+fn parse_claude_clock(text: &str) -> Option<(i32, i32)> {
+    let (time, midday) = match text.strip_suffix("am") {
+        Some(rest) => (rest, 0),
+        None => match text.strip_suffix("pm") {
+            Some(rest) => (rest, 12),
+            None => {
+                let (hour, minute) = text.split_once(':')?;
+                let hour = hour.trim().parse::<i32>().ok()?;
+                let minute = minute.trim().parse::<i32>().ok()?;
+                return (0..=23).contains(&hour).then_some((hour, minute));
+            }
+        },
+    };
+    let (hour, minute) = time.trim().split_once(':').unwrap_or((time.trim(), "0"));
+    let hour = hour.trim().parse::<i32>().ok()?;
+    let minute = minute.trim().parse::<i32>().ok()?;
+    if !(1..=12).contains(&hour) || !(0..=59).contains(&minute) {
+        return None;
+    }
+    Some(((hour % 12) + midday, minute))
 }
 
-fn read_claude_token() -> Result<String, String> {
-    if let Ok(token) = env::var("CLAUDE_CODE_OAUTH_TOKEN") {
-        if !token.trim().is_empty() {
-            return Ok(token.trim().to_owned());
+/// `Sep 10, 3am (Asia/Bangkok)` — a wall-clock time in this machine's own zone,
+/// written without a year. The year is inferred rather than assumed: a reset
+/// that would land in the past belongs to next year, which only ever happens
+/// across a New Year.
+fn parse_claude_reset(text: &str, now_ms: i64) -> Option<i64> {
+    let text = text.split(" (").next()?.trim();
+    let (date, clock) = text.split_once(", ")?;
+    let (month_name, day) = date.trim().split_once(' ')?;
+    let month = MONTHS.iter().position(|name| *name == month_name)? as i32 + 1;
+    let day = day.trim().parse::<i32>().ok()?;
+    let (hour, minute) = parse_claude_clock(clock.trim())?;
+    // The year comes off the clock the caller is working against, not the wall
+    // clock, so the New Year case can be exercised without waiting for one.
+    let this_year = glib::DateTime::from_unix_local(now_ms.div_euclid(1000))
+        .ok()?
+        .year();
+    for year in [this_year, this_year + 1] {
+        // Feb 29 in a year that has no Feb 29: try the next year rather than
+        // giving up on the line.
+        let Ok(at) = glib::DateTime::from_local(year, month, day, hour, minute, 0.0) else {
+            continue;
+        };
+        let reset = at.to_unix().saturating_mul(1000);
+        // A day of slack, so a window that reset moments ago reads as due now
+        // rather than as eleven months away.
+        if reset.saturating_add(86_400_000) >= now_ms {
+            return Some(reset);
         }
     }
-    let path = claude_credentials_path();
-    let raw = fs::read_to_string(&path)
-        .map_err(|_| format!("Claude credentials not found at {}", path.display()))?;
-    let value: Value = serde_json::from_str(&raw)
-        .map_err(|_| "Claude credentials are not valid JSON".to_owned())?;
-    let oauth = value.get("claudeAiOauth").unwrap_or(&value);
-    oauth
-        .get("accessToken")
-        .or_else(|| oauth.get("access_token"))
-        .and_then(Value::as_str)
-        .filter(|token| !token.trim().is_empty())
+    None
+}
+
+/// The CLI writes labels for a full-width terminal; the card has a narrow
+/// column. Only the leading boilerplate goes — a label this build has never
+/// seen is passed through untouched rather than mangled.
+fn claude_window_label(label: &str) -> String {
+    let trimmed = label.strip_prefix("Current ").unwrap_or(label);
+    if let Some(scope) = trimmed
+        .strip_prefix("week (")
+        .and_then(|scope| scope.strip_suffix(')'))
+    {
+        return match scope {
+            "all models" => "Weekly".to_owned(),
+            named => format!("Weekly · {named}"),
+        };
+    }
+    match trimmed {
+        "session" => "Session".to_owned(),
+        _ => label.to_owned(),
+    }
+}
+
+/// One quota line, e.g.
+/// `Current week (all models): 57% used · resets Sep 10, 3am (Asia/Bangkok)`.
+/// Matched on its shape rather than against a list of known window names, so a
+/// plan with limits this build has never heard of still reaches the card.
+fn parse_claude_usage_line(line: &str, now_ms: i64) -> Option<Window> {
+    let (label, rest) = line.split_once(": ")?;
+    let (percent, after) = rest.split_once("% used")?;
+    let used = percent.trim().parse::<f64>().ok()?;
+    let reset = after
+        .split_once("resets ")
+        .and_then(|(_, when)| parse_claude_reset(when, now_ms));
+    window_from_percent(claude_window_label(label.trim()), Some(used), reset, None)
+}
+
+fn parse_claude_usage(report: &str, now_ms: i64) -> Vec<Window> {
+    report
+        .lines()
+        .filter_map(|line| parse_claude_usage_line(line.trim(), now_ms))
+        .collect()
+}
+
+/// Nothing in the report reads as a quota: an API-key credential rather than a
+/// subscription, or a login that has lapsed. The CLI's own opening line says
+/// which, and says it better than a message invented here.
+fn claude_report_status(report: &str) -> String {
+    report
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && line.len() <= 160)
         .map(str::to_owned)
-        .ok_or_else(|| "Claude OAuth access token is missing".to_owned())
+        .unwrap_or_else(|| "Claude reported no usage limits".to_owned())
 }
 
-fn claude_bucket(value: Option<&Value>, label: &str, duration_ms: i64) -> Option<Window> {
-    let object = value?.as_object()?;
-    let used =
-        finite_number(object.get("utilization")).or_else(|| finite_number(object.get("percent")));
-    let reset = parse_iso_reset(object.get("resets_at").or_else(|| object.get("resetsAt")));
-    window_from_percent(label, used, reset, Some(duration_ms))
-}
-
-fn money_amount(value: Option<&Value>) -> Option<f64> {
-    let object = value?.as_object()?;
-    let minor = finite_number(object.get("amount_minor"))?;
-    let exponent = finite_number(object.get("exponent")).unwrap_or(0.0);
-    if minor < 0.0 || !(0.0..=18.0).contains(&exponent) {
-        return None;
-    }
-    let amount = minor / 10_f64.powf(exponent);
-    amount.is_finite().then_some(amount)
-}
-
-fn claude_extra_bucket(value: Option<&Value>, label: &str) -> Option<Window> {
-    let object = value?.as_object()?;
-    if object
-        .get("is_enabled")
-        .or_else(|| object.get("enabled"))
+/// Claude Code answers `/usage` from what it already knows, without reaching
+/// the API: the reply comes back with `total_cost_usd` and every token counter
+/// at zero. So the CLI is not only the cheapest source, it is the only one that
+/// cannot be rate limited by the very quota it is reporting on.
+fn fetch_claude() -> Result<Snapshot, String> {
+    let output = run_cli(
+        "Claude",
+        "claude",
+        &["-p", "/usage", "--output-format", "json"],
+        CLI_TIMEOUT,
+    )?;
+    let value: Value = serde_json::from_slice(&output)
+        .map_err(|_| "Claude returned invalid usage JSON".to_owned())?;
+    let report = value
+        .get("result")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Claude usage output carried no report".to_owned())?;
+    if value
+        .get("is_error")
         .and_then(Value::as_bool)
-        .is_some_and(|enabled| !enabled)
+        .unwrap_or(false)
     {
-        return None;
+        return Err(claude_report_status(report));
     }
-    let used =
-        finite_number(object.get("used_credits")).or_else(|| money_amount(object.get("used")))?;
-    let limit =
-        finite_number(object.get("monthly_limit")).or_else(|| money_amount(object.get("limit")))?;
-    if used < 0.0 || limit <= 0.0 {
-        return None;
-    }
-    let reset = parse_iso_reset(object.get("resets_at").or_else(|| object.get("resetsAt")));
-    window_from_percent(
-        label,
-        Some(used / limit * 100.0),
-        reset,
-        Some(30 * 24 * 60 * 60 * 1000),
-    )
-}
-
-fn parse_claude_response(value: &Value, fetched_at_ms: i64) -> Result<Snapshot, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "Claude returned an invalid usage response".to_owned())?;
-    let mut windows = Vec::new();
-    if let Some(window) = claude_bucket(object.get("five_hour"), "5h", 5 * 60 * 60 * 1000) {
-        windows.push(window);
-    }
-    if let Some(window) = claude_bucket(object.get("seven_day"), "Weekly", 7 * 24 * 60 * 60 * 1000)
-    {
-        windows.push(window);
-    }
-    for (key, label) in [
-        ("seven_day_opus", "Weekly · Opus"),
-        ("seven_day_sonnet", "Weekly · Sonnet"),
-    ] {
-        if let Some(window) = claude_bucket(object.get(key), label, 7 * 24 * 60 * 60 * 1000) {
-            windows.push(window);
-        }
-    }
-    // Enterprise/team accounts can expose only a monthly spend cap. It is a
-    // real quota when both sides of the amount are present; never turn a
-    // dollar total without a denominator into a percentage.
-    if let Some(window) = claude_extra_bucket(object.get("spend"), "Monthly")
-        .or_else(|| claude_extra_bucket(object.get("extra_usage"), "Monthly"))
-    {
-        windows.push(window);
-    }
-    if let Some(limits) = object.get("limits").and_then(Value::as_array) {
-        for entry in limits {
-            let Some(entry_object) = entry.as_object() else {
-                continue;
-            };
-            if entry_object.get("kind").and_then(Value::as_str) != Some("weekly_scoped") {
-                continue;
-            }
-            let name = entry_object
-                .get("scope")
-                .and_then(Value::as_object)
-                .and_then(|scope| scope.get("model"))
-                .and_then(Value::as_object)
-                .and_then(|model| model.get("display_name"))
-                .and_then(Value::as_str)
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or("model");
-            if let Some(window) = claude_bucket(
-                Some(entry),
-                &format!("Weekly · {name}"),
-                7 * 24 * 60 * 60 * 1000,
-            ) {
-                windows.push(window);
-            }
-        }
-    }
+    let fetched_at_ms = now_ms();
+    let windows = parse_claude_usage(report, fetched_at_ms);
     if windows.is_empty() {
-        return Err("Claude returned no usable usage windows".to_owned());
+        return Err(claude_report_status(report));
     }
     Ok(Snapshot {
         source: Source::Claude,
-        account: None,
+        account: claude_email(),
         fetched_at_ms,
         windows,
     })
-}
-
-fn fetch_claude() -> Result<Snapshot, FetchError> {
-    let token = read_claude_token()?;
-    let agent = ureq::builder()
-        .timeout_connect(HTTP_TIMEOUT)
-        .timeout(HTTP_TIMEOUT)
-        .redirects(0)
-        .user_agent("sysi-usage")
-        .build();
-    let response = agent
-        .get(CLAUDE_USAGE_URL)
-        .set("Accept", "application/json")
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("anthropic-beta", "oauth-2025-04-20")
-        .call()
-        .map_err(|error| {
-            let delay = match &error {
-                ureq::Error::Status(_, response) => {
-                    retry_after(response.header("Retry-After"), now_ms())
-                }
-                _ => Duration::ZERO,
-            };
-            let message = match error {
-                ureq::Error::Status(401, _) => {
-                    "Claude login expired; sign in again with Claude Code".to_owned()
-                }
-                ureq::Error::Status(403, _) => {
-                    "Claude usage unavailable for this credential (profile scope required)"
-                        .to_owned()
-                }
-                ureq::Error::Status(429, _) => {
-                    "Claude usage is rate limited; waiting before retry".to_owned()
-                }
-                ureq::Error::Status(code, _) => {
-                    format!("Claude usage request failed (HTTP {code})")
-                }
-                _ => format!("Claude usage request failed: {error}"),
-            };
-            FetchError {
-                message,
-                retry_after: delay,
-            }
-        })?;
-    if (300..400).contains(&response.status()) {
-        return Err(
-            "Claude usage endpoint redirected; no credential was forwarded"
-                .to_owned()
-                .into(),
-        );
-    }
-    let body = response
-        .into_string()
-        .map_err(|error| format!("Could not read Claude usage: {error}"))?;
-    let value: Value =
-        serde_json::from_str(&body).map_err(|_| "Claude returned invalid usage JSON".to_owned())?;
-    let mut snapshot = parse_claude_response(&value, now_ms())?;
-    snapshot.account = claude_email();
-    Ok(snapshot)
 }
 
 fn amount_percent(amount: &Value) -> Option<(f64, f64)> {
@@ -869,7 +840,7 @@ fn invalidate_omp_cache() {
     else {
         return;
     };
-    let deadline = Instant::now() + HTTP_TIMEOUT;
+    let deadline = Instant::now() + CLI_TIMEOUT;
     while Instant::now() < deadline {
         // A failure here is not worth surfacing: the report still renders,
         // just from the cache the refresh meant to skip.
@@ -885,48 +856,7 @@ fn fetch_omp(force: bool) -> Result<Snapshot, String> {
     if force {
         invalidate_omp_cache();
     }
-    let mut child = Command::new(resolve_executable("omp"))
-        .args(["usage", "--json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| command_start_error("OMP", error))?;
-    let Some(stdout) = child.stdout.take() else {
-        terminate_child(&mut child);
-        return Err("OMP has no stdout".to_owned());
-    };
-    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        let _ = BufReader::new(stdout).read_to_end(&mut output);
-        let _ = output_tx.send(output);
-    });
-    let deadline = Instant::now() + CODEX_TIMEOUT;
-    let status;
-    loop {
-        match child.try_wait() {
-            Ok(Some(next_status)) => {
-                status = next_status;
-                break;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                terminate_child(&mut child);
-                return Err(format!("Could not read OMP status: {error}"));
-            }
-        }
-        if Instant::now() >= deadline {
-            terminate_child(&mut child);
-            return Err("Timed out waiting for OMP usage".to_owned());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    if !status.success() {
-        return Err(format!("OMP usage exited with {status}"));
-    }
-    let output = output_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| "Timed out reading OMP usage output".to_owned())?;
+    let output = run_cli("OMP", "omp", &["usage", "--json"], CLI_TIMEOUT)?;
     let value: Value = serde_json::from_slice(&output)
         .map_err(|_| "OMP returned invalid usage JSON".to_owned())?;
     let reports = value
@@ -1652,21 +1582,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_parses_seconds_dates_and_invalid_values() {
-        assert_eq!(retry_after(Some("1800"), 0).as_secs(), 1800);
-        let now = parse_iso_reset(Some(&json!("2030-09-14T12:00:00Z"))).unwrap();
-        assert_eq!(
-            retry_after(Some("Sat, 14 Sep 2030 12:05:00 GMT"), now).as_secs(),
-            300
-        );
-        assert_eq!(
-            retry_after(Some("Sat, 14 Sep 2030 11:00:00 GMT"), now),
-            Duration::ZERO
-        );
-        assert_eq!(retry_after(Some("invalid"), now), Duration::ZERO);
-    }
-
-    #[test]
     fn omp_accounts_remain_distinct_and_all_rows_survive() {
         let limits: Vec<_> = (0..20)
             .map(|i| {
@@ -1743,33 +1658,86 @@ mod tests {
         assert_eq!(snapshot.windows[0].remaining_percent, Some(92.0));
     }
 
+    /// The whole reason for reading the CLI instead of the endpoint: this report
+    /// costs nothing and cannot be refused by the quota it describes.
     #[test]
-    fn claude_null_bucket_is_omitted_without_becoming_full() {
-        let value = serde_json::json!({
-            "five_hour": null,
-            "seven_day": {"utilization": 12, "resets_at": "2030-09-14T12:00:00Z"}
-        });
-        let snapshot = parse_claude_response(&value, 10).expect("weekly fixture");
-        assert_eq!(snapshot.windows.len(), 1);
-        assert_eq!(snapshot.windows[0].remaining_percent, Some(88.0));
+    fn a_claude_usage_report_is_read_line_by_line_off_the_cli() {
+        let report = "You are currently using your subscription to power your Claude Code usage\n\
+                      \n\
+                      Current session: 59% used \u{b7} resets Sep 8, 1:10pm (Asia/Bangkok)\n\
+                      Current week (all models): 57% used \u{b7} resets Sep 10, 3am (Asia/Bangkok)\n\
+                      Current week (Fable): 40% used \u{b7} resets Sep 10, 3am (Asia/Bangkok)\n\
+                      Current week (Opus): 100% used\n\
+                      \n\
+                      What\'s contributing to your limits usage?\n\
+                      Last 24h \u{b7} 424 requests \u{b7} 6 sessions\n\
+                        86% of your usage came from subagent-heavy sessions\n\
+                        Top skills: /claude-api 1%, /dataviz 1%\n";
+        let now = now_ms();
+        let windows = parse_claude_usage(report, now);
+        // The prose, the headings and the contributing bullets are not quotas,
+        // however many per-cent signs they carry.
+        assert_eq!(windows.len(), 4);
+        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].used_percent, Some(59.0));
+        assert_eq!(windows[0].remaining_percent, Some(41.0));
+        assert_eq!(windows[1].label, "Weekly");
+        assert_eq!(windows[2].label, "Weekly \u{b7} Fable");
+        // A window with no reset printed on it is still a window.
+        assert_eq!(windows[3].label, "Weekly \u{b7} Opus");
+        assert_eq!(windows[3].remaining_percent, Some(0.0));
+        assert_eq!(windows[3].reset_at_ms, None);
+        for window in &windows[..3] {
+            let reset = window.reset_at_ms.expect("a parsed reset time");
+            assert!(
+                reset > now - 86_400_000,
+                "{} reset in the past",
+                window.label
+            );
+            assert!(
+                reset < now + 32 * 86_400_000,
+                "{} reset a year out",
+                window.label
+            );
+        }
+        // A label this build has never seen reaches the card rather than being
+        // dropped for not matching a known name.
+        let exotic = parse_claude_usage("Current fortnight (Mythos): 3% used", now);
+        assert_eq!(exotic.len(), 1);
+        assert_eq!(exotic[0].label, "Current fortnight (Mythos)");
+        // An API-key credential has no subscription limits to report. The card
+        // repeats what the CLI said instead of inventing a percentage.
+        assert!(parse_claude_usage("You are currently using the Anthropic API", now).is_empty());
+        assert_eq!(
+            claude_report_status("You are currently using the Anthropic API\n"),
+            "You are currently using the Anthropic API"
+        );
     }
 
     #[test]
-    fn claude_monthly_spend_is_reported_only_with_a_cap() {
-        let value = serde_json::json!({
-            "five_hour": null,
-            "seven_day": null,
-            "extra_usage": {
-                "is_enabled": true,
-                "monthly_limit": 600,
-                "used_credits": 434.43
-            }
-        });
-        let snapshot = parse_claude_response(&value, 10).expect("monthly fixture");
-        assert_eq!(snapshot.windows.len(), 1);
-        assert_eq!(snapshot.windows[0].label, "Monthly");
-        assert!((snapshot.windows[0].used_percent.unwrap() - 72.405).abs() < 0.001);
-        assert!((snapshot.windows[0].remaining_percent.unwrap() - 27.595).abs() < 0.001);
+    fn a_reset_time_written_without_a_year_lands_on_the_next_one_it_could_be() {
+        assert_eq!(parse_claude_clock("3am"), Some((3, 0)));
+        assert_eq!(parse_claude_clock("1:10pm"), Some((13, 10)));
+        assert_eq!(parse_claude_clock("12am"), Some((0, 0)));
+        assert_eq!(parse_claude_clock("12:30pm"), Some((12, 30)));
+        assert_eq!(parse_claude_clock("13:10"), Some((13, 10)));
+        assert_eq!(parse_claude_clock("25:00"), None);
+        assert_eq!(parse_claude_clock("13pm"), None);
+        assert_eq!(parse_claude_clock("later"), None);
+        assert_eq!(parse_claude_reset("nonsense", now_ms()), None);
+        assert_eq!(
+            parse_claude_reset("Foo 3, 1am (Asia/Bangkok)", now_ms()),
+            None
+        );
+        // New Year's Eve: a reset dated in January belongs to the year about to
+        // start, not to the one that is eleven months gone.
+        let new_years_eve = glib::DateTime::from_local(2030, 12, 31, 23, 0, 0.0)
+            .expect("a valid local time")
+            .to_unix()
+            * 1000;
+        let reset = parse_claude_reset("Jan 2, 3am", new_years_eve).expect("a January reset");
+        assert!(reset > new_years_eve, "a reset must not be in the past");
+        assert!(reset - new_years_eve < 3 * 86_400_000);
     }
 
     #[test]
