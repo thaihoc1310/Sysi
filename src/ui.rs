@@ -6634,11 +6634,27 @@ fn rebuild_pinned_notes(
         editor.set_can_focus(true);
         editor.set_cursor_visible(true);
         editor.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
-        editor.connect_button_press_event(|editor, event| {
-            if event.button() == 1 {
+        // GTK never resets the caret's blink phase on a mouse click: the
+        // cursor moves to where you clicked, but if the blink is in its 400ms
+        // off phase the caret stays invisible until that phase ends -- one
+        // click in three, which reads as a click that lost the cursor.
+        // Toggling cursor-visible restarts the blink with the caret lit.
+        let focus_editor: Rc<dyn Fn()> = Rc::new({
+            let editor = editor.clone();
+            move || {
                 editor.grab_focus();
+                editor.set_cursor_visible(false);
+                editor.set_cursor_visible(true);
             }
-            glib::Propagation::Proceed
+        });
+        editor.connect_button_press_event({
+            let focus_editor = focus_editor.clone();
+            move |_, event| {
+                if event.button() == 1 {
+                    focus_editor();
+                }
+                glib::Propagation::Proceed
+            }
         });
         // WordChar (not Word) so an overlong token breaks instead of forcing
         // the layout wider than the card.
@@ -6650,10 +6666,10 @@ fn rebuild_pinned_notes(
         let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
         scroller.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
         scroller.connect_button_press_event({
-            let editor = editor.clone();
+            let focus_editor = focus_editor.clone();
             move |_, event| {
                 if event.button() == 1 {
-                    editor.grab_focus();
+                    focus_editor();
                 }
                 glib::Propagation::Proceed
             }

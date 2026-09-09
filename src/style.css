@@ -131,6 +131,14 @@ textview, textview text {
   color: currentColor;
 }
 
+/* The text colour comes from the mode class, but GTK leaves the insertion
+ * caret on the system theme's — a white bar sitting in dark note text. Pin it
+ * to whatever the text is. */
+textview, textview text, entry {
+  caret-color: currentColor;
+  -gtk-secondary-caret-color: currentColor;
+}
+
 .note-editor, .pinned-editor {
   background-color: transparent;
   border: none;
