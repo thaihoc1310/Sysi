@@ -9834,17 +9834,27 @@ fn apply_widget_size(
     fallback: Size,
 ) {
     let saved = state.borrow().sizes.get(key).copied().unwrap_or(fallback);
-    let width = if saved.width > 0 {
-        saved.width
-    } else {
-        fallback.width
-    };
-    let height = if saved.height > 0 {
-        saved.height
-    } else {
-        fallback.height
-    };
-    card.set_size_request(width, height);
+    let size = restored_size(saved, fallback);
+    card.set_size_request(size.width, size.height);
+}
+
+/// A hidden card allocates 1x1, and that stub can reach the saved sizes; a
+/// single pixel is not a size any widget wants back, so it reads as absent —
+/// the same rule `card_size` applies — instead of pinning the card invisible
+/// on the next launch.
+fn restored_size(saved: Size, fallback: Size) -> Size {
+    Size {
+        width: if saved.width > 1 {
+            saved.width
+        } else {
+            fallback.width
+        },
+        height: if saved.height > 1 {
+            saved.height
+        } else {
+            fallback.height
+        },
+    }
 }
 
 fn apply_translate_elastic_size(card: &gtk::EventBox, state: &Rc<RefCell<AppState>>) {
@@ -12450,6 +12460,26 @@ mod usage_ui_tests {
         pump();
         assert!(!menu.is_visible());
         host.close();
+    }
+
+    #[test]
+    fn a_one_pixel_saved_size_falls_back_to_the_default() {
+        let fallback = Size {
+            width: 196,
+            height: 76,
+        };
+        let stub = Size {
+            width: 1,
+            height: 182,
+        };
+        assert_eq!(
+            restored_size(stub, fallback),
+            Size {
+                width: 196,
+                height: 182,
+            }
+        );
+        assert_eq!(restored_size(fallback, stub), fallback);
     }
 
     #[test]
