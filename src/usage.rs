@@ -13,7 +13,10 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{mpsc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Mutex, OnceLock,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -21,6 +24,8 @@ use std::{
 /// Every usage source is a local CLI, so this is how long any of them may take
 /// before it is killed and reported as unavailable.
 const CLI_TIMEOUT: Duration = Duration::from_secs(20);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Source {
@@ -145,12 +150,32 @@ impl Schedule {
     }
 }
 
+// Retry-After allows either delta seconds or an IMF-fixdate (RFC 9110).
+fn retry_after(value: Option<&str>, now: i64) -> Duration {
+    let Some(value) = value else {
+        return Duration::ZERO;
+    };
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Duration::from_secs(seconds);
+    }
+    let parts: Vec<_> = value.split_whitespace().collect();
+    if parts.len() != 6 || parts[5] != "GMT" {
+        return Duration::ZERO;
+    }
+    let Some(month) = MONTHS.iter().position(|month| *month == parts[2]) else {
+        return Duration::ZERO;
+    };
+    let iso = format!("{}-{:02}-{}T{}Z", parts[3], month + 1, parts[1], parts[4]);
+    let reset = parse_iso_reset(Some(&Value::String(iso))).unwrap_or(now);
+    Duration::from_millis(reset.saturating_sub(now).max(0) as u64)
+}
+
 /// `force` marks a refresh the user asked for: OMP answers from a cache, so
 /// without clearing it the card shows the same numbers with the same age.
 pub fn fetch(source: Source, force: bool) -> Result<Snapshot, FetchError> {
     match source {
         Source::Codex => fetch_codex().map_err(Into::into),
-        Source::Claude => fetch_claude().map_err(Into::into),
+        Source::Claude => fetch_claude(),
         Source::Omp => fetch_omp(force).map_err(Into::into),
     }
 }
@@ -181,6 +206,15 @@ fn normalize_reset(value: Option<&Value>) -> Option<i64> {
     millis
         .is_finite()
         .then_some(millis.min(i64::MAX as f64) as i64)
+}
+
+fn parse_iso_reset(value: Option<&Value>) -> Option<i64> {
+    let text = value?.as_str()?.trim();
+    // GLib is already a Sysi dependency and understands offsets, fractional
+    // seconds and the UTC `Z` spelling used by Anthropic.
+    glib::DateTime::from_iso8601(text, None)
+        .ok()
+        .map(|datetime| datetime.to_unix().saturating_mul(1000))
 }
 
 fn window_from_percent(
@@ -679,11 +713,10 @@ fn claude_report_status(report: &str) -> String {
         .unwrap_or_else(|| "Claude reported no usage limits".to_owned())
 }
 
-/// Claude Code answers `/usage` from what it already knows, without reaching
-/// the API: the reply comes back with `total_cost_usd` and every token counter
-/// at zero. So the CLI is not only the cheapest source, it is the only one that
-/// cannot be rate limited by the very quota it is reporting on.
-fn fetch_claude() -> Result<Snapshot, String> {
+/// Claude Code answers `/usage` from what it already knows, so this costs no
+/// tokens — but the CLI itself refuses to run while the account is over its
+/// limit, and then the report carries no quota line at all.
+fn fetch_claude_cli() -> Result<Snapshot, String> {
     let output = run_cli(
         "Claude",
         "claude",
@@ -714,6 +747,241 @@ fn fetch_claude() -> Result<Snapshot, String> {
         fetched_at_ms,
         windows,
     })
+}
+
+fn claude_credentials_path() -> PathBuf {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .unwrap_or_else(|| PathBuf::from(".claude"))
+        .join(".credentials.json")
+}
+
+fn read_claude_token() -> Result<String, String> {
+    if let Ok(token) = env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        if !token.trim().is_empty() {
+            return Ok(token.trim().to_owned());
+        }
+    }
+    let path = claude_credentials_path();
+    let raw = fs::read_to_string(&path)
+        .map_err(|_| format!("Claude credentials not found at {}", path.display()))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|_| "Claude credentials are not valid JSON".to_owned())?;
+    let oauth = value.get("claudeAiOauth").unwrap_or(&value);
+    oauth
+        .get("accessToken")
+        .or_else(|| oauth.get("access_token"))
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Claude OAuth access token is missing".to_owned())
+}
+
+fn claude_bucket(value: Option<&Value>, label: &str, duration_ms: i64) -> Option<Window> {
+    let object = value?.as_object()?;
+    let used =
+        finite_number(object.get("utilization")).or_else(|| finite_number(object.get("percent")));
+    let reset = parse_iso_reset(object.get("resets_at").or_else(|| object.get("resetsAt")));
+    window_from_percent(label, used, reset, Some(duration_ms))
+}
+
+fn money_amount(value: Option<&Value>) -> Option<f64> {
+    let object = value?.as_object()?;
+    let minor = finite_number(object.get("amount_minor"))?;
+    let exponent = finite_number(object.get("exponent")).unwrap_or(0.0);
+    if minor < 0.0 || !(0.0..=18.0).contains(&exponent) {
+        return None;
+    }
+    let amount = minor / 10_f64.powf(exponent);
+    amount.is_finite().then_some(amount)
+}
+
+fn claude_extra_bucket(value: Option<&Value>, label: &str) -> Option<Window> {
+    let object = value?.as_object()?;
+    if object
+        .get("is_enabled")
+        .or_else(|| object.get("enabled"))
+        .and_then(Value::as_bool)
+        .is_some_and(|enabled| !enabled)
+    {
+        return None;
+    }
+    let used =
+        finite_number(object.get("used_credits")).or_else(|| money_amount(object.get("used")))?;
+    let limit =
+        finite_number(object.get("monthly_limit")).or_else(|| money_amount(object.get("limit")))?;
+    if used < 0.0 || limit <= 0.0 {
+        return None;
+    }
+    let reset = parse_iso_reset(object.get("resets_at").or_else(|| object.get("resetsAt")));
+    window_from_percent(
+        label,
+        Some(used / limit * 100.0),
+        reset,
+        Some(30 * 24 * 60 * 60 * 1000),
+    )
+}
+
+fn parse_claude_response(value: &Value, fetched_at_ms: i64) -> Result<Snapshot, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Claude returned an invalid usage response".to_owned())?;
+    let mut windows = Vec::new();
+    if let Some(window) = claude_bucket(object.get("five_hour"), "Session", 5 * 60 * 60 * 1000) {
+        windows.push(window);
+    }
+    if let Some(window) = claude_bucket(object.get("seven_day"), "Weekly", 7 * 24 * 60 * 60 * 1000)
+    {
+        windows.push(window);
+    }
+    for (key, label) in [
+        ("seven_day_opus", "Weekly · Opus"),
+        ("seven_day_sonnet", "Weekly · Sonnet"),
+    ] {
+        if let Some(window) = claude_bucket(object.get(key), label, 7 * 24 * 60 * 60 * 1000) {
+            windows.push(window);
+        }
+    }
+    // Enterprise/team accounts can expose only a monthly spend cap. It is a
+    // real quota when both sides of the amount are present; never turn a
+    // dollar total without a denominator into a percentage.
+    if let Some(window) = claude_extra_bucket(object.get("spend"), "Monthly")
+        .or_else(|| claude_extra_bucket(object.get("extra_usage"), "Monthly"))
+    {
+        windows.push(window);
+    }
+    if let Some(limits) = object.get("limits").and_then(Value::as_array) {
+        for entry in limits {
+            let Some(entry_object) = entry.as_object() else {
+                continue;
+            };
+            if entry_object.get("kind").and_then(Value::as_str) != Some("weekly_scoped") {
+                continue;
+            }
+            let name = entry_object
+                .get("scope")
+                .and_then(Value::as_object)
+                .and_then(|scope| scope.get("model"))
+                .and_then(Value::as_object)
+                .and_then(|model| model.get("display_name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("model");
+            if let Some(window) = claude_bucket(
+                Some(entry),
+                &format!("Weekly · {name}"),
+                7 * 24 * 60 * 60 * 1000,
+            ) {
+                windows.push(window);
+            }
+        }
+    }
+    if windows.is_empty() {
+        return Err("Claude returned no usable usage windows".to_owned());
+    }
+    Ok(Snapshot {
+        source: Source::Claude,
+        account: claude_email(),
+        fetched_at_ms,
+        windows,
+    })
+}
+
+/// The OAuth usage endpoint, read with the credential Claude Code stored. It
+/// answers even when the CLI will not, at the cost of one request against the
+/// same quota it reports on — which is why it is a fallback and not the
+/// default.
+fn fetch_claude_api() -> Result<Snapshot, FetchError> {
+    let token = read_claude_token()?;
+    let agent = ureq::builder()
+        .timeout_connect(HTTP_TIMEOUT)
+        .timeout(HTTP_TIMEOUT)
+        .redirects(0)
+        .user_agent("sysi-usage")
+        .build();
+    let response = agent
+        .get(CLAUDE_USAGE_URL)
+        .set("Accept", "application/json")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .call()
+        .map_err(|error| {
+            let delay = match &error {
+                ureq::Error::Status(_, response) => {
+                    retry_after(response.header("Retry-After"), now_ms())
+                }
+                _ => Duration::ZERO,
+            };
+            let message = match error {
+                ureq::Error::Status(401, _) => {
+                    "Claude login expired; sign in again with Claude Code".to_owned()
+                }
+                ureq::Error::Status(403, _) => {
+                    "Claude usage unavailable for this credential (profile scope required)"
+                        .to_owned()
+                }
+                ureq::Error::Status(429, _) => {
+                    "Claude usage is rate limited; waiting before retry".to_owned()
+                }
+                ureq::Error::Status(code, _) => {
+                    format!("Claude usage request failed (HTTP {code})")
+                }
+                _ => format!("Claude usage request failed: {error}"),
+            };
+            FetchError {
+                message,
+                retry_after: delay,
+            }
+        })?;
+    if (300..400).contains(&response.status()) {
+        return Err(
+            "Claude usage endpoint redirected; no credential was forwarded"
+                .to_owned()
+                .into(),
+        );
+    }
+    let body = response
+        .into_string()
+        .map_err(|error| format!("Could not read Claude usage: {error}"))?;
+    let value: Value =
+        serde_json::from_str(&body).map_err(|_| "Claude returned invalid usage JSON".to_owned())?;
+    Ok(parse_claude_response(&value, now_ms())?)
+}
+
+/// Either Claude source can be shut out by the very quota it reports on — the
+/// CLI refuses to run while the account is limited, the endpoint answers 429 —
+/// so they cover for each other. The endpoint is asked first because it answers
+/// in one request instead of booting a CLI; whichever answered last is asked
+/// first after that, and a failure falls straight through to the other, so the
+/// pair keeps swapping instead of hammering the side that is currently blocked.
+fn fetch_claude() -> Result<Snapshot, FetchError> {
+    static PREFER_CLI: AtomicBool = AtomicBool::new(false);
+    let cli_first = PREFER_CLI.load(Ordering::Relaxed);
+    let attempt = |cli: bool| {
+        if cli {
+            fetch_claude_cli().map_err(FetchError::from)
+        } else {
+            fetch_claude_api()
+        }
+    };
+    let first = match attempt(cli_first) {
+        Ok(snapshot) => return Ok(snapshot),
+        Err(error) => error,
+    };
+    match attempt(!cli_first) {
+        Ok(snapshot) => {
+            PREFER_CLI.store(!cli_first, Ordering::Relaxed);
+            Ok(snapshot)
+        }
+        // Both are out. Report what the preferred source said, and keep the
+        // shorter cooldown so the fallback's own limit does not hold back the
+        // next attempt.
+        Err(second) => Err(FetchError {
+            message: first.message,
+            retry_after: first.retry_after.min(second.retry_after),
+        }),
+    }
 }
 
 fn amount_percent(amount: &Value) -> Option<(f64, f64)> {
@@ -1661,6 +1929,56 @@ mod tests {
     /// The whole reason for reading the CLI instead of the endpoint: this report
     /// costs nothing and cannot be refused by the quota it describes.
     #[test]
+    fn retry_after_parses_seconds_dates_and_invalid_values() {
+        assert_eq!(retry_after(Some("1800"), 0).as_secs(), 1800);
+        let now = parse_iso_reset(Some(&json!("2030-09-14T12:00:00Z"))).unwrap();
+        assert_eq!(
+            retry_after(Some("Sat, 14 Sep 2030 12:05:00 GMT"), now).as_secs(),
+            300
+        );
+        assert_eq!(
+            retry_after(Some("Sat, 14 Sep 2030 11:00:00 GMT"), now),
+            Duration::ZERO
+        );
+        assert_eq!(retry_after(Some("invalid"), now), Duration::ZERO);
+    }
+
+    #[test]
+    fn claude_null_bucket_is_omitted_without_becoming_full() {
+        let value = json!({
+            "five_hour": null,
+            "seven_day": {"utilization": 12, "resets_at": "2030-09-14T12:00:00Z"}
+        });
+        let snapshot = parse_claude_response(&value, 10).expect("weekly fixture");
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].remaining_percent, Some(88.0));
+    }
+
+    #[test]
+    fn claude_monthly_spend_is_reported_only_with_a_cap() {
+        let value = json!({
+            "five_hour": null,
+            "seven_day": null,
+            "extra_usage": {"is_enabled": true, "monthly_limit": 600, "used_credits": 434.43}
+        });
+        let snapshot = parse_claude_response(&value, 10).expect("monthly fixture");
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].label, "Monthly");
+        assert!((snapshot.windows[0].used_percent.unwrap() - 72.405).abs() < 0.001);
+    }
+
+    /// Both sources feed the same card, so a window must not change name
+    /// depending on which one answered.
+    #[test]
+    fn both_claude_sources_label_the_session_window_the_same() {
+        let now = 1_757_000_000_000;
+        let cli = parse_claude_usage("Current session: 42% used", now);
+        let api = parse_claude_response(&json!({"five_hour": {"utilization": 42}}), now)
+            .expect("session fixture");
+        assert_eq!(cli[0].label, api.windows[0].label);
+    }
+
+    #[test]
     fn a_claude_usage_report_is_read_line_by_line_off_the_cli() {
         let report = "You are currently using your subscription to power your Claude Code usage\n\
                       \n\
@@ -1673,7 +1991,10 @@ mod tests {
                       Last 24h \u{b7} 424 requests \u{b7} 6 sessions\n\
                         86% of your usage came from subagent-heavy sessions\n\
                         Top skills: /claude-api 1%, /dataviz 1%\n";
-        let now = now_ms();
+        // Pinned to the day the fixture was captured (2026-09-08 04:00 UTC),
+        // so its reset dates stay near "now" instead of rotting once the wall
+        // clock moves past them.
+        let now = 1_788_840_000_000;
         let windows = parse_claude_usage(report, now);
         // The prose, the headings and the contributing bullets are not quotas,
         // however many per-cent signs they carry.
