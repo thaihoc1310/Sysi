@@ -3841,6 +3841,11 @@ fn system_content_size(
     values: &SystemSnapshot,
     card_width: Option<i32>,
 ) -> Size {
+    // A hidden card allocates 1x1, and that stub reaches the saved sizes the
+    // width comes from. One pixel is not a width anyone dragged to, so the
+    // card reflows from scratch instead of being pinned to a column too narrow
+    // to see -- which it then saved again, and no toggle could reopen.
+    let card_width = card_width.filter(|width| *width > 1);
     let meter_count = system_meters(details, values).len();
     let usage_rows = system_usage_rows(details, values).len();
     // Everything that stacks under the rings, and so has to be measured as
@@ -9708,17 +9713,28 @@ fn root_display_size(root: &gdk::Window) -> Size {
 fn overlay_screen_rects(widget: &impl IsA<gtk::Widget>) -> Vec<ScreenRect> {
     let size = overlay_display_size(widget);
     let origin = overlay_origin(widget);
-    let screens: Vec<_> = logical_screen_rects(widget.scale_factor(), size.width, size.height)
-        .into_iter()
-        .filter_map(|screen| clip_screen_to_overlay(screen_in_overlay(screen, origin), size))
+    let screens = logical_screen_rects(widget.scale_factor(), size.width, size.height);
+    let clipped: Vec<_> = screens
+        .iter()
+        .filter_map(|screen| clip_screen_to_overlay(screen_in_overlay(*screen, origin), size))
         .collect();
-    if screens.is_empty() {
-        vec![ScreenRect {
-            x: 0,
-            y: 0,
-            width: size.width.max(1),
-            height: size.height.max(1),
-        }]
+    usable_screens(clipped, screens)
+}
+
+/// The monitors a widget may live on, or the unclipped monitors when clipping
+/// them to the overlay left nothing to live on.
+///
+/// The overlay answers 0x0 while the display is still coming up, and on a
+/// backend with no root window at all it never answers anything else. Clipping
+/// to that leaves a one-pixel work area, which `clamp_registered_widgets` then
+/// shrinks every widget into -- and saves, so the layout does not come back
+/// with the display.
+fn usable_screens(clipped: Vec<ScreenRect>, screens: Vec<ScreenRect>) -> Vec<ScreenRect> {
+    if clipped
+        .iter()
+        .any(|screen| screen.width > 1 && screen.height > 1)
+    {
+        clipped
     } else {
         screens
     }
@@ -10071,7 +10087,10 @@ fn clamp_registered_widgets(
         };
         let (width, height) =
             fit_to_work_area(origin, allocation.width(), allocation.height(), screens);
-        if width != allocation.width() || height != allocation.height() {
+        // A single pixel is the hidden-card stub, never a size to shrink a
+        // widget to and never one to save; see `restored_size`.
+        if (width != allocation.width() || height != allocation.height()) && width > 1 && height > 1
+        {
             item.widget.set_size_request(width, height);
             data.sizes.insert(item.key.clone(), Size { width, height });
         }
@@ -10131,7 +10150,8 @@ fn apply_translate_elastic_size(card: &gtk::EventBox, state: &Rc<RefCell<AppStat
         .sizes
         .get("translate")
         .map(|size| size.width)
-        .filter(|width| *width > 0)
+        // The same one-pixel stub `restored_size` rejects.
+        .filter(|width| *width > 1)
         .unwrap_or(TRANSLATE_WIDTH);
     // The empty/loading state is deliberately compact. Once content exists,
     // `fit_translate_height` replaces this with a measured height.
@@ -13122,6 +13142,30 @@ mod usage_ui_tests {
     }
 
     #[test]
+    fn a_display_too_small_to_clip_against_leaves_the_monitors_alone() {
+        let screens = vec![ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        }];
+        let stub = vec![ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }];
+        assert_eq!(usable_screens(stub, screens.clone()), screens);
+        let clipped = vec![ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 691,
+        }];
+        assert_eq!(usable_screens(clipped.clone(), screens), clipped);
+    }
+
+    #[test]
     fn a_one_pixel_saved_size_falls_back_to_the_default() {
         let fallback = Size {
             width: 196,
@@ -13139,6 +13183,17 @@ mod usage_ui_tests {
             }
         );
         assert_eq!(restored_size(fallback, stub), fallback);
+        // The same stub reaching the system card must not pin it one pixel
+        // wide: it is the width the card lays itself out against.
+        assert!(
+            system_content_size(
+                SystemDetails::default(),
+                &SystemSnapshot::default(),
+                Some(stub.width),
+            )
+            .width
+                > 1
+        );
     }
 
     #[test]
