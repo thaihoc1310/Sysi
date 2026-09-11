@@ -2210,6 +2210,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 let queued = queued.clone();
                 move || {
                     queued.set(false);
+                    // Moving one card re-lays the whole overlay, so this runs
+                    // on every frame of a drag -- reshaping the input region
+                    // each time, for a shape the gesture is about to move
+                    // again. The release reshapes it once.
+                    if any_gesture_held(&registry) {
+                        return;
+                    }
                     refresh_input_shape(&window, &registry, interactive.get());
                     refresh_visual_shape(&window, &root, None);
                 }
@@ -10940,8 +10947,7 @@ fn desktop_capture() -> Option<DesktopCapture> {
     let screen = gdk::Screen::default()?;
     let root = screen.root_window()?;
     let scale = root.scale_factor().max(1);
-    let width = root.width() / scale;
-    let height = root.height() / scale;
+    let Size { width, height } = root_display_size(&root);
     if width < 1 || height < 1 {
         return None;
     }
@@ -11175,6 +11181,11 @@ fn refresh_auto_colors(
     registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
     state: &Rc<RefCell<AppState>>,
 ) {
+    // A widget under the pointer paints plain light until it is dropped, and
+    // the desktop behind it is moving; recolouring now only stutters the drag.
+    if any_gesture_held(registry) {
+        return;
+    }
     let items = registry.borrow().clone();
     let (global, overrides) = {
         let data = state.borrow();
@@ -11294,6 +11305,15 @@ fn update_invert_map(
 /// Take or release the pointer's hold on a widget. Taking hold drops the
 /// INVERT map straight away, so the two tones go the instant the button goes
 /// down rather than once the widget has moved far enough to notice.
+/// True while the pointer has hold of a widget to drag or resize it.
+///
+/// Everything a gesture repeats per frame is worth skipping for its duration:
+/// the drag maintains what it moves itself, and its release refreshes the rest
+/// once instead of sixty times a second.
+fn any_gesture_held(registry: &Rc<RefCell<Vec<RegisteredWidget>>>) -> bool {
+    registry.borrow().iter().any(|item| item.held.get())
+}
+
 fn hold_widget(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, key: &str, held: bool) {
     let Some(item) = registry
         .borrow()
