@@ -1,0 +1,46 @@
+name: CI
+
+# ========== TRIGGER: khi nào workflow chạy ==========
+on:
+  push:                     # chạy khi push
+    branches: [main]        # chỉ trên nhánh main
+  pull_request:             # chạy khi có PR
+  workflow_dispatch:        # cho phép chạy tay bằng nút bấm
+
+# ========== JOB 1: build + test ==========
+jobs:
+  test:
+    runs-on: ubuntu-latest  # máy ảo chạy job
+    strategy:               # MATRIX: chạy nhiều phiên bản song song
+      matrix:
+        rust: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4        # lấy code về
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}  # dùng biến từ matrix
+      - name: Cache cargo                # cache để chạy nhanh hơn
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release
+      - name: Run tests
+        run: cargo test
+
+  # ========== JOB 2: lint ==========
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+      - name: Format check
+        run: cargo fmt --check
