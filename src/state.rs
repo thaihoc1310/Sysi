@@ -9,6 +9,10 @@ pub enum ColorMode {
     Auto,
     Light,
     Dark,
+    /// Painted as `Light`, then inverted cell by cell wherever the desktop
+    /// beneath is bright, so one widget can contrast with two backgrounds at
+    /// once.
+    Invert,
 }
 
 impl ColorMode {
@@ -16,7 +20,8 @@ impl ColorMode {
         match self {
             Self::Auto => Self::Light,
             Self::Light => Self::Dark,
-            Self::Dark => Self::Auto,
+            Self::Dark => Self::Invert,
+            Self::Invert => Self::Auto,
         }
     }
 
@@ -25,6 +30,7 @@ impl ColorMode {
             Self::Auto => "AUTO",
             Self::Light => "LIGHT",
             Self::Dark => "DARK",
+            Self::Invert => "INVERT",
         }
     }
 
@@ -35,6 +41,7 @@ impl ColorMode {
             Self::Auto => "auto",
             Self::Light => "light",
             Self::Dark => "dark",
+            Self::Invert => "invert",
         }
     }
 }
@@ -481,10 +488,11 @@ mod tests {
     }
 
     #[test]
-    fn color_mode_cycles_through_all_three_modes() {
+    fn color_mode_cycles_through_every_mode() {
         assert_eq!(ColorMode::Auto.next(), ColorMode::Light);
         assert_eq!(ColorMode::Light.next(), ColorMode::Dark);
-        assert_eq!(ColorMode::Dark.next(), ColorMode::Auto);
+        assert_eq!(ColorMode::Dark.next(), ColorMode::Invert);
+        assert_eq!(ColorMode::Invert.next(), ColorMode::Auto);
     }
 
     #[test]
