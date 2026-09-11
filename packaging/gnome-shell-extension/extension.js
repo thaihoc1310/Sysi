@@ -12,6 +12,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 const UUID = 'sysi-panel@thaihoc';
 
 Gio._promisify(Shell.Screenshot.prototype, 'pick_color');
+Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
 
 export default class SysiPanelExtension extends Extension {
     enable() {
@@ -106,6 +107,14 @@ export default class SysiPanelExtension extends Extension {
         }
         const cacheDir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi']);
         GLib.mkdir_with_parents(cacheDir, 0o700);
+        // One PNG per INVERT widget, rewritten every sample. The runtime dir
+        // is a tmpfs, so a mode left on all day never touches the disk, and
+        // the pictures go away with the session. GLib falls back to the cache
+        // directory when there is no runtime one.
+        this._invertDir = GLib.build_filenamev([
+            GLib.get_user_runtime_dir(), 'sysi', 'invert',
+        ]);
+        GLib.mkdir_with_parents(this._invertDir, 0o700);
         this._autoColorRequestFile = Gio.File.new_for_path(
             GLib.build_filenamev([cacheDir, 'auto-color-request']),
         );
@@ -170,6 +179,7 @@ export default class SysiPanelExtension extends Extension {
         this._lockLabel = null;
         this._pidFile = null;
         this._panelStateFile = null;
+        this._invertDir = null;
     }
 
     _buildSettings() {
@@ -255,7 +265,7 @@ export default class SysiPanelExtension extends Extension {
             const mode = ok
                 ? JSON.parse(new TextDecoder().decode(contents))?.settings?.color_mode
                 : null;
-            return ['auto', 'light', 'dark'].includes(mode) ? mode : 'auto';
+            return ['auto', 'light', 'dark', 'invert'].includes(mode) ? mode : 'auto';
         } catch (_) {
             return 'auto';
         }
@@ -295,14 +305,19 @@ export default class SysiPanelExtension extends Extension {
         }
     }
 
-    _syncVisibility() {
-        let running = false;
+    _readPid() {
         try {
             const [ok, contents] = GLib.file_get_contents(this._pidFile.get_path());
-            running = ok && new TextDecoder().decode(contents).trim().length > 0;
+            if (!ok)
+                return 0;
+            return Number(new TextDecoder().decode(contents).trim()) || 0;
         } catch (_) {
-            running = false;
+            return 0;
         }
+    }
+
+    _syncVisibility() {
+        const running = this._readPid() > 0;
         this._indicator.visible = running;
         if (!running) {
             this._strip.visible = false;
@@ -310,7 +325,7 @@ export default class SysiPanelExtension extends Extension {
         }
     }
 
-    // `<editing|locked> <auto|light|dark> <font-size>`, written by Sysi whenever
+    // `<editing|locked> <auto|light|dark|invert> <font-size>`, written by Sysi whenever
     // one changes and removed when it exits. With no file to read — Sysi is not
     // running — labels fall back to saved settings or defaults.
     _readPanelState() {
@@ -322,7 +337,7 @@ export default class SysiPanelExtension extends Extension {
                 new TextDecoder().decode(contents).trim().split(/\s+/);
             return [
                 interaction === 'locked' || interaction === 'editing' ? interaction : null,
-                ['auto', 'light', 'dark'].includes(mode) ? mode : null,
+                ['auto', 'light', 'dark', 'invert'].includes(mode) ? mode : null,
                 Math.min(26, Math.max(8, Number(fontSize) || 13)),
             ];
         } catch (_) {
@@ -378,17 +393,27 @@ export default class SysiPanelExtension extends Extension {
         }
 
         const requests = raw.split('\n').flatMap(line => {
-            const [key, geometry] = line.trim().split('\t');
+            const [key, geometry, kind] = line.trim().split('\t');
             const values = geometry?.split(',').map(Number) ?? [];
             if (!key || values.length !== 4 || !values.every(Number.isFinite))
                 return [];
             const [x, y, width, height] = values;
-            return width > 0 && height > 0 ? [{key, x, y, width, height}] : [];
+            return width > 0 && height > 0
+                ? [{key, x, y, width, height, kind: kind === 'invert' ? 'invert' : 'auto'}]
+                : [];
         });
         if (requests.length === 0)
             return;
+
+        // The INVERT captures all start inside one hidden window, so do them
+        // before the AUTO picks rather than interleaving the two.
+        await this._captureInvertRects(
+            requests.filter(request => request.kind === 'invert'),
+            generation,
+        );
+
         const results = [];
-        for (const request of requests) {
+        for (const request of requests.filter(request => request.kind === 'auto')) {
             const luminance = await this._sampleRectLuminance(request);
             if (Number.isFinite(luminance))
                 results.push(`${request.key}\t${luminance.toFixed(6)}`);
@@ -397,12 +422,164 @@ export default class SysiPanelExtension extends Extension {
             return;
         if (results.length === 0)
             return;
-        const path = GLib.build_filenamev([
-            GLib.get_user_cache_dir(),
-            'sysi',
-            'auto-color-result',
-        ]);
-        GLib.file_set_contents(path, `${results.join('\n')}\n`);
+        this._writeCacheFile('auto-color-result', `${results.join('\n')}\n`);
+    }
+
+    _writeCacheFile(name, contents) {
+        GLib.file_set_contents(
+            GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi', name]),
+            contents,
+        );
+    }
+
+    // Hand Sysi a picture of the desktop under each of its INVERT widgets, so
+    // it can contrast with two different windows at once instead of picking one
+    // foreground for the whole card.
+    async _captureInvertRects(requests, generation) {
+        if (requests.length === 0 || !this._invertDir)
+            return;
+        // Every grab is started with Sysi's own window invisible, so the
+        // picture holds the desktop and not Sysi's own glyphs — sampling those
+        // would feed the widget's colours straight back into the decision.
+        const captures = this._withSysiHidden(() => requests.flatMap(request => {
+            const rect = this._clampToMonitor(request);
+            if (!rect)
+                return [];
+            const file = Gio.File.new_for_path(GLib.build_filenamev([
+                this._invertDir,
+                this._invertFileName(request.key),
+            ]));
+            let stream = null;
+            try {
+                // REPLACE_DESTINATION writes a temporary and renames on close,
+                // so Sysi never opens a half-written picture.
+                stream = file.replace(
+                    null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+                // One Shell.Screenshot per grab: each owns the single image
+                // buffer its own capture painted into.
+                const done = new Shell.Screenshot().screenshot_area(
+                    rect.x, rect.y, rect.width, rect.height, stream);
+                return [{request, file, stream, done}];
+            } catch (error) {
+                // The grab never started, so nothing downstream will ever
+                // close the stream that was opened for it.
+                this._closeQuietly(stream);
+                logError(error, 'Sysi could not start an invert capture');
+                return [];
+            }
+        }));
+
+        const index = [];
+        for (const capture of captures) {
+            try {
+                // Only the PNG encoding is still outstanding here; the pixels
+                // were painted synchronously while the window was hidden.
+                const [area] = await capture.done;
+                index.push([
+                    capture.request.key,
+                    `${area.x},${area.y},${area.width},${area.height}`,
+                    capture.file.get_path(),
+                ].join('\t'));
+            } catch (error) {
+                logError(error, 'Sysi could not finish an invert capture');
+            } finally {
+                // The rename onto the real name only happens on close, and an
+                // unclosed stream holds a descriptor inside the compositor for
+                // as long as it lives.
+                this._closeQuietly(capture.stream);
+            }
+        }
+        // Every grab has finished, so anything else in there belongs to a
+        // widget that has left INVERT or stopped existing. The pictures sit on
+        // a tmpfs, which is memory.
+        this._pruneInvertCaptures(new Set(
+            requests.map(request => this._invertFileName(request.key))));
+        if (generation !== this._autoColorGeneration || index.length === 0)
+            return;
+        this._writeCacheFile('invert-result', `${index.join('\n')}\n`);
+    }
+
+    _invertFileName(key) {
+        return `${key.replace(/[^\w-]/g, '_')}.png`;
+    }
+
+    _closeQuietly(stream) {
+        try {
+            stream?.close(null);
+        } catch (_) {
+            // Already closed, or the write failed; either way there is nothing
+            // left to do with it.
+        }
+    }
+
+    _pruneInvertCaptures(keep) {
+        const directory = Gio.File.new_for_path(this._invertDir);
+        let children;
+        try {
+            children = directory.enumerate_children(
+                'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+        } catch (_) {
+            return;
+        }
+        try {
+            let info;
+            while ((info = children.next_file(null)) !== null) {
+                const name = info.get_name();
+                if (keep.has(name))
+                    continue;
+                try {
+                    directory.get_child(name).delete(null);
+                } catch (_) {
+                    // Something else removed it first.
+                }
+            }
+        } finally {
+            this._closeQuietly(children);
+        }
+    }
+
+    // Run `fn` with every Sysi window painted at zero opacity. Clutter skips a
+    // fully transparent actor, and Shell.Screenshot paints the stage inside the
+    // call rather than on a later frame, so a grab started here sees the
+    // desktop without Sysi and no frame is ever shown in this state. `fn` must
+    // not await: opacity is restored the moment it returns.
+    _withSysiHidden(fn) {
+        const pid = this._readPid();
+        const actors = (global.get_window_actors?.() ??
+            global.compositor.get_window_actors()).filter(actor => {
+            const window = actor.get_meta_window?.();
+            if (!window)
+                return false;
+            return (pid > 0 && window.get_pid() === pid) ||
+                window.get_wm_class()?.toLowerCase() === 'sysi';
+        });
+        const opacities = actors.map(actor => actor.opacity);
+        actors.forEach(actor => (actor.opacity = 0));
+        try {
+            return fn();
+        } finally {
+            actors.forEach((actor, index) => (actor.opacity = opacities[index]));
+        }
+    }
+
+    // Painting a rectangle that reaches past every monitor fails the grab, so
+    // trim the widget to the monitor holding its middle.
+    _clampToMonitor({x, y, width, height}) {
+        const centreX = x + width / 2;
+        const centreY = y + height / 2;
+        const monitor = Main.layoutManager.monitors.find(candidate =>
+            centreX >= candidate.x && centreY >= candidate.y &&
+            centreX < candidate.x + candidate.width &&
+            centreY < candidate.y + candidate.height);
+        if (!monitor)
+            return null;
+        const left = Math.max(x, monitor.x);
+        const top = Math.max(y, monitor.y);
+        const right = Math.min(x + width, monitor.x + monitor.width);
+        const bottom = Math.min(y + height, monitor.y + monitor.height);
+        return right > left && bottom > top
+            ? {x: left, y: top, width: right - left, height: bottom - top}
+            : null;
     }
 
     async _sampleRectLuminance({x, y, width, height}) {
