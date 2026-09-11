@@ -11026,9 +11026,7 @@ fn append_pixbuf_luminances(pixbuf: &Pixbuf, output: &mut Vec<f64>) {
 
 fn relative_luminance(red: u8, green: u8, blue: u8) -> f64 {
     let linear = channel_linear();
-    0.2126 * linear[red as usize]
-        + 0.7152 * linear[green as usize]
-        + 0.0722 * linear[blue as usize]
+    0.2126 * linear[red as usize] + 0.7152 * linear[green as usize] + 0.0722 * linear[blue as usize]
 }
 
 fn foreground_for_luminance(luminance: f64, previous: Foreground) -> Foreground {
@@ -11234,9 +11232,9 @@ fn update_invert_map(
     let source = fs::metadata(path).and_then(|data| data.modified()).ok();
     let settled = {
         let current = item.invert.borrow();
-        current.as_ref().is_some_and(|map| {
-            map.bounds == bounds && source.is_some() && map.source == source
-        })
+        current
+            .as_ref()
+            .is_some_and(|map| map.bounds == bounds && source.is_some() && map.source == source)
     };
     // Nothing has moved and the compositor has not sent a new photograph, so
     // decoding it again would rebuild exactly the map already in hand.
@@ -11588,22 +11586,23 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        clamp_to_screens, clip_screen_to_overlay, drag_frame_due, ellipsize, fit_to_work_area,
-        fit_within_bounds, foreground_for_luminance, format_rate, history_row_budget, image_room,
-        image_room_after_y, monitor_coordinate_divisor, monitor_root_bounds,
-        normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
-        note_size_for_image, padded_visual_rect, parse_panel_anchor, parse_timer_input,
-        push_recent_search, receives_input_when_locked, record_note_undo, relative_luminance,
-        reopen_point, resize_ceiling, resize_width_limit, resized_image_size, room_on_screen,
-        round_pixbuf_corners, screen_in_overlay, system_content_size, system_meter_columns,
-        system_meter_gap, system_meter_ink_width, system_meter_row_width, system_meter_rows,
-        invert_map, paint_inverted, system_meters, system_usage_rows, temperature_meter,
-        covers, hold_clears_map, shrink_to_budget, timer_style_size, Foreground, InvertMap, INVERT_MAP_BUDGET,
-        NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect,
-        DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS,
-        NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_WIDTH, SYSTEM_HEIGHT,
-        SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN, SYSTEM_METER_RING,
-        SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
+        clamp_to_screens, clip_screen_to_overlay, covers, drag_frame_due, ellipsize,
+        fit_to_work_area, fit_within_bounds, foreground_for_luminance, format_rate,
+        history_row_budget, hold_clears_map, image_room, image_room_after_y, invert_map,
+        monitor_coordinate_divisor, monitor_root_bounds, normalize_monitor_rect, note_headline,
+        note_image_cap, note_search_matches, note_size_for_image, padded_visual_rect,
+        paint_inverted, parse_panel_anchor, parse_timer_input, push_recent_search,
+        receives_input_when_locked, record_note_undo, relative_luminance, reopen_point,
+        resize_ceiling, resize_width_limit, resized_image_size, room_on_screen,
+        round_pixbuf_corners, screen_in_overlay, shrink_to_budget, system_content_size,
+        system_meter_columns, system_meter_gap, system_meter_ink_width, system_meter_row_width,
+        system_meter_rows, system_meters, system_usage_rows, temperature_meter, timer_style_size,
+        Foreground, InvertMap, NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo,
+        NoteUndoState, ScreenRect, DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH,
+        INVERT_MAP_BUDGET, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
+        NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL,
+        SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN, SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS,
+        SYSTEM_METER_RING_STROKE,
     };
     use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
     use crate::system::{SystemSnapshot, Usage};
@@ -11735,7 +11734,8 @@ mod timer_input_tests {
         };
         let scale = shrink_to_budget(2.0, huge);
         assert!(scale < 2.0, "the map has to be coarsened to fit the budget");
-        let cells = (f64::from(huge.width) * scale) as i64 * (f64::from(huge.height) * scale) as i64;
+        let cells =
+            (f64::from(huge.width) * scale) as i64 * (f64::from(huge.height) * scale) as i64;
         assert!(cells <= INVERT_MAP_BUDGET);
         // An ordinary card is left at one decision per screen pixel.
         let card = ScreenRect {
@@ -13024,7 +13024,6 @@ mod timer_input_tests {
 #[cfg(test)]
 mod usage_ui_tests {
     use super::*;
-
 
     #[test]
     #[ignore = "requires an X11 desktop session with a window manager and xdotool"]
