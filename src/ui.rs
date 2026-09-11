@@ -627,8 +627,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     let screen = gdk::Screen::default().expect("Sysi requires a graphical display");
     let root_window = screen.root_window().expect("display root window");
     let scale = root_window.scale_factor().max(1);
-    let screen_width = root_window.width() / scale;
-    let screen_height = root_window.height() / scale;
+    let display = root_display_size(&root_window);
+    let screen_width = display.width;
+    let screen_height = display.height;
     let screens = logical_screen_rects(scale, screen_width, screen_height);
     let primary_screen =
         logical_primary_screen(scale, screen_width, screen_height).unwrap_or(screens[0]);
@@ -2259,10 +2260,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let state = state.clone();
         move |screen| {
             let root_window = screen.root_window().expect("display root window");
-            let scale = root_window.scale_factor().max(1);
-            let width = root_window.width() / scale;
-            let height = root_window.height() / scale;
-            window.resize(width, height);
+            let display = root_display_size(&root_window);
+            window.resize(display.width, display.height);
             window.move_(0, 0);
             clamp_registered_widgets(&root, &registry, &state);
             refresh_auto_colors(&registry, &state);
@@ -9686,10 +9685,23 @@ fn overlay_display_size(widget: &impl IsA<gtk::Widget>) -> Size {
     let root = gtk::prelude::WidgetExt::screen(widget)
         .and_then(|screen| screen.root_window())
         .expect("display root window");
-    let scale = root.scale_factor().max(1);
+    root_display_size(&root)
+}
+
+/// The whole display in the logical pixels every widget coordinate is in.
+///
+/// `width()` reports the root window in device pixels on a fresh connection,
+/// but GDK rewrites it to logical pixels when the display's scale factor
+/// changes mid-session. Dividing it by the scale factor was therefore right
+/// until the first scale change and half the display afterwards: every widget
+/// on a HiDPI screen suddenly stopped resizing a quarter of the way across,
+/// and only restarting Sysi -- which reads the root window afresh -- undid it.
+/// `geometry()` asks the server and scales the answer either way.
+fn root_display_size(root: &gdk::Window) -> Size {
+    let (_, _, width, height) = root.geometry();
     Size {
-        width: root.width() / scale,
-        height: root.height() / scale,
+        width: width.max(1),
+        height: height.max(1),
     }
 }
 
