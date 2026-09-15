@@ -34,6 +34,50 @@
   text-shadow: 0 1px 3px rgba(255, 255, 255, 0.34);
 }
 
+/* LIGHT / DARK: one plate (.frost-body), under the header. AUTO / INVERT
+   leave the plate clear. Inner editors/viewports stay fully transparent so
+   GTK cannot restack a second wash on a clicked line or a caret blink. */
+.frost-body,
+.pinned-note {
+  background-color: transparent;
+}
+
+.mode-solid.mode-light .frost-body {
+  background-color: rgba(242, 242, 244, 0.6);
+  color: #161616;
+  text-shadow: none;
+  border-radius: 0 0 4px 4px;
+}
+
+.mode-solid.mode-dark .frost-body {
+  background-color: rgba(22, 22, 24, 0.6);
+  color: #f2f2f2;
+  text-shadow: none;
+  border-radius: 0 0 4px 4px;
+}
+
+.mode-solid .frost-body scrolledwindow,
+.mode-solid .frost-body viewport,
+.mode-solid .frost-body drawingarea,
+.mode-solid .frost-body textview,
+.mode-solid .frost-body textview:focus,
+.mode-solid .frost-body textview:backdrop,
+.mode-solid .frost-body textview:selected,
+.mode-solid .frost-body textview text,
+.mode-solid .frost-body textview text:focus,
+.mode-solid .frost-body textview text:selected,
+.mode-solid .frost-body textview text:backdrop,
+.mode-solid .frost-body .pinned-editor,
+.mode-solid .frost-body .note-editor,
+.mode-solid .frost-body .history-list,
+.mode-solid .frost-body .usage-rows,
+.mode-solid .frost-body .usage-row,
+.mode-solid .frost-body .translate-results {
+  background-color: transparent;
+  background-image: none;
+  border-radius: 0 0 4px 4px;
+}
+
 .card-title {
   font-size: 13px;
   font-weight: 800;
@@ -155,7 +199,7 @@ textview, textview text, entry {
 
 .history-list {
   background-color: transparent;
-  padding: 3px 2px;
+  padding: 3px 2px 12px;
 }
 
 /* The list sits inside the history window's own frame rather than out on the
@@ -898,6 +942,14 @@ popover.note-search-popover > contents,
 
 .mode-dark .usage-progress progress {
   background-color: rgba(24, 24, 24, 0.82);
+}
+
+.mode-solid.mode-light .usage-progress progress {
+  background-color: rgba(22, 22, 24, 0.55);
+}
+
+.mode-solid.mode-dark .usage-progress progress {
+  background-color: rgba(242, 242, 244, 0.55);
 }
 
 .usage-status {

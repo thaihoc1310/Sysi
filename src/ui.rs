@@ -8,7 +8,7 @@ use crate::{
     translate,
     usage::{self, Source as UsageSource},
 };
-use cairo::{Context, FontSlant, FontWeight, RectangleInt, Region};
+use cairo::{Context, Filter, FontSlant, FontWeight, RectangleInt, Region};
 use gdk::prelude::*;
 use gdk_pixbuf::{InterpType, Pixbuf};
 use gtk::prelude::*;
@@ -89,11 +89,6 @@ const HISTORY_WIDTH: i32 = 236;
 const HISTORY_HEIGHT: i32 = 252;
 const USAGE_WIDTH: i32 = 292;
 const USAGE_HEIGHT: i32 = 188;
-// One rendered row (.note-preview padding + the inherited note font) plus the
-// list spacing, and the header + list padding above it. Used to scale how many
-// rows the window renders to how tall the user dragged it.
-const HISTORY_ROW_HEIGHT: i32 = 30;
-const HISTORY_CHROME_HEIGHT: i32 = 32;
 const TRANSLATE_WIDTH: i32 = 272;
 const TRANSLATE_EMPTY_HEIGHT: i32 = 44;
 const TRANSLATE_RESULTS_MAX_HEIGHT: i32 = 520;
@@ -885,6 +880,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         "system",
         &system_card.card,
         system_card.color_mode.clone(),
+        system_color_mode,
     );
     let system_preview = SystemDetailsPreview {
         card: system_card.card.clone(),
@@ -974,6 +970,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         "timer",
         &timer_card.card,
         timer_card.color_mode.clone(),
+        timer_color_mode,
     );
     attach_color_mode_menu(
         &timer_card.card,
@@ -1037,6 +1034,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         "picker",
         &widget_picker.card,
         widget_picker.color_mode.clone(),
+        picker_color_mode,
     );
     attach_color_mode_menu(
         &widget_picker.card,
@@ -1059,10 +1057,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         window.clone(),
     );
-    let history = build_history_window(foreground_for_mode(saved_color_mode(
-        &state.borrow(),
-        "history",
-    )));
+    let history_color_mode = saved_color_mode(&state.borrow(), "history");
+    let history = build_history_window(foreground_for_mode(history_color_mode));
     let history_position = state
         .borrow()
         .positions
@@ -1087,6 +1083,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         "history",
         &history.card,
         history.color_mode.clone(),
+        history_color_mode,
     );
     if let Some(item) = registry
         .borrow_mut()
@@ -1136,10 +1133,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         },
     );
 
-    let usage = build_usage_window(foreground_for_mode(saved_color_mode(
-        &state.borrow(),
-        "usage",
-    )));
+    let usage_color_mode = saved_color_mode(&state.borrow(), "usage");
+    let usage = build_usage_window(foreground_for_mode(usage_color_mode));
     let initial_usage_tab = UsageTab::from_key(&state.borrow().settings.usage_source);
     let usage_position = state
         .borrow()
@@ -1160,7 +1155,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         },
     );
     place_card(&root, &usage.card, usage_position);
-    register(&registry, "usage", &usage.card, usage.color_mode.clone());
+    register(
+        &registry,
+        "usage",
+        &usage.card,
+        usage.color_mode.clone(),
+        usage_color_mode,
+    );
     if let Some(item) = registry
         .borrow_mut()
         .iter_mut()
@@ -1565,18 +1566,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }) as Rc<dyn Fn(&str)>
     });
 
-    // How many rows the list renders, derived from the window height so
-    // dragging the grip down shows more entries and dragging it up shows
-    // fewer. Kept in a cell so every rebuild path agrees on the current one.
-    let history_limit = Rc::new(Cell::new(history_row_budget(
-        state
-            .borrow()
-            .sizes
-            .get("history")
-            .map(|size| size.height)
-            .filter(|height| *height > 0)
-            .unwrap_or(HISTORY_HEIGHT),
-    )));
     // Search mode is tracked explicitly: show_all() (on unlock, or when the
     // window is reopened) would otherwise reveal both header bars at once.
     let searching = Rc::new(Cell::new(false));
@@ -1590,7 +1579,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let interactive = interactive.clone();
         let window = window.clone();
         let search = history.bar.search.clone();
-        let history_limit = history_limit.clone();
         let hovered_history_row = hovered_history_row.clone();
         Rc::new(move || {
             rebuild_note_list(
@@ -1599,7 +1587,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 state.clone(),
                 note_refresh.clone(),
                 &search.text(),
-                history_limit.get(),
                 hovered_history_row.clone(),
             );
             rebuild_pinned_notes(
@@ -1632,7 +1619,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let state = state.clone();
         let note_refresh = note_refresh.clone();
         let search = history.bar.search.clone();
-        let history_limit = history_limit.clone();
         let hovered_history_row = hovered_history_row.clone();
         Rc::new(move || {
             rebuild_note_list(
@@ -1641,7 +1627,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 state.clone(),
                 note_refresh.clone(),
                 &search.text(),
-                history_limit.get(),
                 hovered_history_row.clone(),
             );
         })
@@ -1661,33 +1646,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 refresh_history();
             });
             *pending_search.borrow_mut() = Some(source);
-        }
-    });
-
-    // Resizing changes how many rows fit, so re-render when the row budget
-    // actually changes — never on every allocation, which would loop.
-    history.card.connect_size_allocate({
-        let history_limit = history_limit.clone();
-        let refresh_history = refresh_history.clone();
-        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        move |_, allocation| {
-            let next = history_row_budget(allocation.height());
-            if next == history_limit.get() {
-                return;
-            }
-            history_limit.set(next);
-            // Adding rows from inside size-allocate re-enters GTK's layout;
-            // defer to the next idle instead.
-            if let Some(source) = pending.borrow_mut().take() {
-                source.remove();
-            }
-            let refresh_history = refresh_history.clone();
-            let pending_for_idle = pending.clone();
-            let source = glib::idle_add_local_once(move || {
-                pending_for_idle.borrow_mut().take();
-                refresh_history();
-            });
-            *pending.borrow_mut() = Some(source);
         }
     });
 
@@ -2356,7 +2314,6 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     let rows = gtk::Box::new(gtk::Orientation::Vertical, 3);
     rows.style_context().add_class("usage-rows");
     scroller.add(&rows);
-    body.pack_start(&scroller, true, true, 0);
 
     let tokens = Rc::new(RefCell::new(TokenState::default()));
     let token_hits = Rc::new(RefCell::new(Vec::<TokenHit>::new()));
@@ -2419,7 +2376,23 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
         }
     });
     tokens_pane.pack_start(&tokens_canvas, true, true, 0);
-    body.pack_start(&tokens_pane, true, true, 0);
+    let status = gtk::Label::new(Some("Loading usage…"));
+    status.set_xalign(0.0);
+    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status.style_context().add_class("usage-status");
+    let updated = gtk::Label::new(None);
+    updated.set_xalign(0.0);
+    updated.style_context().add_class("usage-updated");
+    let plate = frost_plate();
+    let panes = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    panes.set_hexpand(true);
+    panes.set_vexpand(true);
+    panes.pack_start(&scroller, true, true, 0);
+    panes.pack_start(&tokens_pane, true, true, 0);
+    panes.pack_start(&status, false, false, 0);
+    panes.pack_start(&updated, false, false, 0);
+    plate.add(&panes);
+    body.pack_start(&plate, true, true, 0);
     // Both panes take turns in the same slot, so the card keeps one height
     // whichever tab is up. They are shown once here to mark their children
     // visible, then taken out of the card's show_all so that from now on only
@@ -2429,16 +2402,6 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     scroller.set_no_show_all(true);
     tokens_pane.set_no_show_all(true);
     tokens_pane.hide();
-
-    let status = gtk::Label::new(Some("Loading usage…"));
-    status.set_xalign(0.0);
-    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    status.style_context().add_class("usage-status");
-    body.pack_start(&status, false, false, 0);
-    let updated = gtk::Label::new(None);
-    updated.set_xalign(0.0);
-    updated.style_context().add_class("usage-updated");
-    body.pack_start(&updated, false, false, 0);
 
     UsageCard {
         card,
@@ -5008,7 +4971,6 @@ fn rebuild_note_list(
     state: Rc<RefCell<AppState>>,
     refresh: CallbackSlot,
     query: &str,
-    limit: usize,
     hovered: HoveredRow,
 ) {
     for child in list.children() {
@@ -5018,9 +4980,11 @@ fn rebuild_note_list(
     // announces itself with its own enter event.
     hovered.set(None);
     let query = query.trim().to_lowercase();
-    // Borrow the notes instead of cloning every one; only matches become
-    // widgets, and only as many as the window is tall enough to scroll
-    // through, so a huge history stays cheap per keystroke.
+    // Borrow the notes instead of cloning every one; every match becomes a
+    // row. A height-derived cap used to keep search cheap, but it also made
+    // the scrollbar's end a lie — notes past the cap were still there, and
+    // only dragging the window taller revealed them. Search is already
+    // debounced; the list is what the thumb pages through.
     let notes = state.borrow();
     let mut shown = 0_usize;
     for note in notes
@@ -5028,7 +4992,6 @@ fn rebuild_note_list(
         .iter()
         .rev()
         .filter(|note| query.is_empty() || note.text.to_lowercase().contains(&query))
-        .take(limit)
     {
         // First non-empty line, so a note starting with a blank line still
         // shows its content instead of "Untitled note". The headline is not
@@ -5507,22 +5470,43 @@ fn original_image(file: &str, originals: &ImageOriginals) -> Option<Pixbuf> {
     if let Some(pixbuf) = originals.borrow().get(file) {
         return Some(pixbuf.clone());
     }
-    let pixbuf = Pixbuf::from_file(crate::state::images_dir().join(file)).ok()?;
+    let pixbuf = read_original(file)?;
     originals
         .borrow_mut()
         .insert(file.to_owned(), pixbuf.clone());
     Some(pixbuf)
 }
 
+// Load without filling the resize cache. A HiDPI paint must not keep a 4K
+// original in memory for the life of the note; the device-resolution copy is
+// stored on the displayed pixbuf instead.
+fn read_original(file: &str) -> Option<Pixbuf> {
+    Pixbuf::from_file(crate::state::images_dir().join(file)).ok()
+}
+
+fn rescaled_from(original: &Pixbuf, width: i32, height: i32) -> Option<Pixbuf> {
+    if original.width() == width && original.height() == height {
+        return Some(original.clone());
+    }
+    original.scale_simple(width, height, InterpType::Bilinear)
+}
+
+// The scaling core of `scaled_image`, without the display-size clamps: the
+// device-resolution copy painted by `paint_sharp_images` is `scale` times the
+// CSS size and would be clamped away by them.
+fn rescaled_image(
+    file: &str,
+    width: i32,
+    height: i32,
+    originals: &ImageOriginals,
+) -> Option<Pixbuf> {
+    rescaled_from(&original_image(file, originals)?, width, height)
+}
+
 fn scaled_image(file: &str, width: i32, height: i32, originals: &ImageOriginals) -> Option<Pixbuf> {
-    let original = original_image(file, originals)?;
     let width = width.clamp(NOTE_IMAGE_MIN, NOTE_IMAGE_MAX);
     let height = height.clamp(1, NOTE_IMAGE_MAX);
-    let pixbuf = if original.width() == width && original.height() == height {
-        original
-    } else {
-        original.scale_simple(width, height, InterpType::Bilinear)?
-    };
+    let pixbuf = rescaled_image(file, width, height, originals)?;
     // The corners are rounded on the copy that goes into the note, not on the
     // stored original: a square corner would poke out past the focus outline,
     // which is drawn after the text and cannot erase what is under it.
@@ -5578,6 +5562,100 @@ fn round_pixbuf_corners(pixbuf: &Pixbuf, radius: f64) -> Option<Pixbuf> {
         }
     }
     Some(target)
+}
+
+// GTK draws an inline pixbuf one pixel per CSS pixel, so on a scaled display
+// the window surface stretches it and every pasted image comes out soft — the
+// smaller the image, the more of its detail the stretch eats. Paint each image
+// a second time over GTK's copy, from a pixbuf that already holds one pixel per
+// device pixel, and cairo maps it one-for-one. The note's text flow, hit
+// testing and undo keep working on the CSS-size pixbuf underneath.
+const SHARP_IMAGE_KEY: &str = "sysi-image-sharp";
+
+fn sharp_image(displayed: &Pixbuf, scale: i32, originals: &ImageOriginals) -> Option<Pixbuf> {
+    let width = displayed.width().checked_mul(scale)?;
+    let height = displayed.height().checked_mul(scale)?;
+    if let Some(cached) = unsafe { displayed.data::<Pixbuf>(SHARP_IMAGE_KEY) } {
+        let cached = unsafe { cached.as_ref().clone() };
+        if cached.width() == width && cached.height() == height {
+            return Some(cached);
+        }
+    }
+    let file = image_source(displayed)?;
+    // Prefer the in-memory original during a resize drag; otherwise decode
+    // from disk and drop it once the device-resolution copy exists.
+    let original = originals
+        .borrow()
+        .get(&file)
+        .cloned()
+        .or_else(|| read_original(&file))?;
+    let pixbuf = rescaled_from(&original, width, height)?;
+    let pixbuf = round_pixbuf_corners(&pixbuf, NOTE_IMAGE_BORDER_RADIUS * f64::from(scale))
+        .unwrap_or(pixbuf);
+    unsafe { displayed.set_data(SHARP_IMAGE_KEY, pixbuf.clone()) };
+    Some(pixbuf)
+}
+
+fn paint_sharp_images(editor: &gtk::TextView, ctx: &Context, originals: &ImageOriginals) {
+    let scale = editor.scale_factor();
+    if scale <= 1 {
+        return;
+    }
+    let Some(buffer) = editor.buffer() else {
+        return;
+    };
+    let text = note_buffer_text(&buffer);
+    if !text.contains(IMAGE_PLACEHOLDER) {
+        return;
+    }
+    // Clip to the text window: an image scrolled out of view must not be
+    // painted over the note's chrome, where GTK drew nothing for it.
+    let visible = editor.visible_rect();
+    let (visible_x, visible_y) =
+        editor.buffer_to_window_coords(gtk::TextWindowType::Widget, visible.x(), visible.y());
+    let _ = ctx.save();
+    ctx.rectangle(
+        f64::from(visible_x),
+        f64::from(visible_y),
+        f64::from(visible.width()),
+        f64::from(visible.height()),
+    );
+    ctx.clip();
+    for (offset, character) in text.chars().enumerate() {
+        if character != IMAGE_PLACEHOLDER {
+            continue;
+        }
+        let offset = offset as i32;
+        let Some((x, y, width, height)) = image_rect(editor, offset) else {
+            continue;
+        };
+        if x + width <= f64::from(visible_x)
+            || y + height <= f64::from(visible_y)
+            || x >= f64::from(visible_x) + f64::from(visible.width())
+            || y >= f64::from(visible_y) + f64::from(visible.height())
+        {
+            continue;
+        }
+        let Some(pixbuf) = buffer.iter_at_offset(offset).pixbuf() else {
+            continue;
+        };
+        let Some(sharp) = sharp_image(&pixbuf, scale, originals) else {
+            continue;
+        };
+        let _ = ctx.save();
+        rounded_rectangle(ctx, x, y, width, height, NOTE_IMAGE_BORDER_RADIUS);
+        ctx.clip();
+        ctx.translate(x, y);
+        ctx.scale(
+            width / f64::from(sharp.width()),
+            height / f64::from(sharp.height()),
+        );
+        ctx.set_source_pixbuf(&sharp, 0.0, 0.0);
+        ctx.source().set_filter(Filter::Nearest);
+        let _ = ctx.paint();
+        let _ = ctx.restore();
+    }
+    let _ = ctx.restore();
 }
 
 fn store_note_image(pixbuf: &Pixbuf, state: &Rc<RefCell<AppState>>) -> Option<String> {
@@ -6456,7 +6534,8 @@ fn build_note_search(
 
 // Hover the right/bottom image edge to resize it directly. Clicking the image
 // still focuses it and parks the cursor immediately after it, so Backspace
-// deletes it and typing continues after it.
+// deletes it and typing continues after it. The caret itself stays hidden
+// while the outline is up: a blinking bar on the picture is just noise.
 fn attach_note_images(
     editor: &gtk::TextView,
     target: NoteImageTarget,
@@ -6509,6 +6588,7 @@ fn attach_note_images(
                     return;
                 }
                 if focus.borrow_mut().take().is_some() {
+                    editor.set_cursor_visible(true);
                     editor.queue_draw();
                 }
             }
@@ -6577,6 +6657,7 @@ fn attach_note_images(
             let redo = y || event.state().contains(gdk::ModifierType::SHIFT_MASK);
             if undo_note_edit(editor, &target, &state, &originals, &undo, redo) {
                 *focus.borrow_mut() = None;
+                editor.set_cursor_visible(true);
                 editor.queue_draw();
                 glib::Propagation::Stop
             } else {
@@ -6602,6 +6683,7 @@ fn attach_note_images(
                         return glib::Propagation::Proceed;
                     };
                     *focus.borrow_mut() = Some(image);
+                    editor.set_cursor_visible(false);
                     editor.queue_draw();
                     *resize.borrow_mut() = Some(ImageResize {
                         offset: image.offset,
@@ -6628,12 +6710,17 @@ fn attach_note_images(
                 Some(image) => {
                     // Park the cursor after the image instead of letting the
                     // click drop it inside the selection GTK would start.
+                    // Hide the caret: the rounded outline is the focus.
+                    editor.set_cursor_visible(false);
                     if let Some(buffer) = editor.buffer() {
                         buffer.place_cursor(&buffer.iter_at_offset(image.offset + 1));
                     }
                     glib::Propagation::Stop
                 }
-                None => glib::Propagation::Proceed,
+                None => {
+                    editor.set_cursor_visible(true);
+                    glib::Propagation::Proceed
+                }
             }
         }
     });
@@ -6751,6 +6838,7 @@ fn attach_note_images(
     editor.connect_local("draw", true, {
         let focus = focus.clone();
         let hover = hover.clone();
+        let originals = originals.clone();
         move |values| {
             let editor = values
                 .first()
@@ -6759,6 +6847,9 @@ fn attach_note_images(
                 .get(1)
                 .and_then(|value| value.get::<cairo::Context>().ok());
             if let (Some(editor), Some(ctx)) = (editor, ctx) {
+                // Every image gets its device-resolution copy back on top of
+                // GTK's soft one, locked notes included.
+                paint_sharp_images(&editor, &ctx, &originals);
                 // Lock mode is read-only, so it shows no resize affordance.
                 if !editor.is_editable() {
                     return Some(false.to_value());
@@ -6839,7 +6930,8 @@ fn rebuild_pinned_notes(
         .collect();
     for note in pinned {
         let key = format!("note:{}", note.id);
-        let initial_color_mode = foreground_for_mode(saved_color_mode(&state.borrow(), &key));
+        let note_color_mode = saved_color_mode(&state.borrow(), &key);
+        let initial_color_mode = foreground_for_mode(note_color_mode);
         let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
         // Note rows are intentionally flush: the editor already owns its text
         // padding, and the find bar must not inherit CardBody's generic 4px
@@ -6884,8 +6976,12 @@ fn rebuild_pinned_notes(
             let editor = editor.clone();
             move || {
                 editor.grab_focus();
-                editor.set_cursor_visible(false);
-                editor.set_cursor_visible(true);
+                // An inline image keeps the caret off: restarting the blink
+                // here would put it back next to the picture.
+                if editor.is_cursor_visible() {
+                    editor.set_cursor_visible(false);
+                    editor.set_cursor_visible(true);
+                }
             }
         });
         editor.connect_button_press_event({
@@ -6936,8 +7032,14 @@ fn rebuild_pinned_notes(
         scroller.set_propagate_natural_height(false);
         scroller.add(&editor);
         let note_search = build_note_search(&editor, &registry, &search_toggle);
-        body.pack_start(&note_search.revealer, false, false, 0);
-        body.pack_start(&scroller, true, true, 0);
+        let plate = frost_plate();
+        let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        inner.set_hexpand(true);
+        inner.set_vexpand(true);
+        inner.pack_start(&note_search.revealer, false, false, 0);
+        inner.pack_start(&scroller, true, true, 0);
+        plate.add(&inner);
+        body.pack_start(&plate, true, true, 0);
 
         apply_widget_size(
             &card,
@@ -6949,7 +7051,7 @@ fn rebuild_pinned_notes(
             },
         );
         root.put(&card, note.position.x, note.position.y);
-        register(&registry, &key, &card, color_mode);
+        register(&registry, &key, &card, color_mode, note_color_mode);
         if let Some(item) = registry
             .borrow_mut()
             .iter_mut()
@@ -7201,7 +7303,10 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     card.style_context().add_class("picker-widget");
     let color_mode = Rc::new(Cell::new(foreground_for_mode(initial_color_mode)));
     let content = gtk::Box::new(gtk::Orientation::Vertical, 5);
-    card.add(&content);
+    content.style_context().add_class("picker-surface");
+    let plate = frost_plate();
+    plate.add(&content);
+    card.add(&plate);
 
     let drag = gtk::EventBox::new();
     drag.set_visible_window(false);
@@ -7254,15 +7359,6 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
         usage,
         quit,
     }
-}
-
-fn history_row_budget(card_height: i32) -> usize {
-    let list_height = (card_height - HISTORY_CHROME_HEIGHT).max(HISTORY_ROW_HEIGHT);
-    let visible = (list_height / HISTORY_ROW_HEIGHT) as usize;
-    // Render a screenful plus some headroom: the extra rows are what the
-    // scrollbar scrolls through, and the total shrinks with the window so a
-    // small history window stays cheap to rebuild per keystroke.
-    (visible + 10).clamp(14, 240)
 }
 
 fn build_history_window(initial_color_mode: Foreground) -> HistoryWindow {
@@ -7333,8 +7429,13 @@ fn build_history_window(initial_color_mode: Foreground) -> HistoryWindow {
     scroller.style_context().add_class("history-scroller");
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     list.style_context().add_class("history-list");
+    // Size to the rows, not the viewport: a FILL box as tall as the window
+    // would make GtkScrolledWindow think the content already fits.
+    list.set_valign(gtk::Align::Start);
     scroller.add(&list);
-    body.pack_start(&scroller, true, true, 0);
+    let plate = frost_plate();
+    plate.add(&scroller);
+    body.pack_start(&plate, true, true, 0);
 
     HistoryWindow {
         card,
@@ -7511,8 +7612,9 @@ fn place_translate_near_click(ctx: &TranslateContext, id: u64, card: &gtk::Event
 
 fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
     let key = dictionary_key(id);
+    let translate_color_mode = saved_color_mode(&ctx.state.borrow(), &key);
     let translate = Rc::new(build_translate_window(foreground_for_mode(
-        saved_color_mode(&ctx.state.borrow(), &key),
+        translate_color_mode,
     )));
     // Closing the receiver wakes its task immediately. The flag also prevents
     // an event already queued before close from touching the destroyed GTK
@@ -7554,6 +7656,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         &key,
         &translate.card,
         translate.color_mode.clone(),
+        translate_color_mode,
     );
     if let Some(item) = ctx
         .registry
@@ -8199,7 +8302,9 @@ fn build_translate_window(initial_color_mode: Foreground) -> TranslateWindow {
     let results = gtk::Box::new(gtk::Orientation::Vertical, 3);
     results.style_context().add_class("translate-results");
     scroller.add(&results);
-    body.pack_start(&scroller, true, true, 0);
+    let plate = frost_plate();
+    plate.add(&scroller);
+    body.pack_start(&plate, true, true, 0);
 
     TranslateWindow {
         card,
@@ -8981,6 +9086,19 @@ fn publish_panel_state(interactive: bool, state: &AppState) {
     }
 }
 
+/// One GdkWindow for the Light/Dark wash. Painting the same rgba on the
+/// scroller, the viewport *and* the text window stacked three translucent
+/// plates: a click or caret blink redrew just one of them, so the body
+/// flickered between ~0.6 and nearly solid.
+fn frost_plate() -> gtk::EventBox {
+    let plate = gtk::EventBox::new();
+    plate.set_visible_window(true);
+    plate.set_hexpand(true);
+    plate.set_vexpand(true);
+    plate.style_context().add_class("frost-body");
+    plate
+}
+
 fn card_shell(
     title: &str,
     kicker: &str,
@@ -9045,7 +9163,13 @@ fn card_shell(
     body.set_hexpand(true);
     body.set_vexpand(true);
     body.style_context().add_class("card-body");
-    card.pack_start(&body, true, true, 0);
+    if !title.is_empty() || !kicker.is_empty() {
+        let plate = frost_plate();
+        plate.add(&body);
+        card.pack_start(&plate, true, true, 0);
+    } else {
+        card.pack_start(&body, true, true, 0);
+    }
     (
         event,
         body,
@@ -9063,10 +9187,9 @@ fn register(
     key: &str,
     widget: &gtk::EventBox,
     color_mode: Rc<Cell<Foreground>>,
+    mode: ColorMode,
 ) {
-    widget
-        .style_context()
-        .add_class(color_mode.get().css_class());
+    apply_widget_palette(widget, &color_mode, palette_for_mode(mode));
     let invert: Rc<RefCell<Option<InvertMap>>> = Rc::new(RefCell::new(None));
     // The card's own EventBox is the outermost node, so one group here catches
     // every child — canvases, labels, editors and their own GdkWindows alike.
@@ -9206,12 +9329,42 @@ fn saved_color_mode(state: &AppState, key: &str) -> ColorMode {
 }
 
 fn foreground_for_mode(mode: ColorMode) -> Foreground {
+    palette_for_mode(mode).ink
+}
+
+/// How a colour mode is painted: the CSS chrome (header bar, title), the
+/// cairo ink (meters, timers), and whether the card is a filled plate.
+/// LIGHT / DARK sit on a solid card, so the ink is the opposite of the plate.
+/// AUTO / INVERT stay transparent and keep ink and chrome in step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WidgetPalette {
+    chrome: Foreground,
+    ink: Foreground,
+    solid: bool,
+}
+
+fn palette_for_mode(mode: ColorMode) -> WidgetPalette {
     match mode {
-        // AUTO starts light and is corrected as soon as the widget is mapped
-        // and the desktop pixels underneath it can be read.
-        // INVERT paints the light palette and flips it per cell afterwards.
-        ColorMode::Auto | ColorMode::Light | ColorMode::Invert => Foreground::Light,
-        ColorMode::Dark => Foreground::Dark,
+        ColorMode::Auto => WidgetPalette {
+            chrome: Foreground::Light,
+            ink: Foreground::Light,
+            solid: false,
+        },
+        ColorMode::Light => WidgetPalette {
+            chrome: Foreground::Light,
+            ink: Foreground::Dark,
+            solid: true,
+        },
+        ColorMode::Dark => WidgetPalette {
+            chrome: Foreground::Dark,
+            ink: Foreground::Light,
+            solid: true,
+        },
+        ColorMode::Invert => WidgetPalette {
+            chrome: Foreground::Light,
+            ink: Foreground::Light,
+            solid: false,
+        },
     }
 }
 
@@ -11389,34 +11542,58 @@ fn apply_registered_color_mode(
             item.widget.queue_draw();
         }
     }
-    let foreground = match mode {
-        ColorMode::Auto => capture
-            .and_then(|capture| {
-                sample_widget_foreground(&item.widget, item.color_mode.get(), capture)
-            })
-            .unwrap_or_else(|| item.color_mode.get()),
-        ColorMode::Light | ColorMode::Invert => Foreground::Light,
-        ColorMode::Dark => Foreground::Dark,
+    let palette = match mode {
+        ColorMode::Auto => {
+            let foreground = capture
+                .and_then(|capture| {
+                    sample_widget_foreground(&item.widget, item.color_mode.get(), capture)
+                })
+                .unwrap_or_else(|| item.color_mode.get());
+            WidgetPalette {
+                chrome: foreground,
+                ink: foreground,
+                solid: false,
+            }
+        }
+        ColorMode::Light | ColorMode::Dark | ColorMode::Invert => palette_for_mode(mode),
     };
-    set_registered_foreground(item, foreground);
+    apply_widget_palette(&item.widget, &item.color_mode, palette);
 }
 
 fn set_registered_foreground(item: &RegisteredWidget, foreground: Foreground) {
-    set_event_box_foreground(&item.widget, &item.color_mode, foreground);
+    apply_widget_palette(
+        &item.widget,
+        &item.color_mode,
+        WidgetPalette {
+            chrome: foreground,
+            ink: foreground,
+            solid: false,
+        },
+    );
 }
 
-fn set_event_box_foreground(
+fn apply_widget_palette(
     widget: &gtk::EventBox,
     color_mode: &Rc<Cell<Foreground>>,
-    foreground: Foreground,
+    palette: WidgetPalette,
 ) {
-    if color_mode.replace(foreground) == foreground {
+    let context = widget.style_context();
+    let chrome = palette.chrome.css_class();
+    if color_mode.get() == palette.ink
+        && context.has_class(chrome)
+        && context.has_class("mode-solid") == palette.solid
+    {
         return;
     }
-    let context = widget.style_context();
+    color_mode.set(palette.ink);
     context.remove_class("mode-light");
     context.remove_class("mode-dark");
-    context.add_class(foreground.css_class());
+    context.add_class(chrome);
+    if palette.solid {
+        context.add_class("mode-solid");
+    } else {
+        context.remove_class("mode-solid");
+    }
     widget.queue_draw();
 }
 
@@ -11639,24 +11816,26 @@ fn install_css(screen: &gdk::Screen) {
 mod timer_input_tests {
     use super::{
         clamp_to_screens, clip_screen_to_overlay, covers, drag_frame_due, ellipsize,
-        fit_to_work_area, fit_within_bounds, foreground_for_luminance, format_rate,
-        history_row_budget, hold_clears_map, image_room, image_room_after_y, invert_map,
+        fit_to_work_area, fit_within_bounds, foreground_for_luminance, foreground_for_mode,
+        format_rate, hold_clears_map, image_room, image_room_after_y, invert_map,
         monitor_coordinate_divisor, monitor_root_bounds, normalize_monitor_rect, note_headline,
         note_image_cap, note_search_matches, note_size_for_image, padded_visual_rect,
-        paint_inverted, parse_panel_anchor, parse_timer_input, push_recent_search,
-        receives_input_when_locked, record_note_undo, relative_luminance, reopen_point,
-        resize_ceiling, resize_width_limit, resized_image_size, room_on_screen,
-        round_pixbuf_corners, screen_in_overlay, shrink_to_budget, system_content_size,
-        system_meter_columns, system_meter_gap, system_meter_ink_width, system_meter_row_width,
-        system_meter_rows, system_meters, system_usage_rows, temperature_meter, timer_style_size,
-        Foreground, InvertMap, NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo,
-        NoteUndoState, ScreenRect, DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH,
-        INVERT_MAP_BUDGET, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
-        NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL,
-        SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN, SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS,
-        SYSTEM_METER_RING_STROKE,
+        paint_inverted, palette_for_mode, parse_panel_anchor, parse_timer_input,
+        push_recent_search, receives_input_when_locked, record_note_undo, relative_luminance,
+        reopen_point, rescaled_from, resize_ceiling, resize_width_limit, resized_image_size,
+        room_on_screen, round_pixbuf_corners, screen_in_overlay, shrink_to_budget,
+        system_content_size, system_meter_columns, system_meter_gap, system_meter_ink_width,
+        system_meter_row_width, system_meter_rows, system_meters, system_usage_rows,
+        temperature_meter, timer_style_size, Foreground, InvertMap, NoteSearchMatch,
+        NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, WidgetPalette,
+        DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH, INVERT_MAP_BUDGET, NOTE_HEIGHT,
+        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
+        NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
+        SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
     };
-    use crate::state::{NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER};
+    use crate::state::{
+        ColorMode, NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER,
+    };
     use crate::system::{SystemSnapshot, Usage};
     use gdk_pixbuf::{Colorspace, Pixbuf};
     use std::{cell::RefCell, rc::Rc};
@@ -11947,6 +12126,50 @@ mod timer_input_tests {
     }
 
     #[test]
+    fn light_and_dark_modes_fill_the_card_and_auto_stays_clear() {
+        let auto = palette_for_mode(ColorMode::Auto);
+        let light = palette_for_mode(ColorMode::Light);
+        let dark = palette_for_mode(ColorMode::Dark);
+        let invert = palette_for_mode(ColorMode::Invert);
+        assert_eq!(
+            auto,
+            WidgetPalette {
+                chrome: Foreground::Light,
+                ink: Foreground::Light,
+                solid: false,
+            }
+        );
+        assert_eq!(
+            invert,
+            WidgetPalette {
+                chrome: Foreground::Light,
+                ink: Foreground::Light,
+                solid: false,
+            }
+        );
+        // Light plate, dark ink — the overlay's white body text would vanish
+        // on a pale card. Dark is the opposite.
+        assert_eq!(
+            light,
+            WidgetPalette {
+                chrome: Foreground::Light,
+                ink: Foreground::Dark,
+                solid: true,
+            }
+        );
+        assert_eq!(
+            dark,
+            WidgetPalette {
+                chrome: Foreground::Dark,
+                ink: Foreground::Light,
+                solid: true,
+            }
+        );
+        assert_eq!(foreground_for_mode(ColorMode::Light), Foreground::Dark);
+        assert_eq!(foreground_for_mode(ColorMode::Dark), Foreground::Light);
+    }
+
+    #[test]
     fn auto_color_uses_relative_luminance_with_a_stable_middle_band() {
         assert!((relative_luminance(255, 255, 255) - 1.0).abs() < 0.000_001);
         assert_eq!(relative_luminance(0, 0, 0), 0.0);
@@ -12039,21 +12262,6 @@ mod timer_input_tests {
     }
 
     #[test]
-    fn a_taller_history_window_renders_more_rows_than_a_shorter_one() {
-        let short = history_row_budget(120);
-        let tall = history_row_budget(600);
-        assert!(
-            tall > short,
-            "dragging the history window taller must render more rows: {short} -> {tall}"
-        );
-        // Even a window dragged to its minimum keeps a scrollable buffer, and
-        // a huge one stays bounded so each keystroke rebuild stays cheap.
-        assert_eq!(history_row_budget(0), 14);
-        assert!(history_row_budget(100_000) <= 240);
-        assert!(history_row_budget(HISTORY_HEIGHT) >= 14);
-    }
-
-    #[test]
     fn a_pasted_screenshot_is_scaled_down_but_a_small_icon_is_left_alone() {
         // A 1920x1080 screenshot fits the note without distorting its shape.
         let (width, height) =
@@ -12064,6 +12272,20 @@ mod timer_input_tests {
         assert_eq!(fit_within_bounds(200, 1000, 240, 240), (48, 240));
         // Nothing smaller than the cap is ever blown up.
         assert_eq!(fit_within_bounds(60, 40, 240, 240), (60, 40));
+    }
+
+    #[test]
+    fn a_hidpi_paint_copy_is_not_clamped_to_the_css_cap() {
+        // GtkTextView draws the 240px paste. On a 2x display that is stretched
+        // to 480 device pixels, so the overlay we paint has to be that size —
+        // larger than the CSS cap `scaled_image` would have stopped at.
+        let original = Pixbuf::new(Colorspace::Rgb, true, 8, 960, 540).expect("test pixbuf");
+        original.fill(0xff_00_00_ff);
+        let sharp = rescaled_from(&original, NOTE_IMAGE_DEFAULT_MAX * 2, 270)
+            .expect("device-resolution scale");
+        assert_eq!((sharp.width(), sharp.height()), (480, 270));
+        assert!(sharp.width() > NOTE_IMAGE_DEFAULT_MAX);
+        assert!(sharp.width() < NOTE_IMAGE_MAX);
     }
 
     #[test]
