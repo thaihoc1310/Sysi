@@ -7110,6 +7110,7 @@ fn attach_note_images(
             let _ = state.borrow().save();
             let after = note_snapshot(&buffer, &target, &state);
             record_note_undo(&undo, before, &after);
+            collapse_selection_later(&buffer);
             glib::Propagation::Proceed
         }
     });
@@ -7117,6 +7118,21 @@ fn attach_note_images(
     let highlight_menu = build_highlight_menu_actions(editor, &target, state, &undo);
 
     (originals, highlight_menu)
+}
+
+/// Drop the selection once its words have been painted: leaving them selected
+/// hides the colour that was just put on them behind the selection's own.
+///
+/// On the next idle rather than now, because the pen paints from a button
+/// release that GTK is still using to finish the drag the selection was made
+/// with.
+fn collapse_selection_later(buffer: &gtk::TextBuffer) {
+    let buffer = buffer.clone();
+    glib::idle_add_local_once(move || {
+        if let Some((_, end)) = buffer.selection_bounds() {
+            buffer.place_cursor(&end);
+        }
+    });
 }
 
 /// Write the stretches down where the note is kept. Painting never reaches the
@@ -7162,6 +7178,7 @@ fn build_highlight_menu_actions(
             let _ = state.borrow().save();
             let after = note_snapshot(&buffer, &target, &state);
             record_note_undo(&undo, before, &after);
+            collapse_selection_later(&buffer);
         })
     };
 
@@ -12838,7 +12855,7 @@ fn attach_highlight_button(
     state: &Rc<RefCell<AppState>>,
 ) {
     let menu = context_menu();
-    let mode = gtk::CheckMenuItem::with_label("HIGHLIGHT MODE");
+    let mode = gtk::CheckMenuItem::with_label("HIGHLIGHT");
     mode.connect_toggled({
         let pen_on = pen_on.clone();
         let button = button.clone();
