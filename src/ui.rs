@@ -9868,11 +9868,19 @@ fn attach_color_mode_menu(
             }
         });
         let color_row = highlight_row("COLOR", None, false);
+        // The palette reads the click that is latched when the menu opens, so
+        // one submenu serves every stretch rather than being replaced for each.
+        let palette = HighlightPalette::new({
+            let actions = actions.clone();
+            let painted = painted.clone();
+            Rc::new(move |color| (actions.paint)(painted.get(), color))
+        });
+        color_row.set_submenu(Some(&palette.menu));
         let separator = gtk::SeparatorMenuItem::new();
         menu.append(&paint_row);
         menu.append(&color_row);
         menu.append(&separator);
-        (paint_row, color_row, separator)
+        (paint_row, color_row, separator, palette)
     });
 
     // Looking up the selection sits at the top, above the colour modes: it is
@@ -10112,7 +10120,7 @@ fn attach_color_mode_menu(
                 return;
             }
         }
-        if let (Some(actions), Some((paint_row, color_row, separator))) =
+        if let (Some(actions), Some((paint_row, color_row, separator, _palette))) =
             (&highlight, &highlight_rows)
         {
             let what = (actions.resolve)(x, y);
@@ -10132,12 +10140,6 @@ fn attach_color_mode_menu(
                 }
                 let chosen = what.run.map_or(pen, |run| run.color);
                 set_highlight_row(color_row, "COLOR", Some(chosen), false);
-                let pick: Rc<dyn Fn(HighlightColor)> = {
-                    let actions = actions.clone();
-                    let painted = painted.clone();
-                    Rc::new(move |color| (actions.paint)(painted.get(), color))
-                };
-                color_row.set_submenu(Some(&highlight_color_menu(chosen, pick)));
             }
         }
         color_item.set_label(saved_color_mode(&state.borrow(), &key).next().label());
@@ -12799,10 +12801,21 @@ fn nav_button(icon_name: &str, tooltip: &str) -> gtk::Button {
 /// coloured by markup rather than an icon, so it follows the menu's own font
 /// and asks nothing of the icon theme.
 fn highlight_row(label: &str, color: Option<HighlightColor>, ticked: bool) -> gtk::MenuItem {
-    let item = gtk::MenuItem::new();
-    let text = gtk::Label::new(None);
-    text.set_xalign(0.0);
-    item.add(&text);
+    // Built through `with_label`, whose child is the GtkAccelLabel every other
+    // row in these menus uses, and then re-marked up. A plain GtkLabel added by
+    // hand reports a two-line height under the menu's CSS letter-spacing -- the
+    // trap the dictionary's RECENT fold fell into -- and four of those asked
+    // the colour submenu for half a panel of empty space below the last colour.
+    // Whether the bad measurement was the one that stuck depended on when the
+    // menu happened to be built, which is why the gap came and went.
+    let item = gtk::MenuItem::with_label(label);
+    if let Some(text) = item
+        .child()
+        .and_then(|child| child.downcast::<gtk::Label>().ok())
+    {
+        text.set_xalign(0.0);
+        text.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    }
     set_highlight_row(&item, label, color, ticked);
     item
 }
@@ -12829,22 +12842,42 @@ fn set_highlight_row(
         "{dot}{}{tick}",
         glib::markup_escape_text(label).as_str()
     ));
+    // An ellipsizing label asks for next to no width, and a menu sized from
+    // that clips its own longest row. Ask for the characters the row holds,
+    // with room for the dot and the letter-spacing the menu's CSS adds on top
+    // of what an average character is reckoned to be.
+    let dot_chars = if color.is_some() { 3 } else { 0 };
+    text.set_width_chars((dot_chars + label.chars().count() + 4) as i32);
 }
 
-/// Fill a menu with one row per pen colour. `chosen` is ticked, and picking a
-/// row hands that colour back.
-fn highlight_color_menu(chosen: HighlightColor, pick: Rc<dyn Fn(HighlightColor)>) -> gtk::Menu {
-    let menu = context_menu();
-    for color in HighlightColor::ALL {
-        let row = highlight_row(color.label(), Some(color), color == chosen);
-        row.connect_activate({
-            let pick = pick.clone();
-            move |_| pick(color)
-        });
-        menu.append(&row);
+/// The four pens to choose between, as a submenu.
+///
+/// Built once and kept for the life of the note rather than made fresh for
+/// each popup: replacing an item's submenu leaves the one it replaced behind,
+/// and a leftover would sometimes still be mapped -- the stray empty panel
+/// that used to hang below the colours.
+///
+/// Nothing marks the current colour in here. The row this hangs off carries
+/// its dot, one line above, and a tick added to a row after the submenu had
+/// been sized only got itself ellipsized away.
+struct HighlightPalette {
+    menu: gtk::Menu,
+}
+
+impl HighlightPalette {
+    fn new(pick: Rc<dyn Fn(HighlightColor)>) -> Self {
+        let menu = context_menu();
+        for color in HighlightColor::ALL {
+            let row = highlight_row(color.label(), Some(color), false);
+            row.connect_activate({
+                let pick = pick.clone();
+                move |_| pick(color)
+            });
+            menu.append(&row);
+        }
+        menu.show_all();
+        Self { menu }
     }
-    menu.show_all();
-    menu
 }
 
 /// The highlighter's own menu, hung off the pen in a note's header: whether the
@@ -12855,14 +12888,17 @@ fn attach_highlight_button(
     state: &Rc<RefCell<AppState>>,
 ) {
     let menu = context_menu();
-    let mode = gtk::CheckMenuItem::with_label("HIGHLIGHT");
-    mode.connect_toggled({
+    // A tick in the row rather than a GtkCheckMenuItem: its indicator is the
+    // widest thing in this menu, and the space it claims is what pushed the
+    // submenu arrow so far from the word COLOR.
+    let mode = highlight_row("HIGHLIGHT", None, false);
+    mode.connect_activate({
         let pen_on = pen_on.clone();
         let button = button.clone();
-        move |item| {
-            pen_on.set(item.is_active());
+        move |_| {
+            pen_on.set(!pen_on.get());
             let style = button.style_context();
-            if item.is_active() {
+            if pen_on.get() {
                 style.add_class("note-pen-on");
             } else {
                 style.remove_class("note-pen-on");
@@ -12873,29 +12909,23 @@ fn attach_highlight_button(
 
     let color_item = highlight_row("COLOR", None, false);
     menu.append(&color_item);
+    let palette = HighlightPalette::new({
+        let state = state.clone();
+        Rc::new(move |color| {
+            state.borrow_mut().settings.highlight_color = color;
+            let _ = state.borrow().save();
+        })
+    });
+    color_item.set_submenu(Some(&palette.menu));
     menu.show_all();
 
-    // Rebuilt before every popup rather than kept in step: the pen is shared by
-    // every note, so the colour can have been changed from another one. The
-    // submenu is attached here and not from the menu's own show handler, where
-    // a row added mid-popup opens but never activates.
     button.connect_clicked({
         let state = state.clone();
         let pen_on = pen_on.clone();
         move |_| {
-            if mode.is_active() != pen_on.get() {
-                mode.set_active(pen_on.get());
-            }
+            set_highlight_row(&mode, "HIGHLIGHT", None, pen_on.get());
             let chosen = state.borrow().settings.highlight_color;
             set_highlight_row(&color_item, "COLOR", Some(chosen), false);
-            let pick: Rc<dyn Fn(HighlightColor)> = {
-                let state = state.clone();
-                Rc::new(move |color| {
-                    state.borrow_mut().settings.highlight_color = color;
-                    let _ = state.borrow().save();
-                })
-            };
-            color_item.set_submenu(Some(&highlight_color_menu(chosen, pick)));
             menu.popup_easy(0, gtk::current_event_time());
         }
     });
