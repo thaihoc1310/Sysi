@@ -324,6 +324,13 @@ textview, textview text, entry {
   color: #000000;
 }
 
+/* The highlighter, while its pen is down. Filled rather than tinted, so the
+   state reads at a glance on both light and dark notes. */
+.note-pen-on {
+  background-color: alpha(currentColor, 0.16);
+  border-radius: 3px;
+}
+
 .note-hide {
   color: #666666;
 }

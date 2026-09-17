@@ -123,6 +123,10 @@ pub struct Settings {
     pub usage_period: String,
     #[serde(default)]
     pub color_mode: ColorMode,
+    /// What every note's highlighter is loaded with. One pen for the whole
+    /// desk: picking a colour in one note is picking it everywhere.
+    #[serde(default)]
+    pub highlight_color: HighlightColor,
     #[serde(default = "default_font_size")]
     pub font_size: i32,
     #[serde(default)]
@@ -141,6 +145,7 @@ impl Default for Settings {
             usage_source: default_usage_source(),
             usage_period: default_usage_period(),
             color_mode: ColorMode::default(),
+            highlight_color: HighlightColor::default(),
             font_size: default_font_size(),
             system_details: SystemDetails::default(),
         }
@@ -210,6 +215,76 @@ pub struct NoteImage {
     pub height: i32,
 }
 
+/// What a highlighter can be loaded with. Four is enough to sort one note's
+/// ideas apart and few enough that the menu stays one glance tall.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HighlightColor {
+    #[default]
+    Yellow,
+    Green,
+    Pink,
+    Blue,
+}
+
+impl HighlightColor {
+    pub const ALL: [Self; 4] = [Self::Yellow, Self::Green, Self::Pink, Self::Blue];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Yellow => "YELLOW",
+            Self::Green => "GREEN",
+            Self::Pink => "PINK",
+            Self::Blue => "BLUE",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Yellow => "yellow",
+            Self::Green => "green",
+            Self::Pink => "pink",
+            Self::Blue => "blue",
+        }
+    }
+
+    /// The wash itself. Translucent on purpose: the note's own background
+    /// shows through, so one set of colours reads on LIGHT, DARK and INVERT
+    /// alike and nothing has to be repainted when a note changes mode.
+    pub fn rgba(self) -> (f64, f64, f64, f64) {
+        match self {
+            Self::Yellow => (0.98, 0.78, 0.20, 0.42),
+            Self::Green => (0.36, 0.82, 0.44, 0.40),
+            Self::Pink => (0.96, 0.44, 0.70, 0.38),
+            Self::Blue => (0.36, 0.66, 0.98, 0.40),
+        }
+    }
+
+    /// The same colour with the wash taken off, for the dot beside a menu row.
+    /// At 40% alpha over an unknown menu background a swatch reads as grey.
+    pub fn swatch(self) -> &'static str {
+        match self {
+            Self::Yellow => "#e8b41f",
+            Self::Green => "#3fbf5f",
+            Self::Pink => "#ea5f9e",
+            Self::Blue => "#4aa3f5",
+        }
+    }
+}
+
+/// One stretch of highlighted text, in characters from the start of the note.
+///
+/// The offsets are never maintained by hand: GTK moves a tag with the text it
+/// covers, so these are read back out of the buffer when the note is saved and
+/// applied again when it is opened.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NoteHighlight {
+    pub start: i32,
+    pub end: i32,
+    #[serde(default)]
+    pub color: HighlightColor,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Note {
     pub id: u64,
@@ -220,6 +295,8 @@ pub struct Note {
     pub position: Point,
     #[serde(default)]
     pub images: Vec<NoteImage>,
+    #[serde(default)]
+    pub highlights: Vec<NoteHighlight>,
 }
 
 /// One dictionary window. The queries it has shown are kept with it so that

@@ -1,8 +1,8 @@
 use crate::{
     platform,
     state::{
-        AppState, ColorMode, DictionaryWindow, Note, NoteImage, Point, Size, SystemDetails,
-        TimerStyle, IMAGE_PLACEHOLDER,
+        AppState, ColorMode, DictionaryWindow, HighlightColor, Note, NoteHighlight, NoteImage,
+        Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER,
     },
     system::{NetworkRates, SystemReadOptions, SystemReader, SystemSnapshot, Usage},
     translate,
@@ -900,6 +900,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         Some(system_preview.clone()),
         None,
         None,
+        None,
     );
     attach_drag(
         &system_card.drag,
@@ -992,6 +993,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         None,
         None,
         None,
+        None,
     );
     attach_drag(
         &timer_card.drag,
@@ -1042,6 +1044,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
+        None,
         None,
         None,
         None,
@@ -1102,6 +1105,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         None,
         Some(lookup_actions.clone()),
         Some(history_row_menu),
+        None,
     );
     attach_drag(
         &history.header,
@@ -1175,6 +1179,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
+        None,
         None,
         None,
         None,
@@ -1870,6 +1875,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 pinned: true,
                 position,
                 images: Vec::new(),
+                highlights: Vec::new(),
             });
             let _ = data.save();
             drop(data);
@@ -5239,6 +5245,7 @@ struct ImageResize {
 struct NoteSnapshot {
     text: String,
     images: Vec<NoteImage>,
+    highlights: Vec<NoteHighlight>,
     cursor: i32,
     size: Size,
 }
@@ -5693,6 +5700,163 @@ fn note_buffer_text(buffer: &gtk::TextBuffer) -> String {
         .unwrap_or_default()
 }
 
+/// The four pens one note's buffer carries. A tag rather than anything the
+/// note stores by hand: GTK keeps a tag over the same words as the text around
+/// it is edited, so nothing here ever has to shift an offset.
+#[derive(Clone)]
+struct HighlightTags(Rc<Vec<(HighlightColor, gtk::TextTag)>>);
+
+impl HighlightTags {
+    fn install(buffer: &gtk::TextBuffer) -> Self {
+        let table = buffer.tag_table();
+        let tags = HighlightColor::ALL
+            .into_iter()
+            .map(|color| {
+                let tag = gtk::TextTag::new(Some(&format!("sysi-note-highlight-{}", color.key())));
+                let (red, green, blue, alpha) = color.rgba();
+                tag.set_background_rgba(Some(&gdk::RGBA::new(red, green, blue, alpha)));
+                if let Some(table) = table.as_ref() {
+                    table.add(&tag);
+                }
+                (color, tag)
+            })
+            .collect();
+        Self(Rc::new(tags))
+    }
+
+    /// Lay down one colour over a range, taking the other three off it first.
+    /// The pen paints; it never toggles, so drawing over an existing stretch
+    /// recolours it rather than rubbing it out.
+    fn apply(&self, buffer: &gtk::TextBuffer, range: (i32, i32), color: HighlightColor) {
+        let (start, end) = (
+            buffer.iter_at_offset(range.0.min(range.1)),
+            buffer.iter_at_offset(range.0.max(range.1)),
+        );
+        for (candidate, tag) in self.0.iter() {
+            if *candidate == color {
+                buffer.apply_tag(tag, &start, &end);
+            } else {
+                buffer.remove_tag(tag, &start, &end);
+            }
+        }
+    }
+
+    fn clear(&self, buffer: &gtk::TextBuffer, range: (i32, i32)) {
+        let (start, end) = (
+            buffer.iter_at_offset(range.0.min(range.1)),
+            buffer.iter_at_offset(range.0.max(range.1)),
+        );
+        for (_, tag) in self.0.iter() {
+            buffer.remove_tag(tag, &start, &end);
+        }
+    }
+
+    /// Every stretch currently painted, in the order they appear. Walked by
+    /// tag toggle rather than character by character, so a long note costs the
+    /// number of stretches it has and not its length.
+    fn read(&self, buffer: &gtk::TextBuffer) -> Vec<NoteHighlight> {
+        let last = buffer.end_iter().offset();
+        let mut found = Vec::new();
+        for (color, tag) in self.0.iter() {
+            let mut iter = buffer.start_iter();
+            loop {
+                if !iter.starts_tag(Some(tag)) && !iter.forward_to_tag_toggle(Some(tag)) {
+                    break;
+                }
+                if !iter.starts_tag(Some(tag)) {
+                    continue;
+                }
+                let start = iter.offset();
+                let end = if iter.forward_to_tag_toggle(Some(tag)) {
+                    iter.offset()
+                } else {
+                    last
+                };
+                found.push(NoteHighlight {
+                    start,
+                    end,
+                    color: *color,
+                });
+                if end >= last {
+                    break;
+                }
+            }
+        }
+        found.sort_by_key(|highlight| (highlight.start, highlight.end));
+        found
+    }
+
+    fn fill(&self, buffer: &gtk::TextBuffer, highlights: &[NoteHighlight]) {
+        let (start, end) = buffer.bounds();
+        for (_, tag) in self.0.iter() {
+            buffer.remove_tag(tag, &start, &end);
+        }
+        for highlight in sanitize_highlights(highlights, buffer.char_count()) {
+            self.apply(buffer, (highlight.start, highlight.end), highlight.color);
+        }
+    }
+}
+
+/// What a right-click found to work with: the stretch it landed in, and the
+/// words that were selected when it happened.
+#[derive(Clone, Copy, Default)]
+struct HighlightTarget {
+    run: Option<NoteHighlight>,
+    selection: Option<(i32, i32)>,
+}
+
+impl HighlightTarget {
+    fn is_empty(self) -> bool {
+        self.run.is_none() && self.selection.is_none()
+    }
+}
+
+/// One change to a note's highlighting, bracketed by the snapshots that make it
+/// undoable.
+type HighlightEdit = Rc<dyn Fn(&dyn Fn(&gtk::TextBuffer))>;
+
+/// What a note's right-click menu can do to the words under the pointer. Only
+/// notes hand this over; every other widget's menu leaves it out, so nothing
+/// else on the desk grows a highlighter.
+#[derive(Clone)]
+struct HighlightMenu {
+    /// Resolves a click, in the card's coordinates, into what to offer for it.
+    resolve: Rc<dyn Fn(f64, f64) -> HighlightTarget>,
+    /// Paints the stretch under the pointer, or the selection when the click
+    /// landed outside one.
+    paint: Rc<dyn Fn(HighlightTarget, HighlightColor)>,
+    remove: Rc<dyn Fn(HighlightTarget)>,
+    /// What the pen is loaded with, read when the menu opens.
+    color: Rc<dyn Fn() -> HighlightColor>,
+}
+
+/// Ranges that describe text the note no longer has are dropped rather than
+/// applied: a state file can outlive the words it was written about.
+fn sanitize_highlights(highlights: &[NoteHighlight], char_count: i32) -> Vec<NoteHighlight> {
+    highlights
+        .iter()
+        .filter_map(|highlight| {
+            let start = highlight.start.clamp(0, char_count);
+            let end = highlight.end.clamp(0, char_count);
+            (end > start).then_some(NoteHighlight {
+                start,
+                end,
+                color: highlight.color,
+            })
+        })
+        .collect()
+}
+
+/// The stretch a click landed in, which is what the right-click menu offers to
+/// remove or recolour. The end offset is one past the last character covered,
+/// so a caret resting there is outside the stretch.
+fn highlight_at(highlights: &[NoteHighlight], offset: i32) -> Option<NoteHighlight> {
+    highlights
+        .iter()
+        .find(|highlight| offset >= highlight.start && offset < highlight.end)
+        .copied()
+}
+
 // The image metadata behind those placeholders, in the same order. A pixbuf
 // with no file behind it — an image copied from another note, or pasted by a
 // path that bypassed the paste handler — is written out here, so it survives
@@ -5736,6 +5900,7 @@ fn note_snapshot(
 ) -> NoteSnapshot {
     let text = note_buffer_text(buffer);
     let images = note_buffer_images(buffer, &text, state);
+    let highlights = target.highlights.read(buffer);
     let cursor = buffer
         .get_insert()
         .map(|mark| buffer.iter_at_mark(&mark).offset())
@@ -5753,6 +5918,7 @@ fn note_snapshot(
     NoteSnapshot {
         text,
         images,
+        highlights,
         cursor,
         size,
     }
@@ -5761,7 +5927,11 @@ fn note_snapshot(
 fn record_note_undo(history: &NoteUndoState, before: NoteSnapshot, after: &NoteSnapshot) {
     // Moving the caret is navigation, not an edit. The saved cursor still
     // matters when the snapshot is restored, but does not create an undo step.
-    if before.text == after.text && before.images == after.images && before.size == after.size {
+    if before.text == after.text
+        && before.images == after.images
+        && before.highlights == after.highlights
+        && before.size == after.size
+    {
         return;
     }
     let mut history = history.borrow_mut();
@@ -5797,8 +5967,14 @@ fn fill_note_content(
     }
 }
 
-fn fill_note_buffer(buffer: &gtk::TextBuffer, note: &Note, originals: &ImageOriginals) {
+fn fill_note_buffer(
+    buffer: &gtk::TextBuffer,
+    note: &Note,
+    originals: &ImageOriginals,
+    highlights: &HighlightTags,
+) {
     fill_note_content(buffer, &note.text, &note.images, originals);
+    highlights.fill(buffer, &note.highlights);
 }
 
 // Where the image at `offset` is drawn, in widget coordinates — the same space
@@ -6047,6 +6223,11 @@ fn paste_note_image(
 // and the shape to refresh once it has.
 struct NoteImageTarget {
     card: gtk::EventBox,
+    highlights: HighlightTags,
+    /// Whether this note's highlighter is down. Per note and never saved: a
+    /// pen left out is not something to find still out tomorrow.
+    pen_on: Rc<Cell<bool>>,
+    id: u64,
     key: String,
     registry: Rc<RefCell<Vec<RegisteredWidget>>>,
     window: gtk::ApplicationWindow,
@@ -6072,6 +6253,8 @@ fn apply_note_snapshot(
         .sizes
         .insert(target.key.clone(), snapshot.size);
     fill_note_content(&buffer, &snapshot.text, &snapshot.images, originals);
+    target.highlights.fill(&buffer, &snapshot.highlights);
+    store_note_highlights(&buffer, target, state);
     let cursor = snapshot.cursor.clamp(0, buffer.char_count());
     buffer.place_cursor(&buffer.iter_at_offset(cursor));
     // Buffer change handlers have synchronously copied the restored content
@@ -6553,7 +6736,7 @@ fn attach_note_images(
     editor: &gtk::TextView,
     target: NoteImageTarget,
     state: &Rc<RefCell<AppState>>,
-) -> ImageOriginals {
+) -> (ImageOriginals, HighlightMenu) {
     let target = Rc::new(target);
     let originals: ImageOriginals = Rc::new(RefCell::new(HashMap::new()));
     let focus: ImageFocus = Rc::new(RefCell::new(None));
@@ -6901,7 +7084,141 @@ fn attach_note_images(
         }
     });
 
-    originals
+    // The pen paints on release: until the drag that picks the words is over
+    // there is nothing to paint. Painting is an edit like any other, so it is
+    // bracketed by snapshots and can be taken back.
+    editor.connect_button_release_event({
+        let target = target.clone();
+        let state = state.clone();
+        let undo = undo.clone();
+        move |editor, event| {
+            if event.button() != 1 || !target.pen_on.get() {
+                return glib::Propagation::Proceed;
+            }
+            let Some(buffer) = editor.buffer() else {
+                return glib::Propagation::Proceed;
+            };
+            let Some((start, end)) = buffer.selection_bounds() else {
+                return glib::Propagation::Proceed;
+            };
+            let before = note_snapshot(&buffer, &target, &state);
+            let color = state.borrow().settings.highlight_color;
+            target
+                .highlights
+                .apply(&buffer, (start.offset(), end.offset()), color);
+            store_note_highlights(&buffer, &target, &state);
+            let _ = state.borrow().save();
+            let after = note_snapshot(&buffer, &target, &state);
+            record_note_undo(&undo, before, &after);
+            glib::Propagation::Proceed
+        }
+    });
+
+    let highlight_menu = build_highlight_menu_actions(editor, &target, state, &undo);
+
+    (originals, highlight_menu)
+}
+
+/// Write the stretches down where the note is kept. Painting never reaches the
+/// buffer's own change handler: a tag is not a text change.
+fn store_note_highlights(
+    buffer: &gtk::TextBuffer,
+    target: &NoteImageTarget,
+    state: &Rc<RefCell<AppState>>,
+) {
+    let highlights = target.highlights.read(buffer);
+    if let Some(note) = state
+        .borrow_mut()
+        .notes
+        .iter_mut()
+        .find(|note| note.id == target.id)
+    {
+        note.highlights = highlights;
+    }
+}
+
+/// The three things the right-click menu asks of a note: what is under the
+/// pointer, paint it, and take the paint off.
+fn build_highlight_menu_actions(
+    editor: &gtk::TextView,
+    target: &Rc<NoteImageTarget>,
+    state: &Rc<RefCell<AppState>>,
+    undo: &NoteUndoState,
+) -> HighlightMenu {
+    // One place does the work for every entry point, so a stretch painted from
+    // the menu is saved and undone exactly like one painted with the pen.
+    let edit: HighlightEdit = {
+        let editor = editor.clone();
+        let target = target.clone();
+        let state = state.clone();
+        let undo = undo.clone();
+        Rc::new(move |change: &dyn Fn(&gtk::TextBuffer)| {
+            let Some(buffer) = editor.buffer() else {
+                return;
+            };
+            let before = note_snapshot(&buffer, &target, &state);
+            change(&buffer);
+            store_note_highlights(&buffer, &target, &state);
+            let _ = state.borrow().save();
+            let after = note_snapshot(&buffer, &target, &state);
+            record_note_undo(&undo, before, &after);
+        })
+    };
+
+    HighlightMenu {
+        resolve: {
+            let editor = editor.clone();
+            let target = target.clone();
+            Rc::new(move |x: f64, y: f64| {
+                let Some(buffer) = editor.buffer() else {
+                    return HighlightTarget::default();
+                };
+                let selection = buffer
+                    .selection_bounds()
+                    .map(|(start, end)| (start.offset(), end.offset()));
+                // The menu's gesture reports the click in the card's own
+                // coordinates; the stretch it landed in is a buffer offset.
+                let run = target
+                    .card
+                    .translate_coordinates(&editor, x as i32, y as i32)
+                    .map(|(ex, ey)| {
+                        editor.window_to_buffer_coords(gtk::TextWindowType::Widget, ex, ey)
+                    })
+                    .and_then(|(bx, by)| editor.iter_at_location(bx, by))
+                    .and_then(|iter| highlight_at(&target.highlights.read(&buffer), iter.offset()));
+                HighlightTarget { run, selection }
+            })
+        },
+        paint: {
+            let edit = edit.clone();
+            let target = target.clone();
+            Rc::new(move |what: HighlightTarget, color: HighlightColor| {
+                // A click inside a stretch is about that stretch, whatever is
+                // selected elsewhere in the note.
+                let Some(range) = what.run.map(|run| (run.start, run.end)).or(what.selection)
+                else {
+                    return;
+                };
+                let target = target.clone();
+                edit(&move |buffer| target.highlights.apply(buffer, range, color));
+            })
+        },
+        remove: {
+            let edit = edit.clone();
+            let target = target.clone();
+            Rc::new(move |what: HighlightTarget| {
+                let Some(run) = what.run else {
+                    return;
+                };
+                let target = target.clone();
+                edit(&move |buffer| target.highlights.clear(buffer, (run.start, run.end)));
+            })
+        },
+        color: {
+            let state = state.clone();
+            Rc::new(move || state.borrow().settings.highlight_color)
+        },
+    }
 }
 
 fn rebuild_pinned_notes(
@@ -6970,8 +7287,11 @@ fn rebuild_pinned_notes(
         unpin.style_context().add_class("note-hide");
         unpin.set_tooltip_text(Some("Move to History"));
         let search_toggle = icon_button("edit-find-symbolic", "Find in note (Ctrl+F)");
+        let pen_on = Rc::new(Cell::new(false));
+        let pen_toggle = icon_button("document-edit-symbolic", "Highlighter");
         header.pack_start(&unpin, false, false, 0);
         header.pack_end(&search_toggle, false, false, 0);
+        header.pack_end(&pen_toggle, false, false, 0);
         header_drag.add(&header);
         body.pack_start(&header_drag, false, false, 0);
 
@@ -7074,17 +7394,6 @@ fn rebuild_pinned_notes(
             item.editor = Some(editor.clone());
             item.note_search = Some(note_search);
         }
-        attach_color_mode_menu(
-            &card,
-            key.clone(),
-            state.clone(),
-            registry.clone(),
-            interactive.clone(),
-            None,
-            None,
-            Some(lookup.clone()),
-            None,
-        );
         attach_drag(
             &header_drag,
             &card,
@@ -7099,7 +7408,7 @@ fn rebuild_pinned_notes(
             &resize,
             &card,
             root,
-            key,
+            key.clone(),
             state.clone(),
             registry.clone(),
             interactive.clone(),
@@ -7115,13 +7424,20 @@ fn rebuild_pinned_notes(
             },
         );
 
+        // The pens are installed before the buffer is filled, so the stretches
+        // saved with the note have tags to be painted with.
+        let highlight_tags = HighlightTags::install(&editor.buffer().expect("note buffer"));
+
         // Attached after the card is registered and sized, so a paste can grow
         // the note and refresh the input shape for it. Filling the buffer here,
         // before the change handler below, keeps the load out of the save path.
-        let image_originals = attach_note_images(
+        let (image_originals, highlight_menu) = attach_note_images(
             &editor,
             NoteImageTarget {
                 card: card.clone(),
+                highlights: highlight_tags.clone(),
+                pen_on: pen_on.clone(),
+                id: note.id,
                 key: format!("note:{}", note.id),
                 registry: registry.clone(),
                 window: window.clone(),
@@ -7133,21 +7449,40 @@ fn rebuild_pinned_notes(
             &editor.buffer().expect("note buffer"),
             &note,
             &image_originals,
+            &highlight_tags,
+        );
+        attach_highlight_button(&pen_toggle, &pen_on, &state);
+        attach_color_mode_menu(
+            &card,
+            key.clone(),
+            state.clone(),
+            registry.clone(),
+            interactive.clone(),
+            None,
+            None,
+            Some(lookup.clone()),
+            None,
+            Some(highlight_menu.clone()),
         );
 
         let pending_save: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         editor.buffer().expect("note buffer").connect_changed({
             let state = state.clone();
             let pending_save = pending_save.clone();
+            let highlight_tags = highlight_tags.clone();
             let id = note.id;
             move |buffer| {
                 let text = note_buffer_text(buffer);
                 // Resolved before the note is borrowed: adopting an untagged
                 // pixbuf writes a file and bumps the image counter in state.
                 let images = note_buffer_images(buffer, &text, &state);
+                // GTK has already moved every tag along with the text it
+                // covers; this is where those new offsets are written down.
+                let highlights = highlight_tags.read(buffer);
                 if let Some(note) = state.borrow_mut().notes.iter_mut().find(|n| n.id == id) {
                     note.text = text;
                     note.images = images;
+                    note.highlights = highlights;
                 }
                 if let Some(source) = pending_save.borrow_mut().take() {
                     source.remove();
@@ -8150,6 +8485,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
                 header: translate.header.clone(),
             }),
         }),
+        None,
         None,
     );
 
@@ -9488,8 +9824,39 @@ fn attach_color_mode_menu(
     // Pops a menu for whatever the click landed on inside the widget, and says
     // whether it did. Only the history window has one (its note rows).
     row_menu: Option<Rc<dyn Fn() -> bool>>,
+    // The highlighter, which only a note is given.
+    highlight: Option<HighlightMenu>,
 ) {
     let menu = context_menu();
+
+    // Highlighting sits above everything, LOOK UP included: it acts on the
+    // words the click landed on rather than on the widget, and it is usually
+    // the reason the menu was opened at all. Two rows rather than one, because
+    // a GTK row that owns a submenu opens it on click instead of acting.
+    let painted: Rc<Cell<HighlightTarget>> = Rc::new(Cell::new(HighlightTarget::default()));
+    let highlight_rows = highlight.as_ref().map(|actions| {
+        let paint_row = highlight_row("HIGHLIGHT", None, false);
+        paint_row.connect_activate({
+            let actions = actions.clone();
+            let painted = painted.clone();
+            move |_| {
+                let what = painted.get();
+                // The row is REMOVE whenever the click landed inside a
+                // stretch, so this is the same button in both states.
+                if what.run.is_some() {
+                    (actions.remove)(what);
+                } else {
+                    (actions.paint)(what, (actions.color)());
+                }
+            }
+        });
+        let color_row = highlight_row("COLOR", None, false);
+        let separator = gtk::SeparatorMenuItem::new();
+        menu.append(&paint_row);
+        menu.append(&color_row);
+        menu.append(&separator);
+        (paint_row, color_row, separator)
+    });
 
     // Looking up the selection sits at the top, above the colour modes: it is
     // the one item that acts on what the user just highlighted rather than on
@@ -9726,6 +10093,34 @@ fn attach_color_mode_menu(
             if row_menu() {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 return;
+            }
+        }
+        if let (Some(actions), Some((paint_row, color_row, separator))) =
+            (&highlight, &highlight_rows)
+        {
+            let what = (actions.resolve)(x, y);
+            painted.set(what);
+            let offer = !what.is_empty();
+            paint_row.set_visible(offer);
+            color_row.set_visible(offer);
+            separator.set_visible(offer);
+            if offer {
+                let pen = (actions.color)();
+                // A click inside a stretch offers to take that stretch off and
+                // shows the colour it is in; anywhere else it offers to paint
+                // the selection in whatever the pen is holding.
+                match what.run {
+                    Some(run) => set_highlight_row(paint_row, "REMOVE", Some(run.color), false),
+                    None => set_highlight_row(paint_row, "HIGHLIGHT", Some(pen), false),
+                }
+                let chosen = what.run.map_or(pen, |run| run.color);
+                set_highlight_row(color_row, "COLOR", Some(chosen), false);
+                let pick: Rc<dyn Fn(HighlightColor)> = {
+                    let actions = actions.clone();
+                    let painted = painted.clone();
+                    Rc::new(move |color| (actions.paint)(painted.get(), color))
+                };
+                color_row.set_submenu(Some(&highlight_color_menu(chosen, pick)));
             }
         }
         color_item.set_label(saved_color_mode(&state.borrow(), &key).next().label());
@@ -12383,6 +12778,112 @@ fn nav_button(icon_name: &str, tooltip: &str) -> gtk::Button {
     button
 }
 
+/// A menu row carrying a dot in the colour it is about. The dot is a character
+/// coloured by markup rather than an icon, so it follows the menu's own font
+/// and asks nothing of the icon theme.
+fn highlight_row(label: &str, color: Option<HighlightColor>, ticked: bool) -> gtk::MenuItem {
+    let item = gtk::MenuItem::new();
+    let text = gtk::Label::new(None);
+    text.set_xalign(0.0);
+    item.add(&text);
+    set_highlight_row(&item, label, color, ticked);
+    item
+}
+
+fn set_highlight_row(
+    item: &gtk::MenuItem,
+    label: &str,
+    color: Option<HighlightColor>,
+    ticked: bool,
+) {
+    let Some(text) = item
+        .child()
+        .and_then(|child| child.downcast::<gtk::Label>().ok())
+    else {
+        return;
+    };
+    // The swatch is the opaque form of the pen: at the wash's own alpha, over
+    // a menu background nobody owns, every colour reads as the same grey.
+    let dot = color.map_or(String::new(), |color| {
+        format!("<span foreground=\"{}\">\u{25cf}</span>  ", color.swatch())
+    });
+    let tick = if ticked { "  \u{2713}" } else { "" };
+    text.set_markup(&format!(
+        "{dot}{}{tick}",
+        glib::markup_escape_text(label).as_str()
+    ));
+}
+
+/// Fill a menu with one row per pen colour. `chosen` is ticked, and picking a
+/// row hands that colour back.
+fn highlight_color_menu(chosen: HighlightColor, pick: Rc<dyn Fn(HighlightColor)>) -> gtk::Menu {
+    let menu = context_menu();
+    for color in HighlightColor::ALL {
+        let row = highlight_row(color.label(), Some(color), color == chosen);
+        row.connect_activate({
+            let pick = pick.clone();
+            move |_| pick(color)
+        });
+        menu.append(&row);
+    }
+    menu.show_all();
+    menu
+}
+
+/// The highlighter's own menu, hung off the pen in a note's header: whether the
+/// pen is down, and what it is loaded with.
+fn attach_highlight_button(
+    button: &gtk::Button,
+    pen_on: &Rc<Cell<bool>>,
+    state: &Rc<RefCell<AppState>>,
+) {
+    let menu = context_menu();
+    let mode = gtk::CheckMenuItem::with_label("HIGHLIGHT MODE");
+    mode.connect_toggled({
+        let pen_on = pen_on.clone();
+        let button = button.clone();
+        move |item| {
+            pen_on.set(item.is_active());
+            let style = button.style_context();
+            if item.is_active() {
+                style.add_class("note-pen-on");
+            } else {
+                style.remove_class("note-pen-on");
+            }
+        }
+    });
+    menu.append(&mode);
+
+    let color_item = highlight_row("COLOR", None, false);
+    menu.append(&color_item);
+    menu.show_all();
+
+    // Rebuilt before every popup rather than kept in step: the pen is shared by
+    // every note, so the colour can have been changed from another one. The
+    // submenu is attached here and not from the menu's own show handler, where
+    // a row added mid-popup opens but never activates.
+    button.connect_clicked({
+        let state = state.clone();
+        let pen_on = pen_on.clone();
+        move |_| {
+            if mode.is_active() != pen_on.get() {
+                mode.set_active(pen_on.get());
+            }
+            let chosen = state.borrow().settings.highlight_color;
+            set_highlight_row(&color_item, "COLOR", Some(chosen), false);
+            let pick: Rc<dyn Fn(HighlightColor)> = {
+                let state = state.clone();
+                Rc::new(move |color| {
+                    state.borrow_mut().settings.highlight_color = color;
+                    let _ = state.borrow().save();
+                })
+            };
+            color_item.set_submenu(Some(&highlight_color_menu(chosen, pick)));
+            menu.popup_easy(0, gtk::current_event_time());
+        }
+    });
+}
+
 fn icon_button(icon_name: &str, tooltip: &str) -> gtk::Button {
     let button = gtk::Button::new();
     button.set_can_focus(false);
@@ -12503,25 +13004,26 @@ mod timer_input_tests {
     use super::{
         clamp_to_screens, clip_screen_to_overlay, covers, dictate_capture_answer,
         dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area, fit_within_bounds,
-        foreground_for_luminance, foreground_for_mode, format_rate, hold_clears_map, image_room,
-        image_room_after_y, invert_map, monitor_coordinate_divisor, monitor_root_bounds,
-        normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
-        note_size_for_image, padded_visual_rect, paint_inverted, palette_for_mode,
-        parse_panel_anchor, parse_timer_input, push_recent_search, receives_input_when_locked,
-        record_note_undo, relative_luminance, reopen_point, rescaled_from, resize_ceiling,
-        resize_width_limit, resized_image_size, room_on_screen, round_pixbuf_corners,
-        screen_in_overlay, shrink_to_budget, system_content_size, system_meter_columns,
-        system_meter_gap, system_meter_ink_width, system_meter_row_width, system_meter_rows,
-        system_meters, system_usage_rows, temperature_meter, timer_style_size, Foreground,
-        InvertMap, NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState,
-        ScreenRect, WidgetPalette, DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH,
-        INVERT_MAP_BUDGET, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
-        NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL,
-        SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN, SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS,
-        SYSTEM_METER_RING_STROKE,
+        foreground_for_luminance, foreground_for_mode, format_rate, highlight_at, hold_clears_map,
+        image_room, image_room_after_y, invert_map, monitor_coordinate_divisor,
+        monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
+        note_search_matches, note_size_for_image, padded_visual_rect, paint_inverted,
+        palette_for_mode, parse_panel_anchor, parse_timer_input, push_recent_search,
+        receives_input_when_locked, record_note_undo, relative_luminance, reopen_point,
+        rescaled_from, resize_ceiling, resize_width_limit, resized_image_size, room_on_screen,
+        round_pixbuf_corners, sanitize_highlights, screen_in_overlay, shrink_to_budget,
+        system_content_size, system_meter_columns, system_meter_gap, system_meter_ink_width,
+        system_meter_row_width, system_meter_rows, system_meters, system_usage_rows,
+        temperature_meter, timer_style_size, Foreground, InvertMap, NoteSearchMatch,
+        NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, WidgetPalette,
+        DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH, INVERT_MAP_BUDGET, NOTE_HEIGHT,
+        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
+        NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
+        SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
     };
     use crate::state::{
-        ColorMode, NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER,
+        ColorMode, HighlightColor, NoteHighlight, NoteImage, Point, Size, SystemDetails,
+        TimerStyle, IMAGE_PLACEHOLDER,
     };
     use crate::system::{SystemSnapshot, Usage};
     use gdk_pixbuf::{Colorspace, Pixbuf};
@@ -12889,6 +13391,50 @@ mod timer_input_tests {
     }
 
     #[test]
+    fn a_highlight_covers_its_first_character_but_not_the_one_it_ends_before() {
+        let run = |start, end, color| NoteHighlight { start, end, color };
+        let painted = [
+            run(4, 9, HighlightColor::Yellow),
+            run(20, 24, HighlightColor::Blue),
+        ];
+        // Inside, and on the first character the stretch covers.
+        assert_eq!(
+            highlight_at(&painted, 4).map(|found| found.color),
+            Some(HighlightColor::Yellow)
+        );
+        assert_eq!(
+            highlight_at(&painted, 8).map(|found| found.color),
+            Some(HighlightColor::Yellow)
+        );
+        // The end offset is one past the last character, so a caret resting
+        // there is outside the stretch rather than in it.
+        assert_eq!(highlight_at(&painted, 9), None);
+        assert_eq!(highlight_at(&painted, 3), None);
+        assert_eq!(
+            highlight_at(&painted, 23).map(|found| found.color),
+            Some(HighlightColor::Blue)
+        );
+        assert_eq!(highlight_at(&[], 0), None);
+    }
+
+    #[test]
+    fn stretches_are_trimmed_to_the_note_that_is_actually_there() {
+        let run = |start, end| NoteHighlight {
+            start,
+            end,
+            color: HighlightColor::Pink,
+        };
+        // A note that lost its tail keeps the part of the stretch it still has.
+        assert_eq!(sanitize_highlights(&[run(2, 40)], 10), vec![run(2, 10)]);
+        // Nothing left to paint, an empty range, and a range the wrong way
+        // round all drop out rather than being applied.
+        assert_eq!(sanitize_highlights(&[run(12, 40)], 10), vec![]);
+        assert_eq!(sanitize_highlights(&[run(5, 5)], 10), vec![]);
+        assert_eq!(sanitize_highlights(&[run(9, 4)], 10), vec![]);
+        assert_eq!(sanitize_highlights(&[run(-3, 4)], 10), vec![run(0, 4)]);
+    }
+
+    #[test]
     fn a_dictate_drag_selects_the_same_region_in_any_direction() {
         let expected = ScreenRect {
             x: 100,
@@ -13093,6 +13639,7 @@ mod timer_input_tests {
         let before = NoteSnapshot {
             text: "hello".into(),
             images: vec![],
+            highlights: vec![],
             cursor: 5,
             size: Size {
                 width: NOTE_WIDTH,
@@ -13106,6 +13653,7 @@ mod timer_input_tests {
                 width: 200,
                 height: 100,
             }],
+            highlights: vec![],
             cursor: 6,
             size: Size {
                 width: 224,

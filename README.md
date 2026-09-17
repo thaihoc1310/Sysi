@@ -33,6 +33,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 - Right-click the timer, then hover `STYLE` to preview `RING`, `DIGITAL`, `TICKS`, or `ARC`; click one to keep it.
 - HiDPI-aware placement: widgets stop below Ubuntu's top panel and stay inside the real bottom edge of the display.
 - Native HiDPI and multi-monitor placement, including 200% scaling.
+- A note's header carries a highlighter. Its menu puts the pen down and picks one of four colours; with the pen down, selecting words highlights them, and drawing over a stretch recolours it. With the pen up, select and right-click instead: the menu offers `HIGHLIGHT` above everything else, or `REMOVE` and a colour when the click landed inside a stretch. The wash is translucent, so one set of colours reads on `LIGHT`, `DARK` and `INVERT` alike, and the pen is shared by every note.
 - Persistent notes, positions, widget sizes, timer duration, and visibility settings.
 - Automatic startup through XDG Autostart.
 
