@@ -7196,7 +7196,7 @@ fn track_widget_hover(
                 .borrow()
                 .iter()
                 .any(|scroller| scroller.is_visible() && scroller.window().is_some());
-        if !hoverable {
+        if !hoverable || any_gesture_held(&registry) {
             return glib::ControlFlow::Continue;
         }
         let Some(device) = gdk::Display::default()
@@ -10612,7 +10612,25 @@ fn drag_frame_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= DRAG_REDRAW_INTERVAL)
 }
 
-fn move_overlay_card(
+fn overlay_card_rect(card: &gtk::EventBox, point: Point) -> ScreenRect {
+    let allocation = card.allocation();
+    ScreenRect {
+        x: point.x,
+        y: point.y,
+        width: allocation.width(),
+        height: allocation.height(),
+    }
+}
+
+/// Slide one overlay card without asking GtkFixed to relayout the desk.
+///
+/// `gtk_fixed_move` queue-resizes the whole overlay. That invalidates the
+/// desktop-sized RGBA window and every sibling, so a large note's TextView is
+/// relaid out on every pointer tick — and after a pause Xwayland drops those
+/// backing stores, which is why the same window is sometimes butter and
+/// sometimes frames behind the pointer until another, cheaper window has
+/// just been moved (and the stores filled again).
+fn slide_overlay_card(
     window: &gtk::ApplicationWindow,
     root: &gtk::Fixed,
     card: &gtk::EventBox,
@@ -10623,35 +10641,79 @@ fn move_overlay_card(
     if point.x == allocation.x() && point.y == allocation.y() {
         return;
     }
+    refresh_visual_shape(
+        window,
+        root,
+        Some((card_widget, overlay_card_rect(card, point))),
+    );
+    // Native-window cards keep their pixels; only the hole they leave on the
+    // overlay surface has to be cleared. Windowless cards paint on that
+    // surface, so both the old and new rectangles are damaged.
+    if card.has_window() {
+        if let Some(gdk_window) = card.window() {
+            gdk_window.move_(point.x, point.y);
+        }
+        root.queue_draw_area(
+            allocation.x() - 3,
+            allocation.y() - 3,
+            allocation.width() + 6,
+            allocation.height() + 6,
+        );
+    } else {
+        root.queue_draw_area(
+            allocation.x() - 3,
+            allocation.y() - 3,
+            allocation.width() + 6,
+            allocation.height() + 6,
+        );
+        root.queue_draw_area(
+            point.x - 3,
+            point.y - 3,
+            allocation.width() + 6,
+            allocation.height() + 6,
+        );
+    }
+    card.size_allocate(&gtk::Allocation::new(
+        point.x,
+        point.y,
+        allocation.width(),
+        allocation.height(),
+    ));
+}
+
+fn move_overlay_card(
+    window: &gtk::ApplicationWindow,
+    root: &gtk::Fixed,
+    card: &gtk::EventBox,
+    card_widget: &gtk::Widget,
+    point: Point,
+) {
+    let allocation = card.allocation();
     // Change the X11 bounding shape before painting at the new position.
     // Otherwise the old shape clips the first frame there and the card briefly
     // disappears while moving.
     refresh_visual_shape(
         window,
         root,
-        Some((
-            card_widget,
-            ScreenRect {
-                x: point.x,
-                y: point.y,
-                width: allocation.width(),
-                height: allocation.height(),
-            },
-        )),
+        Some((card_widget, overlay_card_rect(card, point))),
     );
-    root.queue_draw_area(
-        allocation.x() - 3,
-        allocation.y() - 3,
-        allocation.width() + 6,
-        allocation.height() + 6,
-    );
+    if point.x != allocation.x() || point.y != allocation.y() {
+        root.queue_draw_area(
+            allocation.x() - 3,
+            allocation.y() - 3,
+            allocation.width() + 6,
+            allocation.height() + 6,
+        );
+        root.queue_draw_area(
+            point.x - 3,
+            point.y - 3,
+            allocation.width() + 6,
+            allocation.height() + 6,
+        );
+    }
+    // Always tell GtkFixed, even when the allocation already matches: a drag
+    // slides the GdkWindow first and only commits the child x/y here.
     root.move_(card, point.x, point.y);
-    root.queue_draw_area(
-        point.x - 3,
-        point.y - 3,
-        allocation.width() + 6,
-        allocation.height() + 6,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10741,7 +10803,7 @@ fn attach_drag(
                     allocation.height(),
                     &screens,
                 );
-                move_overlay_card(&window, &root, &card, &card_widget, point);
+                slide_overlay_card(&window, &root, &card, &card_widget, point);
             }
         }
     });
