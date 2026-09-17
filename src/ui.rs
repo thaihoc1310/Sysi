@@ -8,7 +8,7 @@ use crate::{
     translate,
     usage::{self, Source as UsageSource},
 };
-use cairo::{Context, Filter, FontSlant, FontWeight, RectangleInt, Region};
+use cairo::{Context, Filter, FontSlant, FontWeight, Operator, RectangleInt, Region};
 use gdk::prelude::*;
 use gdk_pixbuf::{InterpType, Pixbuf};
 use gtk::prelude::*;
@@ -1943,6 +1943,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         move |_| toggle_action()
     });
 
+    let dictate = install_dictate(&window, &root, &registry, &interactive);
+
     let dispatch_panel_action: Rc<dyn Fn()> = {
         let system = widget_picker.system.clone();
         let timer = widget_picker.timer.clone();
@@ -1958,6 +1960,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let state = state.clone();
         let registry = registry.clone();
         let system_preview = system_preview.clone();
+        let dictate_start = dictate.start.clone();
         Rc::new(move || {
             for action in take_panel_actions() {
                 // Held only for as long as the action runs, so a widget opened
@@ -1997,6 +2000,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         }
                         toggle_translate();
                     }
+                    // Dictate needs no edit chrome, so unlike a note or a
+                    // dictionary it runs the same in lock mode.
+                    "dictate" => dictate_start(),
                     "quit" => quit.clicked(),
                     _ => {}
                 }
@@ -2013,8 +2019,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let history_card = history.card.clone();
         let close_history_search = close_history_search.clone();
         let translate_close_search = translate_close_search.clone();
+        let dictate_cancel = dictate.cancel.clone();
         move |_, event| {
             if event.keyval() == gdk::keys::constants::Escape {
+                // A selection covers everything, so it is what Escape means
+                // while one is up -- if the key reaches the overlay at all,
+                // which it does not while a Wayland window holds the focus.
+                if dictate_cancel() {
+                    return glib::Propagation::Stop;
+                }
                 let open_note_search = registry
                     .borrow()
                     .iter()
@@ -11074,6 +11087,595 @@ fn refresh_visual_shape(
     LAST_VISUAL_SHAPE.with(|last| *last.borrow_mut() = Some(parts));
 }
 
+/// Below this a drag is a misfire rather than a region: a click that shifted a
+/// pixel under the button should cancel, not put a sliver through the OCR.
+const DICTATE_MIN_SIDE: i32 = 8;
+/// Both language packs have to be installed for this to load. tesseract fails
+/// outright rather than falling back to the one it does have, which is why a
+/// non-zero exit has to be reported as its own outcome.
+const DICTATE_LANGUAGES: &str = "eng+vie";
+const DICTATE_DIM_ALPHA: f64 = 0.35;
+const DICTATE_CHIP_TEXT: f64 = 11.0;
+const DICTATE_CHIP_PADDING: f64 = 8.0;
+/// How long the compositor is given to answer with a picture. The grab itself
+/// costs a frame; the rest is slack for a shell that is busy elsewhere.
+const DICTATE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
+const DICTATE_POLL_INTERVAL: Duration = Duration::from_millis(80);
+/// Long enough to read three words, short enough to stay out of the way.
+const DICTATE_MESSAGE_LINGER: Duration = Duration::from_millis(900);
+/// An X11 readback of the root window sees Sysi's own dimming, so the grab
+/// waits for the layer to have left the screen rather than photographing it.
+const DICTATE_X11_SETTLE: Duration = Duration::from_millis(60);
+
+enum DictateView {
+    /// The desk is dimmed, waiting for a drag; `Some` once one is under way.
+    Selecting(Option<(Point, Point)>),
+    /// The drag is over: no dim any more, just a word about what came of it.
+    Message(String, ScreenRect),
+}
+
+/// What a run has to say for itself and where on the desk to say it, or
+/// nothing at all when the selection was called off.
+type DictateFinish = Rc<dyn Fn(Option<(String, ScreenRect)>)>;
+
+struct Dictate {
+    start: Rc<dyn Fn()>,
+    /// Whether there was a selection to call off. Escape only reaches this
+    /// after everything else has turned it down.
+    cancel: Rc<dyn Fn() -> bool>,
+}
+
+thread_local! {
+    /// Whether the whole desk is currently taking pointer input for a dictate
+    /// selection. A flag rather than an argument: `refresh_input_shape` is
+    /// called from three dozen places that know nothing about this.
+    static DICTATE_SHAPE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Normalise a drag into the region it selected, in whichever direction it was
+/// made. `None` for anything too small to have been meant.
+fn dictate_rect_from_drag(start: Point, end: Point) -> Option<ScreenRect> {
+    let width = (end.x - start.x).abs();
+    let height = (end.y - start.y).abs();
+    (width >= DICTATE_MIN_SIDE && height >= DICTATE_MIN_SIDE).then_some(ScreenRect {
+        x: start.x.min(end.x),
+        y: start.y.min(end.y),
+        width,
+        height,
+    })
+}
+
+/// Wall-clock milliseconds, not a counter: a result file left behind by the
+/// previous run of the overlay must not answer this run's first question.
+fn dictate_nonce() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+fn sysi_runtime_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|runtime| std::path::PathBuf::from(runtime).join("sysi"))
+        .unwrap_or_else(crate::state::cache_dir)
+}
+
+/// Ask the compositor for a photograph of one rectangle of the desk. Its own
+/// file rather than the auto-colour request, which is rewritten on every
+/// sampling pass and would scrub a pending region away before the grab.
+fn publish_dictate_request(nonce: u64, rect: ScreenRect) {
+    let dir = crate::state::cache_dir();
+    let request = format!(
+        "{nonce}\t{},{},{},{}\n",
+        rect.x, rect.y, rect.width, rect.height
+    );
+    if let Err(error) =
+        fs::create_dir_all(&dir).and_then(|_| fs::write(dir.join("dictate-request"), request))
+    {
+        eprintln!("Could not ask for a Sysi dictate capture: {error}");
+    }
+}
+
+fn dictate_capture_path(nonce: u64) -> Option<std::path::PathBuf> {
+    let mut roots = vec![crate::state::cache_dir()];
+    roots.push(sysi_runtime_dir());
+    dictate_capture_answer(&fresh_cache_file("dictate-result"), nonce, &roots)
+}
+
+/// The picture the extension took for `nonce`, or nothing while the file still
+/// answers an older question.
+fn dictate_capture_answer(
+    raw: &str,
+    nonce: u64,
+    roots: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    raw.lines().find_map(|line| {
+        let (answered, path) = line.split_once('\t')?;
+        if answered.trim().parse::<u64>().ok()? != nonce {
+            return None;
+        }
+        let path = std::path::PathBuf::from(path.trim());
+        // Only ever open a file the extension put in one of our own
+        // directories. `starts_with` compares whole components and does not
+        // resolve `..`, so the path has to be free of parent hops before its
+        // prefix means anything.
+        let inside = !path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+            && roots.iter().any(|root| path.starts_with(root));
+        inside.then_some(path)
+    })
+}
+
+/// Read the text off one picture. The binary is only a `Recommends` of the
+/// package, so "not installed" is an outcome the overlay has to be able to say
+/// out loud rather than something to log and forget.
+fn dictate_ocr(path: &std::path::Path) -> Result<String, String> {
+    let output = match std::process::Command::new("tesseract")
+        .arg(path)
+        .arg("stdout")
+        .arg("-l")
+        .arg(DICTATE_LANGUAGES)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err("INSTALL tesseract-ocr".to_owned())
+        }
+        Err(error) => {
+            eprintln!("Could not run tesseract: {error}");
+            return Err("OCR ERROR".to_owned());
+        }
+    };
+    if !output.status.success() {
+        // A missing vie.traineddata looks exactly like this: the binary is
+        // there, the language is not. Folding it into "no text" would send the
+        // user back to squint at the region they picked instead.
+        let complaint: String = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(200)
+            .collect();
+        eprintln!("tesseract could not read the region: {complaint}");
+        return Err("OCR ERROR".to_owned());
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if text.is_empty() {
+        Err("NO TEXT".to_owned())
+    } else {
+        Ok(text)
+    }
+}
+
+/// The one piece of chrome a selection has: its size while the drag is on, the
+/// outcome once it is over. It sits just above the region, or just inside it
+/// when the region is against the top of the desk.
+fn dictate_chip(ctx: &Context, text: &str, rect: ScreenRect, overlay: Size) {
+    ctx.select_font_face("Sans", FontSlant::Normal, FontWeight::Bold);
+    ctx.set_font_size(DICTATE_CHIP_TEXT);
+    let text_width = ctx
+        .text_extents(text)
+        .map(|extents| extents.x_advance())
+        .unwrap_or(0.0);
+    let width = text_width + 2.0 * DICTATE_CHIP_PADDING;
+    let height = DICTATE_CHIP_TEXT + DICTATE_CHIP_PADDING;
+    let x = (rect.x as f64).min(overlay.width as f64 - width).max(0.0);
+    let above = rect.y as f64 - height - 4.0;
+    let y = if above >= 0.0 {
+        above
+    } else {
+        (rect.y as f64 + 4.0).min((overlay.height as f64 - height).max(0.0))
+    };
+    token_bar_path(ctx, x, y, width, height);
+    ctx.set_source_rgba(0.0, 0.0, 0.0, 0.78);
+    let _ = ctx.fill();
+    center_text(
+        ctx,
+        x + width / 2.0,
+        y + height - DICTATE_CHIP_PADDING / 2.0 - 1.0,
+        text,
+        DICTATE_CHIP_TEXT,
+        FontWeight::Bold,
+        (1.0, 1.0, 1.0),
+    );
+}
+
+/// The desk-sized layer DICTATE drags its region out on, and the two handles
+/// the rest of the overlay needs on it.
+///
+/// It is deliberately not a registered widget: nothing about it is dragged,
+/// resized, coloured, font-scaled or remembered between runs.
+fn install_dictate(
+    window: &gtk::ApplicationWindow,
+    root: &gtk::Fixed,
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+    interactive: &Rc<Cell<bool>>,
+) -> Dictate {
+    let layer = gtk::DrawingArea::new();
+    layer.set_widget_name("dictate");
+    // show_all() on the overlay reveals every child it can find, and this one
+    // is only ever shown on purpose.
+    layer.set_no_show_all(true);
+    layer.add_events(
+        gdk::EventMask::BUTTON_PRESS_MASK
+            | gdk::EventMask::BUTTON_RELEASE_MASK
+            | gdk::EventMask::POINTER_MOTION_MASK,
+    );
+    root.put(&layer, 0, 0);
+    // The crosshair belongs to the layer's own window, so it arrives when the
+    // layer is shown and leaves with it. Nothing has to remember to put the
+    // pointer back the way it was.
+    layer.connect_realize(|layer| {
+        let Some(window) = layer.window() else {
+            return;
+        };
+        let crosshair = gdk::Cursor::for_display(&layer.display(), gdk::CursorType::Crosshair);
+        window.set_cursor(crosshair.as_ref());
+    });
+
+    let view: Rc<RefCell<Option<DictateView>>> = Rc::new(RefCell::new(None));
+    let busy = Rc::new(Cell::new(false));
+    let last_frame: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+
+    layer.connect_draw({
+        let view = view.clone();
+        move |area, ctx| {
+            let overlay = Size {
+                width: area.allocated_width(),
+                height: area.allocated_height(),
+            };
+            match view.borrow().as_ref() {
+                Some(DictateView::Selecting(drag)) => {
+                    ctx.set_source_rgba(0.0, 0.0, 0.0, DICTATE_DIM_ALPHA);
+                    ctx.rectangle(0.0, 0.0, overlay.width as f64, overlay.height as f64);
+                    let _ = ctx.fill();
+                    if let Some(rect) =
+                        drag.and_then(|(start, end)| dictate_rect_from_drag(start, end))
+                    {
+                        // Clear the dim out of the region so it is judged at
+                        // its own contrast -- and put the operator back before
+                        // the border, which would otherwise be cleared too.
+                        ctx.set_operator(Operator::Clear);
+                        ctx.rectangle(
+                            rect.x as f64,
+                            rect.y as f64,
+                            rect.width as f64,
+                            rect.height as f64,
+                        );
+                        let _ = ctx.fill();
+                        ctx.set_operator(Operator::Over);
+                        ctx.set_source_rgba(1.0, 1.0, 1.0, 0.85);
+                        ctx.set_line_width(1.0);
+                        ctx.rectangle(
+                            rect.x as f64 + 0.5,
+                            rect.y as f64 + 0.5,
+                            (rect.width - 1).max(0) as f64,
+                            (rect.height - 1).max(0) as f64,
+                        );
+                        let _ = ctx.stroke();
+                        dictate_chip(
+                            ctx,
+                            &format!("{} x {}", rect.width, rect.height),
+                            rect,
+                            overlay,
+                        );
+                    }
+                }
+                Some(DictateView::Message(text, rect)) => dictate_chip(ctx, text, *rect, overlay),
+                None => {}
+            }
+            glib::Propagation::Proceed
+        }
+    });
+
+    // Every way out of a selection comes through here: cancelled, too small,
+    // never photographed, never read, or read and copied. Anything that left
+    // the desk dimmed, the pointer a crosshair or the run marked busy would
+    // cost the user their next click, so there is one path rather than seven.
+    let finish: DictateFinish = {
+        let window = window.clone();
+        let root = root.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let layer = layer.clone();
+        let view = view.clone();
+        let busy = busy.clone();
+        Rc::new(move |message: Option<(String, ScreenRect)>| {
+            DICTATE_SHAPE.with(|active| active.set(false));
+            invalidate_input_shape_cache();
+            refresh_input_shape(&window, &registry, interactive.get());
+            let Some((text, rect)) = message else {
+                *view.borrow_mut() = None;
+                layer.hide();
+                busy.set(false);
+                invalidate_visual_shape_cache();
+                refresh_visual_shape(&window, &root, None);
+                return;
+            };
+            *view.borrow_mut() = Some(DictateView::Message(text, rect));
+            layer.queue_draw();
+            glib::timeout_add_local_once(DICTATE_MESSAGE_LINGER, {
+                let window = window.clone();
+                let root = root.clone();
+                let layer = layer.clone();
+                let view = view.clone();
+                let busy = busy.clone();
+                move || {
+                    *view.borrow_mut() = None;
+                    layer.hide();
+                    busy.set(false);
+                    invalidate_visual_shape_cache();
+                    refresh_visual_shape(&window, &root, None);
+                }
+            });
+        })
+    };
+
+    // The photograph is in hand. Doubling it is what makes the difference:
+    // screen text sits at about 96dpi, well under what tesseract reads
+    // reliably, and the scale costs a few milliseconds on a region this size.
+    let read_region: Rc<dyn Fn(Pixbuf, ScreenRect)> = {
+        let finish = finish.clone();
+        Rc::new(move |pixbuf: Pixbuf, rect: ScreenRect| {
+            let scaled = pixbuf
+                .scale_simple(
+                    pixbuf.width() * 2,
+                    pixbuf.height() * 2,
+                    InterpType::Bilinear,
+                )
+                .unwrap_or(pixbuf);
+            let dir = sysi_runtime_dir();
+            let path = dir.join("dictate-scaled.png");
+            if fs::create_dir_all(&dir).is_err() || scaled.savev(&path, "png", &[]).is_err() {
+                finish(Some(("NO CAPTURE".to_owned(), rect)));
+                return;
+            }
+            let (tx, rx) = async_channel::bounded(1);
+            let spawned = std::thread::Builder::new()
+                .name("sysi-dictate".to_owned())
+                .spawn(move || {
+                    let read = dictate_ocr(&path);
+                    // The picture is a copy of something still on screen, and
+                    // it lives on a tmpfs; there is no reason to keep it once
+                    // tesseract has had it, failure or not.
+                    let _ = fs::remove_file(&path);
+                    let _ = tx.send_blocking(read);
+                })
+                .is_ok();
+            if !spawned {
+                finish(Some(("OCR ERROR".to_owned(), rect)));
+                return;
+            }
+            glib::MainContext::default().spawn_local({
+                let finish = finish.clone();
+                async move {
+                    let Ok(read) = rx.recv().await else {
+                        return;
+                    };
+                    let message = match read {
+                        Ok(text) => {
+                            let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+                            clipboard.set_text(&text);
+                            // Without this the text dies with the overlay, and
+                            // pasting it is often the next thing after a quit.
+                            clipboard.store();
+                            format!("COPIED · {} chars", text.chars().count())
+                        }
+                        Err(complaint) => complaint,
+                    };
+                    finish(Some((message, rect)));
+                }
+            });
+        })
+    };
+
+    // The drag is over. From here the desk is live again: the region is being
+    // photographed and read, and the layer is only still up to say so.
+    let capture_region: Rc<dyn Fn(ScreenRect)> = {
+        let finish = finish.clone();
+        let read_region = read_region.clone();
+        let layer = layer.clone();
+        let view = view.clone();
+        let window = window.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        Rc::new(move |rect: ScreenRect| {
+            DICTATE_SHAPE.with(|active| active.set(false));
+            invalidate_input_shape_cache();
+            refresh_input_shape(&window, &registry, interactive.get());
+            *view.borrow_mut() = Some(DictateView::Message("…".to_owned(), rect));
+            layer.queue_draw();
+
+            let origin = overlay_origin(&layer);
+            let screen = ScreenRect {
+                x: rect.x + origin.x,
+                y: rect.y + origin.y,
+                ..rect
+            };
+            let Some(capture) = desktop_capture() else {
+                // Wayland: only the compositor can see the other windows, so
+                // the extension takes the picture and says where it put it.
+                let nonce = dictate_nonce();
+                publish_dictate_request(nonce, screen);
+                let deadline = Instant::now() + DICTATE_CAPTURE_TIMEOUT;
+                glib::timeout_add_local(DICTATE_POLL_INTERVAL, {
+                    let finish = finish.clone();
+                    let read_region = read_region.clone();
+                    move || {
+                        if let Some(path) = dictate_capture_path(nonce) {
+                            match Pixbuf::from_file(&path) {
+                                Ok(pixbuf) => read_region(pixbuf, rect),
+                                Err(_) => finish(Some(("NO CAPTURE".to_owned(), rect))),
+                            }
+                            return glib::ControlFlow::Break;
+                        }
+                        if Instant::now() < deadline {
+                            return glib::ControlFlow::Continue;
+                        }
+                        finish(Some(("NO CAPTURE".to_owned(), rect)));
+                        glib::ControlFlow::Break
+                    }
+                });
+                return;
+            };
+            // X11: the root window is the desk, so there is nobody to ask --
+            // but that readback includes Sysi, so the dim has to be off the
+            // screen before it is taken.
+            // ponytail: only the dimming is taken down, so a widget of Sysi's
+            // own lying over the region is photographed with it. Hiding the
+            // whole overlay would cost a remap on every run.
+            *view.borrow_mut() = None;
+            layer.queue_draw();
+            glib::timeout_add_local_once(DICTATE_X11_SETTLE, {
+                let finish = finish.clone();
+                let read_region = read_region.clone();
+                let layer = layer.clone();
+                let view = view.clone();
+                move || {
+                    let pixbuf = capture.root.pixbuf(
+                        screen.x - capture.origin.x,
+                        screen.y - capture.origin.y,
+                        rect.width,
+                        rect.height,
+                    );
+                    *view.borrow_mut() = Some(DictateView::Message("…".to_owned(), rect));
+                    layer.queue_draw();
+                    match pixbuf {
+                        Some(pixbuf) => read_region(pixbuf, rect),
+                        None => finish(Some(("NO CAPTURE".to_owned(), rect))),
+                    }
+                }
+            });
+        })
+    };
+
+    layer.connect_button_press_event({
+        let finish = finish.clone();
+        let view = view.clone();
+        move |layer, event| {
+            if event.button() != 1 {
+                // The overlay does not take the keyboard, so Escape may never
+                // arrive. The other mouse button is the way out that always
+                // works.
+                finish(None);
+                return glib::Propagation::Stop;
+            }
+            let (x, y) = event.position();
+            let point = Point {
+                x: x as i32,
+                y: y as i32,
+            };
+            *view.borrow_mut() = Some(DictateView::Selecting(Some((point, point))));
+            layer.queue_draw();
+            glib::Propagation::Stop
+        }
+    });
+
+    layer.connect_motion_notify_event({
+        let view = view.clone();
+        let last_frame = last_frame.clone();
+        move |layer, event| {
+            let (x, y) = event.position();
+            let moved = {
+                let mut view = view.borrow_mut();
+                match view.as_mut() {
+                    Some(DictateView::Selecting(Some((_, end)))) => {
+                        *end = Point {
+                            x: x as i32,
+                            y: y as i32,
+                        };
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            let now = Instant::now();
+            // The dim covers the desk, so every frame of this is a full-screen
+            // redraw. One per drag tick is plenty.
+            if moved && drag_frame_due(last_frame.get(), now) {
+                last_frame.set(Some(now));
+                layer.queue_draw();
+            }
+            glib::Propagation::Stop
+        }
+    });
+
+    layer.connect_button_release_event({
+        let finish = finish.clone();
+        let capture_region = capture_region.clone();
+        let view = view.clone();
+        move |_, event| {
+            if event.button() != 1 {
+                return glib::Propagation::Stop;
+            }
+            let drag = match view.borrow().as_ref() {
+                Some(DictateView::Selecting(drag)) => *drag,
+                _ => None,
+            };
+            match drag.and_then(|(start, end)| dictate_rect_from_drag(start, end)) {
+                Some(rect) => capture_region(rect),
+                None => finish(None),
+            }
+            glib::Propagation::Stop
+        }
+    });
+
+    let start: Rc<dyn Fn()> = {
+        let window = window.clone();
+        let root = root.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let layer = layer.clone();
+        let view = view.clone();
+        let busy = busy.clone();
+        let last_frame = last_frame.clone();
+        Rc::new(move || {
+            // A second click while a region is still being read is ignored
+            // rather than queued: both runs would write the same request file
+            // and wait on the same answer.
+            if busy.get() {
+                return;
+            }
+            busy.set(true);
+            last_frame.set(None);
+            let display = overlay_display_size(&layer);
+            layer.set_size_request(display.width, display.height);
+            *view.borrow_mut() = Some(DictateView::Selecting(None));
+            layer.show();
+            // GtkFixed stacks its children in the order they were added, and
+            // notes and dictionaries are put there long after this layer. Any
+            // of them lying under the pointer would take the press meant for
+            // the selection, so the layer is raised above its siblings each
+            // time it comes up.
+            if let Some(layer_window) = layer.window() {
+                layer_window.raise();
+            }
+            DICTATE_SHAPE.with(|active| active.set(true));
+            invalidate_input_shape_cache();
+            refresh_input_shape(&window, &registry, interactive.get());
+            invalidate_visual_shape_cache();
+            refresh_visual_shape(&window, &root, None);
+            present_overlay(&window);
+            layer.queue_draw();
+        })
+    };
+
+    let cancel: Rc<dyn Fn() -> bool> = {
+        let finish = finish.clone();
+        let view = view.clone();
+        Rc::new(move || {
+            // Only a selection can be called off. Once the region is out for
+            // OCR the answer is already on its way back.
+            let selecting = matches!(view.borrow().as_ref(), Some(DictateView::Selecting(_)));
+            if selecting {
+                finish(None);
+            }
+            selecting
+        })
+    };
+
+    Dictate { start, cancel }
+}
+
 fn refresh_input_shape(
     window: &gtk::ApplicationWindow,
     registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
@@ -11086,6 +11688,44 @@ fn refresh_input_shape(
         return;
     };
     let mut parts: Vec<ShapePart> = Vec::new();
+    // A dictate selection is dragged out anywhere on the desk, so while one is
+    // up the overlay takes the pointer over the whole display rather than only
+    // over its widgets. Nothing else can be clicked until the drag is done
+    // with, which is the same bargain every screenshot tool makes.
+    if DICTATE_SHAPE.with(Cell::get) {
+        let allocation = window.allocation();
+        parts.push(ShapePart::Rect(
+            0,
+            0,
+            allocation.width(),
+            allocation.height(),
+        ));
+    } else {
+        collect_widget_input_shape(registry, interactive, &mut parts);
+    }
+    if LAST_INPUT_SHAPE.with(|last| last.borrow().as_deref() == Some(parts.as_slice())) {
+        return;
+    }
+    let region = Region::create();
+    for part in &parts {
+        match *part {
+            ShapePart::Rect(x, y, width, height) => {
+                let _ = region.union_rectangle(&RectangleInt::new(x, y, width, height));
+            }
+            ShapePart::Circle(x, y, width, height) => {
+                union_circle_region(&region, x, y, width, height);
+            }
+        }
+    }
+    gdk_window.input_shape_combine_region(&region, 0, 0);
+    LAST_INPUT_SHAPE.with(|last| *last.borrow_mut() = Some(parts));
+}
+
+fn collect_widget_input_shape(
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+    interactive: bool,
+    parts: &mut Vec<ShapePart>,
+) {
     for item in registry.borrow().iter() {
         let lock_timer = item.key == "timer";
         let settings = item.key == "picker";
@@ -11118,22 +11758,6 @@ fn refresh_input_shape(
             }
         }
     }
-    if LAST_INPUT_SHAPE.with(|last| last.borrow().as_deref() == Some(parts.as_slice())) {
-        return;
-    }
-    let region = Region::create();
-    for part in &parts {
-        match *part {
-            ShapePart::Rect(x, y, width, height) => {
-                let _ = region.union_rectangle(&RectangleInt::new(x, y, width, height));
-            }
-            ShapePart::Circle(x, y, width, height) => {
-                union_circle_region(&region, x, y, width, height);
-            }
-        }
-    }
-    gdk_window.input_shape_combine_region(&region, 0, 0);
-    LAST_INPUT_SHAPE.with(|last| *last.borrow_mut() = Some(parts));
 }
 
 fn receives_input_when_locked(key: &str) -> bool {
@@ -11877,30 +12501,31 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        clamp_to_screens, clip_screen_to_overlay, covers, drag_frame_due, ellipsize,
-        fit_to_work_area, fit_within_bounds, foreground_for_luminance, foreground_for_mode,
-        format_rate, hold_clears_map, image_room, image_room_after_y, invert_map,
-        monitor_coordinate_divisor, monitor_root_bounds, normalize_monitor_rect, note_headline,
-        note_image_cap, note_search_matches, note_size_for_image, padded_visual_rect,
-        paint_inverted, palette_for_mode, parse_panel_anchor, parse_timer_input,
-        push_recent_search, receives_input_when_locked, record_note_undo, relative_luminance,
-        reopen_point, rescaled_from, resize_ceiling, resize_width_limit, resized_image_size,
-        room_on_screen, round_pixbuf_corners, screen_in_overlay, shrink_to_budget,
-        system_content_size, system_meter_columns, system_meter_gap, system_meter_ink_width,
-        system_meter_row_width, system_meter_rows, system_meters, system_usage_rows,
-        temperature_meter, timer_style_size, Foreground, InvertMap, NoteSearchMatch,
-        NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, WidgetPalette,
-        DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH, INVERT_MAP_BUDGET, NOTE_HEIGHT,
-        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
-        NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
-        SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
+        clamp_to_screens, clip_screen_to_overlay, covers, dictate_capture_answer,
+        dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area, fit_within_bounds,
+        foreground_for_luminance, foreground_for_mode, format_rate, hold_clears_map, image_room,
+        image_room_after_y, invert_map, monitor_coordinate_divisor, monitor_root_bounds,
+        normalize_monitor_rect, note_headline, note_image_cap, note_search_matches,
+        note_size_for_image, padded_visual_rect, paint_inverted, palette_for_mode,
+        parse_panel_anchor, parse_timer_input, push_recent_search, receives_input_when_locked,
+        record_note_undo, relative_luminance, reopen_point, rescaled_from, resize_ceiling,
+        resize_width_limit, resized_image_size, room_on_screen, round_pixbuf_corners,
+        screen_in_overlay, shrink_to_budget, system_content_size, system_meter_columns,
+        system_meter_gap, system_meter_ink_width, system_meter_row_width, system_meter_rows,
+        system_meters, system_usage_rows, temperature_meter, timer_style_size, Foreground,
+        InvertMap, NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState,
+        ScreenRect, WidgetPalette, DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH,
+        INVERT_MAP_BUDGET, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX,
+        NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL,
+        SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN, SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS,
+        SYSTEM_METER_RING_STROKE,
     };
     use crate::state::{
         ColorMode, NoteImage, Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER,
     };
     use crate::system::{SystemSnapshot, Usage};
     use gdk_pixbuf::{Colorspace, Pixbuf};
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     const SCREEN: ScreenRect = ScreenRect {
         x: 0,
@@ -12261,6 +12886,77 @@ mod timer_input_tests {
         assert!(receives_input_when_locked("history"));
         assert!(!receives_input_when_locked("system"));
         assert!(!receives_input_when_locked("translate"));
+    }
+
+    #[test]
+    fn a_dictate_drag_selects_the_same_region_in_any_direction() {
+        let expected = ScreenRect {
+            x: 100,
+            y: 50,
+            width: 220,
+            height: 90,
+        };
+        let corners = [
+            (Point { x: 100, y: 50 }, Point { x: 320, y: 140 }),
+            (Point { x: 320, y: 140 }, Point { x: 100, y: 50 }),
+            (Point { x: 320, y: 50 }, Point { x: 100, y: 140 }),
+            (Point { x: 100, y: 140 }, Point { x: 320, y: 50 }),
+        ];
+        for (start, end) in corners {
+            assert_eq!(dictate_rect_from_drag(start, end), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_dictate_twitch_is_a_click_rather_than_a_region() {
+        let origin = Point { x: 400, y: 300 };
+        // A press that never moved, and one that moved while the button was
+        // going back up: neither is a region anybody meant to select.
+        assert_eq!(dictate_rect_from_drag(origin, origin), None);
+        assert_eq!(
+            dictate_rect_from_drag(origin, Point { x: 403, y: 340 }),
+            None
+        );
+        // Thin in one direction only is still not a region.
+        assert_eq!(
+            dictate_rect_from_drag(origin, Point { x: 480, y: 307 }),
+            None
+        );
+        // The minimum itself is allowed through.
+        assert_eq!(
+            dictate_rect_from_drag(origin, Point { x: 408, y: 308 }),
+            Some(ScreenRect {
+                x: 400,
+                y: 300,
+                width: 8,
+                height: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn a_dictate_capture_is_only_taken_from_the_answer_it_asked_for() {
+        let roots = [PathBuf::from("/run/user/1000/sysi")];
+        let answer = |raw: &str, nonce: u64| dictate_capture_answer(raw, nonce, &roots);
+
+        assert_eq!(
+            answer("1757\t/run/user/1000/sysi/dictate.png\n", 1757),
+            Some(PathBuf::from("/run/user/1000/sysi/dictate.png"))
+        );
+        // The file still holds the previous run's answer.
+        assert_eq!(
+            answer("1756\t/run/user/1000/sysi/dictate.png\n", 1757),
+            None
+        );
+        // Nothing outside the directories the extension is given, and no
+        // climbing out of one of them either.
+        assert_eq!(answer("1757\t/etc/shadow\n", 1757), None);
+        assert_eq!(
+            answer("1757\t/run/user/1000/sysi/../../../etc/shadow\n", 1757),
+            None
+        );
+        assert_eq!(answer("1757\n", 1757), None);
+        assert_eq!(answer("", 1757), None);
     }
 
     #[test]

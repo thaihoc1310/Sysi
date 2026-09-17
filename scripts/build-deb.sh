@@ -41,7 +41,7 @@ Section: utils
 Priority: optional
 Architecture: $architecture
 Depends: libgtk-3-0t64 (>= 3.24) | libgtk-3-0 (>= 3.24), libx11-6
-Recommends: gnome-shell (>= 45)
+Recommends: gnome-shell (>= 45), tesseract-ocr, tesseract-ocr-vie
 Installed-Size: $installed_kib
 Maintainer: Sysi contributors
 Description: Lightweight transparent desktop widgets for Ubuntu

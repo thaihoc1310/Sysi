@@ -66,6 +66,7 @@ export default class SysiPanelExtension extends Extension {
         this._addAction('history', 'toggle-history');
         this._addAction('usage', 'toggle-usage');
         this._addAction('dictionary', 'toggle-translate');
+        this._addAction('dictate', 'dictate');
         this._buildSettings();
 
         this._gear.connect('clicked', () => {
@@ -134,6 +135,27 @@ export default class SysiPanelExtension extends Extension {
         } catch (error) {
             logError(error, 'Sysi could not watch auto-colour requests');
         }
+        // DICTATE asks for one rectangle at a time, on its own file rather than
+        // on the auto-colour one: that request is rewritten on every sampling
+        // pass and would scrub a pending region away before it was grabbed.
+        this._dictateRequestFile = Gio.File.new_for_path(
+            GLib.build_filenamev([cacheDir, 'dictate-request']),
+        );
+        if (!this._dictateRequestFile.query_exists(null))
+            GLib.file_set_contents(this._dictateRequestFile.get_path(), '');
+        this._dictateCapturing = false;
+        this._dictateNonce = null;
+        try {
+            this._dictateRequestMonitor = this._dictateRequestFile.monitor_file(
+                Gio.FileMonitorFlags.NONE,
+                null,
+            );
+            this._dictateRequestMonitor.connect('changed', () => {
+                this._queueDictateCapture();
+            });
+        } catch (error) {
+            logError(error, 'Sysi could not watch dictate requests');
+        }
         this._syncPanelState();
         this._syncVisibility();
         // Sampling before the shell has laid out its monitors makes
@@ -162,6 +184,11 @@ export default class SysiPanelExtension extends Extension {
         this._autoColorRequestMonitor?.cancel();
         this._autoColorRequestMonitor = null;
         this._autoColorRequestFile = null;
+        this._dictateRequestMonitor?.cancel();
+        this._dictateRequestMonitor = null;
+        this._dictateRequestFile = null;
+        this._dictateCapturing = false;
+        this._dictateNonce = null;
         this._autoColorGeneration++;
         this._autoColorSampling = false;
         this._autoColorPending = false;
@@ -501,6 +528,88 @@ export default class SysiPanelExtension extends Extension {
 
     _invertFileName(key) {
         return `${key.replace(/[^\w-]/g, '_')}.png`;
+    }
+
+    // Photograph the rectangle Sysi has just been dragged out over, so its
+    // DICTATE can read text off a Wayland window. Through Xwayland Sysi's own
+    // root window holds X11 clients only, so a selection over anything native
+    // would come back as wallpaper.
+    _queueDictateCapture() {
+        if (!this._dictateRequestFile || Main.layoutManager._startingUp)
+            return;
+        // A second region while one grab is outstanding is dropped rather than
+        // queued: both would write the same picture, and Sysi is only ever
+        // waiting for the nonce it asked with.
+        if (this._dictateCapturing)
+            return;
+        const request = this._readDictateRequest();
+        // A write arrives as several change events, and the file is created
+        // empty at startup. Only a region Sysi has not already been given a
+        // picture of is worth hiding every one of its windows for.
+        if (!request || request.nonce === this._dictateNonce)
+            return;
+        this._dictateNonce = request.nonce;
+        this._dictateCapturing = true;
+        this._captureDictateRegion(request)
+            .catch(error => logError(error, 'Sysi could not capture a dictate region'))
+            .finally(() => (this._dictateCapturing = false));
+    }
+
+    _readDictateRequest() {
+        let raw;
+        try {
+            const [ok, contents] = GLib.file_get_contents(
+                this._dictateRequestFile.get_path(),
+            );
+            if (!ok)
+                return null;
+            raw = new TextDecoder().decode(contents);
+        } catch (_) {
+            return null;
+        }
+        const [nonce, geometry] = raw.trim().split('\t');
+        const values = geometry?.split(',').map(Number) ?? [];
+        if (!nonce || values.length !== 4 || !values.every(Number.isFinite))
+            return null;
+        const [x, y, width, height] = values;
+        return width > 0 && height > 0 ? {nonce, x, y, width, height} : null;
+    }
+
+    async _captureDictateRegion({nonce, x, y, width, height}) {
+        const rect = this._clampToMonitor({x, y, width, height});
+        if (!rect)
+            return;
+        const path = GLib.build_filenamev([
+            GLib.get_user_runtime_dir(), 'sysi', 'dictate.png',
+        ]);
+        const file = Gio.File.new_for_path(path);
+        let stream = null;
+        let done = null;
+        // The dimmed selection layer is still on screen at this point, and it
+        // is Sysi's own window: without hiding it the OCR would be handed a
+        // photograph of the dimming rather than of the text underneath.
+        this._withSysiHidden(() => {
+            try {
+                stream = file.replace(
+                    null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+                done = new Shell.Screenshot().screenshot_area(
+                    rect.x, rect.y, rect.width, rect.height, stream);
+            } catch (error) {
+                this._closeQuietly(stream);
+                stream = null;
+                done = null;
+                logError(error, 'Sysi could not start a dictate capture');
+            }
+        });
+        if (!done)
+            return;
+        try {
+            await done;
+        } finally {
+            // The rename onto the real name only happens on close.
+            this._closeQuietly(stream);
+        }
+        this._writeCacheFile('dictate-result', `${nonce}\t${path}\n`);
     }
 
     _closeQuietly(stream) {
