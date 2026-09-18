@@ -241,23 +241,60 @@ pub fn spawn_suggest(prefix: String, request: Request, tx: Sender<TranslateEvent
     });
 }
 
+/// The clip URLs a speaker button should try. Cambridge is first; Youdao is
+/// the fallback when that download fails. A clip already on disk from either
+/// source is played as-is, without fetching the other.
+pub fn audio_sources(word: &str, lang: &str, primary: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    if !primary.is_empty() {
+        urls.push(primary.to_owned());
+    }
+    let fallback = youdao_audio_url(word, lang);
+    if !fallback.is_empty() && !urls.iter().any(|url| url == &fallback) {
+        urls.push(fallback);
+    }
+    urls
+}
+
+fn youdao_audio_url(word: &str, lang: &str) -> String {
+    let word = word.trim();
+    if word.is_empty() {
+        return String::new();
+    }
+    // type=2 is UK English; everything else, including US, uses type=1.
+    let kind = if lang.eq_ignore_ascii_case("uk") {
+        2
+    } else {
+        1
+    };
+    format!(
+        "https://dict.youdao.com/dictvoice?audio={}&type={kind}",
+        percent_encode(word)
+    )
+}
+
 /// Put a pronunciation clip in the cache and report where it landed. Audio
-/// events are keyed by URL rather than by generation: the receiver matches them
-/// against the buttons currently on screen, so a clip that arrives after its
-/// button is gone simply finds no one waiting.
-pub fn spawn_audio(url: String, tx: Sender<TranslateEvent>) {
+/// events are keyed by the button's URL rather than by generation: the
+/// receiver matches them against the buttons currently on screen, so a clip
+/// that arrives after its button is gone simply finds no one waiting.
+pub fn spawn_audio(key: String, urls: Vec<String>, tx: Sender<TranslateEvent>) {
     spawn_named("sysi-audio", move || {
-        let path = cached_audio_path(&url);
-        if fs::metadata(&path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0) {
-            let _ = tx.send_blocking(TranslateEvent::AudioReady { url, path });
-            return;
-        }
-        match download_audio(&url, &path) {
-            Ok(()) => {
-                let _ = tx.send_blocking(TranslateEvent::AudioReady { url, path });
+        let path = urls
+            .iter()
+            .map(|url| cached_audio_path(url))
+            .find(|path| is_usable_clip(path))
+            .or_else(|| {
+                urls.iter().find_map(|url| {
+                    let path = cached_audio_path(url);
+                    download_audio(url, &path).ok().map(|_| path)
+                })
+            });
+        match path {
+            Some(path) => {
+                let _ = tx.send_blocking(TranslateEvent::AudioReady { url: key, path });
             }
-            Err(_) => {
-                let _ = tx.send_blocking(TranslateEvent::AudioFailed { url });
+            None => {
+                let _ = tx.send_blocking(TranslateEvent::AudioFailed { url: key });
             }
         }
     });
@@ -1310,6 +1347,27 @@ fn stale_clips(clips: &mut [(std::time::SystemTime, u64, PathBuf)], limit: u64) 
     dropped
 }
 
+/// True when `path` already holds a real MP3. An empty or HTML stand-in is
+/// deleted so the next attempt fetches a usable clip instead of replaying it.
+fn is_usable_clip(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if bytes.is_empty() || bytes.len() as u64 > MAX_AUDIO_BYTES || !looks_like_mpeg(&bytes) {
+        let _ = fs::remove_file(path);
+        return false;
+    }
+    true
+}
+
+fn looks_like_mpeg(bytes: &[u8]) -> bool {
+    if bytes.len() < 3 {
+        return false;
+    }
+    // ID3v2, or a bare MPEG frame whose first eleven bits are set.
+    bytes.starts_with(b"ID3") || (bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0)
+}
+
 fn fnv1a(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in input.as_bytes() {
@@ -1338,6 +1396,11 @@ fn download_audio(url: &str, path: &Path) -> Result<(), String> {
     if bytes.len() as u64 > MAX_AUDIO_BYTES {
         return Err("The audio was too large".into());
     }
+    // Cambridge's 403 arrives as HTML; a 200 challenge page would look the
+    // same. Caching either would replay silence until the file aged out.
+    if !looks_like_mpeg(&bytes) {
+        return Err("The audio was not an MPEG clip".into());
+    }
     let Some(parent) = path.parent() else {
         return Err("The cache path has no parent".into());
     };
@@ -1360,10 +1423,10 @@ fn download_audio(url: &str, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_audio_path, cambridge_headword_matches, cambridge_slug, em_to_pango_bold,
-        escape_markup, fnv1a, is_sentence, parse_cambridge, parse_google, parse_tracau,
-        parse_tracau_fulltext, percent_encode, should_probe_dictionary, stale_clips, strip_tags,
-        Request,
+        audio_sources, cached_audio_path, cambridge_headword_matches, cambridge_slug,
+        em_to_pango_bold, escape_markup, fnv1a, is_sentence, looks_like_mpeg, parse_cambridge,
+        parse_google, parse_tracau, parse_tracau_fulltext, percent_encode, should_probe_dictionary,
+        stale_clips, strip_tags, Request,
     };
     use std::{
         path::PathBuf,
@@ -1925,5 +1988,36 @@ mod tests {
         assert_eq!(first, cached_audio_path("https://example.test/uk/word.mp3"));
         assert_ne!(first, cached_audio_path("https://example.test/us/word.mp3"));
         assert_eq!(first.extension().and_then(|ext| ext.to_str()), Some("mp3"));
+    }
+
+    #[test]
+    fn pronunciation_audio_tries_cambridge_then_youdao() {
+        let urls = audio_sources("hello", "uk", "https://dictionary.cambridge.org/hello.mp3");
+        assert_eq!(
+            urls,
+            [
+                "https://dictionary.cambridge.org/hello.mp3",
+                "https://dict.youdao.com/dictvoice?audio=hello&type=2",
+            ]
+        );
+        let us = audio_sources("kick the bucket", "us", "https://example.test/us.mp3");
+        assert_eq!(us[0], "https://example.test/us.mp3");
+        assert_eq!(
+            us[1],
+            "https://dict.youdao.com/dictvoice?audio=kick%20the%20bucket&type=1"
+        );
+        assert!(audio_sources("", "uk", "").is_empty());
+        assert_eq!(
+            audio_sources("hello", "us", ""),
+            ["https://dict.youdao.com/dictvoice?audio=hello&type=1"]
+        );
+    }
+
+    #[test]
+    fn mpeg_clips_are_accepted_and_html_is_not() {
+        assert!(looks_like_mpeg(b"ID3\x04\x00\x00"));
+        assert!(looks_like_mpeg(&[0xFF, 0xFB, 0x90, 0x00]));
+        assert!(!looks_like_mpeg(b"<!DOCTYPE html>"));
+        assert!(!looks_like_mpeg(b""));
     }
 }

@@ -9253,6 +9253,11 @@ fn render_translate_result(
                         let audio_buttons = audio_buttons.clone();
                         let audio_tx = audio_tx.clone();
                         let url = pronunciation.audio_url.clone();
+                        let sources = crate::translate::audio_sources(
+                            &word.headword,
+                            &pronunciation.lang,
+                            &pronunciation.audio_url,
+                        );
                         move |button| {
                             // Disabled until the clip lands, so a slow download
                             // cannot be queued up a dozen times.
@@ -9260,7 +9265,11 @@ fn render_translate_result(
                             audio_buttons
                                 .borrow_mut()
                                 .insert(url.clone(), button.clone());
-                            crate::translate::spawn_audio(url.clone(), audio_tx.clone());
+                            crate::translate::spawn_audio(
+                                url.clone(),
+                                sources.clone(),
+                                audio_tx.clone(),
+                            );
                         }
                     });
                     cell.pack_start(&speaker, false, false, 0);
