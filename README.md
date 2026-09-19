@@ -54,7 +54,7 @@ Quota sources are the CLIs already installed on the machine: `codex app-server` 
 
 The `TOKENS` tab talks to nothing. It reads `~/.codex/sessions`, `~/.claude/projects` (subagent transcripts included) and `~/.omp/agent/sessions`, buckets every accounting record by local calendar day, and caches each file against its size and mtime so a rescan only re-reads the session still being written. Each source is counted the way it records itself: Claude Code repeats one response across streaming updates and again in a forked transcript, so a response is keyed and billed once however many files it appears in; Codex logs a running session total, so the tab reads its growth and discards a jump larger than a turn could be, which is the counter a fork inherits from its parent rather than tokens anyone spent. A full scan of a few hundred megabytes of transcripts takes about a third of a second and runs on its own thread, at most once every two minutes while the tab is open.
 
-In either mode, hovering the timer overlays `START`, `PAUSE`, `RESUME`, or `DISMISS` over the time; click to perform that action. In Edit Mode, right-click the timer and choose `EDIT TIME` to enter `MM:SS`, `HH:MM:SS`, or a plain number of minutes. Four consecutive digits such as `1050` are automatically formatted and accepted as `10:50`.
+In either mode, hovering the timer overlays `START`, `PAUSE`, `RESUME`, or `DISMISS` over the time; a short click performs that action. Dragging the timer to move it does not start or pause it. In Edit Mode, right-click the timer and choose `EDIT TIME` to enter `MM:SS`, `HH:MM:SS`, or a plain number of minutes. Four consecutive digits such as `1050` are automatically formatted and accepted as `10:50`.
 
 ## Build
 

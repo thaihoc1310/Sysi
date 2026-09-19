@@ -34,23 +34,25 @@
   text-shadow: 0 1px 3px rgba(255, 255, 255, 0.34);
 }
 
-/* LIGHT / DARK: one plate (.frost-body), under the header. AUTO / INVERT
+/* LIGHT / DARK: one plate (.frost-body) flush under the header. AUTO / INVERT
    leave the plate clear. Inner editors/viewports stay fully transparent so
-   GTK cannot restack a second wash on a clicked line or a caret blink. */
+   GTK cannot restack a second wash on a clicked line or a caret blink.
+   0.92 is opaque enough to read over a busy desktop; 0.6 left a hole in the
+   middle of USAGE / DICTIONARY that showed the wallpaper through. */
 .frost-body,
 .pinned-note {
   background-color: transparent;
 }
 
 .mode-solid.mode-light .frost-body {
-  background-color: rgba(242, 242, 244, 0.6);
+  background-color: rgba(242, 242, 244, 0.92);
   color: #161616;
   text-shadow: none;
   border-radius: 0 0 4px 4px;
 }
 
 .mode-solid.mode-dark .frost-body {
-  background-color: rgba(22, 22, 24, 0.6);
+  background-color: rgba(22, 22, 24, 0.92);
   color: #f2f2f2;
   text-shadow: none;
   border-radius: 0 0 4px 4px;
@@ -295,7 +297,7 @@ textview, textview text, entry {
 .note-header {
   background-color: rgba(222, 222, 222, 0.72);
   border: none;
-  border-radius: 4px 4px 1px 1px;
+  border-radius: 4px 4px 0 0;
   min-height: 18px;
   padding: 1px 4px;
 }
@@ -306,6 +308,16 @@ textview, textview text, entry {
 
 .mode-dark .note-header {
   background-color: rgba(24, 24, 24, 0.82);
+}
+
+/* Same paint as the plate, so LIGHT / DARK is one slab instead of a bar,
+   a gap, and a wash. AUTO / INVERT keep the greyer grab-bar above. */
+.mode-solid.mode-light .note-header {
+  background-color: rgba(242, 242, 244, 0.92);
+}
+
+.mode-solid.mode-dark .note-header {
+  background-color: rgba(22, 22, 24, 0.92);
 }
 
 .note-window-button {
@@ -530,7 +542,7 @@ scrolledwindow overshoot.right:backdrop {
 
 .notes-header,
 .history-header {
-  border-radius: 4px 4px 1px 1px;
+  border-radius: 4px 4px 0 0;
   min-height: 20px;
   padding-right: 6px;
 }
@@ -733,6 +745,18 @@ scrolledwindow overshoot.right:backdrop {
   border-radius: 3px;
   margin: 2px 1px;
   padding: 3px;
+}
+
+.mode-solid.mode-light .translate-search-panel {
+  background-color: rgba(242, 242, 244, 0.92);
+  border-radius: 0;
+  margin: 0;
+}
+
+.mode-solid.mode-dark .translate-search-panel {
+  background-color: rgba(22, 22, 24, 0.92);
+  border-radius: 0;
+  margin: 0;
 }
 
 .translate-search-input,

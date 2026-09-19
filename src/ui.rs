@@ -119,6 +119,10 @@ const VISUAL_SHAPE_MARGIN: i32 = 8;
 /// on this app's multi-monitor surface, so apply at most roughly 60 moves/s and
 /// always commit the exact pointer position on release.
 const DRAG_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+/// Manhattan pixels in root coordinates. Widget-local slop is useless on
+/// the timer: the card is its own drag handle, so it follows the pointer
+/// and a drag's press and release land on the same local point.
+const CLICK_DRAG_SLOP: f64 = 5.0;
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 // The notes-palette row the pointer is on, or None. The palette's right-click
@@ -2471,6 +2475,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
 fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
+    // Same flush stack a desk note uses: a 4px card-body gap here is a
+    // hole straight through to the desktop once LIGHT / DARK fill the
+    // header and the plate as two separate windows.
+    body.set_spacing(0);
     card.set_visible_window(true);
     card.style_context().add_class("pinned-note");
     card.style_context().add_class("usage-window");
@@ -2503,6 +2511,8 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     bar.pack_end(&refresh, false, false, 0);
     header.add(&bar);
     chrome_body.pack_start(&header, false, false, 0);
+    chrome_body.show_all();
+    body.pack_start(&chrome, false, false, 0);
 
     let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     tab_bar.style_context().add_class("usage-tabs");
@@ -2513,9 +2523,6 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
         tab_bar.pack_start(&button, true, true, 0);
         tabs.push((tab, button));
     }
-    chrome_body.pack_start(&tab_bar, false, false, 0);
-    chrome_body.show_all();
-    body.pack_start(&chrome, false, false, 0);
 
     let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -2603,6 +2610,9 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     let panes = gtk::Box::new(gtk::Orientation::Vertical, 0);
     panes.set_hexpand(true);
     panes.set_vexpand(true);
+    // Tabs live on the plate, not in the header chrome: LIGHT / DARK only
+    // paint those two windows, and a tab strip between them was a hole.
+    panes.pack_start(&tab_bar, false, false, 0);
     panes.pack_start(&scroller, true, true, 0);
     panes.pack_start(&tokens_pane, true, true, 0);
     panes.pack_start(&status, false, false, 0);
@@ -4735,7 +4745,8 @@ fn build_timer_card(
         let click_start = click_start.clone();
         move |_, event| {
             if event.button() == 1 && event.event_type() == gdk::EventType::ButtonPress {
-                click_start.set(Some(event.position()));
+                // Root, not widget-local: the card slides with the pointer.
+                click_start.set(Some(event.root()));
             }
             glib::Propagation::Proceed
         }
@@ -4756,8 +4767,7 @@ fn build_timer_card(
             let Some((start_x, start_y)) = click_start.replace(None) else {
                 return glib::Propagation::Proceed;
             };
-            let (end_x, end_y) = event.position();
-            if (end_x - start_x).abs() + (end_y - start_y).abs() > 5.0 {
+            if click_became_drag((start_x, start_y), event.root()) {
                 return glib::Propagation::Proceed;
             }
             let mut timer = runtime.borrow_mut();
@@ -8085,9 +8095,18 @@ fn rebuild_pinned_notes(
     for note in pinned {
         if !mount.contains(&note.id) {
             if let Some((_, widget)) = registered.iter().find(|(id, _)| *id == note.id) {
-                let allocation = widget.allocation();
-                if allocation.x() != note.position.x || allocation.y() != note.position.y {
-                    root.move_(widget, note.position.x, note.position.y);
+                let key = format!("note:{}", note.id);
+                let held = registry
+                    .borrow()
+                    .iter()
+                    .any(|item| item.key == key && item.held.get());
+                // The drag has not written note.position yet. Moving here
+                // would put the card back where the press started.
+                if !held {
+                    let allocation = widget.allocation();
+                    if allocation.x() != note.position.x || allocation.y() != note.position.y {
+                        root.move_(widget, note.position.x, note.position.y);
+                    }
                 }
             }
             continue;
@@ -8534,6 +8553,7 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     bar.pack_start(&count, false, false, 0);
     bar.pack_end(&hide, false, false, 0);
     header.add(&bar);
+    body.set_spacing(0);
     body.pack_start(&header, false, false, 0);
 
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -9464,6 +9484,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
 
 fn build_translate_window(initial_color_mode: Foreground) -> TranslateWindow {
     let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
+    body.set_spacing(0);
     card.style_context().add_class("pinned-note");
     card.style_context().add_class("translate-window");
     card.set_visible_window(true);
@@ -9473,7 +9494,7 @@ fn build_translate_window(initial_color_mode: Foreground) -> TranslateWindow {
     let chrome = gtk::EventBox::new();
     chrome.set_visible_window(false);
     chrome.set_hexpand(true);
-    let chrome_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let chrome_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     chrome.add(&chrome_box);
     body.pack_start(&chrome, false, false, 0);
 
@@ -11583,6 +11604,12 @@ fn clamp_registered_widgets(
     let screens = &overlay_screen_rects(root);
     let mut data = state.borrow_mut();
     for item in registry.borrow().iter() {
+        // A drag only slides the GdkWindow; GtkFixed still stores the
+        // press-time child x/y. Clamping from that stored origin would yank
+        // the card out from under the pointer.
+        if item.held.get() {
+            continue;
+        }
         let allocation = item.widget.allocation();
         if allocation.width() <= 1 || allocation.height() <= 1 {
             continue;
@@ -11963,6 +11990,19 @@ fn drag_frame_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= DRAG_REDRAW_INTERVAL)
 }
 
+fn click_became_drag(press: (f64, f64), release: (f64, f64)) -> bool {
+    (release.0 - press.0).abs() + (release.1 - press.1).abs() > CLICK_DRAG_SLOP
+}
+
+// A drag slides the GdkWindow and size-allocates the card, but leaves
+// GtkFixed's stored child x/y alone so the whole desk is not relaid out
+// on every tick. A sibling that later queue-resizes (the usage card's
+// one-second clock is the usual one) makes Fixed allocate that stored
+// origin and the card jumps home. Put it back at the live point.
+fn held_slide_point(allocation: Point, live: Option<Point>) -> Option<Point> {
+    live.filter(|point| *point != allocation)
+}
+
 fn overlay_card_rect(card: &gtk::EventBox, point: Point) -> ScreenRect {
     let allocation = card.allocation();
     ScreenRect {
@@ -12090,8 +12130,10 @@ fn attach_drag(
     // repeat sixty times a second, and it cannot change mid-drag.
     let gesture_screens: Rc<RefCell<Vec<ScreenRect>>> = Rc::new(RefCell::new(Vec::new()));
     let last_redraw = Rc::new(Cell::new(None::<Instant>));
+    let live = Rc::new(Cell::new(None::<Point>));
     gesture.connect_drag_begin({
         let start = start.clone();
+        let live = live.clone();
         let last_redraw = last_redraw.clone();
         let card = card.clone();
         let root = root.clone();
@@ -12114,6 +12156,10 @@ fn attach_drag(
                 ));
                 *gesture_screens.borrow_mut() = overlay_screen_rects(&root);
                 start.set(Some((allocation.x(), allocation.y(), pointer_x, pointer_y)));
+                live.set(Some(Point {
+                    x: allocation.x(),
+                    y: allocation.y(),
+                }));
                 last_redraw.set(None);
                 hold_widget(&registry, &key, true);
             } else {
@@ -12129,6 +12175,7 @@ fn attach_drag(
         let window = window.clone();
         let gesture_screens = gesture_screens.clone();
         let last_redraw = last_redraw.clone();
+        let live = live.clone();
         move |gesture, fallback_x, fallback_y| {
             if let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.get() {
                 if fallback_x.abs() + fallback_y.abs() > 4.0 {
@@ -12154,12 +12201,14 @@ fn attach_drag(
                     allocation.height(),
                     &screens,
                 );
+                live.set(Some(point));
                 slide_overlay_card(&window, &root, &card, &card_widget, point);
             }
         }
     });
     gesture.connect_drag_end({
         let start = start.clone();
+        let live = live.clone();
         let card = card.clone();
         let root = root.clone();
         let registry = registry.clone();
@@ -12171,6 +12220,7 @@ fn attach_drag(
             // Released before anything else, so a gesture that was denied or
             // cancelled can never leave the widget stuck on the light palette.
             hold_widget(&registry, &key, false);
+            live.set(None);
             let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.replace(None) else {
                 return;
             };
@@ -12229,6 +12279,32 @@ fn attach_drag(
                 let state = state.clone();
                 move || refresh_auto_colors(&registry, &state)
             });
+        }
+    });
+
+    card.connect_size_allocate({
+        let live = live.clone();
+        let window = window.clone();
+        let root = root.clone();
+        let card = card.clone();
+        let card_widget = card.clone().upcast::<gtk::Widget>();
+        let restoring = Rc::new(Cell::new(false));
+        move |_, alloc| {
+            if restoring.get() {
+                return;
+            }
+            let Some(point) = held_slide_point(
+                Point {
+                    x: alloc.x(),
+                    y: alloc.y(),
+                },
+                live.get(),
+            ) else {
+                return;
+            };
+            restoring.set(true);
+            slide_overlay_card(&window, &root, &card, &card_widget, point);
+            restoring.set(false);
         }
     });
 
@@ -14033,7 +14109,8 @@ fn install_css(screen: &gdk::Screen) {
 mod timer_input_tests {
     use super::{
         clamp_to_screens, clip_screen_to_overlay, covers, dictate_capture_answer,
-        dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area, fit_within_bounds,
+        click_became_drag, dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area,
+        fit_within_bounds, held_slide_point,
         foreground_for_luminance, foreground_for_mode, format_rate, highlight_at, hold_clears_map,
         image_room, image_room_after_y, invert_map, monitor_coordinate_divisor,
         monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
@@ -14081,6 +14158,27 @@ mod timer_input_tests {
             start + DRAG_REDRAW_INTERVAL - std::time::Duration::from_millis(1)
         ));
         assert!(drag_frame_due(Some(start), start + DRAG_REDRAW_INTERVAL));
+    }
+
+    #[test]
+    fn a_timer_wobble_is_still_a_click_but_moving_it_is_not() {
+        assert!(!click_became_drag((40.0, 80.0), (42.0, 81.0)));
+        assert!(!click_became_drag((40.0, 80.0), (40.0, 80.0)));
+        // The card followed the pointer, so widget-local press and release
+        // would look identical. Root coordinates still see the slide.
+        assert!(click_became_drag((40.0, 80.0), (40.0, 88.0)));
+        assert!(click_became_drag((120.0, 40.0), (200.0, 40.0)));
+    }
+
+    #[test]
+    fn a_held_card_is_slid_back_when_fixed_reallocates_it() {
+        let live = Point { x: 80, y: 40 };
+        assert_eq!(
+            held_slide_point(Point { x: 12, y: 20 }, Some(live)),
+            Some(live)
+        );
+        assert_eq!(held_slide_point(live, Some(live)), None);
+        assert_eq!(held_slide_point(Point { x: 12, y: 20 }, None), None);
     }
 
     #[test]
