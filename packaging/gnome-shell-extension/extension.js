@@ -67,7 +67,7 @@ export default class SysiPanelExtension extends Extension {
         this._addAction('notes', 'toggle-notes');
         this._addAction('usage', 'toggle-usage');
         this._addAction('dictionary', 'toggle-translate');
-        this._addAction('dictate', 'dictate');
+        this._addAction('ocr', 'ocr');
         this._buildSettings();
 
         this._gear.connect('clicked', () => {
@@ -172,6 +172,7 @@ export default class SysiPanelExtension extends Extension {
             logError(error, 'Sysi panel gear could not watch focus requests');
         }
         this._bindNotesHotkey();
+        this._bindOcrHotkey();
         this._syncPanelState();
         this._syncVisibility();
         // Sampling before the shell has laid out its monitors makes
@@ -201,6 +202,7 @@ export default class SysiPanelExtension extends Extension {
         this._autoColorRequestMonitor = null;
         this._autoColorRequestFile = null;
         this._unbindNotesHotkey();
+        this._unbindOcrHotkey();
         this._focusRequestMonitor?.cancel();
         this._focusRequestMonitor = null;
         this._focusRequestFile = null;
@@ -328,7 +330,8 @@ export default class SysiPanelExtension extends Extension {
     _runAction(action, button) {
         // Opening Notes needs the overlay to hold the keyboard. An Xwayland
         // client cannot steal that from a native Wayland app; the shell can.
-        if (action === 'toggle-notes' || action === 'toggle-history')
+        if (action === 'toggle-notes' || action === 'toggle-history'
+            || action === 'ocr' || action === 'dictate')
             this._activateOverlaySoon();
         const argv = ['sysi', '--panel-action', action];
         const anchor = button ? this._anchorOf(button) : null;
@@ -465,6 +468,89 @@ export default class SysiPanelExtension extends Extension {
         this._notesAccelAction = 0;
         this._notesAccelName = null;
         this._restoreCustomNotesShortcut();
+    }
+
+    _ocrShortcutSettings() {
+        try {
+            return new Gio.Settings({
+                schema_id: 'org.gnome.settings-daemon.plugins.media-keys.custom-keybinding',
+                path: '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sysi-ocr/',
+            });
+        } catch (_) {
+            return null;
+        }
+    }
+
+    _silenceCustomOcrShortcut() {
+        const settings = this._ocrShortcutSettings();
+        if (!settings)
+            return;
+        if (settings.get_string('command') !== 'sysi --panel-action ocr')
+            return;
+        const binding = settings.get_string('binding');
+        if (!binding)
+            return;
+        this._ocrShortcutBinding = binding;
+        settings.set_string('binding', '');
+    }
+
+    _restoreCustomOcrShortcut() {
+        const settings = this._ocrShortcutSettings();
+        if (!settings || !this._ocrShortcutBinding)
+            return;
+        if (!settings.get_string('binding'))
+            settings.set_string('binding', this._ocrShortcutBinding);
+        this._ocrShortcutBinding = null;
+    }
+
+    _bindOcrHotkey() {
+        // Super is owned by the compositor. An X11 grab never sees it, so
+        // this grab is what makes Super+Shift+A start OCR from any app.
+        this._silenceCustomOcrShortcut();
+        try {
+            this._ocrAccelAction = global.display.grab_accelerator(
+                '<Super><Shift>a',
+                Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            );
+        } catch (error) {
+            logError(error, 'Sysi could not grab Super+Shift+A');
+            this._ocrAccelAction = 0;
+            this._restoreCustomOcrShortcut();
+            return;
+        }
+        if (!this._ocrAccelAction || this._ocrAccelAction === Meta.KeyBindingAction.NONE) {
+            this._ocrAccelAction = 0;
+            this._restoreCustomOcrShortcut();
+            return;
+        }
+        this._ocrAccelName = Meta.external_binding_name_for_action(this._ocrAccelAction);
+        Main.wm.allowKeybinding(
+            this._ocrAccelName,
+            Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+        );
+        this._ocrAccelId = global.display.connect(
+            'accelerator-activated',
+            (_display, action, _deviceId, timestamp) => {
+                if (action !== this._ocrAccelAction)
+                    return;
+                this._activateOverlay(timestamp);
+                this._runAction('ocr', null);
+            },
+        );
+    }
+
+    _unbindOcrHotkey() {
+        if (this._ocrAccelId) {
+            global.display.disconnect(this._ocrAccelId);
+            this._ocrAccelId = 0;
+        }
+        if (this._ocrAccelName)
+            Main.wm.allowKeybinding(this._ocrAccelName, Shell.ActionMode.NONE);
+        if (this._ocrAccelAction)
+            global.display.ungrab_accelerator(this._ocrAccelAction);
+        this._ocrAccelAction = 0;
+        this._ocrAccelName = null;
+        this._restoreCustomOcrShortcut();
     }
 
     // The middle of the button's bottom edge: the overlay centres the widget on

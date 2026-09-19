@@ -467,6 +467,31 @@ popover.note-search-popover > contents,
   box-shadow: none;
 }
 
+/* Yaru paints "more content this way" as inset shadows (undershoot)
+   and a radial black gradient (overshoot). On this transparent overlay
+   those become solid black bars. The hover scrollbar already says that. */
+scrolledwindow undershoot,
+scrolledwindow undershoot.top,
+scrolledwindow undershoot.bottom,
+scrolledwindow undershoot.left,
+scrolledwindow undershoot.right,
+scrolledwindow overshoot,
+scrolledwindow overshoot.top,
+scrolledwindow overshoot.bottom,
+scrolledwindow overshoot.left,
+scrolledwindow overshoot.right,
+scrolledwindow overshoot.top:backdrop,
+scrolledwindow overshoot.bottom:backdrop,
+scrolledwindow overshoot.left:backdrop,
+scrolledwindow overshoot.right:backdrop {
+  background: none;
+  background-image: none;
+  background-color: transparent;
+  box-shadow: none;
+  border: none;
+  padding: 0;
+}
+
 .pinned-note scrollbar {
   background-color: transparent;
   border: none;

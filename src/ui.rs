@@ -1540,11 +1540,17 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     };
     let last_preview: Rc<RefCell<(Option<u64>, String, i64)>> =
         Rc::new(RefCell::new((None, String::new(), 0)));
+    let preview_scroll = NotesPreviewScroll {
+        generation: Rc::new(Cell::new(0)),
+        pin: Rc::new(Cell::new(0)),
+        setting: Rc::new(Cell::new(false)),
+    };
     let rebuild_list_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let close_notes_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
     let fill_preview: Rc<dyn Fn(Option<u64>)> = {
         let preview = notes.preview.clone();
+        let notes_preview_scroller = notes.preview_scroller.clone();
         let state = state.clone();
         let search = notes.search.clone();
         let originals = notes.originals.clone();
@@ -1552,6 +1558,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let match_tag = notes.match_tag.clone();
         let current_tag = notes.current_tag.clone();
         let last_preview = last_preview.clone();
+        let preview_scroll = preview_scroll.clone();
         Rc::new(move |id| {
             let query = search.text().to_string();
             let updated_at = id
@@ -1579,6 +1586,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 &match_tag,
                 &current_tag,
             );
+            schedule_notes_preview_top(&preview, &notes_preview_scroller, &preview_scroll);
         })
     };
 
@@ -1666,6 +1674,25 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         })
     };
     *rebuild_list_slot.borrow_mut() = Some(rebuild_list.clone());
+    notes.preview_scroller.vadjustment().connect_value_changed({
+        let preview_scroll = preview_scroll.clone();
+        move |adj| {
+            // Our own pin sets value to 0. A wheel or drag is the user
+            // taking over, so stop fighting them.
+            if preview_scroll.setting.get() {
+                return;
+            }
+            if adj.value() > 0.5 {
+                preview_scroll.pin.set(0);
+            }
+        }
+    });
+    notes.preview.connect_size_allocate({
+        let preview = notes.preview.clone();
+        let scroller = notes.preview_scroller.clone();
+        let preview_scroll = preview_scroll.clone();
+        move |_, _| notes_preview_apply_pin(&preview, &scroller, &preview_scroll)
+    });
 
     let refresh_closure: Rc<dyn Fn()> = {
         let root = root.clone();
@@ -1738,6 +1765,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let state = state.clone();
         let rebuild_list = rebuild_list.clone();
         let last_preview = last_preview.clone();
+        let preview_scroll = preview_scroll.clone();
         let originals = notes.originals.clone();
         let preview = notes.preview.clone();
         Rc::new(move |open| {
@@ -1769,6 +1797,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 window.set_focus_on_map(false);
                 window.set_accept_focus(interactive.get());
                 *last_preview.borrow_mut() = (None, String::new(), 0);
+                preview_scroll.pin.set(0);
                 originals.borrow_mut().clear();
                 if let Some(buffer) = preview.buffer() {
                     buffer.set_text("");
@@ -2174,9 +2203,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         }
                         toggle_translate();
                     }
-                    // Dictate needs no edit chrome, so unlike a note or a
+                    // OCR needs no edit chrome, so unlike a note or a
                     // dictionary it runs the same in lock mode.
-                    "dictate" => dictate_start(),
+                    "ocr" | "dictate" => dictate_start(),
                     "quit" => quit.clicked(),
                     _ => {}
                 }
@@ -5190,6 +5219,77 @@ struct NotesListState {
     confirm_id: Rc<Cell<Option<u64>>>,
 }
 
+#[derive(Clone)]
+struct NotesPreviewScroll {
+    generation: Rc<Cell<u64>>,
+    /// Same as `generation` while this fill still owns the scrollbar.
+    pin: Rc<Cell<u64>>,
+    setting: Rc<Cell<bool>>,
+}
+
+fn clamp_scroll_value(value: f64, upper: f64, page: f64) -> f64 {
+    let max = (upper - page).max(0.0);
+    if !value.is_finite() {
+        return 0.0;
+    }
+    value.clamp(0.0, max)
+}
+
+fn notes_preview_scroll_top(preview: &gtk::TextView, scroller: &gtk::ScrolledWindow) {
+    if let Some(buffer) = preview.buffer() {
+        // fill_note_content inserts at the end, so the insert mark sits
+        // there. TextView then scrolls to keep that mark on screen and
+        // the preview lands somewhere down the note.
+        buffer.place_cursor(&buffer.start_iter());
+    }
+    if let Some(adj) = preview.vadjustment() {
+        adj.set_value(0.0);
+    }
+    scroller.vadjustment().set_value(0.0);
+}
+
+fn notes_preview_apply_pin(
+    preview: &gtk::TextView,
+    scroller: &gtk::ScrolledWindow,
+    scroll: &NotesPreviewScroll,
+) {
+    if scroll.pin.get() == 0 || scroll.pin.get() != scroll.generation.get() {
+        return;
+    }
+    scroll.setting.set(true);
+    notes_preview_scroll_top(preview, scroller);
+    scroll.setting.set(false);
+}
+
+fn schedule_notes_preview_top(
+    preview: &gtk::TextView,
+    scroller: &gtk::ScrolledWindow,
+    scroll: &NotesPreviewScroll,
+) {
+    let generation = scroll.generation.get().wrapping_add(1);
+    scroll.generation.set(generation);
+    scroll.pin.set(generation);
+    notes_preview_apply_pin(preview, scroller, scroll);
+    let preview = preview.clone();
+    let scroller = scroller.clone();
+    let scroll = scroll.clone();
+    glib::idle_add_local_once(move || {
+        if scroll.generation.get() != generation {
+            return;
+        }
+        notes_preview_apply_pin(&preview, &scroller, &scroll);
+        let preview = preview.clone();
+        let scroller = scroller.clone();
+        let scroll = scroll.clone();
+        glib::idle_add_local_once(move || {
+            if scroll.generation.get() != generation {
+                return;
+            }
+            notes_preview_apply_pin(&preview, &scroller, &scroll);
+        });
+    });
+}
+
 fn rebuild_notes_list(
     list: &gtk::Box,
     root: &gtk::Fixed,
@@ -5911,18 +6011,92 @@ fn note_growth_limit(card: &gtk::EventBox) -> Size {
     }
 }
 
-// The size a note needs so a freshly pasted image is fully visible inside it,
-// image edge included. A note is only ever grown here, never shrunk.
+// How wide the card has to be so a pasted image is not clipped. Height is
+// the user's: they already have a scrollbar, and growing to the monitor
+// edge is what ballooned a deliberately short note on every paste.
 fn note_size_for_image(current: Size, chrome: Size, image: Size, limit: Size) -> Size {
     Size {
         width: (image.width + chrome.width).clamp(current.width, limit.width.max(current.width)),
-        height: (image.height + chrome.height + NOTE_IMAGE_ROOM)
-            .clamp(current.height, limit.height.max(current.height)),
+        height: current.height,
     }
 }
 
-// Grow the note so the image inside it stays fully visible, edge included, and
-// remember the new size the way a resize drag does.
+fn note_scroll_value(editor: &gtk::TextView) -> f64 {
+    editor
+        .vadjustment()
+        .map(|adj| adj.value())
+        .unwrap_or(0.0)
+}
+
+fn note_set_scroll_value(editor: &gtk::TextView, value: f64) {
+    let apply = |adj: &gtk::Adjustment| {
+        adj.set_value(clamp_scroll_value(value, adj.upper(), adj.page_size()));
+    };
+    if let Some(adj) = editor.vadjustment() {
+        apply(&adj);
+    }
+    if let Some(parent) = editor.parent() {
+        if let Ok(scroller) = parent.downcast::<gtk::ScrolledWindow>() {
+            apply(&scroller.vadjustment());
+        }
+    }
+}
+
+fn note_validate_layout(editor: &gtk::TextView) {
+    let Some(buffer) = editor.buffer() else {
+        return;
+    };
+    let _ = editor.iter_location(&buffer.end_iter());
+}
+
+// Rebuilding the buffer resets the scrollbar and GTK may paint that
+// before an idle can put it back. Freeze the text window so the old
+// pixels stay up until the restore has landed.
+struct NotePaintFreeze {
+    windows: Vec<gdk::Window>,
+}
+
+impl NotePaintFreeze {
+    fn new(editor: &gtk::TextView) -> Self {
+        let mut windows = Vec::new();
+        let mut push = |window: Option<gdk::Window>| {
+            let Some(window) = window else {
+                return;
+            };
+            if windows.iter().any(|have| have == &window) {
+                return;
+            }
+            window.freeze_updates();
+            windows.push(window);
+        };
+        push(TextViewExt::window(editor, gtk::TextWindowType::Text));
+        push(TextViewExt::window(editor, gtk::TextWindowType::Widget));
+        push(gtk::prelude::WidgetExt::window(editor));
+        if let Some(parent) = editor.parent() {
+            push(gtk::prelude::WidgetExt::window(&parent));
+        }
+        Self { windows }
+    }
+}
+
+impl Drop for NotePaintFreeze {
+    fn drop(&mut self) {
+        for window in &self.windows {
+            window.thaw_updates();
+        }
+    }
+}
+
+fn note_reveal_offset(editor: &gtk::TextView, offset: i32) {
+    let Some(buffer) = editor.buffer() else {
+        return;
+    };
+    let mut at = buffer.iter_at_offset(offset.clamp(0, buffer.char_count()));
+    editor.scroll_to_iter(&mut at, 0.12, false, 0.0, 0.0);
+}
+
+// Widen the note if the image would be clipped, and remember the size the
+// way a resize drag does. Height is left alone.
 fn grow_note_for_image(
     editor: &gtk::TextView,
     target: &NoteImageTarget,
@@ -6780,8 +6954,12 @@ fn paste_note_image(
     buffer.place_cursor(&buffer.iter_at_offset(offset + 1));
     // Include any text/images already above this one. Growing for the pixbuf's
     // height alone clips a paste made after a few lines of text.
-    let extent = image_layout_extent(editor, offset, Size { width, height });
-    grow_note_for_image(editor, target, state, extent);
+    grow_note_for_image(editor, target, state, Size { width, height });
+    note_reveal_offset(editor, offset);
+    let editor = editor.clone();
+    glib::idle_add_local_once(move || {
+        note_reveal_offset(&editor, offset);
+    });
     // Saved to disk already, so keeping the full-resolution paste in memory
     // buys nothing until the image is actually resized.
     originals.borrow_mut().remove(&file);
@@ -6821,19 +6999,31 @@ fn apply_note_snapshot(
         .borrow_mut()
         .sizes
         .insert(target.key.clone(), snapshot.size);
+    // Rebuilding the buffer from scratch resets the scrollbar to 0 and
+    // place_cursor then scrolls to the caret. Neither should paint: the
+    // user was reading somewhere already.
+    let scroll = note_scroll_value(editor);
+    let freeze = NotePaintFreeze::new(editor);
     fill_note_content(&buffer, &snapshot.text, &snapshot.images, originals);
     target.highlights.fill(&buffer, &snapshot.highlights);
     store_note_highlights(&buffer, target, state);
     let cursor = snapshot.cursor.clamp(0, buffer.char_count());
     buffer.place_cursor(&buffer.iter_at_offset(cursor));
+    note_validate_layout(editor);
+    note_set_scroll_value(editor, scroll);
     // Buffer change handlers have synchronously copied the restored content
     // into AppState by this point; persist both content and note geometry now.
     let _ = state.borrow().save();
-    editor.queue_draw();
     let window = target.window.clone();
     let registry = target.registry.clone();
     let interactive = target.interactive.clone();
+    let editor = editor.clone();
     glib::idle_add_local_once(move || {
+        // Images finish laying out on this idle. Restore before thaw so
+        // the first painted frame is already at the old place.
+        note_validate_layout(&editor);
+        note_set_scroll_value(&editor, scroll);
+        drop(freeze);
         refresh_input_shape(&window, &registry, interactive.get());
     });
 }
@@ -8265,6 +8455,9 @@ fn fill_notes_preview(
         return;
     };
     fill_note_buffer(&buffer, note, originals, highlights);
+    // Inserts leave the caret at the end. Put it back so GTK's
+    // keep-the-insert-visible pass cannot dive down the note.
+    buffer.place_cursor(&buffer.start_iter());
     let query = query.trim();
     if query.is_empty() {
         return;
@@ -8279,7 +8472,7 @@ fn fill_notes_preview(
         matches,
         current,
     };
-    paint_note_search(preview, &dummy, match_tag, current_tag, &search, true);
+    paint_note_search(preview, &dummy, match_tag, current_tag, &search, false);
 }
 
 // The notes list is a centred command palette: a search field that is always
@@ -12640,6 +12833,7 @@ fn install_dictate(
                 let finish = finish.clone();
                 async move {
                     let Ok(read) = rx.recv().await else {
+                        finish(Some(("OCR ERROR".to_owned(), rect)));
                         return;
                     };
                     let message = match read {
@@ -12819,7 +13013,14 @@ fn install_dictate(
         let view = view.clone();
         let busy = busy.clone();
         let last_frame = last_frame.clone();
+        let finish = finish.clone();
         Rc::new(move || {
+            // The same key that opened the overlay should put it away: a
+            // second Super+Shift+A while dragging is a cancel, not a no-op.
+            if matches!(view.borrow().as_ref(), Some(DictateView::Selecting(_))) {
+                finish(None);
+                return;
+            }
             // A second click while a region is still being read is ignored
             // rather than queued: both runs would write the same request file
             // and wait on the same answer.
@@ -12846,6 +13047,11 @@ fn install_dictate(
             invalidate_visual_shape_cache();
             refresh_visual_shape(&window, &root, None);
             present_overlay(&window);
+            // Escape only reaches the overlay when it holds the keyboard.
+            // Super+Shift+A is often pressed over a Wayland app, so ask the
+            // compositor as well as present() — the X11 call alone cannot
+            // take focus from that app.
+            request_compositor_focus();
             layer.queue_draw();
         })
     };
@@ -13832,7 +14038,7 @@ mod timer_input_tests {
         image_room, image_room_after_y, invert_map, monitor_coordinate_divisor,
         monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
         note_search_matches, note_size_for_image, padded_visual_rect, paint_inverted,
-        age_label, centre_on_screen, note_snippets, note_sort_key, notes_delete_eats_key,
+        age_label, centre_on_screen, clamp_scroll_value, note_snippets, note_sort_key, notes_delete_eats_key,
         palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
         parse_timer_input, pinned_note_sync, push_recent_search,
         receives_input_when_locked, record_note_undo, relative_luminance, reopen_point,
@@ -14516,44 +14722,50 @@ mod timer_input_tests {
     }
 
     #[test]
-    fn a_note_grows_around_a_pasted_image_so_the_edge_stays_reachable() {
+    fn a_pasted_image_widens_a_note_but_keeps_the_users_height() {
         let current = Size {
             width: NOTE_WIDTH,
             height: NOTE_HEIGHT,
         };
-        // A default note shows far less than a pasted screenshot's height, so
-        // it has to grow or the resize edge is clipped away below the fold.
         let chrome = Size {
             width: 24,
             height: 48,
         };
         let image = Size {
             width: 208,
-            height: 117,
+            height: 400,
         };
         let limit = Size {
             width: 440,
             height: 440,
         };
         let grown = note_size_for_image(current, chrome, image, limit);
-        assert!(grown.height >= image.height + chrome.height);
-        assert!(grown.width >= current.width);
+        assert_eq!(grown.height, current.height);
+        assert_eq!(grown.width, 232);
 
-        // A note already big enough is left exactly as the user sized it.
+        let wide = Size {
+            width: 300,
+            height: 80,
+        };
+        let grown = note_size_for_image(current, chrome, wide, limit);
+        assert_eq!(grown.height, current.height);
+        assert_eq!(grown.width, 324);
+
+        // A note already wide enough is left exactly as the user sized it.
         let roomy = Size {
             width: 400,
-            height: 400,
+            height: 90,
         };
         assert_eq!(note_size_for_image(roomy, chrome, image, limit), roomy);
 
-        // Growth never exceeds what the note is allowed to be, even for an
-        // image bigger than the cap.
+        // Width never exceeds what the note is allowed to be.
         let tight = Size {
             width: 260,
             height: 200,
         };
-        let grown = note_size_for_image(current, chrome, image, tight);
-        assert!(grown.width <= tight.width && grown.height <= tight.height);
+        let grown = note_size_for_image(current, chrome, wide, tight);
+        assert_eq!(grown.height, current.height);
+        assert_eq!(grown.width, tight.width);
     }
 
     #[test]
@@ -14699,6 +14911,16 @@ mod timer_input_tests {
         assert!(notes_delete_eats_key(true, true, false));
         assert!(notes_delete_eats_key(true, false, true));
         assert!(notes_delete_eats_key(false, false, false));
+    }
+
+    #[test]
+    fn clamp_scroll_value_stays_inside_the_page() {
+        assert_eq!(clamp_scroll_value(0.0, 400.0, 200.0), 0.0);
+        assert_eq!(clamp_scroll_value(50.0, 400.0, 200.0), 50.0);
+        assert_eq!(clamp_scroll_value(5000.0, 400.0, 200.0), 200.0);
+        assert_eq!(clamp_scroll_value(-12.0, 400.0, 200.0), 0.0);
+        assert_eq!(clamp_scroll_value(80.0, 120.0, 200.0), 0.0);
+        assert_eq!(clamp_scroll_value(f64::NAN, 400.0, 200.0), 0.0);
     }
 
     fn sample_note(id: u64, starred: bool, updated_at: i64) -> Note {

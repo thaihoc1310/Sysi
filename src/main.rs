@@ -79,6 +79,9 @@ fn main() {
     if let Err(error) = install_notes_hotkey() {
         eprintln!("Could not register Ctrl+Alt+N as a GNOME shortcut: {error}");
     }
+    if let Err(error) = install_ocr_hotkey() {
+        eprintln!("Could not register Super+Shift+A as a GNOME shortcut: {error}");
+    }
     write_pid();
 
     // SIGUSR1's default action terminates the process, so a toggle sent
@@ -281,24 +284,56 @@ const CUSTOM_KEYBINDING_SCHEMA: &str =
     "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding";
 
 fn install_notes_hotkey() -> io::Result<()> {
+    install_custom_hotkey(
+        NOTES_HOTKEY_PATH,
+        NOTES_HOTKEY_NAME,
+        NOTES_HOTKEY_COMMAND,
+        NOTES_HOTKEY_BINDING,
+        binding_is_ctrl_alt_n,
+    )
+}
+
+const OCR_HOTKEY_PATH: &str =
+    "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sysi-ocr/";
+const OCR_HOTKEY_NAME: &str = "Sysi OCR";
+const OCR_HOTKEY_COMMAND: &str = "sysi --panel-action ocr";
+const OCR_HOTKEY_BINDING: &str = "<Super><Shift>a";
+
+fn install_ocr_hotkey() -> io::Result<()> {
+    install_custom_hotkey(
+        OCR_HOTKEY_PATH,
+        OCR_HOTKEY_NAME,
+        OCR_HOTKEY_COMMAND,
+        OCR_HOTKEY_BINDING,
+        binding_is_super_shift_a,
+    )
+}
+
+fn install_custom_hotkey(
+    path: &str,
+    name: &str,
+    command: &str,
+    binding: &str,
+    binding_taken: fn(&str) -> bool,
+) -> io::Result<()> {
     let list_raw = gsettings_output(&["get", MEDIA_KEYS_SCHEMA, "custom-keybindings"])?;
     let mut paths = parse_gsettings_path_list(&list_raw);
-    if paths.iter().any(|path| {
-        gsettings_reloc_get(path, "command")
-            .is_some_and(|value| unquote_gsettings(&value) == NOTES_HOTKEY_COMMAND)
+    if paths.iter().any(|item| {
+        gsettings_reloc_get(item, "command")
+            .is_some_and(|value| unquote_gsettings(&value) == command)
     }) {
         // Already registered — keep whatever key the user chose.
         return Ok(());
     }
-    if paths.iter().any(|path| {
-        gsettings_reloc_get(path, "binding")
-            .is_some_and(|value| binding_is_ctrl_alt_n(&unquote_gsettings(&value)))
+    if paths.iter().any(|item| {
+        gsettings_reloc_get(item, "binding")
+            .is_some_and(|value| binding_taken(&unquote_gsettings(&value)))
     }) {
-        // Something else already owns Ctrl+Alt+N.
+        // Something else already owns this combination.
         return Ok(());
     }
-    if !paths.iter().any(|path| path == NOTES_HOTKEY_PATH) {
-        paths.push(NOTES_HOTKEY_PATH.to_owned());
+    if !paths.iter().any(|item| item == path) {
+        paths.push(path.to_owned());
         gsettings_run(&[
             "set",
             MEDIA_KEYS_SCHEMA,
@@ -306,13 +341,13 @@ fn install_notes_hotkey() -> io::Result<()> {
             &format_gsettings_path_list(&paths),
         ])?;
     }
-    gsettings_reloc_set(NOTES_HOTKEY_PATH, "name", NOTES_HOTKEY_NAME)?;
-    gsettings_reloc_set(NOTES_HOTKEY_PATH, "command", NOTES_HOTKEY_COMMAND)?;
-    gsettings_reloc_set(NOTES_HOTKEY_PATH, "binding", NOTES_HOTKEY_BINDING)?;
+    gsettings_reloc_set(path, "name", name)?;
+    gsettings_reloc_set(path, "command", command)?;
+    gsettings_reloc_set(path, "binding", binding)?;
     Ok(())
 }
 
-fn binding_is_ctrl_alt_n(binding: &str) -> bool {
+fn binding_modifiers(binding: &str) -> (Vec<String>, String) {
     let mut parts = Vec::new();
     let mut rest = binding.trim();
     while let Some(start) = rest.find('<') {
@@ -323,13 +358,28 @@ fn binding_is_ctrl_alt_n(binding: &str) -> bool {
         parts.push(after[..end].to_ascii_lowercase());
         rest = &after[end + 1..];
     }
-    let key = rest.trim().to_ascii_lowercase();
+    (parts, rest.trim().to_ascii_lowercase())
+}
+
+fn binding_has(parts: &[String], names: &[&str]) -> bool {
+    parts.iter().any(|part| names.iter().any(|name| part == name))
+}
+
+fn binding_is_ctrl_alt_n(binding: &str) -> bool {
+    let (parts, key) = binding_modifiers(binding);
     key == "n"
-        && parts.iter().any(|part| {
-            part == "control" || part == "ctrl" || part == "primary"
-        })
-        && parts.iter().any(|part| part == "alt")
-        && !parts.iter().any(|part| part == "shift" || part == "super")
+        && binding_has(&parts, &["control", "ctrl", "primary"])
+        && binding_has(&parts, &["alt"])
+        && !binding_has(&parts, &["shift", "super"])
+}
+
+// Super+Shift+A, not Super+A (Show Apps) and not Super+Shift+S (screenshot).
+fn binding_is_super_shift_a(binding: &str) -> bool {
+    let (parts, key) = binding_modifiers(binding);
+    key == "a"
+        && binding_has(&parts, &["super"])
+        && binding_has(&parts, &["shift"])
+        && !binding_has(&parts, &["control", "ctrl", "primary", "alt"])
 }
 
 fn parse_gsettings_path_list(raw: &str) -> Vec<String> {
@@ -443,6 +493,16 @@ mod tests {
         assert!(!binding_is_ctrl_alt_n("<Control><Alt>o"));
         assert!(!binding_is_ctrl_alt_n("<Control><Shift><Alt>n"));
         assert!(!binding_is_ctrl_alt_n("<Super>n"));
+    }
+
+    #[test]
+    fn binding_is_super_shift_a_accepts_common_spellings() {
+        assert!(binding_is_super_shift_a("<Super><Shift>a"));
+        assert!(binding_is_super_shift_a("<Shift><Super>A"));
+        assert!(!binding_is_super_shift_a("<Super>a"));
+        assert!(!binding_is_super_shift_a("<Super><Shift>s"));
+        assert!(!binding_is_super_shift_a("<Super><Shift>d"));
+        assert!(!binding_is_super_shift_a("<Control><Super><Shift>a"));
     }
 
     #[test]
