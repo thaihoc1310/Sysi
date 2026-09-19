@@ -1756,8 +1756,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 // grab_focus only moves GTK's caret. Ctrl+Alt+N arrives as a
                 // GNOME shortcut or a grab on another X connection, so this
                 // display has no current user_time and mutter will not focus
-                // a Utility overlay from a stale present(). Take the keyboard
-                // first, then put the caret in search.
+                // a Utility overlay from a stale present(). Ask the shell to
+                // activate us, take the X11 keyboard, then put the caret
+                // in search.
+                request_compositor_focus();
                 focus_overlay_for_typing(&window);
                 window.set_focus(Some(&search));
                 search.grab_focus();
@@ -1823,6 +1825,19 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     notes.hide.connect_clicked({
         let toggle_notes = toggle_notes.clone();
         move |_| toggle_notes()
+    });
+    // Mutter may hand the overlay the keyboard a frame later than show().
+    // When that happens, put the caret back in search.
+    window.connect_focus_in_event({
+        let card = notes.card.clone();
+        let search = notes.search.clone();
+        move |window, _| {
+            if card.is_visible() {
+                window.set_focus(Some(&search));
+                search.grab_focus();
+            }
+            glib::Propagation::Proceed
+        }
     });
 
     let handle_notes_keys: Rc<dyn Fn(&gdk::EventKey) -> glib::Propagation> = {
@@ -12071,6 +12086,14 @@ fn present_overlay(window: &gtk::ApplicationWindow) {
     } else {
         window.present();
     }
+}
+
+/// Ask the GNOME panel extension to activate this overlay. An Xwayland
+/// client cannot steal the keyboard from a native Wayland app; the shell can.
+fn request_compositor_focus() {
+    let dir = crate::state::cache_dir();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(dir.join("focus-request"), format!("{}\n", now_ms()));
 }
 
 fn overlay_last_user_time() -> u32 {

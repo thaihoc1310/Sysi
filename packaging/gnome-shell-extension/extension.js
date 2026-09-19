@@ -1,6 +1,7 @@
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
@@ -156,6 +157,21 @@ export default class SysiPanelExtension extends Extension {
         } catch (error) {
             logError(error, 'Sysi could not watch dictate requests');
         }
+        this._focusRequestFile = Gio.File.new_for_path(
+            GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi', 'focus-request']),
+        );
+        if (!this._focusRequestFile.query_exists(null))
+            GLib.file_set_contents(this._focusRequestFile.get_path(), '');
+        try {
+            this._focusRequestMonitor = this._focusRequestFile.monitor_file(
+                Gio.FileMonitorFlags.NONE,
+                null,
+            );
+            this._focusRequestMonitor.connect('changed', () => this._activateOverlaySoon());
+        } catch (error) {
+            logError(error, 'Sysi panel gear could not watch focus requests');
+        }
+        this._bindNotesHotkey();
         this._syncPanelState();
         this._syncVisibility();
         // Sampling before the shell has laid out its monitors makes
@@ -184,6 +200,10 @@ export default class SysiPanelExtension extends Extension {
         this._autoColorRequestMonitor?.cancel();
         this._autoColorRequestMonitor = null;
         this._autoColorRequestFile = null;
+        this._unbindNotesHotkey();
+        this._focusRequestMonitor?.cancel();
+        this._focusRequestMonitor = null;
+        this._focusRequestFile = null;
         this._dictateRequestMonitor?.cancel();
         this._dictateRequestMonitor = null;
         this._dictateRequestFile = null;
@@ -306,8 +326,12 @@ export default class SysiPanelExtension extends Extension {
     // own place on the stage, which is already in the logical coordinates the
     // overlay lays its widgets out in.
     _runAction(action, button) {
+        // Opening Notes needs the overlay to hold the keyboard. An Xwayland
+        // client cannot steal that from a native Wayland app; the shell can.
+        if (action === 'toggle-notes' || action === 'toggle-history')
+            this._activateOverlaySoon();
         const argv = ['sysi', '--panel-action', action];
-        const anchor = this._anchorOf(button);
+        const anchor = button ? this._anchorOf(button) : null;
         if (anchor)
             argv.push('--at', anchor);
         try {
@@ -315,6 +339,132 @@ export default class SysiPanelExtension extends Extension {
         } catch (error) {
             logError(error, `Sysi panel action ${action} failed`);
         }
+    }
+
+    _overlayWindow() {
+        const actors = global.get_window_actors();
+        for (const actor of actors) {
+            const win = actor.meta_window;
+            if (!win)
+                continue;
+            const title = win.get_title() ?? '';
+            const wmClass = (win.get_wm_class() ?? '').toLowerCase();
+            const gtkId = win.get_gtk_application_id?.() ?? '';
+            if (title === 'Sysi Overlay' || wmClass === 'sysi' || gtkId === 'io.sysi.Overlay')
+                return win;
+        }
+        return null;
+    }
+
+    _activateOverlay(timestamp) {
+        const win = this._overlayWindow();
+        if (!win)
+            return;
+        const time = timestamp || global.get_current_time();
+        Main.activateWindow(win, time);
+    }
+
+    _activateOverlaySoon(timestamp) {
+        this._activateOverlay(timestamp);
+        // The overlay refuses the keyboard until Notes is open. The helper
+        // process has not finished that yet, so try once more after it has.
+        if (this._activateTimeout)
+            GLib.source_remove(this._activateTimeout);
+        this._activateTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 80, () => {
+            this._activateTimeout = 0;
+            this._activateOverlay();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _notesShortcutSettings() {
+        try {
+            return new Gio.Settings({
+                schema_id: 'org.gnome.settings-daemon.plugins.media-keys.custom-keybinding',
+                path: '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sysi-notes/',
+            });
+        } catch (_) {
+            return null;
+        }
+    }
+
+    _silenceCustomNotesShortcut() {
+        const settings = this._notesShortcutSettings();
+        if (!settings)
+            return;
+        if (settings.get_string('command') !== 'sysi --panel-action toggle-notes')
+            return;
+        const binding = settings.get_string('binding');
+        if (!binding)
+            return;
+        this._notesShortcutBinding = binding;
+        settings.set_string('binding', '');
+    }
+
+    _restoreCustomNotesShortcut() {
+        const settings = this._notesShortcutSettings();
+        if (!settings || !this._notesShortcutBinding)
+            return;
+        if (!settings.get_string('binding'))
+            settings.set_string('binding', this._notesShortcutBinding);
+        this._notesShortcutBinding = null;
+    }
+
+    _bindNotesHotkey() {
+        // The GNOME custom shortcut only launches a helper process. That
+        // process cannot take the keyboard. Grabbing here runs inside the
+        // compositor, so Notes can type even when a Wayland app had focus.
+        // Silence our own custom shortcut first; otherwise the grab fails
+        // and we are back to a helper that cannot focus the overlay.
+        this._silenceCustomNotesShortcut();
+        try {
+            this._notesAccelAction = global.display.grab_accelerator(
+                '<Control><Alt>n',
+                Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            );
+        } catch (error) {
+            logError(error, 'Sysi could not grab Ctrl+Alt+N');
+            this._notesAccelAction = 0;
+            this._restoreCustomNotesShortcut();
+            return;
+        }
+        if (!this._notesAccelAction || this._notesAccelAction === Meta.KeyBindingAction.NONE) {
+            this._notesAccelAction = 0;
+            this._restoreCustomNotesShortcut();
+            return;
+        }
+        this._notesAccelName = Meta.external_binding_name_for_action(this._notesAccelAction);
+        Main.wm.allowKeybinding(
+            this._notesAccelName,
+            Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+        );
+        this._notesAccelId = global.display.connect(
+            'accelerator-activated',
+            (_display, action, _deviceId, timestamp) => {
+                if (action !== this._notesAccelAction)
+                    return;
+                this._activateOverlay(timestamp);
+                this._runAction('toggle-notes', null);
+            },
+        );
+    }
+
+    _unbindNotesHotkey() {
+        if (this._activateTimeout) {
+            GLib.source_remove(this._activateTimeout);
+            this._activateTimeout = 0;
+        }
+        if (this._notesAccelId) {
+            global.display.disconnect(this._notesAccelId);
+            this._notesAccelId = 0;
+        }
+        if (this._notesAccelName)
+            Main.wm.allowKeybinding(this._notesAccelName, Shell.ActionMode.NONE);
+        if (this._notesAccelAction)
+            global.display.ungrab_accelerator(this._notesAccelAction);
+        this._notesAccelAction = 0;
+        this._notesAccelName = null;
+        this._restoreCustomNotesShortcut();
     }
 
     // The middle of the button's bottom edge: the overlay centres the widget on
