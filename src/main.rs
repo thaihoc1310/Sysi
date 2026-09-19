@@ -73,6 +73,12 @@ fn main() {
     if let Err(error) = install_panel_extension() {
         eprintln!("Could not refresh the Sysi panel extension: {error}");
     }
+    // Wayland never delivers the X11 grab to a focused Wayland client. A
+    // GNOME custom shortcut runs the same IPC the panel button uses, so
+    // Ctrl+Alt+N works from any app. Left alone if the user already bound it.
+    if let Err(error) = install_notes_hotkey() {
+        eprintln!("Could not register Ctrl+Alt+N as a GNOME shortcut: {error}");
+    }
     write_pid();
 
     // SIGUSR1's default action terminates the process, so a toggle sent
@@ -263,4 +269,185 @@ fn spawn_instance() {
 
 fn read_pid(path: &Path) -> Option<i32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+const NOTES_HOTKEY_PATH: &str =
+    "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sysi-notes/";
+const NOTES_HOTKEY_NAME: &str = "Sysi Notes";
+const NOTES_HOTKEY_COMMAND: &str = "sysi --panel-action toggle-notes";
+const NOTES_HOTKEY_BINDING: &str = "<Control><Alt>n";
+const MEDIA_KEYS_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
+const CUSTOM_KEYBINDING_SCHEMA: &str =
+    "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding";
+
+fn install_notes_hotkey() -> io::Result<()> {
+    let list_raw = gsettings_output(&["get", MEDIA_KEYS_SCHEMA, "custom-keybindings"])?;
+    let mut paths = parse_gsettings_path_list(&list_raw);
+    if paths.iter().any(|path| {
+        gsettings_reloc_get(path, "command")
+            .is_some_and(|value| unquote_gsettings(&value) == NOTES_HOTKEY_COMMAND)
+    }) {
+        // Already registered — keep whatever key the user chose.
+        return Ok(());
+    }
+    if paths.iter().any(|path| {
+        gsettings_reloc_get(path, "binding")
+            .is_some_and(|value| binding_is_ctrl_alt_n(&unquote_gsettings(&value)))
+    }) {
+        // Something else already owns Ctrl+Alt+N.
+        return Ok(());
+    }
+    if !paths.iter().any(|path| path == NOTES_HOTKEY_PATH) {
+        paths.push(NOTES_HOTKEY_PATH.to_owned());
+        gsettings_run(&[
+            "set",
+            MEDIA_KEYS_SCHEMA,
+            "custom-keybindings",
+            &format_gsettings_path_list(&paths),
+        ])?;
+    }
+    gsettings_reloc_set(NOTES_HOTKEY_PATH, "name", NOTES_HOTKEY_NAME)?;
+    gsettings_reloc_set(NOTES_HOTKEY_PATH, "command", NOTES_HOTKEY_COMMAND)?;
+    gsettings_reloc_set(NOTES_HOTKEY_PATH, "binding", NOTES_HOTKEY_BINDING)?;
+    Ok(())
+}
+
+fn binding_is_ctrl_alt_n(binding: &str) -> bool {
+    let mut parts = Vec::new();
+    let mut rest = binding.trim();
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('>') else {
+            break;
+        };
+        parts.push(after[..end].to_ascii_lowercase());
+        rest = &after[end + 1..];
+    }
+    let key = rest.trim().to_ascii_lowercase();
+    key == "n"
+        && parts.iter().any(|part| {
+            part == "control" || part == "ctrl" || part == "primary"
+        })
+        && parts.iter().any(|part| part == "alt")
+        && !parts.iter().any(|part| part == "shift" || part == "super")
+}
+
+fn parse_gsettings_path_list(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("@as").map(str::trim).unwrap_or(raw);
+    let mut paths = Vec::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\'' && character != '"' {
+            continue;
+        }
+        let quote = character;
+        let mut item = String::new();
+        for character in chars.by_ref() {
+            if character == quote {
+                break;
+            }
+            item.push(character);
+        }
+        if !item.is_empty() {
+            paths.push(item);
+        }
+    }
+    paths
+}
+
+fn format_gsettings_path_list(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return "@as []".to_owned();
+    }
+    let inner = paths
+        .iter()
+        .map(|path| format!("'{path}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{inner}]")
+}
+
+fn unquote_gsettings(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.len() >= 2
+        && ((raw.starts_with('\'') && raw.ends_with('\''))
+            || (raw.starts_with('"') && raw.ends_with('"')))
+    {
+        return raw[1..raw.len() - 1].replace("\\'", "'");
+    }
+    raw.to_owned()
+}
+
+fn gsettings_reloc_schema(path: &str) -> String {
+    format!("{CUSTOM_KEYBINDING_SCHEMA}:{path}")
+}
+
+fn gsettings_reloc_get(path: &str, key: &str) -> Option<String> {
+    gsettings_output(&["get", &gsettings_reloc_schema(path), key]).ok()
+}
+
+fn gsettings_reloc_set(path: &str, key: &str, value: &str) -> io::Result<()> {
+    gsettings_run(&["set", &gsettings_reloc_schema(path), key, value])
+}
+
+fn gsettings_output(args: &[&str]) -> io::Result<String> {
+    let output = process::Command::new("gsettings").args(args).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(stderr.trim().to_owned()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn gsettings_run(args: &[&str]) -> io::Result<()> {
+    gsettings_output(args).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_gsettings_path_list_reads_quoted_entries() {
+        assert!(parse_gsettings_path_list("@as []").is_empty());
+        assert_eq!(
+            parse_gsettings_path_list(
+                "['/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/', '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/heminus-terminal/']"
+            ),
+            [
+                "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/",
+                "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/heminus-terminal/",
+            ]
+        );
+    }
+
+    #[test]
+    fn format_gsettings_path_list_round_trips() {
+        let paths = vec![
+            "/a/".to_owned(),
+            "/b/".to_owned(),
+        ];
+        assert_eq!(
+            parse_gsettings_path_list(&format_gsettings_path_list(&paths)),
+            paths
+        );
+        assert_eq!(format_gsettings_path_list(&[]), "@as []");
+    }
+
+    #[test]
+    fn binding_is_ctrl_alt_n_accepts_common_spellings() {
+        assert!(binding_is_ctrl_alt_n("<Control><Alt>n"));
+        assert!(binding_is_ctrl_alt_n("<Ctrl><Alt>N"));
+        assert!(binding_is_ctrl_alt_n("<Primary><Alt>n"));
+        assert!(!binding_is_ctrl_alt_n("<Control><Alt>o"));
+        assert!(!binding_is_ctrl_alt_n("<Control><Shift><Alt>n"));
+        assert!(!binding_is_ctrl_alt_n("<Super>n"));
+    }
+
+    #[test]
+    fn unquote_gsettings_strips_surrounding_quotes() {
+        assert_eq!(unquote_gsettings("'Sysi Notes'"), "Sysi Notes");
+        assert_eq!(unquote_gsettings("sysi --panel-action toggle-notes"), "sysi --panel-action toggle-notes");
+    }
 }

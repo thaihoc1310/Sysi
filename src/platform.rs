@@ -15,6 +15,7 @@ static GRAB_REFUSED: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy, Debug)]
 pub enum HotkeyAction {
     ToggleInteraction,
+    ToggleNotes,
 }
 
 // Xlib's default error handler calls exit(), which would silently kill the
@@ -62,6 +63,7 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
             }
             let root = xlib::XDefaultRootWindow(display);
             let toggle_keycode = xlib::XKeysymToKeycode(display, b'o' as u64);
+            let notes_keycode = xlib::XKeysymToKeycode(display, b'n' as u64);
             let base = xlib::ControlMask | xlib::Mod1Mask;
             for extra in [
                 0,
@@ -69,21 +71,23 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
                 xlib::Mod2Mask,
                 xlib::LockMask | xlib::Mod2Mask,
             ] {
-                xlib::XGrabKey(
-                    display,
-                    toggle_keycode as i32,
-                    base | extra,
-                    root,
-                    xlib::True,
-                    xlib::GrabModeAsync,
-                    xlib::GrabModeAsync,
-                );
+                for keycode in [toggle_keycode, notes_keycode] {
+                    xlib::XGrabKey(
+                        display,
+                        keycode as i32,
+                        base | extra,
+                        root,
+                        xlib::True,
+                        xlib::GrabModeAsync,
+                        xlib::GrabModeAsync,
+                    );
+                }
             }
             xlib::XSync(display, xlib::False);
             if GRAB_REFUSED.swap(false, Ordering::Relaxed) {
                 eprintln!(
-                    "Sysi could not take Ctrl+Alt+O: another application already holds it. \
-                     Lock and unlock from the panel strip instead."
+                    "Sysi could not take Ctrl+Alt+O or Ctrl+Alt+N: another application already holds one of them. \
+                     Lock, unlock, and open notes from the panel strip instead."
                 );
             }
             let connection = xlib::XConnectionNumber(display);
@@ -97,13 +101,17 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
                 while xlib::XPending(display) > 0 {
                     let mut event: xlib::XEvent = mem::zeroed();
                     xlib::XNextEvent(display, &mut event);
-                    if event.get_type() == xlib::KeyPress
-                        && sender
-                            .send_blocking(HotkeyAction::ToggleInteraction)
-                            .is_err()
-                    {
-                        // The overlay has gone; there is nothing left to toggle.
-                        break 'listen;
+                    if event.get_type() == xlib::KeyPress {
+                        let keycode = event.key.keycode;
+                        let action = if keycode == u32::from(notes_keycode) {
+                            HotkeyAction::ToggleNotes
+                        } else {
+                            HotkeyAction::ToggleInteraction
+                        };
+                        if sender.send_blocking(action).is_err() {
+                            // The overlay has gone; there is nothing left to toggle.
+                            break 'listen;
+                        }
                     }
                 }
                 // Wait on the socket rather than inside Xlib. A connection that

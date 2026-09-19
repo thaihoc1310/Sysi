@@ -63,7 +63,7 @@ export default class SysiPanelExtension extends Extension {
         this._system = this._addAction('system', 'toggle-system');
         this._timer = this._addAction('timer', 'toggle-timer');
         this._addAction('+ note', 'new-note');
-        this._addAction('history', 'toggle-history');
+        this._addAction('notes', 'toggle-notes');
         this._addAction('usage', 'toggle-usage');
         this._addAction('dictionary', 'toggle-translate');
         this._addAction('dictate', 'dictate');

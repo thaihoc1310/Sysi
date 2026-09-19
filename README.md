@@ -12,7 +12,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
   Every sensor, `/proc` walk, and `nvidia-smi` call runs only while its section is enabled, and all of it on a sampler thread rather than the GTK main loop.
 - Focus countdown with four visual styles, hover controls in both modes, and a persistent animated alarm that must be dismissed.
 - A compact gear menu with persistent SYSTEM and timer visibility toggles.
-- Note History: click or drag an old note onto the desktop to pin it again.
+- Notes palette: `Ctrl+Alt+N` opens a centred command palette of every note. Search shows the matching passage, a preview reads the note in place, and Enter pins it on the desk.
 - A small transparent `USAGE` card for Codex, Claude Code, and Oh My Pi (OMP). It
   shows the remaining percentage, the server-provided reset time, and the age
   of the last snapshot. The card polls only while visible, keeps the previous
@@ -23,7 +23,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
   figure, a bar splitting it between the three, and a bar per source; hover any
   of them for the exact count and the input / output / cache breakdown. The
   window is `TODAY`, `7D`, `30D`, or everything the logs still hold.
-- Create multiple independent notes from the `NOTE` action. Hiding a blank note deletes it; notes containing text or images stay in History.
+- Create multiple independent notes from the `NOTE` action. Hiding a blank note deletes it; notes containing text or images stay in Notes.
 - The panel’s final `settings` button opens colour mode, font size (`− number +`), lock/unlock, and quit. Each window also has its own font-size controls in its right-click menu. Changing the global font size clears the individual overrides; sizes persist across restarts.
 - Click-through lock mode. Mouse events pass through everywhere except the timer circle, which keeps its hover and click control.
 - `AUTO` samples the background beneath each widget and chooses a contrasting `LIGHT` or `DARK` foreground. In Edit Mode, right-click any widget to override it; the single colour entry cycles AUTO → LIGHT → DARK → INVERT → AUTO. Using the Settings mode button resets every widget to the selected global mode.
@@ -40,13 +40,14 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 ## Controls
 
 - `Ctrl+Alt+O` — lock or unlock interaction.
+- `Ctrl+Alt+N` — open or close the Notes palette. Search, move with Up/Down, Enter to open on the desk, Ctrl+P to pin, Delete to delete, Escape to close.
 - `Ctrl+F` — find text in the focused note. Use `Enter` / `Shift+Enter` (or
   `F3` / `Shift+F3`) to move between matches and `Escape` to close the panel.
-- `Escape` — return to click-through lock mode.
+- `Escape` — close the Notes palette if it is open; otherwise return to click-through lock mode.
 - `sysi --toggle` — toggle interaction from a terminal or a custom desktop shortcut.
 - `sysi --quit` — stop the running overlay.
 
-Sysi opens in Edit Mode. Drag a widget to move it or drag the small bottom-right arc to resize it. Notes show their title bar only in Edit Mode and use it as the move handle. A short click still activates buttons and note editing. While Sysi is running, the gear in the GNOME panel expands to `SYSTEM`, `TIMER`, `NOTE`, `HISTORY`, `USAGE`, `DICTIONARY`, `DICTATE`, and `SETTINGS` directly in the panel.
+Sysi opens in Edit Mode. Drag a widget to move it or drag the small bottom-right arc to resize it. Notes show their title bar only in Edit Mode and use it as the move handle. A short click still activates buttons and note editing. While Sysi is running, the gear in the GNOME panel expands to `SYSTEM`, `TIMER`, `NOTE`, `NOTES`, `USAGE`, `DICTIONARY`, `DICTATE`, and `SETTINGS` directly in the panel.
 
 Quota sources are the CLIs already installed on the machine: `codex app-server` for Codex's `account/rateLimits/read`, `claude -p /usage --output-format json` for Claude Code, and `omp usage --json` for OMP. Claude Code answers `/usage` from what it already knows, at no token cost, but it refuses to run at all while the account is over its limit — so Claude has a second source, Anthropic's OAuth usage endpoint read with the credential Claude Code stored. Either can be shut out by the very quota it reports on, so they cover for each other: the endpoint is asked first because it answers in one request instead of booting a CLI, after that whichever answered last is asked first, a failure falls through to the other, and a working fallback becomes the preferred source, so the pair swaps rather than hammering the blocked side. The stored Claude token is read to send that one request and never written, refreshed or persisted; no other credential is touched. Each source has its own in-flight guard and retry cooldown (2, 4, 8, then 15 minutes on errors). Switching sources or reopening keeps each source's last successful rows visible while its refresh is in flight; failed reads clear that source's quota because account ownership cannot be verified. OMP rows retain per-limit account identifiers in RAM and all rows are scrollable; no raw JSON is saved. Reset labels update locally and each elapsed reset triggers one fetch, subject to cooldown. The card names the signed-in account by the address each CLI stores locally (`~/.codex/auth.json`, `~/.claude.json`, the OMP report metadata) rather than an opaque account id, and a manual refresh runs `omp usage invalidate` first so OMP re-reads the providers instead of replaying its cached report. A missing login, unsupported plan, or provider without quota data is shown as a status message instead of being converted to a fake percentage — for Claude that message is the CLI's own opening line, which says whether the credential is a subscription or an API key.
 
@@ -90,4 +91,4 @@ Sysi is an X11 overlay: always-on-top placement, sticky multi-monitor coverage, 
 
 Ubuntu 26.04 (GNOME 50) ships no Xorg session at all — `/usr/share/xsessions` is gone — so this is the path every 26.04 desktop takes.
 
-One thing Xwayland cannot give back is a truly global hotkey. `Ctrl+Alt+O` is grabbed on the X server, so it fires only while an X11 window holds focus; a focused Wayland window never delivers it. For a hotkey that works everywhere, bind `sysi --toggle` to a GNOME custom keyboard shortcut in Settings → Keyboard → Custom Shortcuts. The panel strip's `LOCK` / `UNLOCK` button and `Escape` are unaffected.
+Xwayland cannot grab a key while a Wayland window is focused. Sysi therefore also registers `Ctrl+Alt+N` as a GNOME custom shortcut (`sysi --panel-action toggle-notes`) so Notes opens from any app. Change or remove it in Settings → Keyboard → Custom Shortcuts. `Ctrl+Alt+O` still needs an X11 window focused, or bind `sysi --toggle` yourself. The panel strip's `LOCK` / `UNLOCK` and `NOTES` buttons and `Escape` are unaffected.

@@ -15,7 +15,8 @@ use gtk::prelude::*;
 use regex::RegexBuilder;
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
     f64::consts::{FRAC_PI_2, PI, TAU},
     fs,
     rc::{Rc, Weak},
@@ -85,8 +86,6 @@ const SYSTEM_ROW_TOP_GAP: f64 = 16.0;
 const TIMER_SIZE: i32 = 116;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
-const HISTORY_WIDTH: i32 = 236;
-const HISTORY_HEIGHT: i32 = 252;
 const USAGE_WIDTH: i32 = 292;
 const USAGE_HEIGHT: i32 = 188;
 const TRANSLATE_WIDTH: i32 = 272;
@@ -122,8 +121,8 @@ const VISUAL_SHAPE_MARGIN: i32 = 8;
 const DRAG_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
-// The history row the pointer is on, or None. The history window's right-click
-// menu reads it to know which note a delete applies to.
+// The notes-palette row the pointer is on, or None. The palette's right-click
+// menu reads it to know which note a delete or pin applies to.
 type HoveredRow = Rc<Cell<Option<u64>>>;
 // The dictionary lookup, handed to context menus that are built before it
 // exists. Filled in once during startup, like `CallbackSlot`.
@@ -794,6 +793,21 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             data.layout_version = 9;
             let _ = data.save();
         }
+        if data.layout_version < 10 {
+            // HISTORY became a centred NOTES palette: colour and font follow
+            // the widget under the new key, but place and size are forgotten
+            // because the palette is always laid out in the middle.
+            if let Some(mode) = data.widget_color_modes.remove("history") {
+                data.widget_color_modes.insert("notes".into(), mode);
+            }
+            if let Some(size) = data.widget_font_sizes.remove("history") {
+                data.widget_font_sizes.insert("notes".into(), size);
+            }
+            data.positions.remove("history");
+            data.sizes.remove("history");
+            data.layout_version = 10;
+            let _ = data.save();
+        }
     }
     // Image files left behind by a note deleted while Sysi was not running, or
     // by an image backspaced out of a note, are reclaimed once per launch. So
@@ -837,14 +851,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     let translate_scrollers: Rc<RefCell<Vec<gtk::ScrolledWindow>>> =
         Rc::new(RefCell::new(Vec::new()));
     let note_refresh: CallbackSlot = Rc::new(RefCell::new(None));
-    // Which history row the pointer is on: the rows set it as they are entered
-    // and left, and the history window's right-click menu reads it. Built here,
-    // with the menu, because the menu is attached while the window is.
-    let hovered_history_row: HoveredRow = Rc::new(Cell::new(None));
-    let history_row_menu = build_history_row_menu(
+    // Which notes-palette row the pointer is on: the rows set it as they are
+    // entered and left, and the palette's right-click menu reads it. Built
+    // here, with the menu, because the menu is attached while the window is.
+    let hovered_notes_row: HoveredRow = Rc::new(Cell::new(None));
+    let notes_row_menu = build_notes_row_menu(
         state.clone(),
         note_refresh.clone(),
-        hovered_history_row.clone(),
+        hovered_notes_row.clone(),
     );
     window.set_accept_focus(true);
     window.style_context().add_class("editing");
@@ -1060,81 +1074,27 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         window.clone(),
     );
-    let history_color_mode = saved_color_mode(&state.borrow(), "history");
-    let history = build_history_window(foreground_for_mode(history_color_mode));
-    let history_position = state
-        .borrow()
-        .positions
-        .get("history")
-        .copied()
-        .unwrap_or(Point {
-            x: primary_screen.x + 28,
-            y: primary_screen.y + 186,
-        });
-    apply_widget_size(
-        &history.card,
-        "history",
-        &state,
-        Size {
-            width: HISTORY_WIDTH,
-            height: HISTORY_HEIGHT,
-        },
-    );
-    place_card(&root, &history.card, history_position);
+    let notes_color_mode = saved_color_mode(&state.borrow(), "notes");
+    let notes = build_notes_palette(foreground_for_mode(notes_color_mode));
+    place_card(&root, &notes.card, Point { x: 0, y: 0 });
     register(
         &registry,
-        "history",
-        &history.card,
-        history.color_mode.clone(),
-        history_color_mode,
+        "notes",
+        &notes.card,
+        notes.color_mode.clone(),
+        notes_color_mode,
     );
-    if let Some(item) = registry
-        .borrow_mut()
-        .iter_mut()
-        .find(|item| item.key == "history")
-    {
-        item.edit_only = Some(history.header.clone());
-    }
     attach_color_mode_menu(
-        &history.card,
-        "history".into(),
+        &notes.card,
+        "notes".into(),
         state.clone(),
         registry.clone(),
         interactive.clone(),
         None,
         None,
         Some(lookup_actions.clone()),
-        Some(history_row_menu),
+        Some(notes_row_menu),
         None,
-    );
-    attach_drag(
-        &history.header,
-        &history.card,
-        &root,
-        "history".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        window.clone(),
-    );
-    attach_resize(
-        &history.resize,
-        &history.card,
-        &root,
-        "history".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        window.clone(),
-        ResizeBounds {
-            min_width: 132,
-            min_height: 92,
-            max_width: Some(620),
-            max_height: Some(760),
-            aspect_ratio: None,
-            preserve_current_aspect: false,
-            height_for_width: None,
-        },
     );
 
     let usage_color_mode = saved_color_mode(&state.borrow(), "usage");
@@ -1571,29 +1531,152 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }) as Rc<dyn Fn(&str)>
     });
 
-    // Search mode is tracked explicitly: show_all() (on unlock, or when the
-    // window is reopened) would otherwise reveal both header bars at once.
-    let searching = Rc::new(Cell::new(false));
+    let notes_view = NotesListState {
+        selected: Rc::new(Cell::new(None)),
+        visible_ids: Rc::new(RefCell::new(Vec::new())),
+        rows: Rc::new(RefCell::new(HashMap::new())),
+        confirms: Rc::new(RefCell::new(HashMap::new())),
+        confirm_id: Rc::new(Cell::new(None)),
+    };
+    let last_preview: Rc<RefCell<(Option<u64>, String, i64)>> =
+        Rc::new(RefCell::new((None, String::new(), 0)));
+    let rebuild_list_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let close_notes_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+
+    let fill_preview: Rc<dyn Fn(Option<u64>)> = {
+        let preview = notes.preview.clone();
+        let state = state.clone();
+        let search = notes.search.clone();
+        let originals = notes.originals.clone();
+        let highlights = notes.highlights.clone();
+        let match_tag = notes.match_tag.clone();
+        let current_tag = notes.current_tag.clone();
+        let last_preview = last_preview.clone();
+        Rc::new(move |id| {
+            let query = search.text().to_string();
+            let updated_at = id
+                .and_then(|id| {
+                    state
+                        .borrow()
+                        .notes
+                        .iter()
+                        .find(|note| note.id == id)
+                        .map(|note| note.updated_at)
+                })
+                .unwrap_or(0);
+            let key = (id, query.clone(), updated_at);
+            if *last_preview.borrow() == key {
+                return;
+            }
+            *last_preview.borrow_mut() = key;
+            fill_notes_preview(
+                &preview,
+                &state,
+                id,
+                &query,
+                &originals,
+                &highlights,
+                &match_tag,
+                &current_tag,
+            );
+        })
+    };
+
+    let select_note: Rc<dyn Fn(u64)> = {
+        let view = notes_view.clone();
+        let fill_preview = fill_preview.clone();
+        let list_scroller = notes.list_scroller.clone();
+        Rc::new(move |id| {
+            view.selected.set(Some(id));
+            view.confirm_id.set(None);
+            notes_hide_confirms(&view);
+            notes_paint_selection(&view, &list_scroller);
+            fill_preview(Some(id));
+        })
+    };
+
+    let on_star: Rc<dyn Fn(u64)> = {
+        let state = state.clone();
+        let rebuild_list_slot = rebuild_list_slot.clone();
+        Rc::new(move |id| {
+            if let Some(note) = state.borrow_mut().notes.iter_mut().find(|note| note.id == id)
+            {
+                note.starred ^= true;
+            }
+            let _ = state.borrow().save();
+            if let Some(rebuild) = rebuild_list_slot.borrow().clone() {
+                rebuild();
+            }
+        })
+    };
+
+    let on_open: Rc<dyn Fn(u64)> = {
+        let state = state.clone();
+        let note_refresh = note_refresh.clone();
+        let close_notes_slot = close_notes_slot.clone();
+        Rc::new(move |id| {
+            pin_note_on_desk(&state, id);
+            if let Some(callback) = note_refresh.borrow().as_ref() {
+                callback();
+            }
+            if let Some(close) = close_notes_slot.borrow().clone() {
+                close();
+            }
+        })
+    };
+
+    let rebuild_list: Rc<dyn Fn()> = {
+        let list = notes.list.clone();
+        let count = notes.count.clone();
+        let search = notes.search.clone();
+        let root = root.clone();
+        let state = state.clone();
+        let note_refresh = note_refresh.clone();
+        let hovered = hovered_notes_row.clone();
+        let view = notes_view.clone();
+        let on_select = select_note.clone();
+        let on_open = on_open.clone();
+        let on_star = on_star.clone();
+        let fill_preview = fill_preview.clone();
+        let list_scroller = notes.list_scroller.clone();
+        Rc::new(move || {
+            let keep = view.selected.get();
+            view.confirm_id.set(None);
+            rebuild_notes_list(
+                &list,
+                &root,
+                &state,
+                &note_refresh,
+                &search.text(),
+                &hovered,
+                &view,
+                &on_select,
+                &on_open,
+                &on_star,
+                &count,
+            );
+            let next = {
+                let ids = view.visible_ids.borrow();
+                keep.filter(|id| ids.contains(id))
+                    .or_else(|| ids.first().copied())
+            };
+            view.selected.set(next);
+            notes_paint_selection(&view, &list_scroller);
+            fill_preview(next);
+        })
+    };
+    *rebuild_list_slot.borrow_mut() = Some(rebuild_list.clone());
 
     let refresh_closure: Rc<dyn Fn()> = {
         let root = root.clone();
         let state = state.clone();
         let registry = registry.clone();
-        let list = history.list.clone();
         let note_refresh = note_refresh.clone();
         let interactive = interactive.clone();
         let window = window.clone();
-        let search = history.bar.search.clone();
-        let hovered_history_row = hovered_history_row.clone();
+        let card = notes.card.clone();
+        let rebuild_list = rebuild_list.clone();
         Rc::new(move || {
-            rebuild_note_list(
-                &list,
-                &root,
-                state.clone(),
-                note_refresh.clone(),
-                &search.text(),
-                hovered_history_row.clone(),
-            );
             rebuild_pinned_notes(
                 &root,
                 state.clone(),
@@ -1603,6 +1686,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 window.clone(),
                 lookup_actions.clone(),
             );
+            // Desktop typing never reaches here. Opening, starring, deleting,
+            // or dragging a note out of the palette does. Desk cards that
+            // already exist are left alone so their images stay decoded.
+            // Rebuild the list only while it is on screen so a closed
+            // palette stays cheap.
+            if card.is_visible() {
+                rebuild_list();
+            }
             refresh_input_shape(&window, &registry, interactive.get());
             glib::idle_add_local_once({
                 let window = window.clone();
@@ -1615,111 +1706,72 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     *note_refresh.borrow_mut() = Some(refresh_closure.clone());
     refresh_closure();
 
-    // Typing in the search box rebuilds only the history rows — pinned notes
-    // and the input shape are untouched — and the rebuild is debounced so a
-    // fast typing burst stays smooth.
-    let refresh_history: Rc<dyn Fn()> = {
-        let list = history.list.clone();
-        let root = root.clone();
-        let state = state.clone();
-        let note_refresh = note_refresh.clone();
-        let search = history.bar.search.clone();
-        let hovered_history_row = hovered_history_row.clone();
-        Rc::new(move || {
-            rebuild_note_list(
-                &list,
-                &root,
-                state.clone(),
-                note_refresh.clone(),
-                &search.text(),
-                hovered_history_row.clone(),
-            );
-        })
-    };
+    // Typing rebuilds only the visible rows. The regex is compiled once per
+    // query, images stay out of the list, and a short debounce keeps a burst
+    // of keys from rebuilding on every glyph.
     let pending_search: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    history.bar.search.connect_changed({
-        let refresh_history = refresh_history.clone();
+    notes.search.connect_changed({
+        let rebuild_list = rebuild_list.clone();
         let pending_search = pending_search.clone();
         move |_| {
             if let Some(source) = pending_search.borrow_mut().take() {
                 source.remove();
             }
-            let refresh_history = refresh_history.clone();
+            let rebuild_list = rebuild_list.clone();
             let pending_for_timer = pending_search.clone();
             let source = glib::timeout_add_local_once(Duration::from_millis(120), move || {
                 pending_for_timer.borrow_mut().take();
-                refresh_history();
+                rebuild_list();
             });
             *pending_search.borrow_mut() = Some(source);
         }
     });
 
-    // The search icon turns the header into the search field, plus the "\u{00d7}"
-    // that puts the plain title bar back.
-    history.bar.open_search.connect_clicked({
-        let bar = history.bar.clone();
-        let window = window.clone();
-        let searching = searching.clone();
-        move |_| {
-            searching.set(true);
-            bar.set_search_mode(true);
-            present_overlay(&window);
-            bar.search.grab_focus();
-        }
-    });
-    let close_history_search: Rc<dyn Fn()> = {
-        let bar = history.bar.clone();
-        let searching = searching.clone();
-        Rc::new(move || {
-            searching.set(false);
-            bar.set_search_mode(false);
-            // Clearing fires `changed`, which reruns the (now empty) query and
-            // restores the full list.
-            bar.search.set_text("");
-        })
-    };
-    history.bar.close_search.connect_clicked({
-        let close_history_search = close_history_search.clone();
-        move |_| close_history_search()
-    });
-
-    let toggle_history: Rc<dyn Fn()> = {
-        let card = history.card.clone();
-        let header = history.header.clone();
-        let bar = history.bar.clone();
-        let searching = searching.clone();
-        let state = state.clone();
+    let set_notes_open: Rc<dyn Fn(bool)> = {
+        let card = notes.card.clone();
+        let search = notes.search.clone();
+        let paned = notes.paned.clone();
         let window = window.clone();
         let registry = registry.clone();
         let interactive = interactive.clone();
         let root = root.clone();
-        let picker = widget_picker.card.clone();
-        Rc::new(move || {
-            let open = !card.is_visible();
+        let state = state.clone();
+        let rebuild_list = rebuild_list.clone();
+        let last_preview = last_preview.clone();
+        let originals = notes.originals.clone();
+        let preview = notes.preview.clone();
+        Rc::new(move |open| {
             if open {
-                // Always come back near the click, so a window left
-                // half off-screen is reachable again by its header.
-                reopen_widget(
-                    &card,
-                    "history",
-                    &root,
-                    &state,
-                    Size {
-                        width: HISTORY_WIDTH,
-                        height: HISTORY_HEIGHT,
-                    },
-                    Some(&picker),
-                );
+                place_notes_palette(&card, &root);
+                // GTK3's show_all() returns immediately when no_show_all is
+                // set, which is how the palette stays closed through the
+                // startup window.show_all(). Drop the flag here so this
+                // call actually maps the card, then put it back on hide.
+                card.set_no_show_all(false);
                 card.show_all();
-                // show_all() reveals both slot occupants and the header
-                // itself; restore the search mode and the lock-mode rule.
-                bar.set_search_mode(searching.get());
-                header.set_visible(interactive.get());
+                rebuild_list();
+                // The palette is usable in lock mode: take keyboard focus
+                // even when the rest of the overlay is click-through.
+                window.set_accept_focus(true);
+                // grab_focus only moves GTK's caret. Ctrl+Alt+N arrives as a
+                // GNOME shortcut or a grab on another X connection, so this
+                // display has no current user_time and mutter will not focus
+                // a Utility overlay from a stale present(). Take the keyboard
+                // first, then put the caret in search.
+                focus_overlay_for_typing(&window);
+                window.set_focus(Some(&search));
+                search.grab_focus();
             } else {
                 card.hide();
+                card.set_no_show_all(true);
+                window.set_focus_on_map(false);
+                window.set_accept_focus(interactive.get());
+                *last_preview.borrow_mut() = (None, String::new(), 0);
+                originals.borrow_mut().clear();
+                if let Some(buffer) = preview.buffer() {
+                    buffer.set_text("");
+                }
             }
-            state.borrow_mut().settings.history_open = open;
-            let _ = state.borrow().save();
             refresh_input_shape(&window, &registry, interactive.get());
             glib::idle_add_local_once({
                 let window = window.clone();
@@ -1727,18 +1779,113 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 let interactive = interactive.clone();
                 let root = root.clone();
                 let state = state.clone();
+                let card = card.clone();
+                let paned = paned.clone();
+                let search = search.clone();
                 move || {
                     if open {
+                        let width = card.allocation().width();
+                        if width > 1 {
+                            paned.set_position(width * 2 / 5);
+                        }
                         clamp_registered_widgets(&root, &registry, &state);
+                        // present() and the first map can land focus on the
+                        // paned or a scroller; put it back in search.
+                        window.set_focus(Some(&search));
+                        search.grab_focus();
                     }
                     refresh_input_shape(&window, &registry, interactive.get());
                 }
             });
         })
     };
-    history.hide.connect_clicked({
-        let toggle_history = toggle_history.clone();
-        move |_| toggle_history()
+
+    let toggle_notes: Rc<dyn Fn()> = {
+        let card = notes.card.clone();
+        let set_notes_open = set_notes_open.clone();
+        // The X11 grab and the GNOME custom shortcut can both fire for one
+        // press; two toggles would open and close before a frame was drawn.
+        let last = Rc::new(Cell::new(0_i64));
+        Rc::new(move || {
+            let now = now_ms();
+            if now.saturating_sub(last.get()) < 200 {
+                return;
+            }
+            last.set(now);
+            set_notes_open(!card.is_visible());
+        })
+    };
+    let close_notes: Rc<dyn Fn()> = {
+        let set_notes_open = set_notes_open.clone();
+        Rc::new(move || set_notes_open(false))
+    };
+    *close_notes_slot.borrow_mut() = Some(close_notes.clone());
+    notes.hide.connect_clicked({
+        let toggle_notes = toggle_notes.clone();
+        move |_| toggle_notes()
+    });
+
+    let handle_notes_keys: Rc<dyn Fn(&gdk::EventKey) -> glib::Propagation> = {
+        let view = notes_view.clone();
+        let select_note = select_note.clone();
+        let on_open = on_open.clone();
+        let on_star = on_star.clone();
+        let close_notes = close_notes.clone();
+        let refresh_closure = refresh_closure.clone();
+        let state = state.clone();
+        let search = notes.search.clone();
+        Rc::new(move |event| {
+            let key = event.keyval();
+            if key == gdk::keys::constants::Escape {
+                if view.confirm_id.get().is_some() {
+                    view.confirm_id.set(None);
+                    notes_hide_confirms(&view);
+                    return glib::Propagation::Stop;
+                }
+                close_notes();
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::keys::constants::Up || key == gdk::keys::constants::Down {
+                let delta = if key == gdk::keys::constants::Up {
+                    -1
+                } else {
+                    1
+                };
+                if let Some(id) = notes_step_selection(&view, delta) {
+                    select_note(id);
+                }
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::keys::constants::Return || key == gdk::keys::constants::KP_Enter {
+                if let Some(id) = view.selected.get() {
+                    on_open(id);
+                }
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::keys::constants::Delete || key == gdk::keys::constants::KP_Delete {
+                let shift = event.state().contains(gdk::ModifierType::SHIFT_MASK);
+                if !notes_delete_eats_key(search.has_focus(), search.text().is_empty(), shift) {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(id) = view.selected.get() {
+                    notes_request_delete(&view, &state, &refresh_closure, id);
+                }
+                return glib::Propagation::Stop;
+            }
+            if (key == gdk::keys::constants::p || key == gdk::keys::constants::P)
+                && event.state().contains(gdk::ModifierType::CONTROL_MASK)
+            {
+                if let Some(id) = view.selected.get() {
+                    on_star(id);
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        })
+    };
+    notes.search.connect_key_press_event({
+        let handle_notes_keys = handle_notes_keys.clone();
+        move |_, event| handle_notes_keys(event)
     });
 
     let (system_enabled, timer_enabled, color_mode) = {
@@ -1757,6 +1904,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let interactive = interactive.clone();
         let root = root.clone();
         let picker = widget_picker.card.clone();
+        let resample = system_card.resample.clone();
         move |button| {
             let enabled = button.is_active();
             if enabled {
@@ -1772,6 +1920,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     Some(&picker),
                 );
                 target.show_all();
+                if let Some(request) = resample.borrow().clone() {
+                    request();
+                }
             } else {
                 target.hide();
             }
@@ -1873,6 +2024,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 id,
                 text: String::new(),
                 pinned: true,
+                starred: false,
+                updated_at: now_ms(),
                 position,
                 images: Vec::new(),
                 highlights: Vec::new(),
@@ -1958,7 +2111,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let lock = widget_picker.lock.clone();
         let new_note = widget_picker.new_note.clone();
         let quit = widget_picker.quit.clone();
-        let toggle_history = toggle_history.clone();
+        let toggle_notes = toggle_notes.clone();
         let toggle_usage = toggle_usage.clone();
         let toggle_translate = toggle_translate.clone();
         let translate_any_visible = translate_any_visible.clone();
@@ -1995,7 +2148,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         }
                         new_note.clicked();
                     }
-                    "toggle-history" => toggle_history(),
+                    "toggle-notes" | "toggle-history" => toggle_notes(),
                     "toggle-usage" => toggle_usage(),
                     "toggle-translate" => {
                         // The entry is edit chrome, so a translate window
@@ -2021,12 +2174,17 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let toggle_action = toggle_action.clone();
         let interactive = interactive.clone();
         let registry = registry.clone();
-        let searching = searching.clone();
-        let history_card = history.card.clone();
-        let close_history_search = close_history_search.clone();
+        let notes_card = notes.card.clone();
+        let handle_notes_keys = handle_notes_keys.clone();
         let translate_close_search = translate_close_search.clone();
         let dictate_cancel = dictate.cancel.clone();
         move |_, event| {
+            if notes_card.is_visible() {
+                let result = handle_notes_keys(event);
+                if result == glib::Propagation::Stop {
+                    return result;
+                }
+            }
             if event.keyval() == gdk::keys::constants::Escape {
                 // A selection covers everything, so it is what Escape means
                 // while one is up -- if the key reaches the overlay at all,
@@ -2041,13 +2199,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     .find(|search| search.revealer.reveals_child());
                 if let Some(search) = open_note_search {
                     (search.close)();
-                    return glib::Propagation::Stop;
-                }
-                // The overlay sees key events before the focused widget, so
-                // Escape while searching must close the search box rather than
-                // lock the whole overlay out from under the user.
-                if searching.get() && history_card.is_visible() {
-                    close_history_search();
                     return glib::Propagation::Stop;
                 }
                 // Same for the dictionary's query panel: the first Escape puts
@@ -2099,10 +2250,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // show_all() above revealed both slot occupants; the window starts on the
     // plain title bar, and stays hidden until the panel or a saved session
     // opens it.
-    history.bar.set_search_mode(false);
-    if !state.borrow().settings.history_open {
-        history.card.hide();
-    }
+    notes.card.hide();
     if !state.borrow().settings.usage_open {
         usage.card.hide();
     } else {
@@ -2205,10 +2353,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     platform::spawn_global_hotkey(hotkey_tx);
     glib::MainContext::default().spawn_local({
         let toggle_action = toggle_action.clone();
+        let toggle_notes = toggle_notes.clone();
         async move {
             while let Ok(action) = hotkey_rx.recv().await {
                 match action {
                     platform::HotkeyAction::ToggleInteraction => toggle_action(),
+                    platform::HotkeyAction::ToggleNotes => toggle_notes(),
                 }
             }
         }
@@ -2265,7 +2415,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     translate_scrollers
         .borrow_mut()
-        .push(history.scroller.clone());
+        .push(notes.list_scroller.clone());
+    translate_scrollers
+        .borrow_mut()
+        .push(notes.preview_scroller.clone());
     track_widget_hover(registry.clone(), translate_scrollers.clone());
     start_auto_color_updates(registry.clone(), state.clone());
     start_system_updates(system_card, state.clone());
@@ -2443,12 +2596,16 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     }
 }
 
-fn usage_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+fn usage_now_ms() -> i64 {
+    now_ms()
 }
 
 fn usage_percent_label(value: Option<f64>) -> String {
@@ -3494,12 +3651,17 @@ fn start_system_updates(system: SystemCard, state: Rc<RefCell<AppState>>) {
             });
         }
     });
-    request();
+    if system.card.is_visible() {
+        request();
+    }
     // Toggling a section on should not leave the card a sample behind, so the
     // details menu gets a way to ask for one straight away.
     *system.resample.borrow_mut() = Some(request.clone());
+    let card = system.card.clone();
     glib::timeout_add_local(Duration::from_secs(2), move || {
-        request();
+        if card.is_visible() {
+            request();
+        }
         glib::ControlFlow::Continue
     });
 }
@@ -4932,22 +5094,38 @@ fn delete_note(state: &Rc<RefCell<AppState>>, id: u64) {
     state.borrow().prune_orphan_images();
 }
 
-// One menu serves the whole history list: it acts on whichever row the pointer
+// One menu serves the whole notes list: it acts on whichever row the pointer
 // is on, so a rebuild does not have to build (and leak) a menu per row. Returns
-// a closure that pops it up and reports whether it did — the history window's
+// a closure that pops it up and reports whether it did — the palette's
 // colour-mode menu calls it first and stands down when a row claims the click.
-fn build_history_row_menu(
+fn build_notes_row_menu(
     state: Rc<RefCell<AppState>>,
     refresh: CallbackSlot,
     hovered: HoveredRow,
 ) -> Rc<dyn Fn() -> bool> {
     let menu = context_menu();
-    // The row the menu was opened on, latched at popup time. Reading `hovered`
-    // when the item is activated would always come up empty: popping the menu
-    // grabs the pointer, which leaves the row and clears it before the click.
     let target: HoveredRow = Rc::new(Cell::new(None));
+    let pin = gtk::MenuItem::with_label("PIN");
+    pin.connect_activate({
+        let state = state.clone();
+        let refresh = refresh.clone();
+        let target = target.clone();
+        move |_| {
+            let Some(id) = target.take() else {
+                return;
+            };
+            if let Some(note) = state.borrow_mut().notes.iter_mut().find(|note| note.id == id)
+            {
+                note.starred = !note.starred;
+            }
+            let _ = state.borrow().save();
+            let callback = refresh.borrow().clone();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    });
     let delete = gtk::MenuItem::with_label("DELETE");
-    // The one irreversible item in the app; it warms to red on hover.
     delete.style_context().add_class("menu-destructive");
     delete.connect_activate({
         let state = state.clone();
@@ -4958,14 +5136,13 @@ fn build_history_row_menu(
                 return;
             };
             delete_note(&state, id);
-            // Cloned out of the borrow: the refresh re-enters the UI and would
-            // trip over the slot still being borrowed.
             let callback = refresh.borrow().clone();
             if let Some(callback) = callback {
                 callback();
             }
         }
     });
+    menu.append(&pin);
     menu.append(&delete);
     menu.show_all();
 
@@ -4973,65 +5150,100 @@ fn build_history_row_menu(
         let Some(id) = hovered.get() else {
             return false;
         };
-        // A stale id (its row rebuilt away under the pointer) must not swallow
-        // the click; let the colour-mode menu have it instead.
         if !state.borrow().notes.iter().any(|note| note.id == id) {
             return false;
         }
+        let starred = state
+            .borrow()
+            .notes
+            .iter()
+            .find(|note| note.id == id)
+            .is_some_and(|note| note.starred);
+        pin.set_label(if starred { "UNPIN" } else { "PIN" });
         target.set(Some(id));
         menu.popup_easy(3, gtk::current_event_time());
         true
     })
 }
 
-fn rebuild_note_list(
+#[derive(Clone)]
+struct NotesListState {
+    selected: Rc<Cell<Option<u64>>>,
+    visible_ids: Rc<RefCell<Vec<u64>>>,
+    rows: Rc<RefCell<HashMap<u64, gtk::EventBox>>>,
+    confirms: Rc<RefCell<HashMap<u64, gtk::Label>>>,
+    confirm_id: Rc<Cell<Option<u64>>>,
+}
+
+fn rebuild_notes_list(
     list: &gtk::Box,
     root: &gtk::Fixed,
-    state: Rc<RefCell<AppState>>,
-    refresh: CallbackSlot,
+    state: &Rc<RefCell<AppState>>,
+    refresh: &CallbackSlot,
     query: &str,
-    hovered: HoveredRow,
+    hovered: &HoveredRow,
+    view: &NotesListState,
+    on_select: &Rc<dyn Fn(u64)>,
+    on_open: &Rc<dyn Fn(u64)>,
+    on_star: &Rc<dyn Fn(u64)>,
+    count: &gtk::Label,
 ) {
     for child in list.children() {
         list.remove(&child);
     }
-    // Every row the pointer could have been on is gone; the fresh one under it
-    // announces itself with its own enter event.
     hovered.set(None);
-    let query = query.trim().to_lowercase();
-    // Borrow the notes instead of cloning every one; every match becomes a
-    // row. A height-derived cap used to keep search cheap, but it also made
-    // the scrollbar's end a lie — notes past the cap were still there, and
-    // only dragging the window taller revealed them. Search is already
-    // debounced; the list is what the thumb pages through.
-    let notes = state.borrow();
+    view.rows.borrow_mut().clear();
+    view.confirms.borrow_mut().clear();
+    view.visible_ids.borrow_mut().clear();
+
+    let query = query.trim();
+    let compiled = if query.is_empty() {
+        None
+    } else {
+        note_search_regex(query, NoteSearchOptions::default()).ok()
+    };
+    let now = now_ms();
+    let data = state.borrow();
+    let mut order: Vec<usize> = (0..data.notes.len()).collect();
+    order.sort_by_key(|&index| note_sort_key(&data.notes[index]));
     let mut shown = 0_usize;
-    for note in notes
-        .notes
-        .iter()
-        .rev()
-        .filter(|note| query.is_empty() || note.text.to_lowercase().contains(&query))
-    {
-        // First non-empty line, so a note starting with a blank line still
-        // shows its content instead of "Untitled note". The headline is not
-        // truncated here: the row label ellipsizes, so widening the window
-        // reveals more of it and narrowing it reveals less.
-        let headline = note_headline(&note.text);
-        let row = draggable_note_preview(
-            &format!(
-                "{}  {headline}",
-                if note.pinned { "\u{25cf}" } else { "\u{25cb}" }
-            ),
-            note.id,
+    for index in order {
+        let note = &data.notes[index];
+        let matches = compiled
+            .as_ref()
+            .map(|expression| note_search_hits(&note.text, expression, NoteSearchOptions::default()))
+            .unwrap_or_default();
+        if compiled.is_some() && matches.is_empty() {
+            continue;
+        }
+        let row = note_row(
+            note,
+            query,
+            &matches,
+            now,
             root,
             state.clone(),
             refresh.clone(),
             hovered.clone(),
+            on_select.clone(),
+            on_open.clone(),
+            on_star.clone(),
+            view.confirm_id.clone(),
         );
+        if let Some(confirm) = notes_row_confirm(&row) {
+            view.confirms.borrow_mut().insert(note.id, confirm);
+        }
+        view.rows.borrow_mut().insert(note.id, row.clone());
+        view.visible_ids.borrow_mut().push(note.id);
         list.pack_start(&row, false, false, 0);
         shown += 1;
     }
-    drop(notes);
+    drop(data);
+    count.set_text(&if shown == 1 {
+        "1 note".to_owned()
+    } else {
+        format!("{shown} notes")
+    });
     if shown == 0 {
         let empty = gtk::Label::new(Some(if query.is_empty() {
             "No notes yet"
@@ -5040,28 +5252,295 @@ fn rebuild_note_list(
         }));
         empty.set_xalign(0.0);
         empty.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        empty.style_context().add_class("history-empty");
+        empty.style_context().add_class("notes-empty");
         list.pack_start(&empty, false, false, 0);
     }
-
     list.show_all();
 }
 
-fn draggable_note_preview(
-    text: &str,
-    note_id: u64,
+fn notes_row_confirm(row: &gtk::EventBox) -> Option<gtk::Label> {
+    row.child()
+        .and_then(|child| child.downcast::<gtk::Box>().ok())
+        .and_then(|body| {
+            body.children().into_iter().find_map(|child| {
+                child.downcast::<gtk::Label>().ok().filter(|label| {
+                    label.style_context().has_class("notes-row-confirm")
+                })
+            })
+        })
+}
+
+fn note_sort_key(note: &Note) -> (bool, Reverse<i64>, Reverse<u64>) {
+    (!note.starred, Reverse(note.updated_at), Reverse(note.id))
+}
+
+fn note_preview_plain(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .filter(|value| *value != IMAGE_PLACEHOLDER)
+        .collect();
+    let mut lines = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or("");
+    match lines.next() {
+        Some(second) => truncate_chars(second, 80),
+        None => truncate_chars(first, 80),
+    }
+}
+
+fn note_meta_label(note: &Note, now: i64) -> String {
+    let mut parts = Vec::new();
+    if note.pinned {
+        parts.push("ON DESK".to_owned());
+    }
+    let age = age_label(note.updated_at, now);
+    if !age.is_empty() {
+        parts.push(age);
+    }
+    parts.join("  ·  ")
+}
+
+fn age_label(ms: i64, now: i64) -> String {
+    if ms <= 0 {
+        return String::new();
+    }
+    let secs = (now - ms).max(0) / 1000;
+    if secs < 60 {
+        "now".to_owned()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else if secs < 86_400 * 14 {
+        format!("{}d", secs / 86_400)
+    } else {
+        format!("{}w", secs / (86_400 * 7))
+    }
+}
+
+struct Snippet {
+    before: String,
+    hit: String,
+    after: String,
+}
+
+const SNIPPET_RADIUS: usize = 40;
+
+fn note_snippets(text: &str, matches: &[NoteSearchMatch], limit: usize) -> Vec<Snippet> {
+    let raw: Vec<(usize, char)> = text.char_indices().collect();
+    let raw_len = raw.len();
+    matches
+        .iter()
+        .take(limit)
+        .filter_map(|found| {
+            let start = (found.start.max(0) as usize).min(raw_len);
+            let end = (found.end.max(0) as usize).min(raw_len);
+            if start > end {
+                return None;
+            }
+            let line_start = raw[..start]
+                .iter()
+                .rposition(|(_, character)| *character == '\n')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let line_end = raw[start..]
+                .iter()
+                .position(|(_, character)| *character == '\n')
+                .map(|index| start + index)
+                .unwrap_or(raw_len);
+            let from = start.saturating_sub(SNIPPET_RADIUS).max(line_start);
+            let to = (end + SNIPPET_RADIUS).min(line_end);
+            let leading = from > line_start;
+            let trailing = to < line_end;
+            let slice = |lo: usize, hi: usize| {
+                raw[lo..hi]
+                    .iter()
+                    .map(|(_, character)| *character)
+                    .filter(|character| *character != IMAGE_PLACEHOLDER)
+                    .collect::<String>()
+            };
+            let mut before = slice(from, start);
+            let hit = slice(start, end);
+            let mut after = slice(end, to);
+            if leading {
+                before.insert(0, '\u{2026}');
+            }
+            if trailing {
+                after.push('\u{2026}');
+            }
+            Some(Snippet { before, hit, after })
+        })
+        .collect()
+}
+
+fn snippet_markup(snippet: &Snippet) -> String {
+    format!(
+        "{}<span background=\"#e8c84a\" foreground=\"#111111\">{}</span>{}",
+        glib::markup_escape_text(&snippet.before),
+        glib::markup_escape_text(&snippet.hit),
+        glib::markup_escape_text(&snippet.after),
+    )
+}
+
+fn palette_size(screen: ScreenRect) -> Size {
+    Size {
+        width: (screen.width * 3 / 5)
+            .clamp(520, 860)
+            .min(screen.width.max(1)),
+        height: (screen.height * 3 / 5)
+            .clamp(360, 560)
+            .min(screen.height.max(1)),
+    }
+}
+
+fn screen_containing(pointer: Option<(f64, f64)>, screens: &[ScreenRect]) -> Option<ScreenRect> {
+    let (x, y) = pointer?;
+    let x = x as i32;
+    let y = y as i32;
+    screens.iter().copied().find(|screen| {
+        x >= screen.x
+            && x < screen.x + screen.width
+            && y >= screen.y
+            && y < screen.y + screen.height
+    })
+}
+
+fn centre_on_screen(
+    pointer: Option<(f64, f64)>,
+    size: Size,
+    screens: &[ScreenRect],
+    primary: ScreenRect,
+) -> Point {
+    let host = screen_containing(pointer, screens).unwrap_or(primary);
+    let desired = Point {
+        x: host.x + (host.width - size.width) / 2,
+        y: host.y + (host.height - size.height) / 2,
+    };
+    clamp_to_screens(desired, size.width, size.height, screens)
+}
+
+fn place_notes_palette(card: &gtk::EventBox, root: &gtk::Fixed) {
+    let screens = overlay_screen_rects(root);
+    let primary = overlay_primary_screen(root);
+    let pointer = reopen_anchor(root);
+    let host = screen_containing(pointer, &screens).unwrap_or(primary);
+    let size = palette_size(host);
+    card.set_size_request(size.width, size.height);
+    let point = centre_on_screen(pointer, size, &screens, primary);
+    root.move_(card, point.x, point.y);
+}
+
+fn notes_hide_confirms(view: &NotesListState) {
+    for label in view.confirms.borrow().values() {
+        label.hide();
+    }
+}
+
+fn notes_step_selection(view: &NotesListState, delta: isize) -> Option<u64> {
+    let ids = view.visible_ids.borrow();
+    if ids.is_empty() {
+        return None;
+    }
+    let current = view
+        .selected
+        .get()
+        .and_then(|id| ids.iter().position(|item| *item == id));
+    let last = ids.len() as isize - 1;
+    let next = match current {
+        Some(index) => (index as isize + delta).clamp(0, last) as usize,
+        None if delta < 0 => ids.len() - 1,
+        None => 0,
+    };
+    Some(ids[next])
+}
+
+fn notes_paint_selection(view: &NotesListState, scroller: &gtk::ScrolledWindow) {
+    let selected = view.selected.get();
+    let rows = view.rows.borrow();
+    for (id, row) in rows.iter() {
+        let context = row.style_context();
+        if Some(*id) == selected {
+            context.add_class("notes-row-selected");
+        } else {
+            context.remove_class("notes-row-selected");
+        }
+    }
+    if let Some(row) = selected.and_then(|id| rows.get(&id)) {
+        notes_scroll_row(scroller, row);
+    }
+}
+
+fn notes_scroll_row(scroller: &gtk::ScrolledWindow, row: &impl IsA<gtk::Widget>) {
+    let alloc = row.allocation();
+    let adj = scroller.vadjustment();
+    let y = f64::from(alloc.y());
+    let height = f64::from(alloc.height());
+    let value = adj.value();
+    let page = adj.page_size();
+    if y < value {
+        adj.set_value(y);
+    } else if y + height > value + page {
+        adj.set_value((y + height - page).max(0.0));
+    }
+}
+
+fn pin_note_on_desk(state: &Rc<RefCell<AppState>>, id: u64) {
+    if let Some(note) = state.borrow_mut().notes.iter_mut().find(|note| note.id == id) {
+        note.pinned = true;
+    }
+    let _ = state.borrow().save();
+}
+
+fn notes_delete_eats_key(search_focused: bool, search_empty: bool, shift: bool) -> bool {
+    // Shift+Delete always removes a note. Plain Delete does too when the
+    // search field is empty or unfocused, so browsing still has a one-key
+    // delete. While the query has text, Delete belongs to the entry.
+    shift || !search_focused || search_empty
+}
+
+fn notes_request_delete(
+    view: &NotesListState,
+    state: &Rc<RefCell<AppState>>,
+    after: &Rc<dyn Fn()>,
+    id: u64,
+) {
+    if view.confirm_id.get() == Some(id) {
+        view.confirm_id.set(None);
+        delete_note(state, id);
+        after();
+        return;
+    }
+    view.confirm_id.set(Some(id));
+    notes_hide_confirms(view);
+    if let Some(label) = view.confirms.borrow().get(&id) {
+        label.show();
+    }
+}
+
+
+fn note_row(
+    note: &Note,
+    query: &str,
+    matches: &[NoteSearchMatch],
+    now: i64,
     root: &gtk::Fixed,
     state: Rc<RefCell<AppState>>,
     refresh: CallbackSlot,
     hovered: HoveredRow,
+    on_select: Rc<dyn Fn(u64)>,
+    on_open: Rc<dyn Fn(u64)>,
+    on_star: Rc<dyn Fn(u64)>,
+    confirm_id: Rc<Cell<Option<u64>>>,
 ) -> gtk::EventBox {
+    let note_id = note.id;
+    let headline = note_headline(&note.text);
     let row = gtk::EventBox::new();
-    // A GtkEventBox only paints its CSS background when it owns a window, so
-    // the hover tint needs a visible one; the class stays transparent at rest.
     row.set_visible_window(true);
-    row.style_context().add_class("note-preview");
+    row.style_context().add_class("notes-row");
     row.set_tooltip_text(Some(
-        "Click or drag onto the desktop to pin  ·  right-click to delete",
+        "Click to preview  ·  drag or Enter to open on the desk  ·  right-click to pin or delete",
     ));
     row.add_events(
         gdk::EventMask::BUTTON_PRESS_MASK
@@ -5070,18 +5549,86 @@ fn draggable_note_preview(
             | gdk::EventMask::ENTER_NOTIFY_MASK
             | gdk::EventMask::LEAVE_NOTIFY_MASK,
     );
-    let label = gtk::Label::new(Some(text));
-    label.set_xalign(0.0);
-    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    row.add(&label);
 
-    // The pointer's row drives both the hover tint and what the history
-    // window's right-click menu deletes, so one pair of handlers owns both.
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    // Only a pinned note gets a mark. An empty star reserved space on every
+    // row and made the title sit off to the right of nothing.
+    if note.starred {
+        let pin = gtk::EventBox::new();
+        pin.set_visible_window(false);
+        pin.set_valign(gtk::Align::Center);
+        pin.set_tooltip_text(Some("Unpin"));
+        pin.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+        let mark = gtk::Image::from_icon_name(Some("media-record-symbolic"), gtk::IconSize::Menu);
+        mark.set_pixel_size(8);
+        mark.style_context().add_class("notes-row-pin");
+        pin.add(&mark);
+        pin.connect_button_press_event({
+            let on_star = on_star.clone();
+            move |_, event| {
+                if event.button() == 1 {
+                    on_star(note_id);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
+        });
+        header.pack_start(&pin, false, false, 0);
+    }
+    let title = gtk::Label::new(Some(&headline));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.style_context().add_class("notes-row-title");
+    header.pack_start(&title, true, true, 0);
+
+    let preview = gtk::Label::new(None);
+    preview.set_xalign(0.0);
+    preview.set_hexpand(true);
+    // Wrap and ellipsize together so a long line reserves its height instead
+    // of painting a second line over the ON DESK row beneath it.
+    preview.set_line_wrap(true);
+    preview.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
+    preview.set_lines(2);
+    preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    preview.set_max_width_chars(1);
+    preview.style_context().add_class("notes-row-preview");
+    if query.is_empty() {
+        preview.set_text(&note_preview_plain(&note.text));
+    } else if let Some(snippet) = note_snippets(&note.text, matches, 1).into_iter().next() {
+        preview.set_use_markup(true);
+        preview.set_markup(&snippet_markup(&snippet));
+    } else {
+        preview.set_text(&note_preview_plain(&note.text));
+    }
+    let meta_text = note_meta_label(note, now);
+    let meta = gtk::Label::new(Some(&meta_text));
+    meta.set_xalign(0.0);
+    meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    meta.style_context().add_class("notes-row-meta");
+    if meta_text.is_empty() {
+        meta.set_no_show_all(true);
+        meta.hide();
+    }
+    let confirm = gtk::Label::new(Some("Delete? Press Delete again"));
+    confirm.set_xalign(0.0);
+    confirm.style_context().add_class("notes-row-confirm");
+    confirm.set_no_show_all(true);
+    if confirm_id.get() == Some(note_id) {
+        confirm.show();
+    }
+    body.pack_start(&header, false, false, 0);
+    body.pack_start(&preview, false, false, 0);
+    body.pack_start(&meta, false, false, 0);
+    body.pack_start(&confirm, false, false, 0);
+    row.add(&body);
+
     row.connect_enter_notify_event({
         let hovered = hovered.clone();
         move |row, _| {
             hovered.set(Some(note_id));
-            row.style_context().add_class("note-preview-hover");
+            row.style_context().add_class("notes-row-hover");
             if let Some(window) = row.window() {
                 let cursor = gdk::Cursor::from_name(&window.display(), "pointer");
                 window.set_cursor(cursor.as_ref());
@@ -5092,12 +5639,10 @@ fn draggable_note_preview(
     row.connect_leave_notify_event({
         let hovered = hovered.clone();
         move |row, _| {
-            // Guarded: moving between two rows can land the next row's enter
-            // before this leave, and clearing then would lose the new row.
             if hovered.get() == Some(note_id) {
                 hovered.set(None);
             }
-            row.style_context().remove_class("note-preview-hover");
+            row.style_context().remove_class("notes-row-hover");
             if let Some(window) = row.window() {
                 window.set_cursor(None);
             }
@@ -5107,27 +5652,36 @@ fn draggable_note_preview(
 
     let start = Rc::new(Cell::new(None::<(f64, f64)>));
     let ghost: Rc<RefCell<Option<gtk::Label>>> = Rc::new(RefCell::new(None));
+    let opened = Rc::new(Cell::new(false));
     row.connect_button_press_event({
         let start = start.clone();
+        let on_select = on_select.clone();
+        let on_open = on_open.clone();
+        let opened = opened.clone();
         move |_, event| {
-            if event.button() == 1 {
-                start.set(Some(event.root()));
+            if event.button() != 1 {
+                return glib::Propagation::Proceed;
+            }
+            if event.event_type() == gdk::EventType::DoubleButtonPress {
+                opened.set(true);
+                on_open(note_id);
                 return glib::Propagation::Stop;
             }
-            glib::Propagation::Proceed
+            on_select(note_id);
+            start.set(Some(event.root()));
+            opened.set(false);
+            glib::Propagation::Stop
         }
     });
     row.connect_motion_notify_event({
         let start = start.clone();
         let ghost = ghost.clone();
         let root = root.clone();
-        let text = text.to_string();
+        let headline = headline.clone();
         move |_, event| {
             let Some((sx, sy)) = start.get() else {
                 return glib::Propagation::Proceed;
             };
-            // A lost release (broken grab) would leave the ghost stranded on
-            // the overlay; drop the drag as soon as the button is no longer down.
             if !event.state().contains(gdk::ModifierType::BUTTON1_MASK) {
                 start.set(None);
                 if let Some(floating) = ghost.borrow_mut().take() {
@@ -5139,7 +5693,7 @@ fn draggable_note_preview(
             let origin = overlay_origin(&root);
             let (local_x, local_y) = (x as i32 - origin.x, y as i32 - origin.y);
             if ghost.borrow().is_none() && ((x - sx).abs() > 5.0 || (y - sy).abs() > 5.0) {
-                let floating = gtk::Label::new(Some(&truncate_chars(&text, 34)));
+                let floating = gtk::Label::new(Some(&truncate_chars(&headline, 34)));
                 floating.style_context().add_class("note-ghost");
                 root.put(&floating, local_x - 72, local_y - 18);
                 floating.show();
@@ -5155,16 +5709,21 @@ fn draggable_note_preview(
         let start = start.clone();
         let ghost = ghost.clone();
         let root = root.clone();
+        let opened = opened.clone();
         move |_, event| {
             start.set(None);
+            if opened.take() {
+                return glib::Propagation::Stop;
+            }
             let floating = ghost.borrow_mut().take();
-            let dragged = floating.is_some();
+            if floating.is_none() {
+                return glib::Propagation::Stop;
+            }
             let (x, y) = event.root();
             let origin = overlay_origin(&root);
             let (x, y) = (x as i32 - origin.x, y as i32 - origin.y);
             let desired = if let Some(floating) = floating {
                 root.remove(&floating);
-                // Pin the note exactly where the ghost preview was dropped.
                 Point {
                     x: (x - 72).max(0),
                     y: (y - 18).max(0),
@@ -5179,12 +5738,7 @@ fn draggable_note_preview(
             let point = clamp_to_screens(desired, NOTE_WIDTH, NOTE_HEIGHT, &screens);
             let mut data = state.borrow_mut();
             if let Some(note) = data.notes.iter_mut().find(|note| note.id == note_id) {
-                // Only an explicit drag repositions. A plain click on a row
-                // whose note is already on the desktop used to teleport that
-                // note to the pointer, which read as the note jumping away.
-                if dragged || !note.pinned {
-                    note.position = point;
-                }
+                note.position = point;
                 note.pinned = true;
             }
             let _ = data.save();
@@ -6309,24 +6863,27 @@ fn is_note_search_word_char(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }
 
-fn note_search_matches(
-    text: &str,
+fn note_search_regex(
     query: &str,
     options: NoteSearchOptions,
-) -> Result<Vec<NoteSearchMatch>, regex::Error> {
-    if query.is_empty() {
-        return Ok(Vec::new());
-    }
+) -> Result<regex::Regex, regex::Error> {
     let pattern = if options.regular_expression {
         query.to_owned()
     } else {
         regex::escape(query)
     };
-    let expression = RegexBuilder::new(&pattern)
+    RegexBuilder::new(&pattern)
         .case_insensitive(!options.case_sensitive)
         .unicode(true)
-        .build()?;
-    Ok(expression
+        .build()
+}
+
+fn note_search_hits(
+    text: &str,
+    expression: &regex::Regex,
+    options: NoteSearchOptions,
+) -> Vec<NoteSearchMatch> {
+    expression
         .find_iter(text)
         .filter(|found| {
             if !options.whole_word {
@@ -6334,8 +6891,8 @@ fn note_search_matches(
             }
             let before = text[..found.start()].chars().next_back();
             let after = text[found.end()..].chars().next();
-            !before.is_some_and(is_note_search_word_char)
-                && !after.is_some_and(is_note_search_word_char)
+            before.is_some_and(is_note_search_word_char) == false
+                && after.is_some_and(is_note_search_word_char) == false
         })
         .map(|found| NoteSearchMatch {
             // GtkTextBuffer offsets count Unicode characters, while regex
@@ -6344,8 +6901,21 @@ fn note_search_matches(
             start: text[..found.start()].chars().count() as i32,
             end: text[..found.end()].chars().count() as i32,
         })
-        .collect())
+        .collect()
 }
+
+fn note_search_matches(
+    text: &str,
+    query: &str,
+    options: NoteSearchOptions,
+) -> Result<Vec<NoteSearchMatch>, regex::Error> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let expression = note_search_regex(query, options)?;
+    Ok(note_search_hits(text, &expression, options))
+}
+
 
 fn clear_note_search_tags(
     buffer: &gtk::TextBuffer,
@@ -7238,6 +7808,26 @@ fn build_highlight_menu_actions(
     }
 }
 
+fn parse_note_widget_id(key: &str) -> Option<u64> {
+    key.strip_prefix("note:")?.parse().ok()
+}
+
+/// Cards the desk should drop and notes it should mount so the overlay matches
+/// the pinned set. Existing cards stay put: tearing them down would decode
+/// every image again.
+fn pinned_note_sync(
+    registered: impl IntoIterator<Item = u64>,
+    pinned: impl IntoIterator<Item = u64>,
+) -> (Vec<u64>, Vec<u64>) {
+    let have: HashSet<u64> = registered.into_iter().collect();
+    let want: HashSet<u64> = pinned.into_iter().collect();
+    let mut drop: Vec<u64> = have.difference(&want).copied().collect();
+    let mut mount: Vec<u64> = want.difference(&have).copied().collect();
+    drop.sort_unstable();
+    mount.sort_unstable();
+    (drop, mount)
+}
+
 fn rebuild_pinned_notes(
     root: &gtk::Fixed,
     state: Rc<RefCell<AppState>>,
@@ -7247,27 +7837,6 @@ fn rebuild_pinned_notes(
     window: gtk::ApplicationWindow,
     lookup: LookupActions,
 ) {
-    let old: Vec<gtk::EventBox> = registry
-        .borrow()
-        .iter()
-        .filter(|item| item.key.starts_with("note:"))
-        .map(|item| item.widget.clone())
-        .collect();
-    for widget in old {
-        root.remove(&widget);
-        // Removing a card only drops the container's reference to it. Its own
-        // handlers hold the card (through the image target they need to grow
-        // and resize it), so the card, its editor and every pixbuf in that
-        // editor's buffer would outlive the rebuild. Destroying it disposes
-        // the object, which disconnects those handlers and breaks the cycle.
-        // SAFETY: the card has just been unparented and nothing reads it
-        // again; the loop owns the only remaining reference.
-        unsafe { widget.destroy() };
-    }
-    registry
-        .borrow_mut()
-        .retain(|item| !item.key.starts_with("note:"));
-
     let pinned: Vec<Note> = state
         .borrow()
         .notes
@@ -7275,7 +7844,49 @@ fn rebuild_pinned_notes(
         .filter(|note| note.pinned)
         .cloned()
         .collect();
+    let desired: HashSet<u64> = pinned.iter().map(|note| note.id).collect();
+    let registered: Vec<(u64, gtk::EventBox)> = registry
+        .borrow()
+        .iter()
+        .filter_map(|item| parse_note_widget_id(&item.key).map(|id| (id, item.widget.clone())))
+        .collect();
+    let (drop, mount) = pinned_note_sync(
+        registered.iter().map(|(id, _)| *id),
+        desired.iter().copied(),
+    );
+    for id in &drop {
+        let Some((_, widget)) = registered.iter().find(|(item, _)| item == id) else {
+            continue;
+        };
+        root.remove(widget);
+        // Removing a card only drops the container's reference to it. Its own
+        // handlers hold the card (through the image target they need to grow
+        // and resize it), so the card, its editor and every pixbuf in that
+        // editor's buffer would outlive the rebuild. Destroying it disposes
+        // the object, which disconnects those handlers and breaks the cycle.
+        // SAFETY: the card has just been unparented and nothing reads it
+        // again; this loop owns the only remaining reference.
+        unsafe { widget.destroy() };
+    }
+    if !drop.is_empty() {
+        registry
+            .borrow_mut()
+            .retain(|item| match parse_note_widget_id(&item.key) {
+                Some(id) => desired.contains(&id),
+                None => true,
+            });
+    }
+
     for note in pinned {
+        if !mount.contains(&note.id) {
+            if let Some((_, widget)) = registered.iter().find(|(id, _)| *id == note.id) {
+                let allocation = widget.allocation();
+                if allocation.x() != note.position.x || allocation.y() != note.position.y {
+                    root.move_(widget, note.position.x, note.position.y);
+                }
+            }
+            continue;
+        }
         let key = format!("note:{}", note.id);
         let note_color_mode = saved_color_mode(&state.borrow(), &key);
         let initial_color_mode = foreground_for_mode(note_color_mode);
@@ -7302,7 +7913,7 @@ fn rebuild_pinned_notes(
         let unpin = small_button("−");
         unpin.style_context().add_class("note-window-button");
         unpin.style_context().add_class("note-hide");
-        unpin.set_tooltip_text(Some("Move to History"));
+        unpin.set_tooltip_text(Some("Move to Notes"));
         let search_toggle = icon_button("edit-find-symbolic", "Find in note (Ctrl+F)");
         let pen_on = Rc::new(Cell::new(false));
         let pen_toggle = icon_button("document-edit-symbolic", "Highlighter");
@@ -7500,6 +8111,7 @@ fn rebuild_pinned_notes(
                     note.text = text;
                     note.images = images;
                     note.highlights = highlights;
+                    note.updated_at = now_ms();
                 }
                 if let Some(source) = pending_save.borrow_mut().take() {
                     source.remove();
@@ -7540,6 +8152,27 @@ fn rebuild_pinned_notes(
     }
 }
 
+fn widget_contains_pointer(widget: &impl IsA<gtk::Widget>, pointer_x: i32, pointer_y: i32) -> bool {
+    widget.window().is_some_and(|window| {
+        let (_, origin_x, origin_y) = window.origin();
+        pointer_x >= origin_x
+            && pointer_x < origin_x + window.width()
+            && pointer_y >= origin_y
+            && pointer_y < origin_y + window.height()
+    })
+}
+
+fn set_style_class(context: &gtk::StyleContext, class: &str, on: bool) {
+    if context.has_class(class) == on {
+        return;
+    }
+    if on {
+        context.add_class(class);
+    } else {
+        context.remove_class(class);
+    }
+}
+
 fn track_widget_hover(
     registry: Rc<RefCell<Vec<RegisteredWidget>>>,
     scrollers: Rc<RefCell<Vec<gtk::ScrolledWindow>>>,
@@ -7571,81 +8204,245 @@ fn track_widget_hover(
             return glib::ControlFlow::Continue;
         };
         let (_, pointer_x, pointer_y) = device.position();
-        let notes: Vec<gtk::EventBox> = registry
-            .borrow()
-            .iter()
-            .filter(|item| item.key.starts_with("note:"))
-            .map(|item| item.widget.clone())
-            .collect();
-        for card in notes {
-            let hovered = card.window().is_some_and(|window| {
-                let (_, origin_x, origin_y) = window.origin();
-                pointer_x >= origin_x
-                    && pointer_x < origin_x + window.width()
-                    && pointer_y >= origin_y
-                    && pointer_y < origin_y + window.height()
-            });
-            let context = card.style_context();
-            if hovered {
-                context.add_class("note-hover");
-            } else {
-                context.remove_class("note-hover");
+        let notes = registry.borrow();
+        for item in notes.iter() {
+            if !item.key.starts_with("note:") {
+                continue;
             }
+            let hovered = widget_contains_pointer(&item.widget, pointer_x, pointer_y);
+            set_style_class(&item.widget.style_context(), "note-hover", hovered);
         }
+        drop(notes);
         for scroller in scrollers.borrow().iter() {
+            let hovered = widget_contains_pointer(scroller, pointer_x, pointer_y);
             let context = scroller.style_context();
-            let hovered = scroller.window().is_some_and(|window| {
-                let (_, origin_x, origin_y) = window.origin();
-                pointer_x >= origin_x
-                    && pointer_x < origin_x + window.width()
-                    && pointer_y >= origin_y
-                    && pointer_y < origin_y + window.height()
-            });
-            if hovered {
-                context.add_class("history-hover");
-            } else {
-                context.remove_class("history-hover");
-            }
+            set_style_class(&context, "history-hover", hovered);
+            set_style_class(&context, "notes-hover", hovered);
         }
         glib::ControlFlow::Continue
     });
 }
 
-// The history list is its own note-shaped overlay window: a draggable header
-// that flips between a title bar and a search field, a scrolling column of
-// note headlines, and a resize grip. Widening it reveals more of each
-// headline; heightening it renders and shows more rows.
-struct HistoryWindow {
+fn fill_notes_preview(
+    preview: &gtk::TextView,
+    state: &Rc<RefCell<AppState>>,
+    id: Option<u64>,
+    query: &str,
+    originals: &ImageOriginals,
+    highlights: &HighlightTags,
+    match_tag: &gtk::TextTag,
+    current_tag: &gtk::TextTag,
+) {
+    let Some(buffer) = preview.buffer() else {
+        return;
+    };
+    // Only the note on screen needs its originals. Holding every previewed
+    // file for the life of the process is how a 4K paste became a leak.
+    originals.borrow_mut().clear();
+    let Some(id) = id else {
+        buffer.set_text("");
+        return;
+    };
+    let data = state.borrow();
+    let Some(note) = data.notes.iter().find(|note| note.id == id) else {
+        drop(data);
+        buffer.set_text("");
+        return;
+    };
+    fill_note_buffer(&buffer, note, originals, highlights);
+    let query = query.trim();
+    if query.is_empty() {
+        return;
+    }
+    let Ok(matches) = note_search_matches(&note.text, query, NoteSearchOptions::default()) else {
+        return;
+    };
+    let dummy = gtk::Label::new(None);
+    let current = if matches.is_empty() { None } else { Some(0) };
+    let search = NoteSearchState {
+        options: NoteSearchOptions::default(),
+        matches,
+        current,
+    };
+    paint_note_search(preview, &dummy, match_tag, current_tag, &search, true);
+}
+
+// The notes list is a centred command palette: a search field that is always
+// on, a split list/preview, and a footer of keyboard hints. It is not dragged
+// or resized; opening it lays it out in the middle of the monitor under the
+// pointer.
+struct NotesPalette {
     card: gtk::EventBox,
-    header: gtk::EventBox,
-    bar: HistoryHeader,
+    search: gtk::Entry,
+    count: gtk::Label,
     hide: gtk::Button,
     list: gtk::Box,
-    scroller: gtk::ScrolledWindow,
+    list_scroller: gtk::ScrolledWindow,
+    preview: gtk::TextView,
+    preview_scroller: gtk::ScrolledWindow,
+    paned: gtk::Paned,
     color_mode: Rc<Cell<Foreground>>,
-    resize: ResizeHandle,
+    originals: ImageOriginals,
+    highlights: HighlightTags,
+    match_tag: gtk::TextTag,
+    current_tag: gtk::TextTag,
 }
 
-// The two modes share one row: the hide button never moves, the title and the
-// entry occupy the same slot, and the magnifier and the "clear" cross share
-// the trailing slot. Only the occupant of each slot changes, so the caret
-// lands exactly where the title text was.
-#[derive(Clone)]
-struct HistoryHeader {
-    title: gtk::Label,
-    search: gtk::Entry,
-    open_search: gtk::Button,
-    close_search: gtk::Button,
-}
+fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
+    let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
+    card.style_context().add_class("pinned-note");
+    card.style_context().add_class("notes-window");
+    card.set_visible_window(true);
+    card.set_no_show_all(true);
+    card.hide();
+    resize.hitbox.set_no_show_all(true);
+    resize.hitbox.hide();
 
-impl HistoryHeader {
-    fn set_search_mode(&self, searching: bool) {
-        self.title.set_visible(!searching);
-        self.open_search.set_visible(!searching);
-        self.search.set_visible(searching);
-        self.close_search.set_visible(searching);
+    let header = gtk::EventBox::new();
+    header.set_visible_window(true);
+    header.set_hexpand(true);
+    header.style_context().add_class("note-header");
+    header.style_context().add_class("notes-header");
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    bar.set_hexpand(true);
+    let find = gtk::Image::from_icon_name(Some("edit-find-symbolic"), gtk::IconSize::Menu);
+    find.set_pixel_size(11);
+    let search = gtk::Entry::new();
+    search.set_placeholder_text(Some("Search notes\u{2026}"));
+    search.set_has_frame(false);
+    search.set_can_focus(true);
+    search.set_width_chars(1);
+    search.set_max_width_chars(1);
+    search.set_hexpand(true);
+    search.style_context().add_class("notes-search");
+    let count = gtk::Label::new(Some("0 notes"));
+    count.style_context().add_class("notes-count");
+    let hide = small_button("\u{00d7}");
+    hide.style_context().add_class("note-window-button");
+    hide.style_context().add_class("note-close");
+    hide.set_tooltip_text(Some("Close Notes"));
+    bar.pack_start(&find, false, false, 0);
+    bar.pack_start(&search, true, true, 0);
+    bar.pack_start(&count, false, false, 0);
+    bar.pack_end(&hide, false, false, 0);
+    header.add(&bar);
+    body.pack_start(&header, false, false, 0);
+
+    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    paned.set_wide_handle(true);
+    paned.set_can_focus(false);
+    paned.set_hexpand(true);
+    paned.set_vexpand(true);
+    paned.style_context().add_class("notes-paned");
+
+    let list_scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    list_scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
+    list_scroller.set_overlay_scrolling(true);
+    list_scroller.set_shadow_type(gtk::ShadowType::None);
+    list_scroller.set_propagate_natural_width(false);
+    list_scroller.set_propagate_natural_height(false);
+    list_scroller.set_size_request(1, -1);
+    list_scroller.set_hexpand(true);
+    list_scroller.set_vexpand(true);
+    list_scroller.set_can_focus(false);
+    list_scroller.style_context().add_class("notes-scroller");
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    list.style_context().add_class("notes-list");
+    list.set_valign(gtk::Align::Start);
+    list_scroller.add(&list);
+
+    let preview_scroller =
+        gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    preview_scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
+    preview_scroller.set_overlay_scrolling(true);
+    preview_scroller.set_shadow_type(gtk::ShadowType::None);
+    preview_scroller.set_propagate_natural_width(false);
+    preview_scroller.set_propagate_natural_height(false);
+    preview_scroller.set_size_request(1, -1);
+    preview_scroller.set_hexpand(true);
+    preview_scroller.set_vexpand(true);
+    preview_scroller.set_can_focus(false);
+    preview_scroller.style_context().add_class("notes-scroller");
+    let preview = gtk::TextView::new();
+    preview.set_editable(false);
+    preview.set_cursor_visible(false);
+    preview.set_can_focus(false);
+    preview.set_wrap_mode(gtk::WrapMode::WordChar);
+    preview.set_hexpand(true);
+    preview.set_vexpand(true);
+    preview.style_context().add_class("notes-preview-view");
+    preview_scroller.add(&preview);
+    // Same HiDPI overlay the desk notes use. GTK paints inline pixbufs at
+    // CSS size; without this pass a scaled display stretches them soft.
+    let originals: ImageOriginals = Rc::new(RefCell::new(HashMap::new()));
+    preview.connect_local("draw", true, {
+        let originals = originals.clone();
+        move |values| {
+            let editor = values
+                .first()
+                .and_then(|value| value.get::<gtk::TextView>().ok());
+            let ctx = values
+                .get(1)
+                .and_then(|value| value.get::<cairo::Context>().ok());
+            if let (Some(editor), Some(ctx)) = (editor, ctx) {
+                paint_sharp_images(&editor, &ctx, &originals);
+            }
+            Some(false.to_value())
+        }
+    });
+
+    paned.pack1(&list_scroller, true, false);
+    paned.pack2(&preview_scroller, true, false);
+
+    let hint = gtk::Label::new(Some(
+        "Up/Down move  ·  Enter open on desk  ·  Ctrl+P pin  ·  Del delete  ·  Esc",
+    ));
+    hint.set_xalign(0.0);
+    hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    hint.set_valign(gtk::Align::End);
+    hint.style_context().add_class("notes-hint");
+
+    // One plate under the header, same as a desk note or the dictionary:
+    // AUTO / INVERT stay clear, LIGHT / DARK fill it, and the bottom corners
+    // of the window are the plate's own corners.
+    let plate = frost_plate();
+    let inner = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    inner.set_hexpand(true);
+    inner.set_vexpand(true);
+    inner.pack_start(&paned, true, true, 0);
+    inner.pack_start(&hint, false, false, 0);
+    plate.add(&inner);
+    body.pack_start(&plate, true, true, 0);
+
+    let buffer = preview.buffer().expect("notes preview buffer");
+    let highlights = HighlightTags::install(&buffer);
+    let match_tag = gtk::TextTag::new(Some("sysi-notes-search-match"));
+    match_tag.set_background_rgba(Some(&gdk::RGBA::new(0.98, 0.78, 0.20, 0.42)));
+    let current_tag = gtk::TextTag::new(Some("sysi-notes-search-current"));
+    current_tag.set_background_rgba(Some(&gdk::RGBA::new(1.0, 0.52, 0.08, 0.78)));
+    if let Some(table) = buffer.tag_table() {
+        table.add(&match_tag);
+        table.add(&current_tag);
+    }
+
+    NotesPalette {
+        card,
+        search,
+        count,
+        hide,
+        list,
+        list_scroller,
+        preview,
+        preview_scroller,
+        paned,
+        color_mode,
+        originals,
+        highlights,
+        match_tag,
+        current_tag,
     }
 }
+
 
 struct WidgetPicker {
     card: gtk::EventBox,
@@ -7726,98 +8523,6 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     }
 }
 
-fn build_history_window(initial_color_mode: Foreground) -> HistoryWindow {
-    let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
-    // Share the pinned-note look (transparent card, faded scrollbar thumb) so
-    // the history window reads as one of the notes.
-    card.style_context().add_class("pinned-note");
-    card.style_context().add_class("history-window");
-    // Own a GdkWindow so the hover tracker can test pointer containment.
-    card.set_visible_window(true);
-
-    let header = gtk::EventBox::new();
-    header.set_visible_window(true);
-    header.set_hexpand(true);
-    header.style_context().add_class("note-header");
-    header.style_context().add_class("history-header");
-    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-    bar.set_hexpand(true);
-    let hide = small_button("\u{2212}");
-    hide.style_context().add_class("note-window-button");
-    hide.style_context().add_class("note-hide");
-    hide.set_tooltip_text(Some("Hide History"));
-    let title = gtk::Label::new(Some("HISTORY"));
-    title.set_xalign(0.0);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.style_context().add_class("history-title");
-    let search = gtk::Entry::new();
-    search.set_placeholder_text(Some("SEARCH NOTES\u{2026}"));
-    search.set_has_frame(false);
-    // GtkEntry's default width-chars is a hard minimum that GtkFixed would
-    // honour, pinning the window open at ~150px; one char lets it shrink with
-    // the card while still expanding to fill the header.
-    search.set_width_chars(1);
-    search.set_max_width_chars(1);
-    search.set_hexpand(true);
-    search.style_context().add_class("history-search");
-    let open_search = icon_button("edit-find-symbolic", "Search notes");
-    let close_search = small_button("\u{00d7}");
-    close_search.style_context().add_class("note-window-button");
-    close_search.style_context().add_class("note-close");
-    close_search.set_tooltip_text(Some("Close search"));
-    bar.pack_start(&hide, false, false, 0);
-    bar.pack_start(&title, true, true, 0);
-    bar.pack_start(&search, true, true, 0);
-    // Packed end-first, so the cross sits at the very edge and the magnifier
-    // takes the same spot when it is the visible one.
-    bar.pack_end(&close_search, false, false, 0);
-    bar.pack_end(&open_search, false, false, 0);
-    header.add(&bar);
-    body.pack_start(&header, false, false, 0);
-
-    let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-    // External (not Never) horizontally: a Never-policy scrolled window
-    // propagates its child's minimum width, so the widest row would stop the
-    // window from ever being dragged narrower again.
-    scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
-    // The indicator floats over the rows, so rows use the full width and the
-    // thumb fades in while the pointer is over the list.
-    scroller.set_overlay_scrolling(true);
-    scroller.set_shadow_type(gtk::ShadowType::None);
-    scroller.set_propagate_natural_width(false);
-    scroller.set_propagate_natural_height(false);
-    // Width must remain unconstrained, but a fixed one-pixel height would also
-    // become the natural height and clip every answer to a single line.
-    scroller.set_size_request(1, -1);
-    scroller.set_hexpand(true);
-    scroller.set_vexpand(true);
-    scroller.style_context().add_class("history-scroller");
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    list.style_context().add_class("history-list");
-    // Size to the rows, not the viewport: a FILL box as tall as the window
-    // would make GtkScrolledWindow think the content already fits.
-    list.set_valign(gtk::Align::Start);
-    scroller.add(&list);
-    let plate = frost_plate();
-    plate.add(&scroller);
-    body.pack_start(&plate, true, true, 0);
-
-    HistoryWindow {
-        card,
-        header,
-        bar: HistoryHeader {
-            title,
-            search,
-            open_search,
-            close_search,
-        },
-        hide,
-        list,
-        scroller,
-        color_mode,
-        resize,
-    }
-}
 
 // The dictionary window is the history window's twin: the same note chrome and
 // resize grip, a plain title bar to grab it by, and a scrolling column of
@@ -10688,7 +11393,9 @@ fn clamp_registered_widgets(
         if (width != allocation.width() || height != allocation.height()) && width > 1 && height > 1
         {
             item.widget.set_size_request(width, height);
-            data.sizes.insert(item.key.clone(), Size { width, height });
+            if item.key != "notes" {
+                data.sizes.insert(item.key.clone(), Size { width, height });
+            }
         }
         let point = clamp_to_screens(origin, width, height, screens);
         if point.x != allocation.x() || point.y != allocation.y() {
@@ -10702,7 +11409,7 @@ fn clamp_registered_widgets(
             if let Some(note) = data.notes.iter_mut().find(|note| note.id == id) {
                 note.position = point;
             }
-        } else {
+        } else if item.key != "notes" {
             data.positions.insert(item.key.clone(), point);
         }
     }
@@ -11358,17 +12065,55 @@ fn present_overlay(window: &gtk::ApplicationWindow) {
     // a _NET_ACTIVE_WINDOW message with a timestamp of 0" and lets the overlay
     // steal focus from the app the user is typing in. Use the X server's last
     // user-interaction timestamp when one is available.
-    let timestamp = gdk::Display::default()
+    let timestamp = overlay_last_user_time();
+    if timestamp != 0 {
+        window.present_with_time(timestamp);
+    } else {
+        window.present();
+    }
+}
+
+fn overlay_last_user_time() -> u32 {
+    gdk::Display::default()
         .and_then(|display| {
             display
                 .downcast_ref::<gdkx11::X11Display>()
                 .map(|display| display.user_time())
         })
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Take the keyboard so a just-opened notes palette can type immediately.
+///
+/// `grab_focus` only names the GTK widget. Ctrl+Alt+N never went through this
+/// GDK display — it is a GNOME custom shortcut or an X grab on another
+/// connection — so `user_time` is stale and mutter ignores `_NET_ACTIVE_WINDOW`.
+/// Ask the X server for a fresh timestamp and focus the overlay ourselves.
+fn focus_overlay_for_typing(window: &gtk::ApplicationWindow) {
+    window.set_accept_focus(true);
+    window.set_focus_on_map(true);
+    let Some(gdk_window) = window.window() else {
+        window.present();
+        return;
+    };
+    let timestamp = gdk_window
+        .downcast_ref::<gdkx11::X11Window>()
+        .map(gdkx11::functions::x11_get_server_time)
+        .filter(|time| *time != 0)
+        .unwrap_or_else(overlay_last_user_time);
+    if let Some(x11) = gdk_window.downcast_ref::<gdkx11::X11Window>() {
+        if timestamp != 0 {
+            x11.set_user_time(timestamp);
+        }
+    }
     if timestamp != 0 {
         window.present_with_time(timestamp);
+        gdk_window.focus(timestamp);
     } else {
+        // CurrentTime may log a mutter warning. A palette that cannot take
+        // the keyboard is worse than that line.
         window.present();
+        gdk_window.focus(0);
     }
 }
 
@@ -12184,7 +12929,7 @@ fn collect_widget_input_shape(
 }
 
 fn receives_input_when_locked(key: &str) -> bool {
-    key.starts_with("note:") || key.starts_with("dict:") || key == "history" || key == "usage"
+    key.starts_with("note:") || key.starts_with("dict:") || key == "notes" || key == "usage"
 }
 
 fn union_circle_region(region: &Region, x: i32, y: i32, width: i32, height: i32) {
@@ -13064,7 +13809,9 @@ mod timer_input_tests {
         image_room, image_room_after_y, invert_map, monitor_coordinate_divisor,
         monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
         note_search_matches, note_size_for_image, padded_visual_rect, paint_inverted,
-        palette_for_mode, parse_panel_anchor, parse_timer_input, push_recent_search,
+        age_label, centre_on_screen, note_snippets, note_sort_key, notes_delete_eats_key,
+        palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
+        parse_timer_input, pinned_note_sync, push_recent_search,
         receives_input_when_locked, record_note_undo, relative_luminance, reopen_point,
         rescaled_from, resize_ceiling, resize_width_limit, resized_image_size, room_on_screen,
         round_pixbuf_corners, sanitize_highlights, screen_in_overlay, shrink_to_budget,
@@ -13072,13 +13819,13 @@ mod timer_input_tests {
         system_meter_row_width, system_meter_rows, system_meters, system_usage_rows,
         temperature_meter, timer_style_size, Foreground, InvertMap, NoteSearchMatch,
         NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, WidgetPalette,
-        DRAG_REDRAW_INTERVAL, HISTORY_HEIGHT, HISTORY_WIDTH, INVERT_MAP_BUDGET, NOTE_HEIGHT,
+        DRAG_REDRAW_INTERVAL, INVERT_MAP_BUDGET, NOTE_HEIGHT,
         NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
         NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
         SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
     };
     use crate::state::{
-        ColorMode, HighlightColor, NoteHighlight, NoteImage, Point, Size, SystemDetails,
+        ColorMode, HighlightColor, Note, NoteHighlight, NoteImage, Point, Size, SystemDetails,
         TimerStyle, IMAGE_PLACEHOLDER,
     };
     use crate::system::{SystemSnapshot, Usage};
@@ -13091,9 +13838,9 @@ mod timer_input_tests {
         width: 1280,
         height: 800,
     };
-    const HISTORY: Size = Size {
-        width: HISTORY_WIDTH,
-        height: HISTORY_HEIGHT,
+    const CARD: Size = Size {
+        width: 236,
+        height: 252,
     };
 
     #[test]
@@ -13441,7 +14188,8 @@ mod timer_input_tests {
         assert!(receives_input_when_locked("dict:1"));
         assert!(receives_input_when_locked("dict:42"));
         assert!(receives_input_when_locked("note:7"));
-        assert!(receives_input_when_locked("history"));
+        assert!(receives_input_when_locked("notes"));
+        assert!(receives_input_when_locked("usage"));
         assert!(!receives_input_when_locked("system"));
         assert!(!receives_input_when_locked("translate"));
     }
@@ -13580,23 +14328,23 @@ mod timer_input_tests {
 
     #[test]
     fn a_reopened_window_lands_near_the_click_and_fully_on_screen() {
-        let point = reopen_point(Some((900.0, 300.0)), HISTORY, &[SCREEN], SCREEN, None);
+        let point = reopen_point(Some((900.0, 300.0)), CARD, &[SCREEN], SCREEN, None);
         assert_eq!(point, Point { x: 782, y: 324 });
         // A click at the far edge still yields a window whose header — its only
         // drag handle — is on screen.
-        let edge = reopen_point(Some((1279.0, 795.0)), HISTORY, &[SCREEN], SCREEN, None);
-        assert!(edge.x >= SCREEN.x && edge.x + HISTORY.width <= SCREEN.width);
-        assert!(edge.y >= SCREEN.y && edge.y + HISTORY.height <= SCREEN.height);
+        let edge = reopen_point(Some((1279.0, 795.0)), CARD, &[SCREEN], SCREEN, None);
+        assert!(edge.x >= SCREEN.x && edge.x + CARD.width <= SCREEN.width);
+        assert!(edge.y >= SCREEN.y && edge.y + CARD.height <= SCREEN.height);
     }
 
     #[test]
     fn a_reopened_window_without_a_pointer_centres_on_the_primary_screen() {
-        let point = reopen_point(None, HISTORY, &[SCREEN], SCREEN, None);
+        let point = reopen_point(None, CARD, &[SCREEN], SCREEN, None);
         assert_eq!(
             point,
             Point {
-                x: (SCREEN.width - HISTORY.width) / 2,
-                y: (SCREEN.height - HISTORY.height) / 2,
+                x: (SCREEN.width - CARD.width) / 2,
+                y: (SCREEN.height - CARD.height) / 2,
             }
         );
     }
@@ -13611,13 +14359,13 @@ mod timer_input_tests {
         };
         // Clicking "history" on the bar itself: the window drops clear of the
         // bar instead of sliding under it, where its header is unreachable.
-        let point = reopen_point(Some((850.0, 48.0)), HISTORY, &[SCREEN], SCREEN, Some(bar));
+        let point = reopen_point(Some((850.0, 48.0)), CARD, &[SCREEN], SCREEN, Some(bar));
         assert!(
             point.y >= bar.y + bar.height,
             "reopened window must clear the picker bar: {point:?}"
         );
         // A click well below the bar is left alone.
-        let clear = reopen_point(Some((850.0, 400.0)), HISTORY, &[SCREEN], SCREEN, Some(bar));
+        let clear = reopen_point(Some((850.0, 400.0)), CARD, &[SCREEN], SCREEN, Some(bar));
         assert_eq!(clear.y, 424);
     }
 
@@ -13901,6 +14649,216 @@ mod timer_input_tests {
         );
         assert!(note_search_matches("text", "(", regex).is_err());
     }
+
+    #[test]
+    fn pinned_note_sync_only_mounts_and_drops_the_delta() {
+        let (drop, mount) = pinned_note_sync([1, 2, 3], [2, 3, 4]);
+        assert_eq!(drop, vec![1]);
+        assert_eq!(mount, vec![4]);
+        let (drop, mount) = pinned_note_sync([1], [1]);
+        assert!(drop.is_empty() && mount.is_empty());
+        let (drop, mount) = pinned_note_sync([], [7, 8]);
+        assert!(drop.is_empty());
+        assert_eq!(mount, vec![7, 8]);
+    }
+
+    #[test]
+    fn parse_note_widget_id_reads_desk_keys() {
+        assert_eq!(parse_note_widget_id("note:42"), Some(42));
+        assert_eq!(parse_note_widget_id("notes"), None);
+        assert_eq!(parse_note_widget_id("note:"), None);
+        assert_eq!(parse_note_widget_id("system"), None);
+    }
+
+    #[test]
+    fn notes_delete_leaves_search_text_alone() {
+        assert!(!notes_delete_eats_key(true, false, false));
+        assert!(notes_delete_eats_key(true, true, false));
+        assert!(notes_delete_eats_key(true, false, true));
+        assert!(notes_delete_eats_key(false, false, false));
+    }
+
+    fn sample_note(id: u64, starred: bool, updated_at: i64) -> Note {
+        Note {
+            id,
+            text: String::new(),
+            pinned: false,
+            starred,
+            updated_at,
+            position: Point { x: 0, y: 0 },
+            images: Vec::new(),
+            highlights: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn note_snippets_clip_a_mid_line_hit_and_keep_vietnamese_offsets() {
+        let pad = "word ".repeat(12);
+        let text = format!("{pad}away from the station and more words after that");
+        let matches = note_search_matches(&text, "away", Default::default()).unwrap();
+        let snippets = note_snippets(&text, &matches, 1);
+        assert_eq!(snippets[0].hit, "away");
+        assert!(
+            snippets[0].before.starts_with('\u{2026}'),
+            "a mid-line hit should be trimmed on the left: {:?}",
+            snippets[0].before
+        );
+        assert!(
+            snippets[0].after.ends_with('\u{2026}'),
+            "a mid-line hit should be trimmed on the right: {:?}",
+            snippets[0].after
+        );
+
+        let edges = note_search_matches("away", "away", Default::default()).unwrap();
+        let snippets = note_snippets("away", &edges, 1);
+        assert_eq!(snippets[0].hit, "away");
+        assert!(snippets[0].before.is_empty());
+        assert!(snippets[0].after.is_empty());
+        let empty = note_snippets("", &[], 2);
+        assert!(empty.is_empty());
+
+        let vietnamese = "Đây là ghi chú. GHI CHÚ nữa.";
+        let matches = note_search_matches(vietnamese, "ghi chú", Default::default()).unwrap();
+        assert_eq!(
+            matches,
+            [
+                NoteSearchMatch { start: 7, end: 14 },
+                NoteSearchMatch { start: 16, end: 23 },
+            ]
+        );
+        let snippets = note_snippets(vietnamese, &matches, 1);
+        assert_eq!(snippets[0].hit, "ghi chú");
+    }
+
+    #[test]
+    fn notes_sort_stars_first_and_falls_back_to_id_when_untimestamped() {
+        let mut notes = [
+            sample_note(1, false, 0),
+            sample_note(2, false, 0),
+            sample_note(3, true, 0),
+            sample_note(4, false, 100),
+        ];
+        notes.sort_by_key(note_sort_key);
+        assert_eq!(
+            notes.iter().map(|note| note.id).collect::<Vec<_>>(),
+            [3, 4, 2, 1]
+        );
+    }
+
+    #[test]
+    fn palette_size_is_three_fifths_and_clamped_to_the_work_area() {
+        let small = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 500,
+        };
+        assert_eq!(
+            palette_size(small),
+            Size {
+                width: 520,
+                height: 360
+            }
+        );
+        let mid = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        assert_eq!(
+            palette_size(mid),
+            Size {
+                width: 768,
+                height: 480
+            }
+        );
+        let huge = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 4000,
+            height: 2000,
+        };
+        assert_eq!(
+            palette_size(huge),
+            Size {
+                width: 860,
+                height: 560
+            }
+        );
+        let tiny = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 300,
+        };
+        let size = palette_size(tiny);
+        assert!(size.width <= tiny.width);
+        assert!(size.height <= tiny.height);
+    }
+
+    #[test]
+    fn centre_on_screen_uses_the_monitor_under_the_pointer() {
+        let left = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        let right = ScreenRect {
+            x: 1280,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        let size = Size {
+            width: 600,
+            height: 400,
+        };
+        let on_right = centre_on_screen(Some((1600.0, 100.0)), size, &[left, right], left);
+        assert_eq!(
+            on_right,
+            Point {
+                x: 1280 + (1280 - 600) / 2,
+                y: (800 - 400) / 2,
+            }
+        );
+        let on_primary = centre_on_screen(None, size, &[left, right], left);
+        assert_eq!(
+            on_primary,
+            Point {
+                x: (1280 - 600) / 2,
+                y: (800 - 400) / 2,
+            }
+        );
+        let oversized = centre_on_screen(
+            Some((10.0, 10.0)),
+            Size {
+                width: 2000,
+                height: 900,
+            },
+            &[left],
+            left,
+        );
+        assert!(oversized.x >= left.x);
+        assert!(oversized.y >= left.y);
+        assert_eq!(
+            oversized,
+            clamp_to_screens(Point { x: left.x, y: left.y }, 2000, 900, &[left]),
+        );
+    }
+
+    #[test]
+    fn age_label_reads_in_the_largest_useful_unit() {
+        let now = 1_700_000_000_000;
+        assert_eq!(age_label(0, now), "");
+        assert_eq!(age_label(now, now), "now");
+        assert_eq!(age_label(now - 5 * 60 * 1000, now), "5m");
+        assert_eq!(age_label(now - 2 * 3600 * 1000, now), "2h");
+        assert_eq!(age_label(now - 3 * 86_400 * 1000, now), "3d");
+        assert_eq!(age_label(now - 14 * 86_400 * 1000, now), "2w");
+    }
+
 
     #[test]
     fn parses_supported_timer_formats() {
