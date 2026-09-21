@@ -840,6 +840,42 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     });
 
     let registry: Rc<RefCell<Vec<RegisteredWidget>>> = Rc::new(RefCell::new(Vec::new()));
+    // Capture on the overlay, not on each card: a TextView owns its own
+    // GdkWindow, so a gesture on the card EventBox never sees clicks in the
+    // editor. Denied so the click still lands on the child that was hit.
+    //
+    // Child GdkWindows on this Xwayland overlay do not restack when raised.
+    // The last gtk::Fixed child is the one that paints on top, so remount
+    // after the press — not during it, and not while a drag holds the card.
+    let raise = gtk::GestureMultiPress::new(&window);
+    raise.set_button(0);
+    raise.set_propagation_phase(gtk::PropagationPhase::Capture);
+    raise.connect_pressed({
+        let root = root.clone();
+        let registry = registry.clone();
+        move |gesture, _, x, y| {
+            if let Some(card) = overlay_card_at(&root, x, y) {
+                raise_card_windows(&card);
+                glib::idle_add_local_once({
+                    let card = card.clone();
+                    let registry = registry.clone();
+                    move || {
+                        if !registry
+                            .borrow()
+                            .iter()
+                            .any(|item| item.widget == card && item.held.get())
+                        {
+                            restack_overlay_card(&card);
+                        }
+                    }
+                });
+            }
+            gesture.set_state(gtk::EventSequenceState::Denied);
+        }
+    });
+    unsafe {
+        window.set_data("sysi-raise-gesture", raise);
+    }
     let interactive = Rc::new(Cell::new(true));
     publish_panel_state(true, &state.borrow());
     // Context menus are attached while their windows are built, well before the
@@ -1209,6 +1245,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     Some(&picker),
                 );
                 card.show_all();
+                raise_card(&card);
                 chrome.set_visible(interactive.get());
                 request();
             } else {
@@ -1323,6 +1360,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     .or_else(|| ctx.instances.borrow().last().cloned());
                 if let Some(instance) = recent {
                     instance.window.card.show_all();
+                    raise_card(&instance.window.card);
                     instance.window.chrome.set_visible(ctx.interactive.get());
                     (instance.refresh_nav)();
                     {
@@ -1366,6 +1404,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 .cloned();
             if let Some(instance) = spawned {
                 instance.window.card.show_all();
+                raise_card(&instance.window.card);
                 instance.window.chrome.set_visible(ctx.interactive.get());
                 (instance.refresh_nav)();
                 match query {
@@ -1412,6 +1451,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 if visible {
                     place_translate_near_click(&ctx, instance.id, &instance.window.card);
                     instance.window.card.show_all();
+                    raise_card(&instance.window.card);
                     // show_all() reveals the chrome and the query panel
                     // regardless of lock mode; restore both rules.
                     instance.window.chrome.set_visible(ctx.interactive.get());
@@ -1525,6 +1565,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             };
             if !instance.window.card.is_visible() {
                 instance.window.card.show_all();
+                raise_card(&instance.window.card);
                 instance.window.chrome.set_visible(ctx.interactive.get());
                 (instance.refresh_nav)();
                 let mut data = ctx.state.borrow_mut();
@@ -1781,6 +1822,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 // call actually maps the card, then put it back on hide.
                 card.set_no_show_all(false);
                 card.show_all();
+                raise_card(&card);
+                // Mapping can leave allocation at 0 until the next idle.
+                // Restack again then so the palette is last in gtk::Fixed.
+                glib::idle_add_local_once({
+                    let card = card.clone();
+                    move || restack_overlay_card(&card)
+                });
                 rebuild_list();
                 // The palette is usable in lock mode: take keyboard focus
                 // even when the rest of the overlay is click-through.
@@ -2537,6 +2585,7 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     let rows = gtk::Box::new(gtk::Orientation::Vertical, 3);
     rows.style_context().add_class("usage-rows");
     scroller.add(&rows);
+    repaint_card_on_scroll(&scroller, &card);
 
     let tokens = Rc::new(RefCell::new(TokenState::default()));
     let token_hits = Rc::new(RefCell::new(Vec::<TokenHit>::new()));
@@ -8216,6 +8265,7 @@ fn rebuild_pinned_notes(
         scroller.set_propagate_natural_width(false);
         scroller.set_propagate_natural_height(false);
         scroller.add(&editor);
+        repaint_card_on_scroll(&scroller, &card);
         let note_search = build_note_search(&editor, &registry, &search_toggle);
         let plate = frost_plate();
         let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -8532,8 +8582,10 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     header.style_context().add_class("notes-header");
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
     bar.set_hexpand(true);
-    let find = gtk::Image::from_icon_name(Some("edit-find-symbolic"), gtk::IconSize::Menu);
-    find.set_pixel_size(11);
+    // Same path as the header buttons: a symbolic icon recolours to the
+    // button's CSS, so it stays opposite the LIGHT / DARK plate.
+    let find = icon_button("edit-find-symbolic", "Search notes");
+    find.style_context().add_class("notes-find");
     let search = gtk::Entry::new();
     search.set_placeholder_text(Some("Search notes\u{2026}"));
     search.set_has_frame(false);
@@ -8578,6 +8630,7 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     list.style_context().add_class("notes-list");
     list.set_valign(gtk::Align::Start);
     list_scroller.add(&list);
+    repaint_card_on_scroll(&list_scroller, &card);
 
     let preview_scroller =
         gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
@@ -8600,6 +8653,7 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     preview.set_vexpand(true);
     preview.style_context().add_class("notes-preview-view");
     preview_scroller.add(&preview);
+    repaint_card_on_scroll(&preview_scroller, &card);
     // Same HiDPI overlay the desk notes use. GTK paints inline pixbufs at
     // CSS size; without this pass a scaled display stretches them soft.
     let originals: ImageOriginals = Rc::new(RefCell::new(HashMap::new()));
@@ -9572,6 +9626,7 @@ fn build_translate_window(initial_color_mode: Foreground) -> TranslateWindow {
     input.set_size_request(1, 1);
     input.style_context().add_class("translate-search-input");
     input_scroller.add(&input);
+    repaint_card_on_scroll(&input_scroller, &card);
     search_panel.pack_start(&input_scroller, false, false, 0);
 
     // The completions live inside the panel so they come and go with it.
@@ -9602,6 +9657,7 @@ fn build_translate_window(initial_color_mode: Foreground) -> TranslateWindow {
     let results = gtk::Box::new(gtk::Orientation::Vertical, 3);
     results.style_context().add_class("translate-results");
     scroller.add(&results);
+    repaint_card_on_scroll(&scroller, &card);
     let plate = frost_plate();
     plate.add(&scroller);
     body.pack_start(&plate, true, true, 0);
@@ -10531,6 +10587,191 @@ fn register(
         edit_only: None,
         editor: None,
         note_search: None,
+    });
+}
+
+#[cfg(test)]
+fn top_child_at(children: &[(i32, i32, i32, i32)], x: i32, y: i32) -> Option<usize> {
+    let ranked: Vec<_> = children
+        .iter()
+        .map(|&(child_x, child_y, width, height)| (child_x, child_y, width, height, 0, false))
+        .collect();
+    top_raised_child_at(&ranked, x, y)
+}
+
+/// Later children sit above earlier ones, matching `gtk::Fixed`. A higher
+/// raise stamp wins over that list order, so a windowed card whose GdkWindow
+/// was raised is still the one hit next time. Windowed children paint in
+/// their own GdkWindows above the overlay, so they beat a windowless overlap
+/// regardless of stamp.
+fn top_raised_child_at(
+    children: &[(i32, i32, i32, i32, u64, bool)],
+    x: i32,
+    y: i32,
+) -> Option<usize> {
+    let mut best: Option<(bool, u64, usize)> = None;
+    for (index, (child_x, child_y, width, height, stamp, windowed)) in children.iter().enumerate() {
+        if x < *child_x || x >= *child_x + *width || y < *child_y || y >= *child_y + *height {
+            continue;
+        }
+        let key = (*windowed, *stamp, index);
+        if best.is_none_or(|current| key > current) {
+            best = Some(key);
+        }
+    }
+    best.map(|(_, _, index)| index)
+}
+
+const RAISE_STAMP_KEY: &str = "sysi-raise-stamp";
+static RAISE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn card_raise_stamp(widget: &gtk::Widget) -> u64 {
+    unsafe {
+        widget
+            .data::<u64>(RAISE_STAMP_KEY)
+            .map(|ptr| *ptr.as_ref())
+            .unwrap_or(0)
+    }
+}
+
+fn mark_card_raised(widget: &impl IsA<gtk::Widget>) {
+    let next = RAISE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    unsafe {
+        widget.set_data(RAISE_STAMP_KEY, next);
+    }
+}
+
+fn overlay_card_at(root: &gtk::Fixed, x: f64, y: f64) -> Option<gtk::EventBox> {
+    let x = x as i32;
+    let y = y as i32;
+    let children = root.children();
+    let ranked: Vec<(i32, i32, i32, i32, u64, bool)> = children
+        .iter()
+        .map(|child| {
+            if !child.is_visible() {
+                return (0, 0, 0, 0, 0, false);
+            }
+            let allocation = child.allocation();
+            (
+                allocation.x(),
+                allocation.y(),
+                allocation.width(),
+                allocation.height(),
+                card_raise_stamp(child),
+                child.has_window(),
+            )
+        })
+        .collect();
+    let index = top_raised_child_at(&ranked, x, y)?;
+    children.into_iter().nth(index)?.downcast().ok()
+}
+
+fn raise_widget_windows(widget: &impl IsA<gtk::Widget>) {
+    if widget.has_window() {
+        if let Some(window) = widget.window() {
+            window.raise();
+        }
+    }
+    let Ok(container) = widget
+        .upcast_ref::<gtk::Widget>()
+        .clone()
+        .downcast::<gtk::Container>()
+    else {
+        return;
+    };
+    for child in container.children() {
+        raise_widget_windows(&child);
+    }
+}
+
+fn raise_card_windows(card: &gtk::EventBox) {
+    mark_card_raised(card);
+    raise_widget_windows(card);
+    if let Some(parent) = card.parent() {
+        parent.queue_draw();
+    }
+    card.queue_draw();
+}
+
+fn restack_overlay_card(card: &gtk::EventBox) {
+    let Some(parent) = card.parent() else {
+        return;
+    };
+    let Ok(fixed) = parent.downcast::<gtk::Fixed>() else {
+        return;
+    };
+    let already_top = fixed.children().iter().rev().find(|child| child.widget_name() != "dictate")
+        .is_some_and(|child| child == card.upcast_ref::<gtk::Widget>());
+    if already_top {
+        raise_card_windows(card);
+        return;
+    }
+    let focus = card
+        .toplevel()
+        .and_then(|top| top.downcast::<gtk::Window>().ok())
+        .and_then(|window| window.focused_widget());
+    let allocation = card.allocation();
+    if allocation.width() <= 0 || allocation.height() <= 0 {
+        raise_card_windows(card);
+        return;
+    }
+    let shown = card.is_visible();
+    fixed.remove(card);
+    fixed.put(card, allocation.x(), allocation.y());
+    if shown {
+        card.set_visible(true);
+    }
+    keep_overlay_layers_on_top(&fixed);
+    if let Some(focus) = focus {
+        focus.grab_focus();
+    }
+    raise_card_windows(card);
+}
+
+fn keep_overlay_layers_on_top(fixed: &gtk::Fixed) {
+    let layers: Vec<gtk::Widget> = fixed
+        .children()
+        .into_iter()
+        .filter(|child| child.widget_name() == "dictate")
+        .collect();
+    for layer in layers {
+        let allocation = layer.allocation();
+        let shown = layer.is_visible();
+        fixed.remove(&layer);
+        fixed.put(&layer, allocation.x(), allocation.y());
+        if shown {
+            layer.set_visible(true);
+        }
+    }
+}
+
+fn raise_card(card: &gtk::EventBox) {
+    restack_overlay_card(card);
+}
+
+fn repaint_card_on_scroll(scroller: &gtk::ScrolledWindow, card: &gtk::EventBox) {
+    // GtkScrolledWindow has no GdkWindow of its own in GTK 3: it paints on
+    // the frost plate. A Source-clear here punched a hole through LIGHT /
+    // DARK and left the wallpaper showing. Redraw the plate instead so a
+    // scroll cannot leave a ghost without wiping the fill.
+    let redraw = {
+        let scroller = scroller.clone();
+        let card = card.clone();
+        Rc::new(move || {
+            card.queue_draw();
+            scroller.queue_draw();
+            if let Some(child) = scroller.child() {
+                child.queue_draw();
+            }
+        }) as Rc<dyn Fn()>
+    };
+    scroller.vadjustment().connect_value_changed({
+        let redraw = redraw.clone();
+        move |_| redraw()
+    });
+    scroller.hadjustment().connect_value_changed({
+        let redraw = redraw.clone();
+        move |_| redraw()
     });
 }
 
@@ -11584,6 +11825,7 @@ fn reopen_widget(
     );
     root.move_(card, point.x, point.y);
     state.borrow_mut().positions.insert(key.to_owned(), point);
+    raise_card(card);
 }
 
 fn widget_rect(widget: &gtk::EventBox) -> Option<ScreenRect> {
@@ -11971,6 +12213,7 @@ fn attach_resize(
             let size = latest.get();
             state.borrow_mut().sizes.insert(key.clone(), size);
             let _ = state.borrow().save();
+            restack_overlay_card(&card);
             card.queue_resize();
             handle_hitbox.queue_draw();
             let window = window.clone();
@@ -12118,119 +12361,40 @@ fn attach_drag(
     interactive: Rc<Cell<bool>>,
     window: gtk::ApplicationWindow,
 ) {
-    let gesture = gtk::GestureDrag::new(handle);
-    gesture.set_button(1);
-    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
-    // GestureDrag's local deltas are rounded around HiDPI scale boundaries.
-    // Follow the root pointer instead, so moving the Fixed child never feeds
-    // back into the next drag delta.
+    // Cards are windowless, so raising one is GtkFixed child order: remove +
+    // put. That remount cancels GestureDrag. The overlay window is never
+    // remounted, so a seat grab there plus a 16ms seat poll can follow the
+    // pointer even while the card is restacked. Release is hooked once on
+    // the overlay (not per card) so unpinning a note cannot leak handlers.
     let start = Rc::new(Cell::new(None::<(i32, i32, f64, f64)>));
-    // Read once when the drag starts rather than on every motion event: asking
-    // the server for each monitor's geometry and work area is not something to
-    // repeat sixty times a second, and it cannot change mid-drag.
     let gesture_screens: Rc<RefCell<Vec<ScreenRect>>> = Rc::new(RefCell::new(Vec::new()));
-    let last_redraw = Rc::new(Cell::new(None::<Instant>));
     let live = Rc::new(Cell::new(None::<Point>));
-    gesture.connect_drag_begin({
+    let ticking = Rc::new(Cell::new(false));
+    let finish: Rc<dyn Fn(f64, f64)> = Rc::new({
         let start = start.clone();
         let live = live.clone();
-        let last_redraw = last_redraw.clone();
         let card = card.clone();
         let root = root.clone();
-        let gesture_screens = gesture_screens.clone();
-        let interactive = interactive.clone();
         let registry = registry.clone();
+        let window = window.clone();
+        let interactive = interactive.clone();
+        let card_widget = card.clone().upcast::<gtk::Widget>();
+        let gesture_screens = gesture_screens.clone();
+        let state = state.clone();
         let key = key.clone();
-        move |gesture, local_x, local_y| {
-            if interactive.get() {
-                let allocation = card.allocation();
-                if local_x >= f64::from(allocation.width() - RESIZE_HIT_SIZE)
-                    && local_y >= f64::from(allocation.height() - RESIZE_HIT_SIZE)
-                {
-                    gesture.set_state(gtk::EventSequenceState::Denied);
-                    return;
-                }
-                let (pointer_x, pointer_y) = pointer_position().unwrap_or((
-                    f64::from(allocation.x()) + local_x,
-                    f64::from(allocation.y()) + local_y,
-                ));
-                *gesture_screens.borrow_mut() = overlay_screen_rects(&root);
-                start.set(Some((allocation.x(), allocation.y(), pointer_x, pointer_y)));
-                live.set(Some(Point {
-                    x: allocation.x(),
-                    y: allocation.y(),
-                }));
-                last_redraw.set(None);
-                hold_widget(&registry, &key, true);
-            } else {
-                gesture.set_state(gtk::EventSequenceState::Denied);
-            }
-        }
-    });
-    gesture.connect_drag_update({
-        let start = start.clone();
-        let card = card.clone();
-        let card_widget = card.clone().upcast::<gtk::Widget>();
-        let root = root.clone();
-        let window = window.clone();
-        let gesture_screens = gesture_screens.clone();
-        let last_redraw = last_redraw.clone();
-        let live = live.clone();
-        move |gesture, fallback_x, fallback_y| {
-            if let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.get() {
-                if fallback_x.abs() + fallback_y.abs() > 4.0 {
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                }
-                let now = Instant::now();
-                if !drag_frame_due(last_redraw.get(), now) {
-                    return;
-                }
-                last_redraw.set(Some(now));
-                let (pointer_x, pointer_y) = pointer_position()
-                    .unwrap_or((pointer_start_x + fallback_x, pointer_start_y + fallback_y));
-                let offset_x = pointer_x - pointer_start_x;
-                let offset_y = pointer_y - pointer_start_y;
-                let allocation = card.allocation();
-                let screens = gesture_screens.borrow();
-                let point = clamp_to_screens(
-                    Point {
-                        x: ox + offset_x as i32,
-                        y: oy + offset_y as i32,
-                    },
-                    allocation.width(),
-                    allocation.height(),
-                    &screens,
-                );
-                live.set(Some(point));
-                slide_overlay_card(&window, &root, &card, &card_widget, point);
-            }
-        }
-    });
-    gesture.connect_drag_end({
-        let start = start.clone();
-        let live = live.clone();
-        let card = card.clone();
-        let root = root.clone();
-        let registry = registry.clone();
-        let window = window.clone();
-        let interactive = interactive.clone();
-        let card_widget = card.clone().upcast::<gtk::Widget>();
-        let gesture_screens = gesture_screens.clone();
-        move |_, fallback_x, fallback_y| {
-            // Released before anything else, so a gesture that was denied or
-            // cancelled can never leave the widget stuck on the light palette.
+        move |fallback_x, fallback_y| {
+            OVERLAY_DRAG_FINISH.with(|slot| slot.borrow_mut().take());
             hold_widget(&registry, &key, false);
             live.set(None);
+            ungrab_pointer();
             let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.replace(None) else {
                 return;
             };
             let allocation = card.allocation();
-            // A throttled motion may still be waiting when the button comes
-            // up. Commit the exact final pointer position so rate limiting
-            // never changes where the user actually dropped the card.
-            let (pointer_x, pointer_y) = pointer_position()
+            let (pointer_x, pointer_y) = pointer_drag_sample()
+                .map(|(x, y, _)| (x, y))
                 .unwrap_or((pointer_start_x + fallback_x, pointer_start_y + fallback_y));
-            let gesture_screens = gesture_screens.borrow();
+            let screens = gesture_screens.borrow();
             let origin = clamp_to_screens(
                 Point {
                     x: ox + (pointer_x - pointer_start_x) as i32,
@@ -12238,14 +12402,10 @@ fn attach_drag(
                 },
                 allocation.width(),
                 allocation.height(),
-                &gesture_screens,
+                &screens,
             );
-            drop(gesture_screens);
+            drop(screens);
             move_overlay_card(&window, &root, &card, &card_widget, origin);
-            // The widget may have just landed on a shorter monitor than the one
-            // it was sized on. Left oversized it would be stuck there: the
-            // position clamp collapses that axis to a single point, so it could
-            // slide sideways but never up or down again.
             let screens = overlay_screen_rects(&root);
             let (width, height) =
                 fit_to_work_area(origin, allocation.width(), allocation.height(), &screens);
@@ -12257,6 +12417,7 @@ fn attach_drag(
             if point.x != origin.x || point.y != origin.y {
                 root.move_(&card, point.x, point.y);
             }
+            let moved = point.x != ox || point.y != oy;
             let mut data = state.borrow_mut();
             if resized {
                 data.sizes.insert(key.clone(), Size { width, height });
@@ -12268,17 +12429,120 @@ fn attach_drag(
                 if let Some(note) = data.notes.iter_mut().find(|note| note.id == id) {
                     note.position = point;
                 }
-            } else {
+            } else if moved {
                 data.positions.insert(key.clone(), point);
             }
-            let _ = data.save();
+            if moved || resized {
+                let _ = data.save();
+            }
             drop(data);
+            restack_overlay_card(&card);
             refresh_input_shape(&window, &registry, interactive.get());
             glib::idle_add_local_once({
                 let registry = registry.clone();
                 let state = state.clone();
                 move || refresh_auto_colors(&registry, &state)
             });
+        }
+    });
+
+    ensure_overlay_drag_release(&window);
+
+    handle.add_events(
+        gdk::EventMask::BUTTON_PRESS_MASK | gdk::EventMask::BUTTON_RELEASE_MASK,
+    );
+    handle.connect_button_press_event({
+        let start = start.clone();
+        let live = live.clone();
+        let ticking = ticking.clone();
+        let card = card.clone();
+        let root = root.clone();
+        let gesture_screens = gesture_screens.clone();
+        let interactive = interactive.clone();
+        let registry = registry.clone();
+        let window = window.clone();
+        let key = key.clone();
+        let finish = finish.clone();
+        let card_widget = card.clone().upcast::<gtk::Widget>();
+        move |_, event| {
+            if !interactive.get() || event.button() != 1 {
+                return glib::Propagation::Proceed;
+            }
+            let allocation = card.allocation();
+            let (local_x, local_y) = event.position();
+            if local_x >= f64::from(allocation.width() - RESIZE_HIT_SIZE)
+                && local_y >= f64::from(allocation.height() - RESIZE_HIT_SIZE)
+            {
+                return glib::Propagation::Proceed;
+            }
+            let (pointer_x, pointer_y) = pointer_drag_sample()
+                .map(|(x, y, _)| (x, y))
+                .unwrap_or(event.root());
+            *gesture_screens.borrow_mut() = overlay_screen_rects(&root);
+            start.set(Some((allocation.x(), allocation.y(), pointer_x, pointer_y)));
+            live.set(Some(Point {
+                x: allocation.x(),
+                y: allocation.y(),
+            }));
+            hold_widget(&registry, &key, true);
+            grab_overlay_pointer(&window);
+            restack_overlay_card(&card);
+            OVERLAY_DRAG_FINISH.with(|slot| *slot.borrow_mut() = Some(finish.clone()));
+            if !ticking.get() {
+                ticking.set(true);
+                glib::timeout_add_local(DRAG_REDRAW_INTERVAL, {
+                    let start = start.clone();
+                    let live = live.clone();
+                    let ticking = ticking.clone();
+                    let card = card.clone();
+                    let card_widget = card_widget.clone();
+                    let root = root.clone();
+                    let window = window.clone();
+                    let gesture_screens = gesture_screens.clone();
+                    let finish = finish.clone();
+                    move || {
+                        let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.get() else {
+                            ticking.set(false);
+                            return glib::ControlFlow::Break;
+                        };
+                        let Some((pointer_x, pointer_y, button1)) = pointer_drag_sample() else {
+                            return glib::ControlFlow::Continue;
+                        };
+                        if !button1 {
+                            finish(0.0, 0.0);
+                            ticking.set(false);
+                            return glib::ControlFlow::Break;
+                        }
+                        let allocation = card.allocation();
+                        let screens = gesture_screens.borrow();
+                        let point = clamp_to_screens(
+                            Point {
+                                x: ox + (pointer_x - pointer_start_x) as i32,
+                                y: oy + (pointer_y - pointer_start_y) as i32,
+                            },
+                            allocation.width(),
+                            allocation.height(),
+                            &screens,
+                        );
+                        drop(screens);
+                        live.set(Some(point));
+                        slide_overlay_card(&window, &root, &card, &card_widget, point);
+                        glib::ControlFlow::Continue
+                    }
+                });
+            }
+            glib::Propagation::Stop
+        }
+    });
+    handle.connect_button_release_event({
+        let start = start.clone();
+        let finish = finish.clone();
+        move |_, event| {
+            if event.button() != 1 || start.get().is_none() {
+                return glib::Propagation::Proceed;
+            }
+            finish(0.0, 0.0);
+            glib::Propagation::Stop
         }
     });
 
@@ -12307,17 +12571,13 @@ fn attach_drag(
             restoring.set(false);
         }
     });
-
-    // A GTK gesture is detached when its final strong reference is dropped.
-    // Keep it with the handle so dragging remains active for the widget's lifetime.
-    unsafe {
-        handle.set_data("sysi-drag-gesture", gesture);
-    }
 }
 
 thread_local! {
     /// Set while a panel action is being carried out; see `reopen_anchor`.
     static PANEL_ANCHOR: Cell<Option<Point>> = const { Cell::new(None) };
+    static OVERLAY_DRAG_FINISH: RefCell<Option<Rc<dyn Fn(f64, f64)>>> = RefCell::new(None);
+    static OVERLAY_DRAG_RELEASE_HOOKED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Where a widget being opened should be centred.
@@ -12335,6 +12595,62 @@ fn reopen_anchor(root: &gtk::Fixed) -> Option<(f64, f64)> {
         .or_else(pointer_position)?;
     let origin = overlay_origin(root);
     Some((point.0 - f64::from(origin.x), point.1 - f64::from(origin.y)))
+}
+
+fn grab_overlay_pointer(window: &gtk::ApplicationWindow) {
+    let Some(gdk_window) = window.window() else {
+        return;
+    };
+    let Some(seat) = gdk_window.display().default_seat() else {
+        return;
+    };
+    // owner_events=false: remounting the card must not steal the stream.
+    let _ = seat.grab(
+        &gdk_window,
+        gdk::SeatCapabilities::POINTER,
+        false,
+        None,
+        None,
+        None,
+    );
+}
+
+fn ensure_overlay_drag_release(window: &gtk::ApplicationWindow) {
+    if OVERLAY_DRAG_RELEASE_HOOKED.get() {
+        return;
+    }
+    OVERLAY_DRAG_RELEASE_HOOKED.set(true);
+    window.add_events(gdk::EventMask::BUTTON_RELEASE_MASK);
+    window.connect_button_release_event(|_, event| {
+        if event.button() != 1 {
+            return glib::Propagation::Proceed;
+        }
+        let finish = OVERLAY_DRAG_FINISH.with(|slot| slot.borrow().clone());
+        if let Some(finish) = finish {
+            finish(0.0, 0.0);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+}
+
+/// One X11 round-trip: root pointer and whether button 1 is down.
+fn pointer_drag_sample() -> Option<(f64, f64, bool)> {
+    let display = gdk::Display::default()?;
+    let pointer = display.default_seat()?.pointer()?;
+    let root = display.default_screen().root_window()?;
+    let (_, x, y, mask) = root.device_position_double(&pointer);
+    Some((
+        x,
+        y,
+        mask.contains(gdk::ModifierType::BUTTON1_MASK),
+    ))
+}
+
+fn ungrab_pointer() {
+    if let Some(seat) = gdk::Display::default().and_then(|display| display.default_seat()) {
+        seat.ungrab();
+    }
 }
 
 fn pointer_position() -> Option<(f64, f64)> {
@@ -14110,7 +14426,7 @@ mod timer_input_tests {
     use super::{
         clamp_to_screens, clip_screen_to_overlay, covers, dictate_capture_answer,
         click_became_drag, dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area,
-        fit_within_bounds, held_slide_point,
+        fit_within_bounds, held_slide_point, top_child_at, top_raised_child_at,
         foreground_for_luminance, foreground_for_mode, format_rate, highlight_at, hold_clears_map,
         image_room, image_room_after_y, invert_map, monitor_coordinate_divisor,
         monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
@@ -14179,6 +14495,39 @@ mod timer_input_tests {
         );
         assert_eq!(held_slide_point(live, Some(live)), None);
         assert_eq!(held_slide_point(Point { x: 12, y: 20 }, None), None);
+    }
+
+    #[test]
+    fn the_last_overlapping_child_is_the_one_on_top() {
+        let children = [
+            (0, 0, 100, 80),
+            (40, 20, 100, 80),
+            (200, 0, 50, 50),
+        ];
+        assert_eq!(top_child_at(&children, 10, 10), Some(0));
+        assert_eq!(top_child_at(&children, 50, 30), Some(1));
+        assert_eq!(top_child_at(&children, 210, 10), Some(2));
+        assert_eq!(top_child_at(&children, 400, 10), None);
+    }
+
+    #[test]
+    fn a_raised_child_sits_above_later_siblings() {
+        let children = [
+            (0, 0, 100, 80, 3, false),
+            (40, 20, 100, 80, 1, false),
+        ];
+        assert_eq!(top_raised_child_at(&children, 50, 30), Some(0));
+        assert_eq!(top_raised_child_at(&children, 10, 10), Some(0));
+    }
+
+    #[test]
+    fn a_windowed_child_sits_above_a_windowless_overlap() {
+        let children = [
+            (0, 0, 100, 80, 0, true),
+            (40, 20, 100, 80, 9, false),
+        ];
+        assert_eq!(top_raised_child_at(&children, 50, 30), Some(0));
+        assert_eq!(top_raised_child_at(&children, 120, 30), Some(1));
     }
 
     #[test]

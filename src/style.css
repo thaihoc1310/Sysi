@@ -545,11 +545,18 @@ scrolledwindow overshoot.right:backdrop {
   border-radius: 4px 4px 0 0;
   min-height: 20px;
   padding-right: 6px;
+  color: #222222;
+}
+
+.mode-dark .notes-header,
+.mode-dark .history-header {
+  color: #f2f2f2;
 }
 
 .notes-count,
 .notes-title,
-.history-title {
+.history-title,
+.notes-find {
   color: #222222;
   font-size: 8px;
   font-weight: 800;
@@ -559,7 +566,8 @@ scrolledwindow overshoot.right:backdrop {
 
 .mode-dark .notes-count,
 .mode-dark .notes-title,
-.mode-dark .history-title {
+.mode-dark .history-title,
+.mode-dark .notes-find {
   color: #f2f2f2;
 }
 
@@ -677,8 +685,7 @@ scrolledwindow overshoot.right:backdrop {
 }
 
 .notes-row-meta,
-.notes-hint,
-.notes-count {
+.notes-hint {
   color: alpha(currentColor, 0.55);
   font-size: 8px;
   font-weight: 700;
