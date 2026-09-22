@@ -12,7 +12,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
   Every sensor, `/proc` walk, and `nvidia-smi` call runs only while its section is enabled, and all of it on a sampler thread rather than the GTK main loop.
 - Focus countdown with four visual styles, hover controls in both modes, and a persistent animated alarm that must be dismissed.
 - A compact gear menu with persistent SYSTEM and timer visibility toggles.
-- Notes palette: `Ctrl+Alt+N` opens a centred command palette of every note. Search shows the matching passage, a preview reads the note in place, and Enter pins it on the desk.
+- Notes palette: `Ctrl+Alt+N` opens a centred command palette of every note on the monitor of the window you last clicked. Search shows the matching passage, a preview reads the note in place, and Enter pins it on the desk.
 - A small transparent `USAGE` card for Codex, Claude Code, and Oh My Pi (OMP). It
   shows the remaining percentage, the server-provided reset time, and the age
   of the last snapshot. The card polls only while visible, keeps the previous
@@ -88,7 +88,7 @@ Sysi refreshes this small per-user copy when it starts, so upgrades stay in sync
 
 ## Display support
 
-Sysi is an X11 overlay: always-on-top placement, sticky multi-monitor coverage, and click-through input shaping are all X11 window management. GDK 3 would otherwise pick its Wayland backend whenever `WAYLAND_DISPLAY` is set, where those calls are silent no-ops and the overlay behaves like an ordinary window. So Sysi asks for the X11 backend itself when a display is available, and runs through Xwayland on a Wayland session. Set `GDK_BACKEND` yourself to override that choice.
+Sysi is an X11 overlay: always-on-top placement, sticky multi-monitor coverage, and click-through input shaping are all X11 window management. GDK 3 would otherwise pick its Wayland backend whenever `WAYLAND_DISPLAY` is set, where those calls are silent no-ops and the overlay behaves like an ordinary window. So Sysi asks for the X11 backend itself when a display is available, and runs through Xwayland on a Wayland session. A parent shell that exports `GDK_BACKEND=wayland` is ignored so the overlay cannot shrink to one ordinary window; set `SYSI_GDK_BACKEND` to override.
 
 Ubuntu 26.04 (GNOME 50) ships no Xorg session at all — `/usr/share/xsessions` is gone — so this is the path every 26.04 desktop takes.
 

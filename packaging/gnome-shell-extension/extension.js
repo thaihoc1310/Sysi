@@ -328,13 +328,17 @@ export default class SysiPanelExtension extends Extension {
     // own place on the stage, which is already in the logical coordinates the
     // overlay lays its widgets out in.
     _runAction(action, button) {
-        // Opening Notes needs the overlay to hold the keyboard. An Xwayland
-        // client cannot steal that from a native Wayland app; the shell can.
-        if (action === 'toggle-notes' || action === 'toggle-history'
-            || action === 'ocr' || action === 'dictate')
+        // Snapshot the target before we steal focus. Activating the
+        // overlay first made Notes see Sysi itself (or the mouse) and
+        // walk the palette to the other monitor a frame later.
+        const notes = action === 'toggle-notes' || action === 'toggle-history';
+        const ocr = action === 'ocr' || action === 'dictate';
+        const anchor = button
+            ? this._anchorOf(button)
+            : notes ? this._focusAnchor() : this._pointerAnchor();
+        if (notes || ocr)
             this._activateOverlaySoon();
         const argv = ['sysi', '--panel-action', action];
-        const anchor = button ? this._anchorOf(button) : null;
         if (anchor)
             argv.push('--at', anchor);
         try {
@@ -350,10 +354,7 @@ export default class SysiPanelExtension extends Extension {
             const win = actor.meta_window;
             if (!win)
                 continue;
-            const title = win.get_title() ?? '';
-            const wmClass = (win.get_wm_class() ?? '').toLowerCase();
-            const gtkId = win.get_gtk_application_id?.() ?? '';
-            if (title === 'Sysi Overlay' || wmClass === 'sysi' || gtkId === 'io.sysi.Overlay')
+            if (this._isOverlayWindow(win))
                 return win;
         }
         return null;
@@ -446,7 +447,6 @@ export default class SysiPanelExtension extends Extension {
             (_display, action, _deviceId, timestamp) => {
                 if (action !== this._notesAccelAction)
                     return;
-                this._activateOverlay(timestamp);
                 this._runAction('toggle-notes', null);
             },
         );
@@ -551,6 +551,62 @@ export default class SysiPanelExtension extends Extension {
         this._ocrAccelAction = 0;
         this._ocrAccelName = null;
         this._restoreCustomOcrShortcut();
+    }
+
+    _writeAnchor(text) {
+        try {
+            GLib.file_set_contents(
+                GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi', 'pointer']),
+                text,
+            );
+            return text;
+        } catch (error) {
+            logError(error, 'Sysi could not write the pointer');
+            return null;
+        }
+    }
+
+    _pointerAnchor() {
+        try {
+            const [x, y] = global.get_pointer();
+            if (![x, y].every(Number.isFinite))
+                return null;
+            return this._writeAnchor(`${Math.round(x)},${Math.round(y)}`);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    _isOverlayWindow(win) {
+        if (!win)
+            return false;
+        const title = win.get_title() ?? '';
+        const wmClass = (win.get_wm_class() ?? '').toLowerCase();
+        const gtkId = win.get_gtk_application_id?.() ?? '';
+        return title === 'Sysi Overlay' || wmClass === 'sysi' || gtkId === 'io.sysi.Overlay';
+    }
+
+    // Monitor of the focused window — the one the user last clicked.
+    _focusAnchor() {
+        const win = global.display.focus_window;
+        if (win && !this._isOverlayWindow(win)) {
+            try {
+                const index = win.get_monitor();
+                const monitor = Main.layoutManager.monitors[index];
+                if (monitor)
+                    return this._writeAnchor(
+                        `${Math.round(monitor.x + monitor.width / 2)},${Math.round(monitor.y + monitor.height / 2)}`,
+                    );
+            } catch (_) {}
+            try {
+                const rect = win.get_frame_rect();
+                if (rect)
+                    return this._writeAnchor(
+                        `${Math.round(rect.x + rect.width / 2)},${Math.round(rect.y + rect.height / 2)}`,
+                    );
+            } catch (_) {}
+        }
+        return this._pointerAnchor();
     }
 
     // The middle of the button's bottom edge: the overlay centres the widget on

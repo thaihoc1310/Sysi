@@ -626,8 +626,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     let root_window = screen.root_window().expect("display root window");
     let scale = root_window.scale_factor().max(1);
     let display = root_display_size(&root_window);
-    let screen_width = display.width;
-    let screen_height = display.height;
+    let desktop = logical_desktop_size(scale, display);
+    let screen_width = desktop.width;
+    let screen_height = desktop.height;
     let screens = logical_screen_rects(scale, screen_width, screen_height);
     let primary_screen =
         logical_primary_screen(scale, screen_width, screen_height).unwrap_or(screens[0]);
@@ -895,10 +896,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // entered and left, and the palette's right-click menu reads it. Built
     // here, with the menu, because the menu is attached while the window is.
     let hovered_notes_row: HoveredRow = Rc::new(Cell::new(None));
+    let notes_star_slot: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>> = Rc::new(RefCell::new(None));
     let notes_row_menu = build_notes_row_menu(
         state.clone(),
         note_refresh.clone(),
         hovered_notes_row.clone(),
+        notes_star_slot.clone(),
     );
     window.set_accept_focus(true);
     window.style_context().add_class("editing");
@@ -1617,10 +1620,32 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 })
                 .unwrap_or(0);
             let key = (id, query.clone(), updated_at);
-            if *last_preview.borrow() == key {
+            let prev = last_preview.borrow().clone();
+            if prev == key {
                 return;
             }
             *last_preview.borrow_mut() = key;
+            if prev.0 == id && prev.2 == updated_at {
+                // Same note, new query: keep decoded images, only retag hits.
+                if let Some(id) = id {
+                    if let Some(text) = state
+                        .borrow()
+                        .notes
+                        .iter()
+                        .find(|note| note.id == id)
+                        .map(|note| note.text.clone())
+                    {
+                        paint_notes_preview_search(
+                            &preview,
+                            &text,
+                            &query,
+                            &match_tag,
+                            &current_tag,
+                        );
+                    }
+                }
+                return;
+            }
             fill_notes_preview(
                 &preview,
                 &state,
@@ -1662,6 +1687,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             }
         })
     };
+    *notes_star_slot.borrow_mut() = Some(on_star.clone());
 
     let on_open: Rc<dyn Fn(u64)> = {
         let state = state.clone();
@@ -1815,19 +1841,28 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let preview = notes.preview.clone();
         Rc::new(move |open| {
             if open {
-                place_notes_palette(&card, &root);
                 // GTK3's show_all() returns immediately when no_show_all is
                 // set, which is how the palette stays closed through the
                 // startup window.show_all(). Drop the flag here so this
                 // call actually maps the card, then put it back on hide.
                 card.set_no_show_all(false);
                 card.show_all();
+                // Raise first: restack remounts at the current allocation,
+                // which is still the last open (or 0,0). Place afterwards
+                // so that remount cannot put the palette back on the
+                // other monitor.
                 raise_card(&card);
+                place_notes_palette(&card, &root);
                 // Mapping can leave allocation at 0 until the next idle.
-                // Restack again then so the palette is last in gtk::Fixed.
+                // Place again then, and only restack after, so a stale
+                // allocation cannot walk the card back to the last screen.
                 glib::idle_add_local_once({
                     let card = card.clone();
-                    move || restack_overlay_card(&card)
+                    let root = root.clone();
+                    move || {
+                        place_notes_palette(&card, &root);
+                        restack_overlay_card(&card);
+                    }
                 });
                 rebuild_list();
                 // The palette is usable in lock mode: take keyboard focus
@@ -1844,6 +1879,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 window.set_focus(Some(&search));
                 search.grab_focus();
             } else {
+                NOTES_POINTER.with(|cell| cell.set(None));
                 card.hide();
                 card.set_no_show_all(true);
                 window.set_focus_on_map(false);
@@ -1883,9 +1919,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         })
     };
 
+    let notes_opened_at = Rc::new(Cell::new(0_i64));
     let toggle_notes: Rc<dyn Fn()> = {
         let card = notes.card.clone();
         let set_notes_open = set_notes_open.clone();
+        let notes_opened_at = notes_opened_at.clone();
         // The X11 grab and the GNOME custom shortcut can both fire for one
         // press; two toggles would open and close before a frame was drawn.
         let last = Rc::new(Cell::new(0_i64));
@@ -1895,7 +1933,40 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 return;
             }
             last.set(now);
-            set_notes_open(!card.is_visible());
+            let opening = card.is_visible() == false;
+            if opening {
+                // Snapshot once. Later idle/follow queries see the overlay
+                // focused and the mouse on another monitor — those must not
+                // walk the palette off the window the user just clicked.
+                if NOTES_POINTER.with(Cell::get).is_none() {
+                    if let Some(point) = notes_pointer_global() {
+                        remember_notes_pointer(point);
+                    }
+                }
+                set_notes_open(true);
+                notes_opened_at.set(now);
+            } else {
+                set_notes_open(false);
+            }
+        })
+    };
+    let follow_notes_pointer: Rc<dyn Fn()> = {
+        let card = notes.card.clone();
+        let root = root.clone();
+        Rc::new(move || {
+            if !card.is_visible() {
+                return;
+            }
+            // A second helper/extension press often arrives after the
+            // overlay has taken focus and reports the mouse, not the
+            // window the user clicked. Keep the snapshot from open.
+            if NOTES_POINTER.with(Cell::get).is_some() {
+                return;
+            }
+            if let Some(point) = notes_pointer_global() {
+                remember_notes_pointer(point);
+            }
+            place_notes_palette(&card, &root);
         })
     };
     let close_notes: Rc<dyn Fn()> = {
@@ -2155,6 +2226,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let app = app.clone();
         move |_| app.quit()
     });
+    widget_picker.notes.connect_clicked({
+        let toggle_notes = toggle_notes.clone();
+        move |_| toggle_notes()
+    });
 
     let toggle_action: Rc<dyn Fn()> = {
         let interactive = interactive.clone();
@@ -2208,6 +2283,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let new_note = widget_picker.new_note.clone();
         let quit = widget_picker.quit.clone();
         let toggle_notes = toggle_notes.clone();
+        let follow_notes_pointer = follow_notes_pointer.clone();
+        let notes_opened_at = notes_opened_at.clone();
         let toggle_usage = toggle_usage.clone();
         let toggle_translate = toggle_translate.clone();
         let translate_any_visible = translate_any_visible.clone();
@@ -2244,7 +2321,19 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         }
                         new_note.clicked();
                     }
-                    "toggle-notes" | "toggle-history" => toggle_notes(),
+                    "toggle-notes" | "toggle-history" => {
+                        // The X11 grab often opens first, on a stale seat
+                        // position. A compositor --at that arrives in the
+                        // same press should move the palette, not close it.
+                        let opened_recently = now_ms()
+                            .saturating_sub(notes_opened_at.get())
+                            < 250;
+                        if action.anchor.is_some() && opened_recently {
+                            follow_notes_pointer();
+                        } else {
+                            toggle_notes();
+                        }
+                    }
                     "toggle-usage" => toggle_usage(),
                     "toggle-translate" => {
                         // The entry is edit chrome, so a translate window
@@ -2338,11 +2427,27 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     window.show_all();
     set_edit_chrome_visibility(&registry, true);
-    // The gear and its controls live in GNOME's real panel. This invisible
-    // widget remains only as the native history popover anchor.
+    // The gear lives in GNOME's panel when the extension is loaded.
+    // GNOME 50 will not reload a UUID mid-session, so if the strip is
+    // gone the overlay's own picker is the header again.
     widget_picker.plus.hide();
-    widget_picker.card.hide();
-    widget_picker.revealer.set_reveal_child(false);
+    if crate::panel_extension_is_live() {
+        widget_picker.card.hide();
+        widget_picker.revealer.set_reveal_child(false);
+    } else {
+        // Extension is on disk but GNOME 50 has not loaded it this
+        // session. Show the overlay strip so the header controls are
+        // not just gone, and open the choices — the gear button itself
+        // stays hidden so an empty plate is not all that appears.
+        widget_picker.card.show_all();
+        widget_picker.plus.hide();
+        widget_picker.revealer.set_reveal_child(true);
+        root.move_(
+            &widget_picker.card,
+            primary_screen.x + 12,
+            primary_screen.y + 8,
+        );
+    }
     // show_all() above revealed both slot occupants; the window starts on the
     // plain title bar, and stays hidden until the panel or a saved session
     // opens it.
@@ -2491,7 +2596,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         move |screen| {
             let root_window = screen.root_window().expect("display root window");
             let display = root_display_size(&root_window);
-            window.resize(display.width, display.height);
+            let scale = root_window.scale_factor().max(1);
+            let desktop = logical_desktop_size(scale, display);
+            window.resize(desktop.width, desktop.height);
             window.move_(0, 0);
             clamp_registered_widgets(&root, &registry, &state);
             refresh_auto_colors(&registry, &state);
@@ -5205,26 +5312,20 @@ fn build_notes_row_menu(
     state: Rc<RefCell<AppState>>,
     refresh: CallbackSlot,
     hovered: HoveredRow,
+    star: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
 ) -> Rc<dyn Fn() -> bool> {
     let menu = context_menu();
     let target: HoveredRow = Rc::new(Cell::new(None));
     let pin = gtk::MenuItem::with_label("PIN");
     pin.connect_activate({
-        let state = state.clone();
-        let refresh = refresh.clone();
+        let star = star.clone();
         let target = target.clone();
         move |_| {
             let Some(id) = target.take() else {
                 return;
             };
-            if let Some(note) = state.borrow_mut().notes.iter_mut().find(|note| note.id == id)
-            {
-                note.starred = !note.starred;
-            }
-            let _ = state.borrow().save();
-            let callback = refresh.borrow().clone();
-            if let Some(callback) = callback {
-                callback();
+            if let Some(star) = star.borrow().clone() {
+                star(id);
             }
         }
     });
@@ -5337,15 +5438,6 @@ fn schedule_notes_preview_top(
             return;
         }
         notes_preview_apply_pin(&preview, &scroller, &scroll);
-        let preview = preview.clone();
-        let scroller = scroller.clone();
-        let scroll = scroll.clone();
-        glib::idle_add_local_once(move || {
-            if scroll.generation.get() != generation {
-                return;
-            }
-            notes_preview_apply_pin(&preview, &scroller, &scroll);
-        });
     });
 }
 
@@ -5503,50 +5595,56 @@ struct Snippet {
 const SNIPPET_RADIUS: usize = 40;
 
 fn note_snippets(text: &str, matches: &[NoteSearchMatch], limit: usize) -> Vec<Snippet> {
-    let raw: Vec<(usize, char)> = text.char_indices().collect();
-    let raw_len = raw.len();
     matches
         .iter()
         .take(limit)
         .filter_map(|found| {
-            let start = (found.start.max(0) as usize).min(raw_len);
-            let end = (found.end.max(0) as usize).min(raw_len);
-            if start > end {
-                return None;
-            }
-            let line_start = raw[..start]
-                .iter()
-                .rposition(|(_, character)| *character == '\n')
-                .map(|index| index + 1)
-                .unwrap_or(0);
-            let line_end = raw[start..]
-                .iter()
-                .position(|(_, character)| *character == '\n')
-                .map(|index| start + index)
-                .unwrap_or(raw_len);
-            let from = start.saturating_sub(SNIPPET_RADIUS).max(line_start);
-            let to = (end + SNIPPET_RADIUS).min(line_end);
-            let leading = from > line_start;
-            let trailing = to < line_end;
-            let slice = |lo: usize, hi: usize| {
-                raw[lo..hi]
-                    .iter()
-                    .map(|(_, character)| *character)
-                    .filter(|character| *character != IMAGE_PLACEHOLDER)
-                    .collect::<String>()
-            };
-            let mut before = slice(from, start);
-            let hit = slice(start, end);
-            let mut after = slice(end, to);
-            if leading {
-                before.insert(0, '\u{2026}');
-            }
-            if trailing {
-                after.push('\u{2026}');
-            }
-            Some(Snippet { before, hit, after })
+            snippet_around(text, found.start.max(0) as usize, found.end.max(0) as usize)
         })
         .collect()
+}
+
+fn snippet_around(text: &str, start: usize, end: usize) -> Option<Snippet> {
+    if start > end {
+        return None;
+    }
+    let mut line_start = 0;
+    let mut line_end = None;
+    for (index, character) in text.chars().enumerate() {
+        if index < start && character == '\n' {
+            line_start = index + 1;
+        }
+        if index >= start && line_end.is_none() && character == '\n' {
+            line_end = Some(index);
+        }
+    }
+    let line_end = line_end.unwrap_or_else(|| text.chars().count());
+    let start = start.min(line_end);
+    let end = end.min(line_end);
+    if start > end {
+        return None;
+    }
+    let from = start.saturating_sub(SNIPPET_RADIUS).max(line_start);
+    let to = (end + SNIPPET_RADIUS).min(line_end);
+    let leading = from > line_start;
+    let trailing = to < line_end;
+    let slice = |lo: usize, hi: usize| {
+        text.chars()
+            .skip(lo)
+            .take(hi.saturating_sub(lo))
+            .filter(|character| *character != IMAGE_PLACEHOLDER)
+            .collect::<String>()
+    };
+    let mut before = slice(from, start);
+    let hit = slice(start, end);
+    let mut after = slice(end, to);
+    if leading {
+        before.insert(0, '\u{2026}');
+    }
+    if trailing {
+        after.push('\u{2026}');
+    }
+    Some(Snippet { before, hit, after })
 }
 
 fn snippet_markup(snippet: &Snippet) -> String {
@@ -5595,10 +5693,92 @@ fn centre_on_screen(
     clamp_to_screens(desired, size.width, size.height, screens)
 }
 
+fn remember_notes_pointer(point: Point) {
+    NOTES_POINTER.with(|cell| cell.set(Some(point)));
+}
+
+fn read_compositor_pointer() -> Option<Point> {
+    let path = crate::state::cache_dir().join("pointer");
+    // The extension writes this on the same press. A file from the last
+    // session is the monitor the user has already left.
+    let modified = fs::metadata(&path).ok()?.modified().ok()?;
+    if modified.elapsed().ok()? > Duration::from_secs(2) {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    parse_panel_anchor(raw.trim())
+}
+
+fn seat_pointer_now() -> Option<Point> {
+    pointer_position().map(|(x, y)| Point {
+        x: x.round() as i32,
+        y: y.round() as i32,
+    })
+}
+
+fn notes_pointer_live() -> Option<Point> {
+    PANEL_ANCHOR
+        .with(Cell::get)
+        .or_else(read_compositor_pointer)
+}
+
+fn notes_pointer_global() -> Option<Point> {
+    notes_pointer_live().or_else(seat_pointer_now)
+}
+
+/// Where this open of the palette belongs. The snapshot taken at open
+/// wins so an idle place or a late --at cannot walk it to another screen.
+fn notes_place_point() -> Option<Point> {
+    NOTES_POINTER
+        .with(Cell::get)
+        .or_else(notes_pointer_global)
+}
+
+fn notes_pointer_local(root: &gtk::Fixed, point: Point) -> Point {
+    let origin = overlay_origin(root);
+    Point {
+        x: point.x - origin.x,
+        y: point.y - origin.y,
+    }
+}
+
+/// Compositor, X11, and GDK disagree on logical vs device pixels.
+/// Keep the first candidate that actually sits on a monitor.
+fn fit_point_to_screens(
+    point: Point,
+    screens: &[ScreenRect],
+    scale: i32,
+) -> Option<(f64, f64)> {
+    let scale = scale.max(1);
+    let candidates = [
+        (f64::from(point.x), f64::from(point.y)),
+        (
+            f64::from(point.x) / f64::from(scale),
+            f64::from(point.y) / f64::from(scale),
+        ),
+        (
+            f64::from(point.x) * f64::from(scale),
+            f64::from(point.y) * f64::from(scale),
+        ),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| screen_containing(Some(*candidate), screens).is_some())
+}
+
 fn place_notes_palette(card: &gtk::EventBox, root: &gtk::Fixed) {
     let screens = overlay_screen_rects(root);
     let primary = overlay_primary_screen(root);
-    let pointer = reopen_anchor(root);
+    let scale = root.scale_factor().max(1);
+    let global = notes_place_point();
+    if let Some(point) = global {
+        remember_notes_pointer(point);
+    }
+    let pointer = global.and_then(|point| {
+        let local = notes_pointer_local(root, point);
+        fit_point_to_screens(local, &screens, scale)
+            .or_else(|| fit_point_to_screens(point, &screens, scale))
+    });
     let host = screen_containing(pointer, &screens).unwrap_or(primary);
     let size = palette_size(host);
     card.set_size_request(size.width, size.height);
@@ -7147,6 +7327,8 @@ fn note_search_hits(
     expression: &regex::Regex,
     options: NoteSearchOptions,
 ) -> Vec<NoteSearchMatch> {
+    let mut chars_before = 0;
+    let mut byte_at = 0;
     expression
         .find_iter(text)
         .filter(|found| {
@@ -7158,12 +7340,18 @@ fn note_search_hits(
             before.is_some_and(is_note_search_word_char) == false
                 && after.is_some_and(is_note_search_word_char) == false
         })
-        .map(|found| NoteSearchMatch {
+        .map(|found| {
             // GtkTextBuffer offsets count Unicode characters, while regex
-            // offsets count UTF-8 bytes. Convert both edges so Vietnamese and
-            // every other multi-byte script highlight the right glyphs.
-            start: text[..found.start()].chars().count() as i32,
-            end: text[..found.end()].chars().count() as i32,
+            // offsets count UTF-8 bytes. Walk forward from the last hit so
+            // a long note with many matches is linear, not n × matches.
+            chars_before += text[byte_at..found.start()].chars().count();
+            let start = chars_before as i32;
+            chars_before += text[found.start()..found.end()].chars().count();
+            byte_at = found.end();
+            NoteSearchMatch {
+                start,
+                end: chars_before as i32,
+            }
         })
         .collect()
 }
@@ -8527,11 +8715,25 @@ fn fill_notes_preview(
     // Inserts leave the caret at the end. Put it back so GTK's
     // keep-the-insert-visible pass cannot dive down the note.
     buffer.place_cursor(&buffer.start_iter());
+    paint_notes_preview_search(preview, &note.text, query, match_tag, current_tag);
+}
+
+fn paint_notes_preview_search(
+    preview: &gtk::TextView,
+    text: &str,
+    query: &str,
+    match_tag: &gtk::TextTag,
+    current_tag: &gtk::TextTag,
+) {
+    let Some(buffer) = preview.buffer() else {
+        return;
+    };
+    clear_note_search_tags(&buffer, match_tag, current_tag);
     let query = query.trim();
     if query.is_empty() {
         return;
     }
-    let Ok(matches) = note_search_matches(&note.text, query, NoteSearchOptions::default()) else {
+    let Ok(matches) = note_search_matches(text, query, NoteSearchOptions::default()) else {
         return;
     };
     let dummy = gtk::Label::new(None);
@@ -8737,6 +8939,7 @@ struct WidgetPicker {
     mode: gtk::Button,
     lock: gtk::Button,
     new_note: gtk::Button,
+    notes: gtk::Button,
     usage: gtk::Button,
     quit: gtk::Button,
 }
@@ -8777,6 +8980,7 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let mode = picker_button(initial_color_mode.label());
     let lock = picker_button("LOCK");
     let new_note = picker_button("＋  NOTE");
+    let notes_btn = picker_button("NOTES");
     let usage = picker_button("USAGE");
     let quit = picker_button("QUIT");
     choices.pack_start(&system, false, false, 0);
@@ -8784,6 +8988,7 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     choices.pack_start(&mode, false, false, 0);
     choices.pack_start(&lock, false, false, 0);
     choices.pack_start(&new_note, false, false, 0);
+    choices.pack_start(&notes_btn, false, false, 0);
     choices.pack_start(&usage, false, false, 0);
     choices.pack_start(&quit, false, false, 0);
     revealer.add(&choices);
@@ -8800,6 +9005,7 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
         mode,
         lock,
         new_note,
+        notes: notes_btn,
         usage,
         quit,
     }
@@ -11456,12 +11662,42 @@ fn clip_screen_to_overlay(screen: ScreenRect, size: Size) -> Option<ScreenRect> 
 }
 
 fn overlay_display_size(widget: &impl IsA<gtk::Widget>) -> Size {
-    // The overlay's allocation can still describe the previous monitor setup
-    // while its resize request is waiting for the WM.
+    // Prefer the window GTK is actually laying out in. `root.geometry()`
+    // sometimes answers in device pixels; sizing the overlay from that
+    // made a scale-2 desk 16256×6144 and every widget sat in one corner.
+    if let Some(alloc) = widget.toplevel().map(|top| top.allocation()) {
+        if alloc.width() > 1 && alloc.height() > 1 {
+            return Size {
+                width: alloc.width(),
+                height: alloc.height(),
+            };
+        }
+    }
     let root = gtk::prelude::WidgetExt::screen(widget)
         .and_then(|screen| screen.root_window())
         .expect("display root window");
-    root_display_size(&root)
+    let raw = root_display_size(&root);
+    logical_desktop_size(widget.scale_factor().max(1), raw)
+}
+
+fn logical_desktop_size(scale: i32, fallback: Size) -> Size {
+    let screens = logical_screen_rects(scale, fallback.width, fallback.height);
+    let min_x = screens.iter().map(|screen| screen.x).min().unwrap_or(0);
+    let min_y = screens.iter().map(|screen| screen.y).min().unwrap_or(0);
+    let max_x = screens
+        .iter()
+        .map(|screen| screen.x.saturating_add(screen.width))
+        .max()
+        .unwrap_or(fallback.width);
+    let max_y = screens
+        .iter()
+        .map(|screen| screen.y.saturating_add(screen.height))
+        .max()
+        .unwrap_or(fallback.height);
+    Size {
+        width: (max_x - min_x).max(1),
+        height: (max_y - min_y).max(1),
+    }
 }
 
 /// The whole display in the logical pixels every widget coordinate is in.
@@ -11850,6 +12086,11 @@ fn clamp_registered_widgets(
         // press-time child x/y. Clamping from that stored origin would yank
         // the card out from under the pointer.
         if item.held.get() {
+            continue;
+        }
+        // The palette is centred on the pointer each time it opens. Clamping
+        // from a stale allocation (still the last monitor) would walk it back.
+        if item.key == "notes" {
             continue;
         }
         let allocation = item.widget.allocation();
@@ -12576,6 +12817,7 @@ fn attach_drag(
 thread_local! {
     /// Set while a panel action is being carried out; see `reopen_anchor`.
     static PANEL_ANCHOR: Cell<Option<Point>> = const { Cell::new(None) };
+    static NOTES_POINTER: Cell<Option<Point>> = const { Cell::new(None) };
     static OVERLAY_DRAG_FINISH: RefCell<Option<Rc<dyn Fn(f64, f64)>>> = RefCell::new(None);
     static OVERLAY_DRAG_RELEASE_HOOKED: Cell<bool> = const { Cell::new(false) };
 }
@@ -14432,7 +14674,8 @@ mod timer_input_tests {
         monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
         note_search_matches, note_size_for_image, padded_visual_rect, paint_inverted,
         age_label, centre_on_screen, clamp_scroll_value, note_snippets, note_sort_key, notes_delete_eats_key,
-        palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
+        notes_pointer_global, notes_pointer_live, notes_place_point, palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
+        fit_point_to_screens, read_compositor_pointer, NOTES_POINTER, PANEL_ANCHOR,
         parse_timer_input, pinned_note_sync, push_recent_search,
         receives_input_when_locked, record_note_undo, relative_luminance, reopen_point,
         rescaled_from, resize_ceiling, resize_width_limit, resized_image_size, room_on_screen,
@@ -15538,6 +15781,88 @@ mod timer_input_tests {
             oversized,
             clamp_to_screens(Point { x: left.x, y: left.y }, 2000, 900, &[left]),
         );
+    }
+
+    #[test]
+    fn fit_point_maps_device_pixels_onto_logical_monitors() {
+        let left = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 864,
+            height: 1536,
+        };
+        let mid = ScreenRect {
+            x: 864,
+            y: 345,
+            width: 1920,
+            height: 1051,
+        };
+        let right = ScreenRect {
+            x: 2784,
+            y: 493,
+            width: 1280,
+            height: 720,
+        };
+        let screens = [left, mid, right];
+        assert_eq!(
+            fit_point_to_screens(Point { x: 3400, y: 600 }, &screens, 2),
+            Some((3400.0, 600.0)),
+            "a logical compositor --at must stay as-is"
+        );
+        assert_eq!(
+            fit_point_to_screens(Point { x: 6800, y: 1200 }, &screens, 2),
+            Some((3400.0, 600.0)),
+            "device pixels of the same point must land on the same monitor"
+        );
+        assert_eq!(
+            centre_on_screen(
+                fit_point_to_screens(Point { x: 6800, y: 1200 }, &screens, 2),
+                Size {
+                    width: 600,
+                    height: 400
+                },
+                &screens,
+                mid,
+            )
+            .x,
+            2784 + (1280 - 600) / 2,
+        );
+    }
+
+    #[test]
+    fn notes_pointer_uses_the_compositor_not_a_stale_seat() {
+        PANEL_ANCHOR.with(|cell| cell.set(Some(Point { x: 2100, y: 80 })));
+        NOTES_POINTER.with(|cell| cell.set(Some(Point { x: 10, y: 10 })));
+        assert_eq!(
+            notes_pointer_global(),
+            Some(Point { x: 2100, y: 80 }),
+            "a live --at must beat a remembered point"
+        );
+        PANEL_ANCHOR.with(|cell| cell.set(None));
+        assert_eq!(
+            notes_pointer_live(),
+            read_compositor_pointer(),
+            "a remembered point from the last open must not beat the compositor"
+        );
+        NOTES_POINTER.with(|cell| cell.set(None));
+    }
+
+    #[test]
+    fn notes_place_keeps_the_snapshot_from_open() {
+        NOTES_POINTER.with(|cell| cell.set(Some(Point { x: 200, y: 400 })));
+        PANEL_ANCHOR.with(|cell| cell.set(Some(Point { x: 3400, y: 600 })));
+        assert_eq!(
+            notes_place_point(),
+            Some(Point { x: 200, y: 400 }),
+            "a late --at or compositor file must not move an already-opened palette"
+        );
+        NOTES_POINTER.with(|cell| cell.set(None));
+        assert_eq!(
+            notes_place_point(),
+            Some(Point { x: 3400, y: 600 }),
+            "with no snapshot, a live --at still chooses the monitor"
+        );
+        PANEL_ANCHOR.with(|cell| cell.set(None));
     }
 
     #[test]

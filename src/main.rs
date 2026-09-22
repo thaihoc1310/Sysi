@@ -40,7 +40,9 @@ fn main() {
     if let Some(action) = option_value("--panel-action") {
         // Where the panel button that asked for this sits. The overlay cannot
         // find that out for itself; see the extension's _runAction.
-        let anchor = option_value("--at");
+        let anchor = option_value("--at").or_else(|| {
+            platform::query_focus_or_pointer().map(|(x, y)| format!("{x},{y}"))
+        });
         if let Err(error) = write_panel_action(&action, anchor.as_deref()) {
             eprintln!("Could not send the Sysi panel action: {error}");
             process::exit(1);
@@ -132,13 +134,15 @@ fn main() {
 // across every monitor are all X11 window-management, and on Wayland they are
 // silent no-ops that leave the overlay behaving like an ordinary window.
 // Xwayland is always running in that session, so ask for the X11 backend and
-// keep the full behaviour. An explicit GDK_BACKEND from the user still wins,
-// and a session with no X display at all is left to GDK's own choice.
+// keep the full behaviour. GDK_BACKEND inherited from a parent shell is
+// ignored — an accidental `wayland` would shrink the overlay to one window.
+// Set SYSI_GDK_BACKEND to override.
 fn prefer_x11_backend() {
-    if std::env::var_os("GDK_BACKEND").is_some() {
+    if std::env::var_os("DISPLAY").is_none() {
         return;
     }
-    if std::env::var_os("DISPLAY").is_none() {
+    if let Ok(backend) = std::env::var("SYSI_GDK_BACKEND") {
+        std::env::set_var("GDK_BACKEND", backend);
         return;
     }
     std::env::set_var("GDK_BACKEND", "x11");
@@ -163,6 +167,42 @@ fn install_panel_extension() -> io::Result<()> {
     // GNOME loads stylesheet.css from the extension directory on its own; the
     // strip's whole look lives there rather than in inline styles.
     write_if_changed(&extension_dir.join("stylesheet.css"), PANEL_EXTENSION_CSS)
+}
+
+/// The GNOME panel gear is only alive after the shell has loaded our
+/// extension. GNOME 50 will not pick a freshly copied UUID up until the
+/// next login, so the overlay shows its own picker when this is false.
+pub(crate) fn panel_extension_is_live() -> bool {
+    let output = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.Shell",
+            "--object-path",
+            "/org/gnome/Shell",
+            "--method",
+            "org.gnome.Shell.Extensions.GetExtensionInfo",
+            PANEL_EXTENSION_UUID,
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            panel_extension_state_enabled(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => false,
+    }
+}
+
+/// GNOME Shell `ExtensionState.ENABLED` is 1. A disabled or missing UUID
+/// still serialises a `state` field, so looking for the key alone is not
+/// enough to know whether the gear in the header is actually live.
+fn panel_extension_state_enabled(text: &str) -> bool {
+    text.contains("'state': <1>")
+        || text.contains("\"state\": <1>")
+        || text.contains("'state': <uint32 1>")
+        || text.contains("'state': <int32 1>")
+        || text.contains("\"state\": 1")
 }
 
 fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
@@ -509,5 +549,14 @@ mod tests {
     fn unquote_gsettings_strips_surrounding_quotes() {
         assert_eq!(unquote_gsettings("'Sysi Notes'"), "Sysi Notes");
         assert_eq!(unquote_gsettings("sysi --panel-action toggle-notes"), "sysi --panel-action toggle-notes");
+    }
+
+    #[test]
+    fn panel_extension_state_enabled_is_only_gnome_enabled() {
+        assert!(panel_extension_state_enabled("(@a{sv} {'state': <1>},)"));
+        assert!(panel_extension_state_enabled("{'state': <uint32 1>}"));
+        assert!(!panel_extension_state_enabled("(@a{sv} {},)"));
+        assert!(!panel_extension_state_enabled("{'state': <2>}"));
+        assert!(!panel_extension_state_enabled("{'uuid': <'sysi-panel@thaihoc'>}"));
     }
 }
