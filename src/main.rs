@@ -169,42 +169,6 @@ fn install_panel_extension() -> io::Result<()> {
     write_if_changed(&extension_dir.join("stylesheet.css"), PANEL_EXTENSION_CSS)
 }
 
-/// The GNOME panel gear is only alive after the shell has loaded our
-/// extension. GNOME 50 will not pick a freshly copied UUID up until the
-/// next login, so the overlay shows its own picker when this is false.
-pub(crate) fn panel_extension_is_live() -> bool {
-    let output = std::process::Command::new("gdbus")
-        .args([
-            "call",
-            "--session",
-            "--dest",
-            "org.gnome.Shell",
-            "--object-path",
-            "/org/gnome/Shell",
-            "--method",
-            "org.gnome.Shell.Extensions.GetExtensionInfo",
-            PANEL_EXTENSION_UUID,
-        ])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            panel_extension_state_enabled(&String::from_utf8_lossy(&output.stdout))
-        }
-        _ => false,
-    }
-}
-
-/// GNOME Shell `ExtensionState.ENABLED` is 1. A disabled or missing UUID
-/// still serialises a `state` field, so looking for the key alone is not
-/// enough to know whether the gear in the header is actually live.
-fn panel_extension_state_enabled(text: &str) -> bool {
-    text.contains("'state': <1>")
-        || text.contains("\"state\": <1>")
-        || text.contains("'state': <uint32 1>")
-        || text.contains("'state': <int32 1>")
-        || text.contains("\"state\": 1")
-}
-
 fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
     if fs::read_to_string(path).ok().as_deref() == Some(contents) {
         return Ok(());
@@ -551,12 +515,4 @@ mod tests {
         assert_eq!(unquote_gsettings("sysi --panel-action toggle-notes"), "sysi --panel-action toggle-notes");
     }
 
-    #[test]
-    fn panel_extension_state_enabled_is_only_gnome_enabled() {
-        assert!(panel_extension_state_enabled("(@a{sv} {'state': <1>},)"));
-        assert!(panel_extension_state_enabled("{'state': <uint32 1>}"));
-        assert!(!panel_extension_state_enabled("(@a{sv} {},)"));
-        assert!(!panel_extension_state_enabled("{'state': <2>}"));
-        assert!(!panel_extension_state_enabled("{'uuid': <'sysi-panel@thaihoc'>}"));
-    }
 }

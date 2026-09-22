@@ -2427,27 +2427,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     window.show_all();
     set_edit_chrome_visibility(&registry, true);
-    // The gear lives in GNOME's panel when the extension is loaded.
-    // GNOME 50 will not reload a UUID mid-session, so if the strip is
-    // gone the overlay's own picker is the header again.
+    // The gear lives in the GNOME panel. A fallback strip when the
+    // extension reported INITIALIZED after a version bump sat a second
+    // bar on the desk, under the top panel.
     widget_picker.plus.hide();
-    if crate::panel_extension_is_live() {
-        widget_picker.card.hide();
-        widget_picker.revealer.set_reveal_child(false);
-    } else {
-        // Extension is on disk but GNOME 50 has not loaded it this
-        // session. Show the overlay strip so the header controls are
-        // not just gone, and open the choices — the gear button itself
-        // stays hidden so an empty plate is not all that appears.
-        widget_picker.card.show_all();
-        widget_picker.plus.hide();
-        widget_picker.revealer.set_reveal_child(true);
-        root.move_(
-            &widget_picker.card,
-            primary_screen.x + 12,
-            primary_screen.y + 8,
-        );
-    }
+    widget_picker.card.hide();
+    widget_picker.revealer.set_reveal_child(false);
     // show_all() above revealed both slot occupants; the window starts on the
     // plain title bar, and stays hidden until the panel or a saved session
     // opens it.
