@@ -171,8 +171,23 @@ export default class SysiPanelExtension extends Extension {
         } catch (error) {
             logError(error, 'Sysi panel gear could not watch focus requests');
         }
+        this._ocrSelectingFile = Gio.File.new_for_path(
+            GLib.build_filenamev([cacheDir, 'ocr-selecting']),
+        );
+        if (!this._ocrSelectingFile.query_exists(null))
+            GLib.file_set_contents(this._ocrSelectingFile.get_path(), '');
+        try {
+            this._ocrSelectingMonitor = this._ocrSelectingFile.monitor_file(
+                Gio.FileMonitorFlags.NONE,
+                null,
+            );
+            this._ocrSelectingMonitor.connect('changed', () => this._syncOcrEscape());
+        } catch (error) {
+            logError(error, 'Sysi could not watch OCR Escape');
+        }
         this._bindNotesHotkey();
         this._bindOcrHotkey();
+        this._syncOcrEscape();
         this._syncPanelState();
         this._syncVisibility();
         // Sampling before the shell has laid out its monitors makes
@@ -203,6 +218,10 @@ export default class SysiPanelExtension extends Extension {
         this._autoColorRequestFile = null;
         this._unbindNotesHotkey();
         this._unbindOcrHotkey();
+        this._unbindOcrEscape();
+        this._ocrSelectingMonitor?.cancel();
+        this._ocrSelectingMonitor = null;
+        this._ocrSelectingFile = null;
         this._focusRequestMonitor?.cancel();
         this._focusRequestMonitor = null;
         this._focusRequestFile = null;
@@ -333,11 +352,21 @@ export default class SysiPanelExtension extends Extension {
         // walk the palette to the other monitor a frame later.
         const notes = action === 'toggle-notes' || action === 'toggle-history';
         const ocr = action === 'ocr' || action === 'dictate';
+        const cancelOcr = action === 'cancel-ocr';
         const anchor = button
             ? this._anchorOf(button)
             : notes ? this._focusAnchor() : this._pointerAnchor();
         if (notes || ocr)
             this._activateOverlaySoon();
+        if (cancelOcr) {
+            const argv = ['sysi', '--panel-action', action];
+            try {
+                GLib.spawn_async(null, argv, null, GLib.SpawnFlags.SEARCH_PATH, null);
+            } catch (error) {
+                logError(error, `Sysi panel action ${action} failed`);
+            }
+            return;
+        }
         const argv = ['sysi', '--panel-action', action];
         if (anchor)
             argv.push('--at', anchor);
@@ -539,6 +568,81 @@ export default class SysiPanelExtension extends Extension {
         );
     }
 
+    _ocrSelecting() {
+        if (!this._ocrSelectingFile || this._readPid() <= 0)
+            return false;
+        try {
+            const [ok, contents] = GLib.file_get_contents(this._ocrSelectingFile.get_path());
+            return ok && new TextDecoder().decode(contents).trim().length > 0;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    _syncOcrEscape() {
+        if (this._ocrSelecting())
+            this._bindOcrEscape();
+        else
+            this._unbindOcrEscape();
+    }
+
+    _bindOcrEscape() {
+        if (this._ocrEscapeAction)
+            return;
+        try {
+            this._ocrEscapeAction = global.display.grab_accelerator(
+                'Escape',
+                Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            );
+        } catch (error) {
+            logError(error, 'Sysi could not grab Escape for OCR');
+            this._ocrEscapeAction = 0;
+            return;
+        }
+        if (!this._ocrEscapeAction || this._ocrEscapeAction === Meta.KeyBindingAction.NONE) {
+            try {
+                this._ocrEscapeAction = global.display.grab_accelerator(
+                    '<Escape>',
+                    Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+                );
+            } catch (error) {
+                logError(error, 'Sysi could not grab <Escape> for OCR');
+                this._ocrEscapeAction = 0;
+                return;
+            }
+        }
+        if (!this._ocrEscapeAction || this._ocrEscapeAction === Meta.KeyBindingAction.NONE) {
+            this._ocrEscapeAction = 0;
+            return;
+        }
+        this._ocrEscapeName = Meta.external_binding_name_for_action(this._ocrEscapeAction);
+        Main.wm.allowKeybinding(
+            this._ocrEscapeName,
+            Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+        );
+        this._ocrEscapeId = global.display.connect(
+            'accelerator-activated',
+            (_display, action) => {
+                if (action !== this._ocrEscapeAction)
+                    return;
+                this._runAction('cancel-ocr', null);
+            },
+        );
+    }
+
+    _unbindOcrEscape() {
+        if (this._ocrEscapeId) {
+            global.display.disconnect(this._ocrEscapeId);
+            this._ocrEscapeId = 0;
+        }
+        if (this._ocrEscapeName)
+            Main.wm.allowKeybinding(this._ocrEscapeName, Shell.ActionMode.NONE);
+        if (this._ocrEscapeAction)
+            global.display.ungrab_accelerator(this._ocrEscapeAction);
+        this._ocrEscapeAction = 0;
+        this._ocrEscapeName = null;
+    }
+
     _unbindOcrHotkey() {
         if (this._ocrAccelId) {
             global.display.disconnect(this._ocrAccelId);
@@ -641,6 +745,9 @@ export default class SysiPanelExtension extends Extension {
         if (!running) {
             this._strip.visible = false;
             this._settingsMenu?.close();
+            this._unbindOcrEscape();
+        } else {
+            this._syncOcrEscape();
         }
     }
 

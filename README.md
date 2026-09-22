@@ -44,7 +44,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 - `Super+Shift+A` — start OCR (same as the panel `ocr` button). Drag a rectangle; the text is copied. Press again, right-click, or Escape to cancel. Super+Shift+A rather than Super+Shift+D: Super+A is Show Apps, Super+Shift+S is the screenshot UI, and Super+D is often “hide windows”.
 - `Ctrl+F` — find text in the focused note. Use `Enter` / `Shift+Enter` (or
   `F3` / `Shift+F3`) to move between matches and `Escape` to close the panel.
-- `Escape` — close the Notes palette if it is open; otherwise return to click-through lock mode.
+- `Escape` — cancel an OCR selection if one is up; otherwise close the Notes palette if it is open; otherwise return to click-through lock mode.
 - `sysi --toggle` — toggle interaction from a terminal or a custom desktop shortcut.
 - `sysi --quit` — stop the running overlay.
 

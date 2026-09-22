@@ -2273,7 +2273,17 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         move |_| toggle_action()
     });
 
-    let dictate = install_dictate(&window, &root, &registry, &interactive);
+    let dictate = install_dictate(
+        &window,
+        &root,
+        &registry,
+        &interactive,
+        {
+            let notes = notes.card.clone();
+            let interactive = interactive.clone();
+            Rc::new(move || notes.is_visible() || interactive.get())
+        },
+    );
 
     let dispatch_panel_action: Rc<dyn Fn()> = {
         let system = widget_picker.system.clone();
@@ -2293,6 +2303,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let system_preview = system_preview.clone();
         let dictate_start = dictate.start.clone();
+        let dictate_cancel = dictate.cancel.clone();
         Rc::new(move || {
             for action in take_panel_actions() {
                 // Held only for as long as the action runs, so a widget opened
@@ -2347,6 +2358,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     // OCR needs no edit chrome, so unlike a note or a
                     // dictionary it runs the same in lock mode.
                     "ocr" | "dictate" => dictate_start(),
+                    "cancel-ocr" => {
+                        let _ = dictate_cancel();
+                    }
                     "quit" => quit.clicked(),
                     _ => {}
                 }
@@ -2364,6 +2378,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let translate_close_search = translate_close_search.clone();
         let dictate_cancel = dictate.cancel.clone();
         move |_, event| {
+            if event.keyval() == gdk::keys::constants::Escape && dictate_cancel() {
+                return glib::Propagation::Stop;
+            }
             if notes_card.is_visible() {
                 let result = handle_notes_keys(event);
                 if result == glib::Propagation::Stop {
@@ -2371,12 +2388,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 }
             }
             if event.keyval() == gdk::keys::constants::Escape {
-                // A selection covers everything, so it is what Escape means
-                // while one is up -- if the key reaches the overlay at all,
-                // which it does not while a Wayland window holds the focus.
-                if dictate_cancel() {
-                    return glib::Propagation::Stop;
-                }
                 let open_note_search = registry
                     .borrow()
                     .iter()
@@ -13287,21 +13298,36 @@ fn dictate_chip(ctx: &Context, text: &str, rect: ScreenRect, overlay: Size) {
 ///
 /// It is deliberately not a registered widget: nothing about it is dragged,
 /// resized, coloured, font-scaled or remembered between runs.
+fn publish_ocr_selecting(on: bool) {
+    let dir = crate::state::cache_dir();
+    let path = dir.join("ocr-selecting");
+    let body = if on {
+        format!("{}\n", now_ms())
+    } else {
+        String::new()
+    };
+    let _ = fs::create_dir_all(&dir).and_then(|_| fs::write(path, body));
+}
+
 fn install_dictate(
     window: &gtk::ApplicationWindow,
     root: &gtk::Fixed,
     registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
     interactive: &Rc<Cell<bool>>,
+    keep_keyboard: Rc<dyn Fn() -> bool>,
 ) -> Dictate {
+    publish_ocr_selecting(false);
     let layer = gtk::DrawingArea::new();
     layer.set_widget_name("dictate");
     // show_all() on the overlay reveals every child it can find, and this one
     // is only ever shown on purpose.
     layer.set_no_show_all(true);
+    layer.set_can_focus(true);
     layer.add_events(
         gdk::EventMask::BUTTON_PRESS_MASK
             | gdk::EventMask::BUTTON_RELEASE_MASK
-            | gdk::EventMask::POINTER_MOTION_MASK,
+            | gdk::EventMask::POINTER_MOTION_MASK
+            | gdk::EventMask::KEY_PRESS_MASK,
     );
     root.put(&layer, 0, 0);
     // The crosshair belongs to the layer's own window, so it arrives when the
@@ -13379,13 +13405,17 @@ fn install_dictate(
         let root = root.clone();
         let registry = registry.clone();
         let interactive = interactive.clone();
+        let keep_keyboard = keep_keyboard.clone();
         let layer = layer.clone();
         let view = view.clone();
         let busy = busy.clone();
         Rc::new(move |message: Option<(String, ScreenRect)>| {
+            publish_ocr_selecting(false);
             DICTATE_SHAPE.with(|active| active.set(false));
             invalidate_input_shape_cache();
             refresh_input_shape(&window, &registry, interactive.get());
+            window.set_focus_on_map(false);
+            window.set_accept_focus(keep_keyboard());
             let Some((text, rect)) = message else {
                 *view.borrow_mut() = None;
                 layer.hide();
@@ -13483,6 +13513,7 @@ fn install_dictate(
         let registry = registry.clone();
         let interactive = interactive.clone();
         Rc::new(move |rect: ScreenRect| {
+            publish_ocr_selecting(false);
             DICTATE_SHAPE.with(|active| active.set(false));
             invalidate_input_shape_cache();
             refresh_input_shape(&window, &registry, interactive.get());
@@ -13666,11 +13697,15 @@ fn install_dictate(
             invalidate_visual_shape_cache();
             refresh_visual_shape(&window, &root, None);
             present_overlay(&window);
-            // Escape only reaches the overlay when it holds the keyboard.
-            // Super+Shift+A is often pressed over a Wayland app, so ask the
-            // compositor as well as present() — the X11 call alone cannot
-            // take focus from that app.
+            // Escape only reaches this Xwayland window when it holds the
+            // keyboard. Super+Shift+A is often pressed over a Wayland app,
+            // so take focus the way Notes does, and tell the panel gear
+            // to grab Escape in the compositor until this selection ends.
+            publish_ocr_selecting(true);
+            window.set_accept_focus(true);
             request_compositor_focus();
+            focus_overlay_for_typing(&window);
+            layer.grab_focus();
             layer.queue_draw();
         })
     };
@@ -13688,6 +13723,15 @@ fn install_dictate(
             selecting
         })
     };
+    layer.connect_key_press_event({
+        let cancel = cancel.clone();
+        move |_, event| {
+            if event.keyval() == gdk::keys::constants::Escape && cancel() {
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
 
     Dictate { start, cancel }
 }
