@@ -11919,8 +11919,15 @@ fn monitor_coordinate_divisor(
         .map(|screen| screen.y.saturating_add(screen.height))
         .max()
         .unwrap_or(root_bounds.height);
-    if max_x.saturating_sub(min_x) > root_bounds.width
-        || max_y.saturating_sub(min_y) > root_bounds.height
+    // Device pixels are `scale` times the overlay, not merely larger than it.
+    // The overlay sits below the top bar, so logical monitors already overhang
+    // it by the bar's height; halving those confined every widget to the
+    // top-left quarter of a scale-2 desk. Split the difference instead.
+    let device = |span: i32, bound: i32| {
+        i64::from(span) * 2 > i64::from(bound) * i64::from(scale + 1)
+    };
+    if device(max_x.saturating_sub(min_x), root_bounds.width)
+        || device(max_y.saturating_sub(min_y), root_bounds.height)
     {
         scale
     } else {
@@ -16032,6 +16039,32 @@ mod timer_input_tests {
         let divisor = monitor_coordinate_divisor(&[physical], 2, root);
         assert_eq!(divisor, 2);
         assert_eq!(normalize_monitor_rect(physical, divisor, root), Some(root));
+    }
+
+    #[test]
+    fn an_overlay_below_the_top_bar_keeps_logical_monitors_whole() {
+        // GNOME places the overlay under the 29px bar, so a logical monitor
+        // overhangs it. Halving that shut widgets into the top-left quarter.
+        let overlay = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 691,
+        };
+        let logical = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        };
+        assert_eq!(monitor_coordinate_divisor(&[logical], 2, overlay), 1);
+        let physical = ScreenRect {
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        assert_eq!(monitor_coordinate_divisor(&[physical], 2, overlay), 2);
     }
     #[test]
     fn monitors_left_of_the_primary_keep_negative_coordinates() {
