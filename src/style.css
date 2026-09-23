@@ -58,6 +58,12 @@
   border-radius: 0 0 4px 4px;
 }
 
+/* Lock mode hides the title bar that carried the top corners, so the plate
+   becomes the top edge. The Notes palette keeps its header when locked. */
+window:not(.editing) .pinned-note:not(.notes-window) .frost-body {
+  border-radius: 4px;
+}
+
 .mode-solid .frost-body scrolledwindow,
 .mode-solid .frost-body viewport,
 .mode-solid .frost-body drawingarea,

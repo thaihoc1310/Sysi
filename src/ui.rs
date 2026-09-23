@@ -2311,11 +2311,24 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let system_preview = system_preview.clone();
         let dictate_start = dictate.start.clone();
         let dictate_cancel = dictate.cancel.clone();
+        let window = window.clone();
         Rc::new(move || {
             for action in take_panel_actions() {
                 // Held only for as long as the action runs, so a widget opened
                 // any other way still goes by the pointer.
                 PANEL_ANCHOR.with(|cell| cell.set(action.anchor));
+                // Hiding unmaps the whole overlay; the map handler reshapes it
+                // on the way back. Anything else asked of a hidden Sysi (open
+                // Notes, OCR, a note) would happen out of sight, so show first.
+                if action.name == "toggle-hidden" {
+                    if window.is_visible() {
+                        window.hide();
+                    } else {
+                        window.show();
+                    }
+                } else if action.name != "quit" && !window.is_visible() {
+                    window.show();
+                }
                 match action.name.as_str() {
                     "toggle-system" => system.set_active(!system.is_active()),
                     "toggle-timer" => timer.set_active(!timer.is_active()),

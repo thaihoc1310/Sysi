@@ -39,7 +39,9 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 
 ## Controls
 
-- `Ctrl+Alt+O` — lock or unlock interaction.
+- `Super+Shift+O` — lock or unlock interaction.
+- `Super+Shift+N` — create a new note, ready to type into (same as the panel `NOTE` button).
+- `Super+Shift+H` — hide or show every Sysi window at once (also `hide` / `show` in the panel's settings menu). The timer keeps running while hidden, and any other panel action or hotkey shows Sysi again first.
 - `Ctrl+Alt+N` — open or close the Notes palette. Search, move with Up/Down, Enter to open on the desk, Ctrl+P to pin, Delete to delete, Escape to close.
 - `Super+Shift+A` — start OCR (same as the panel `ocr` button). Drag a rectangle; the text is copied. Press again, right-click, or Escape to cancel. Super+Shift+A rather than Super+Shift+D: Super+A is Show Apps, Super+Shift+S is the screenshot UI, and Super+D is often “hide windows”.
 - `Ctrl+F` — find text in the focused note. Use `Enter` / `Shift+Enter` (or
@@ -84,7 +86,7 @@ On Ubuntu GNOME, install the panel extension into your own extension directory, 
 gnome-extensions enable sysi-panel@thaihoc
 ```
 
-Sysi refreshes this small per-user copy when it starts, so upgrades stay in sync. The panel gear is visible only while Sysi runs. It watches the PID file through a GNOME event monitor—there is no polling loop. Clicking it expands the controls directly in the GNOME panel. Its `LOCK` / `UNLOCK` button changes the desktop widgets between Edit and Lock mode; `Ctrl+Alt+O` still does the same without disabling the panel controls.
+Sysi refreshes this small per-user copy when it starts, so upgrades stay in sync. The panel gear is visible only while Sysi runs. It watches the PID file through a GNOME event monitor—there is no polling loop. Clicking it expands the controls directly in the GNOME panel. Its `LOCK` / `UNLOCK` button changes the desktop widgets between Edit and Lock mode; `Super+Shift+O` still does the same without disabling the panel controls.
 
 ## Display support
 
@@ -92,4 +94,4 @@ Sysi is an X11 overlay: always-on-top placement, sticky multi-monitor coverage, 
 
 Ubuntu 26.04 (GNOME 50) ships no Xorg session at all — `/usr/share/xsessions` is gone — so this is the path every 26.04 desktop takes.
 
-Xwayland cannot grab a key while a Wayland window is focused, and an Xwayland client cannot take the keyboard from a native Wayland app either. The panel extension therefore grabs `Ctrl+Alt+N` and `Super+Shift+A` inside the compositor and activates the overlay before Notes or OCR starts. If the extension is off, Sysi falls back to GNOME custom shortcuts (`sysi --panel-action toggle-notes` / `sysi --panel-action ocr`). Notes opened that way may leave the caret outside the search field; OCR still starts, but on Wayland it cannot photograph native windows without the extension. `Ctrl+Alt+O` still needs an X11 window focused, or bind `sysi --toggle` yourself. The panel strip's `LOCK` / `UNLOCK`, `NOTES`, and `OCR` buttons and `Escape` are unaffected.
+Xwayland cannot grab a key while a Wayland window is focused, and an Xwayland client cannot take the keyboard from a native Wayland app either. The panel extension therefore grabs `Ctrl+Alt+N`, `Super+Shift+O`, `Super+Shift+A`, `Super+Shift+H` and `Super+Shift+N` inside the compositor and activates the overlay before Notes or OCR starts. If the extension is off, Sysi falls back to GNOME custom shortcuts (`sysi --panel-action toggle-notes` / `sysi --panel-action ocr`). Notes opened that way may leave the caret outside the search field; OCR still starts, but on Wayland it cannot photograph native windows without the extension. Without the extension `Super+Shift+O`, `Super+Shift+H` and `Super+Shift+N` do nothing on Wayland; bind `sysi --toggle` / `sysi --panel-action toggle-hidden` yourself. The panel strip's `LOCK` / `UNLOCK`, `NOTES`, and `OCR` buttons and `Escape` are unaffected.

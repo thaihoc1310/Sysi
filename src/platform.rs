@@ -78,7 +78,7 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
                 xlib::XGrabKey(
                     display,
                     toggle_keycode as i32,
-                    base | extra,
+                    xlib::ShiftMask | xlib::Mod4Mask | extra,
                     root,
                     xlib::True,
                     xlib::GrabModeAsync,
@@ -99,7 +99,7 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
             xlib::XSync(display, xlib::False);
             if GRAB_REFUSED.swap(false, Ordering::Relaxed) {
                 eprintln!(
-                    "Sysi could not take Ctrl+Alt+O{}: another application already holds it. \
+                    "Sysi could not take Super+Shift+O{}: another application already holds it. \
                      Lock, unlock, and open notes from the panel strip instead.",
                     if grab_notes { " or Ctrl+Alt+N" } else { "" }
                 );
@@ -111,7 +111,7 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
                 // return value says nothing at all — it is 0 whether or not it
                 // read an event, so reading it as an error code is what used to
                 // end this thread on the very first key press and leave
-                // Ctrl+Alt+O doing nothing for the rest of the session.
+                // Super+Shift+O doing nothing for the rest of the session.
                 while xlib::XPending(display) > 0 {
                     let mut event: xlib::XEvent = mem::zeroed();
                     xlib::XNextEvent(display, &mut event);

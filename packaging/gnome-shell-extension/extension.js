@@ -187,6 +187,12 @@ export default class SysiPanelExtension extends Extension {
         }
         this._bindNotesHotkey();
         this._bindOcrHotkey();
+        // Xwayland never sees Super while a Wayland app has focus. Grab both here instead.
+        this._plainGrabs = [
+            this._grabKey('<Super><Shift>o', 'toggle-lock'),
+            this._grabKey('<Super><Shift>h', 'toggle-hidden'),
+            this._grabKey('<Super><Shift>n', 'new-note'),
+        ].filter(Boolean);
         this._syncOcrEscape();
         this._syncPanelState();
         this._syncVisibility();
@@ -218,6 +224,9 @@ export default class SysiPanelExtension extends Extension {
         this._autoColorRequestFile = null;
         this._unbindNotesHotkey();
         this._unbindOcrHotkey();
+        for (const grab of this._plainGrabs ?? [])
+            this._ungrabKey(grab);
+        this._plainGrabs = [];
         this._unbindOcrEscape();
         this._ocrSelectingMonitor?.cancel();
         this._ocrSelectingMonitor = null;
@@ -245,6 +254,7 @@ export default class SysiPanelExtension extends Extension {
         this._timer = null;
         this._modeLabel = null;
         this._lockLabel = null;
+        this._hideLabel = null;
         this._pidFile = null;
         this._panelStateFile = null;
         this._invertDir = null;
@@ -288,6 +298,12 @@ export default class SysiPanelExtension extends Extension {
         lock.label.x_expand = true;
         lock.connect('activate', () => this._runAction('toggle-lock', button));
         this._settingsMenu.addMenuItem(lock);
+        const hide = new PopupMenu.PopupMenuItem('hide');
+        this._hideLabel = hide.label;
+        hide.label.x_align = Clutter.ActorAlign.CENTER;
+        hide.label.x_expand = true;
+        hide.connect('activate', () => this._runAction('toggle-hidden', button));
+        this._settingsMenu.addMenuItem(hide);
         const quit = new PopupMenu.PopupMenuItem('quit');
         quit.label.x_align = Clutter.ActorAlign.CENTER;
         quit.label.x_expand = true;
@@ -352,11 +368,13 @@ export default class SysiPanelExtension extends Extension {
         // walk the palette to the other monitor a frame later.
         const notes = action === 'toggle-notes' || action === 'toggle-history';
         const ocr = action === 'ocr' || action === 'dictate';
+        // A new note is for typing into straight away.
+        const typing = action === 'new-note';
         const cancelOcr = action === 'cancel-ocr';
         const anchor = button
             ? this._anchorOf(button)
             : notes ? this._focusAnchor() : this._pointerAnchor();
-        if (notes || ocr)
+        if (notes || ocr || typing)
             this._activateOverlaySoon();
         if (cancelOcr) {
             const argv = ['sysi', '--panel-action', action];
@@ -643,6 +661,31 @@ export default class SysiPanelExtension extends Extension {
         this._ocrEscapeName = null;
     }
 
+    // A compositor grab with no GNOME custom-shortcut fallback to juggle.
+    _grabKey(accelerator, sysiAction) {
+        let action = 0;
+        try {
+            action = global.display.grab_accelerator(accelerator, Meta.KeyBindingFlags.IGNORE_AUTOREPEAT);
+        } catch (error) {
+            logError(error, `Sysi could not grab ${accelerator}`);
+        }
+        if (!action || action === Meta.KeyBindingAction.NONE)
+            return null;
+        const name = Meta.external_binding_name_for_action(action);
+        Main.wm.allowKeybinding(name, Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW);
+        const id = global.display.connect('accelerator-activated', (_display, activated) => {
+            if (activated === action)
+                this._runAction(sysiAction, null);
+        });
+        return {action, name, id};
+    }
+
+    _ungrabKey({action, name, id}) {
+        global.display.disconnect(id);
+        Main.wm.allowKeybinding(name, Shell.ActionMode.NONE);
+        global.display.ungrab_accelerator(action);
+    }
+
     _unbindOcrHotkey() {
         if (this._ocrAccelId) {
             global.display.disconnect(this._ocrAccelId);
@@ -779,6 +822,9 @@ export default class SysiPanelExtension extends Extension {
             this._fontLabel.text = String(fontSize);
         if (this._lockLabel)
             this._lockLabel.text = interaction === 'locked' ? 'unlock' : 'lock';
+        // Hidden means unmapped, and an unmapped window has no actor.
+        if (this._hideLabel)
+            this._hideLabel.text = this._overlayWindow() ? 'hide' : 'show';
         if (this._modeLabel)
             this._modeLabel.text = mode ?? this._readColorMode();
     }
