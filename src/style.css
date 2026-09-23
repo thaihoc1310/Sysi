@@ -774,6 +774,55 @@ scrolledwindow overshoot.right:backdrop {
   font-size: 12px;
 }
 
+/* Search and completions sit in the chrome, above the frost plate, so they
+   inherit .card — and .mode-dark .card is dark ink. On a LIGHT / DARK plate
+   that ink is the same colour as the wash. Pin the same ink the plate uses. */
+.mode-light .translate-search-input,
+.mode-light .translate-search-input text,
+.mode-light .translate-suggestion,
+.mode-light .translate-suggestion label,
+.mode-light .translate-recent-toggle {
+  caret-color: #f6f6f6;
+  color: #f6f6f6;
+}
+
+.mode-dark .translate-search-input,
+.mode-dark .translate-search-input text,
+.mode-dark .translate-suggestion,
+.mode-dark .translate-suggestion label,
+.mode-dark .translate-recent-toggle {
+  caret-color: #111111;
+  color: #111111;
+}
+
+.mode-solid.mode-light .translate-search-input,
+.mode-solid.mode-light .translate-search-input text,
+.mode-solid.mode-light .translate-suggestion,
+.mode-solid.mode-light .translate-suggestion label,
+.mode-solid.mode-light .translate-recent-toggle {
+  caret-color: #161616;
+  color: #161616;
+}
+
+.mode-solid.mode-dark .translate-search-input,
+.mode-solid.mode-dark .translate-search-input text,
+.mode-solid.mode-dark .translate-suggestion,
+.mode-solid.mode-dark .translate-suggestion label,
+.mode-solid.mode-dark .translate-recent-toggle {
+  caret-color: #f2f2f2;
+  color: #f2f2f2;
+}
+
+.mode-solid.mode-dark .translate-search-input text selection {
+  background-color: rgba(255, 255, 255, 0.22);
+  color: #f2f2f2;
+}
+
+.mode-solid.mode-light .translate-search-input text selection {
+  background-color: rgba(22, 22, 24, 0.18);
+  color: #161616;
+}
+
 /* currentColor throughout, like the notes: the card already carries the
    resolved light/dark mode class, and a fixed colour would disappear against
    one of the two backgrounds. */

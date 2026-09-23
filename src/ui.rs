@@ -2001,8 +2001,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let refresh_closure = refresh_closure.clone();
         let state = state.clone();
         let search = notes.search.clone();
+        let preview = notes.preview.clone();
         Rc::new(move |event| {
             let key = event.keyval();
+            if event.state().contains(gdk::ModifierType::CONTROL_MASK)
+                && (key == gdk::keys::constants::c || key == gdk::keys::constants::C)
+                && copy_notes_preview_selection(&preview)
+            {
+                return glib::Propagation::Stop;
+            }
             if key == gdk::keys::constants::Escape {
                 if view.confirm_id.get().is_some() {
                     view.confirm_id.set(None);
@@ -5391,13 +5398,28 @@ fn clamp_scroll_value(value: f64, upper: f64, page: f64) -> f64 {
     value.clamp(0.0, max)
 }
 
-fn notes_preview_scroll_top(preview: &gtk::TextView, scroller: &gtk::ScrolledWindow) {
-    if let Some(buffer) = preview.buffer() {
-        // fill_note_content inserts at the end, so the insert mark sits
-        // there. TextView then scrolls to keep that mark on screen and
-        // the preview lands somewhere down the note.
-        buffer.place_cursor(&buffer.start_iter());
+fn copy_notes_preview_selection(preview: &gtk::TextView) -> bool {
+    let Some(buffer) = preview.buffer() else {
+        return false;
+    };
+    let Some((start, end)) = buffer.selection_bounds() else {
+        return false;
+    };
+    let Some(text) = buffer.text(&start, &end, false) else {
+        return false;
+    };
+    if text.is_empty() {
+        return false;
     }
+    let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+    clipboard.set_text(&text);
+    clipboard.store();
+    true
+}
+
+fn notes_preview_scroll_top(preview: &gtk::TextView, scroller: &gtk::ScrolledWindow) {
+    // Only the scrollbar. place_cursor belongs in fill_notes_preview —
+    // repeating it on every allocate clears a drag-select.
     if let Some(adj) = preview.vadjustment() {
         adj.set_value(0.0);
     }
@@ -8845,7 +8867,9 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     let preview = gtk::TextView::new();
     preview.set_editable(false);
     preview.set_cursor_visible(false);
-    preview.set_can_focus(false);
+    // Read-only, but must take focus so drag-select and Ctrl+C work.
+    preview.set_can_focus(true);
+    preview.set_accepts_tab(false);
     preview.set_wrap_mode(gtk::WrapMode::WordChar);
     preview.set_hexpand(true);
     preview.set_vexpand(true);
