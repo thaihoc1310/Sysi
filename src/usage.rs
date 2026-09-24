@@ -5,12 +5,14 @@
 //! row, so an authentication failure can never accidentally end up in the
 //! persisted Sysi state or in a widget label.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet},
     env, fs,
     hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, Read, Write},
+    ops::RangeInclusive,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -601,7 +603,7 @@ fn claude_email() -> Option<String> {
     email(config.pointer("/oauthAccount/emailAddress"))
 }
 
-const MONTHS: [&str; 12] = [
+pub const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
@@ -1158,7 +1160,8 @@ fn fetch_omp(force: bool) -> Result<Snapshot, String> {
 /// Tokens spent, split the way all three providers report them. Cache reads
 /// dominate an agent workload and cost a fraction of fresh input, so they are
 /// kept apart from the input the user paid full price for.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct TokenTotals {
     pub input: u64,
     pub output: u64,
@@ -1179,6 +1182,18 @@ impl TokenTotals {
         self.output = self.output.saturating_add(other.output);
         self.cache_read = self.cache_read.saturating_add(other.cache_read);
         self.cache_write = self.cache_write.saturating_add(other.cache_write);
+    }
+
+    /// The larger of two readings of the same day, field by field. Every field
+    /// is a sum over the responses a scan could still see, so each reading is a
+    /// lower bound on what was really spent and the larger one is the better.
+    fn covering(self, other: Self) -> Self {
+        Self {
+            input: self.input.max(other.input),
+            output: self.output.max(other.output),
+            cache_read: self.cache_read.max(other.cache_read),
+            cache_write: self.cache_write.max(other.cache_write),
+        }
     }
 
     /// What this reading added on top of the previous one, for a source that
@@ -1214,26 +1229,30 @@ pub struct TokenReport {
 }
 
 impl TokenReport {
-    /// Per-source totals over `since_day..`, or over everything on record when
-    /// no first day is given. Sources come back in `Source::ALL` order so one
-    /// keeps its place in the chart when another drops to zero.
-    pub fn totals(&self, since_day: Option<i64>) -> Vec<(Source, TokenTotals)> {
+    /// Per-source totals over a span of local days. Sources come back in
+    /// `Source::ALL` order so one keeps its place in the chart when another
+    /// drops to zero.
+    pub fn totals(&self, days: RangeInclusive<i64>) -> Vec<(Source, TokenTotals)> {
         Source::ALL
             .into_iter()
             .map(|source| {
                 let mut totals = TokenTotals::default();
-                if let Some(days) = self.days.get(&source) {
-                    let spent: Box<dyn Iterator<Item = &TokenTotals>> = match since_day {
-                        Some(since) => Box::new(days.range(since..).map(|(_, spent)| spent)),
-                        None => Box::new(days.values()),
-                    };
-                    for day in spent {
-                        totals.merge(*day);
+                if let Some(kept) = self.days.get(&source) {
+                    for (_, spent) in kept.range(days.clone()) {
+                        totals.merge(*spent);
                     }
                 }
                 (source, totals)
             })
             .collect()
+    }
+
+    /// The earliest day anything was spent on, by any source.
+    pub fn first_day(&self) -> Option<i64> {
+        self.days
+            .values()
+            .filter_map(|days| days.keys().next().copied())
+            .min()
     }
 }
 
@@ -1252,7 +1271,7 @@ pub fn local_day_now() -> i64 {
 
 /// Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
 /// `days_from_civil`).
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
@@ -1262,6 +1281,30 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     Some(era * 146_097 + day_of_era - 719_468)
+}
+
+/// The inverse of `days_from_civil`: the year, month and day a day number
+/// falls on.
+pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    (year_of_era + era * 400 + i64::from(month <= 2), month, day)
+}
+
+/// Monday is 0: 1970-01-01, day zero, was a Thursday.
+pub fn weekday_from_days(days: i64) -> i64 {
+    (days + 3).rem_euclid(7)
 }
 
 /// The local day an RFC 3339 UTC timestamp such as `2026-08-29T04:35:43.839Z`
@@ -1512,6 +1555,122 @@ fn session_files(root: &Path, depth: usize, found: &mut Vec<PathBuf>) {
     }
 }
 
+// ------------------------------------------------------------ token ledger
+//
+// The CLIs prune their own transcripts (Claude Code keeps 30 days by default),
+// so a count read only off the logs shrinks as they go. Sysi keeps its own copy
+// of every day it has counted and lets a fresh scan only raise it.
+
+fn ledger_path() -> PathBuf {
+    crate::state::data_dir().join("tokens.json")
+}
+
+/// On disk as `{"claude": {"2026-09-24": {"input": …}}}`, dated rather than
+/// numbered so the file can be read and repaired by hand.
+type LedgerFile = BTreeMap<String, BTreeMap<String, TokenTotals>>;
+
+fn iso_day(day: i64) -> String {
+    let (year, month, day) = civil_from_days(day);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn parse_iso_day(text: &str) -> Option<i64> {
+    let mut parts = text.splitn(3, '-').map(|part| part.parse::<i64>().ok());
+    days_from_civil(parts.next()??, parts.next()??, parts.next()??)
+}
+
+/// Reads the ledger, which is empty before the first save. A file that cannot be
+/// parsed is moved aside instead of being left for the next save to overwrite:
+/// it is the only copy of every day the CLIs have since pruned.
+fn load_ledger(path: &Path) -> HashMap<Source, TokenDays> {
+    let mut days = HashMap::new();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return days;
+    };
+    let file: LedgerFile = match serde_json::from_str(&raw) {
+        Ok(file) => file,
+        Err(error) => {
+            let kept = path.with_extension("json.unreadable");
+            eprintln!(
+                "Could not read the token ledger ({error}). It has been kept at {}.",
+                kept.display()
+            );
+            let _ = fs::rename(path, &kept);
+            return days;
+        }
+    };
+    for source in Source::ALL {
+        let Some(dated) = file.get(source.key()) else {
+            continue;
+        };
+        let kept: TokenDays = dated
+            .iter()
+            .filter_map(|(date, spent)| Some((parse_iso_day(date)?, *spent)))
+            .collect();
+        days.insert(source, kept);
+    }
+    days
+}
+
+fn save_ledger(path: &Path, days: &HashMap<Source, TokenDays>) -> io::Result<()> {
+    let file: LedgerFile = Source::ALL
+        .into_iter()
+        .filter_map(|source| {
+            let dated = days
+                .get(&source)?
+                .iter()
+                .map(|(day, spent)| (iso_day(*day), *spent))
+                .collect();
+            Some((source.key().to_owned(), dated))
+        })
+        .collect();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    fs::write(
+        &temp,
+        serde_json::to_vec_pretty(&file).map_err(io::Error::other)?,
+    )?;
+    fs::rename(temp, path)
+}
+
+/// Folds a scan into what was kept before and returns whether anything moved.
+/// A day the logs no longer hold keeps its old count, and a day they still
+/// hold can only grow, so a pruned transcript never takes tokens back.
+// ponytail: days are local, so a change of time zone re-buckets the logs
+// against a ledger bucketed the old way and can count a boundary hour twice.
+fn fold_into_ledger(
+    kept: &mut HashMap<Source, TokenDays>,
+    scanned: &HashMap<Source, TokenDays>,
+) -> bool {
+    let mut changed = false;
+    for (source, days) in scanned {
+        let ledger = kept.entry(*source).or_default();
+        for (day, spent) in days {
+            let entry = ledger.entry(*day).or_default();
+            let covered = entry.covering(*spent);
+            if covered != *entry {
+                *entry = covered;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// The scan merged into the ledger at `path`, which is rewritten only when
+/// the scan found something it did not already hold.
+fn remember_tokens(path: &Path, scanned: HashMap<Source, TokenDays>) -> HashMap<Source, TokenDays> {
+    let mut kept = load_ledger(path);
+    if fold_into_ledger(&mut kept, &scanned) {
+        if let Err(error) = save_ledger(path, &kept) {
+            eprintln!("Could not save the token ledger: {error}");
+        }
+    }
+    kept
+}
+
 /// What a file held last time it was read. Only the open session is rewritten
 /// between scans, so re-reading the rest of the transcripts is wasted work.
 struct CachedFile {
@@ -1527,8 +1686,9 @@ fn token_cache() -> &'static Mutex<TokenCache> {
     CACHE.get_or_init(|| Mutex::new(TokenCache::new()))
 }
 
-/// Reads every session log the three CLIs have kept and buckets what they spent
-/// by local day. Blocking and disk-bound — call it off the main thread.
+/// Reads every session log the three CLIs have kept, buckets what they spent by
+/// local day and folds that into Sysi's own ledger. Blocking and disk-bound —
+/// call it off the main thread.
 pub fn scan_tokens() -> TokenReport {
     let offset = local_offset_seconds();
     // A poisoned cache is a scan that panicked; drop what it left and rebuild.
@@ -1581,7 +1741,7 @@ pub fn scan_tokens() -> TokenReport {
         *cache = fresh;
     }
     TokenReport {
-        days,
+        days: remember_tokens(&ledger_path(), days),
         scanned_at_ms: now_ms(),
     }
 }
@@ -1778,11 +1938,78 @@ mod tests {
                 .into_iter()
                 .fold(0, |sum, (_, spent)| sum + spent.total())
         };
-        assert_eq!(total(None), 3_333);
-        assert_eq!(total(Some(20_701)), 2_222);
-        assert_eq!(total(Some(20_704)), 0);
+        assert_eq!(total(i64::MIN..=i64::MAX), 3_333);
+        assert_eq!(total(20_701..=i64::MAX), 2_222);
+        assert_eq!(total(20_704..=i64::MAX), 0);
+        assert_eq!(total(20_701..=20_701), 1_111);
+        assert_eq!(report.first_day(), Some(20_700));
+        assert_eq!(TokenReport::default().first_day(), None);
         // Every source keeps its place in the list even with nothing to show.
-        assert_eq!(report.totals(None).len(), Source::ALL.len());
+        assert_eq!(report.totals(i64::MIN..=i64::MAX).len(), Source::ALL.len());
+    }
+
+    #[test]
+    fn a_day_number_and_its_date_convert_both_ways() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(weekday_from_days(0), 3, "1970-01-01 was a Thursday");
+        let today = days_from_civil(2026, 9, 24).unwrap();
+        assert_eq!(civil_from_days(today), (2026, 9, 24));
+        assert_eq!(weekday_from_days(today), 3);
+        assert_eq!(iso_day(today), "2026-09-24");
+        assert_eq!(parse_iso_day("2026-09-24"), Some(today));
+        assert_eq!(parse_iso_day("2026-9"), None);
+        for day in -800_000..800_000 {
+            let (year, month, date) = civil_from_days(day);
+            assert_eq!(days_from_civil(year, month, date), Some(day));
+        }
+    }
+
+    /// The ledger exists for the day a CLI deletes its logs: a scan that sees
+    /// less than was kept must not take anything back, and a scan that sees
+    /// the same day again must not count it twice.
+    #[test]
+    fn the_ledger_keeps_pruned_days_and_never_counts_one_twice() {
+        let dir = env::temp_dir().join(format!("sysi-token-ledger-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("tokens.json");
+        let spent = |input, cache_read| TokenTotals {
+            input,
+            output: 5,
+            cache_read,
+            cache_write: 0,
+        };
+        let scan = |days: &[(i64, TokenTotals)]| {
+            HashMap::from([(Source::Claude, days.iter().copied().collect::<TokenDays>())])
+        };
+
+        let first = remember_tokens(&path, scan(&[(100, spent(10, 1_000)), (101, spent(20, 0))]));
+        assert_eq!(first[&Source::Claude][&100], spent(10, 1_000));
+        assert!(path.exists());
+
+        // Day 100's transcript has been deleted, and day 101 was scanned
+        // mid-turn the first time and has grown since.
+        let second = remember_tokens(&path, scan(&[(101, spent(35, 7)), (102, spent(1, 1))]));
+        let claude = &second[&Source::Claude];
+        assert_eq!(claude[&100], spent(10, 1_000), "a pruned day is kept");
+        assert_eq!(claude[&101], spent(35, 7), "a day seen again is replaced");
+        assert_eq!(claude[&102], spent(1, 1));
+
+        // Part of day 101 has been pruned: nothing is taken back.
+        let third = remember_tokens(&path, scan(&[(101, spent(3, 7))]));
+        assert_eq!(third, second);
+        assert_eq!(load_ledger(&path), second);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(&format!("\"{}\"", iso_day(100))), "{raw}");
+
+        // A ledger that cannot be read is set aside, never overwritten.
+        fs::write(&path, "{ not json").unwrap();
+        let fresh = remember_tokens(&path, scan(&[(102, spent(1, 1))]));
+        assert_eq!(fresh[&Source::Claude].len(), 1);
+        assert_eq!(
+            fs::read_to_string(path.with_extension("json.unreadable")).unwrap(),
+            "{ not json"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

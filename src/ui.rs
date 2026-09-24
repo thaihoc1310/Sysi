@@ -19,6 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     f64::consts::{FRAC_PI_2, PI, TAU},
     fs,
+    ops::RangeInclusive,
     rc::{Rc, Weak},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -87,7 +88,8 @@ const TIMER_SIZE: i32 = 116;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
 const USAGE_WIDTH: i32 = 292;
-const USAGE_HEIGHT: i32 = 188;
+// Tall enough for the token tab's calendar of weeks and its three rows.
+const USAGE_HEIGHT: i32 = 212;
 const TRANSLATE_WIDTH: i32 = 272;
 const TRANSLATE_EMPTY_HEIGHT: i32 = 44;
 const TRANSLATE_RESULTS_MAX_HEIGHT: i32 = 520;
@@ -1295,7 +1297,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let show = usage_controller.show.clone();
         let state = state.clone();
         button.connect_clicked(move |_| {
-            card.tokens.borrow_mut().period = period;
+            {
+                let mut tokens = card.tokens.borrow_mut();
+                tokens.period = period;
+                tokens.selected = None;
+            }
             state.borrow_mut().settings.usage_period = period.key().to_owned();
             let _ = state.borrow().save();
             show(UsageTab::Tokens);
@@ -2728,8 +2734,11 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     tokens_canvas.set_size_request(1, 60);
     tokens_canvas.set_hexpand(true);
     tokens_canvas.set_vexpand(true);
-    tokens_canvas
-        .add_events(gdk::EventMask::POINTER_MOTION_MASK | gdk::EventMask::LEAVE_NOTIFY_MASK);
+    tokens_canvas.add_events(
+        gdk::EventMask::POINTER_MOTION_MASK
+            | gdk::EventMask::LEAVE_NOTIFY_MASK
+            | gdk::EventMask::BUTTON_PRESS_MASK,
+    );
     tokens_canvas.connect_draw({
         let tokens = tokens.clone();
         let hits = token_hits.clone();
@@ -2759,6 +2768,33 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
                     found.and_then(|index| hits.borrow().get(index).map(|hit| hit.tip.clone()));
                 area.set_tooltip_text(tip.as_deref());
             }
+            glib::Propagation::Proceed
+        }
+    });
+    // A click on a heatmap cell shows that day or month in the headline and
+    // rows; a second click on it, or a click anywhere else, puts the window
+    // back.
+    tokens_canvas.connect_button_press_event({
+        let tokens = tokens.clone();
+        let hits = token_hits.clone();
+        let hover = token_hover.clone();
+        move |area, event| {
+            if event.button() != 1 || event.event_type() != gdk::EventType::ButtonPress {
+                return glib::Propagation::Proceed;
+            }
+            let (x, y) = event.position();
+            let span = {
+                let hits = hits.borrow();
+                token_hit_at(&hits, x, y).and_then(|index| hits[index].span)
+            };
+            {
+                let mut tokens = tokens.borrow_mut();
+                tokens.selected = span.filter(|span| tokens.selected != Some(*span));
+            }
+            // The marks are about to be redrawn with new figures.
+            hover.set(None);
+            area.set_tooltip_text(None);
+            area.queue_draw();
             glib::Propagation::Proceed
         }
     });
@@ -2967,26 +3003,28 @@ impl UsageTab {
     }
 }
 
-/// How far back the token tab counts. Nothing longer than a month is offered:
-/// the CLIs rotate their own logs, so "All" is however much they happen to
-/// have kept rather than a promise of history.
+/// How far back the token tab counts. "All" is every day in Sysi's own token
+/// ledger, which outlives the CLIs pruning their logs but reaches back only as
+/// far as the logs did when Sysi first read them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum TokenPeriod {
     Today,
     Week,
     #[default]
     Month,
+    Year,
     All,
 }
 
 impl TokenPeriod {
-    const ALL: [Self; 4] = [Self::Today, Self::Week, Self::Month, Self::All];
+    const ALL: [Self; 5] = [Self::Today, Self::Week, Self::Month, Self::Year, Self::All];
 
     fn label(self) -> &'static str {
         match self {
             Self::Today => "TODAY",
             Self::Week => "7D",
             Self::Month => "30D",
+            Self::Year => "1Y",
             Self::All => "ALL",
         }
     }
@@ -2996,6 +3034,7 @@ impl TokenPeriod {
             Self::Today => "today",
             Self::Week => "7d",
             Self::Month => "30d",
+            Self::Year => "1y",
             Self::All => "all",
         }
     }
@@ -3004,6 +3043,7 @@ impl TokenPeriod {
         match value {
             "today" => Self::Today,
             "7d" => Self::Week,
+            "1y" => Self::Year,
             "all" => Self::All,
             _ => Self::Month,
         }
@@ -3014,6 +3054,7 @@ impl TokenPeriod {
             Self::Today => "today",
             Self::Week => "last 7 days",
             Self::Month => "last 30 days",
+            Self::Year => "last 365 days",
             Self::All => "all recorded",
         }
     }
@@ -3024,6 +3065,7 @@ impl TokenPeriod {
             Self::Today => Some(today),
             Self::Week => Some(today - 6),
             Self::Month => Some(today - 29),
+            Self::Year => Some(today - 364),
             Self::All => None,
         }
     }
@@ -3034,6 +3076,9 @@ struct TokenState {
     report: usage::TokenReport,
     period: TokenPeriod,
     scanning: bool,
+    /// The day or month picked off the heatmap, as its first and last day.
+    /// While set, the headline and rows show that span instead of the window.
+    selected: Option<(i64, i64)>,
 }
 
 /// A shape that was drawn and what hovering it should say. Filled while
@@ -3046,6 +3091,8 @@ struct TokenHit {
     width: f64,
     height: f64,
     tip: String,
+    /// The span a click on this mark picks; `None` puts the window back.
+    span: Option<(i64, i64)>,
 }
 
 /// One shade per source, held in `Source::ALL` order so a source keeps its
@@ -3059,6 +3106,10 @@ const TOKEN_VALUE_WIDTH: f64 = 50.0;
 /// How long a token count is reused before the logs are read again. They only
 /// move when a CLI is mid-turn, and a scan walks every transcript on the disk.
 const TOKEN_RESCAN_MS: i64 = 120_000;
+/// When the background pass first fills the token ledger after launch, and
+/// how often it tops it up after that.
+const TOKEN_LEDGER_FIRST_SECS: u32 = 30;
+const TOKEN_LEDGER_EVERY_SECS: u32 = 3_600;
 
 /// A token count at a glance. This trades digits for something readable at
 /// eight pixels; the exact figure is one hover away.
@@ -3218,23 +3269,26 @@ fn paint_tokens(
     };
     // Widget coordinates, so a hit rect can be compared straight against a
     // pointer position without repeating the scaling.
-    let mut record = |x: f64, y: f64, width: f64, height: f64, tip: String| {
-        hits.push(TokenHit {
-            x: x * scale,
-            y: y * scale,
-            width: width * scale,
-            height: height * scale,
-            tip,
-        });
-    };
+    let mut record =
+        |x: f64, y: f64, width: f64, height: f64, tip: String, span: Option<(i64, i64)>| {
+            hits.push(TokenHit {
+                x: x * scale,
+                y: y * scale,
+                width: width * scale,
+                height: height * scale,
+                tip,
+                span,
+            });
+        };
 
-    let totals = state
-        .report
-        .totals(state.period.since_day(usage::local_day_now()));
-    let grand: u64 = totals
-        .iter()
-        .fold(0u64, |sum, (_, spent)| sum.saturating_add(spent.total()));
-    if grand == 0 {
+    let today = usage::local_day_now();
+    let window = state.period.since_day(today).unwrap_or(i64::MIN)..=i64::MAX;
+    let sum_of = |totals: &[(UsageSource, usage::TokenTotals)]| {
+        totals
+            .iter()
+            .fold(0u64, |sum, (_, spent)| sum.saturating_add(spent.total()))
+    };
+    if sum_of(&state.report.totals(window.clone())) == 0 {
         let message = if state.scanning {
             "Reading session logs…"
         } else {
@@ -3253,6 +3307,19 @@ fn paint_tokens(
         return;
     }
 
+    // A day or month picked off the heatmap narrows every figure but the
+    // heatmap itself, which stays whole so another can be picked.
+    let selected = state
+        .selected
+        .filter(|_| state.period != TokenPeriod::Today);
+    let (totals, scope) = match selected {
+        Some(span) => (state.report.totals(span.0..=span.1), token_span_label(span)),
+        None => (
+            state.report.totals(window),
+            state.period.caption().to_owned(),
+        ),
+    };
+    let grand = sum_of(&totals);
     let mut summed = usage::TokenTotals::default();
     for (_, spent) in &totals {
         summed.merge(*spent);
@@ -3268,7 +3335,7 @@ fn paint_tokens(
         ink,
         0.95,
     );
-    let caption = format!("tokens · {}", state.period.caption());
+    let caption = format!("tokens · {scope}");
     draw_token_text(
         ctx,
         right - token_text_width(ctx, &caption, 8.5, FontWeight::Normal),
@@ -3284,15 +3351,34 @@ fn paint_tokens(
         0.0,
         width,
         hero_block,
-        token_tooltip(&format!("All sources · {}", state.period.caption()), summed),
+        token_tooltip(&format!("All sources · {scope}"), summed),
+        None,
     );
 
-    // The rows below tighten before anything else, and only a card squeezed
-    // past the point of reading loses the split bar entirely.
+    // Any window longer than a day swaps the split bar for a day-by-day
+    // heatmap; the rows already carry each source's share. The rows tighten
+    // before anything else, and a card squeezed past the point of reading
+    // loses the heatmap and then the split bar.
     let split_height = 7.0;
     let split_gap = 4.0;
     let count = totals.len().max(1) as f64;
-    let split_shown = height >= hero_block + split_height + split_gap + 9.0 * count;
+    let heat_height = paint_token_heatmap(
+        ctx,
+        &state.report,
+        state.period,
+        today,
+        &HeatArea {
+            left,
+            top: hero_block + TOKEN_HEAT_GAP,
+            width,
+            budget: height - hero_block - TOKEN_HEAT_GAP - split_gap - TOKEN_HEAT_ROW * count,
+            selected,
+        },
+        ink,
+        &mut record,
+    );
+    let split_shown =
+        heat_height.is_none() && height >= hero_block + split_height + split_gap + 9.0 * count;
     if split_shown {
         let gap = 2.0;
         let spent_sources = totals.iter().filter(|(_, spent)| spent.total() > 0).count();
@@ -3323,10 +3409,11 @@ fn paint_tokens(
                         "{} · {} of {}",
                         source.label(),
                         usage_percent_label(Some(share)),
-                        state.period.caption()
+                        scope
                     ),
                     *spent,
                 ),
+                None,
             );
             x += segment + gap;
         }
@@ -3335,10 +3422,10 @@ fn paint_tokens(
     // Every source keeps a row, so one that spent nothing this window reads as
     // an empty bar rather than disappearing from the list.
     let rows_top = hero_block
-        + if split_shown {
-            split_height + split_gap
-        } else {
-            0.0
+        + match heat_height {
+            Some(used) => TOKEN_HEAT_GAP + used + split_gap,
+            None if split_shown => split_height + split_gap,
+            None => 0.0,
         };
     let row_height = ((height - rows_top) / count).clamp(9.0, 20.0);
     let peak = totals
@@ -3410,12 +3497,533 @@ fn paint_tokens(
                     "{} · {} of {}",
                     source.label(),
                     usage_percent_label(Some(share)),
-                    state.period.caption()
+                    scope
                 ),
                 *spent,
             ),
+            None,
         );
     }
+}
+
+/// The height each source row keeps once a heatmap shares the card.
+const TOKEN_HEAT_ROW: f64 = 12.0;
+/// Air between the headline and the heatmap under it.
+const TOKEN_HEAT_GAP: f64 = 3.0;
+/// How dark a heatmap cell is at each step. Step zero is the empty track the
+/// bars already use, so a quiet day reads as a day with nothing on it rather
+/// than as a hole in the grid.
+const TOKEN_HEAT_ALPHA: [f64; 5] = [0.09, 0.3, 0.5, 0.72, 0.95];
+const TOKEN_HEAT_LABEL: f64 = 7.5;
+const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/// Four steps of the square root of a cell's share of the busiest one. Linear
+/// steps would let one marathon session leave every other day looking empty.
+fn token_heat_level(spent: u64, peak: u64) -> usize {
+    if spent == 0 || peak == 0 {
+        return 0;
+    }
+    ((spent as f64 / peak as f64).sqrt() * 4.0)
+        .ceil()
+        .clamp(1.0, 4.0) as usize
+}
+
+/// What each source spent over `days`, in `UsageSource::ALL` order.
+fn token_spent(report: &usage::TokenReport, days: RangeInclusive<i64>) -> [u64; 3] {
+    let totals = report.totals(days);
+    std::array::from_fn(|index| totals[index].1.total())
+}
+
+fn token_short_date(day: i64) -> String {
+    let (_, month, date) = usage::civil_from_days(day);
+    format!("{} {date}", usage::MONTHS[(month - 1) as usize])
+}
+
+fn token_date_label(day: i64) -> String {
+    format!(
+        "{}, {}",
+        WEEKDAYS[usage::weekday_from_days(day) as usize],
+        token_short_date(day)
+    )
+}
+
+/// What a heatmap cell stands for: one day, or one calendar month.
+fn token_span_label((first, last): (i64, i64)) -> String {
+    if first == last {
+        return token_date_label(first);
+    }
+    let (year, month, _) = usage::civil_from_days(first);
+    format!("{} {year}", usage::MONTHS[(month - 1) as usize])
+}
+
+fn token_span_tooltip(span: (i64, i64), spent: [u64; 3]) -> String {
+    let title = token_span_label(span);
+    let total = spent.iter().sum::<u64>();
+    if total == 0 {
+        return format!("{title}\nNo tokens");
+    }
+    let split = UsageSource::ALL
+        .into_iter()
+        .zip(spent)
+        .filter(|(_, spent)| *spent > 0)
+        .map(|(source, spent)| format!("{} {}", source.label(), format_tokens(spent)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!(
+        "{title}\n{} tokens\n{split}\nClick to show it below",
+        group_digits(total)
+    )
+}
+
+/// One cell. The picked one is ringed firmly and today faintly, the way a
+/// calendar marks it.
+fn paint_token_cell(
+    ctx: &Context,
+    (x, y, width, height): (f64, f64, f64, f64),
+    level: usize,
+    ring: Option<f64>,
+    ink: (f64, f64, f64),
+) {
+    let radius = (width.min(height) / 4.0).min(2.5);
+    ctx.set_source_rgba(ink.0, ink.1, ink.2, TOKEN_HEAT_ALPHA[level]);
+    rounded_rectangle(ctx, x, y, width, height, radius);
+    let _ = ctx.fill();
+    if let Some(alpha) = ring {
+        ctx.set_source_rgba(ink.0, ink.1, ink.2, alpha);
+        ctx.set_line_width(1.2);
+        rounded_rectangle(
+            ctx,
+            x - 1.0,
+            y - 1.0,
+            width + 2.0,
+            height + 2.0,
+            radius + 1.0,
+        );
+        let _ = ctx.stroke();
+    }
+}
+
+fn token_ring(span: (i64, i64), selected: Option<(i64, i64)>, today: i64) -> Option<f64> {
+    if selected == Some(span) {
+        Some(0.95)
+    } else if span.0 == today {
+        Some(0.4)
+    } else {
+        None
+    }
+}
+
+/// Where a heatmap is drawn and what it may mark: `(left, top, width)`, the
+/// height it may take, and the picked cell.
+struct HeatArea {
+    left: f64,
+    top: f64,
+    width: f64,
+    budget: f64,
+    selected: Option<(i64, i64)>,
+}
+
+type TokenRecorder<'a> = dyn FnMut(f64, f64, f64, f64, String, Option<(i64, i64)>) + 'a;
+
+fn token_heat_label(
+    ctx: &Context,
+    area: &HeatArea,
+    x: f64,
+    baseline: f64,
+    text: &str,
+    anchor: f64,
+    ink: (f64, f64, f64),
+) -> f64 {
+    let text_width = token_text_width(ctx, text, TOKEN_HEAT_LABEL, FontWeight::Normal);
+    let x = (x - text_width * anchor).clamp(area.left, area.left + area.width - text_width);
+    draw_token_text(
+        ctx,
+        x,
+        baseline,
+        text,
+        TOKEN_HEAT_LABEL,
+        FontWeight::Normal,
+        ink,
+        0.5,
+    );
+    x + text_width
+}
+
+const TOKEN_HEAT_LABEL_GAP: f64 = 2.0;
+const TOKEN_HEAT_LABEL_HEIGHT: f64 = TOKEN_HEAT_LABEL + 1.5;
+
+/// A heatmap of every source together, laid out for the window: a row of
+/// named days for a week, a row of small squares for a month, a calendar of
+/// weeks for a year or for everything on record, and a calendar of months
+/// once the record is too long for one square a day. Nothing is drawn before
+/// the first day on record, so a new install is not a wall of empty weeks.
+/// Returns the height it took, or `None`, drawing nothing, when the budget is
+/// too short for it to be read.
+fn paint_token_heatmap(
+    ctx: &Context,
+    report: &usage::TokenReport,
+    period: TokenPeriod,
+    today: i64,
+    area: &HeatArea,
+    ink: (f64, f64, f64),
+    record: &mut TokenRecorder,
+) -> Option<f64> {
+    match period {
+        TokenPeriod::Today => None,
+        TokenPeriod::Week | TokenPeriod::Month => paint_token_strip(
+            ctx,
+            report,
+            period.since_day(today)?,
+            today,
+            area,
+            ink,
+            record,
+        ),
+        TokenPeriod::Year | TokenPeriod::All => {
+            let first = report.first_day()?.min(today);
+            let start = match period.since_day(today) {
+                Some(since) => first.max(since),
+                None => first,
+            };
+            // A record no longer than a month is a single row, like 30D: a
+            // calendar of two or three weeks would be a stub of long bricks.
+            if today - start < 30 {
+                return paint_token_strip(ctx, report, start, today, area, ink, record);
+            }
+            paint_token_weeks(ctx, report, start, today, area, ink, record).or_else(|| {
+                if period == TokenPeriod::All {
+                    paint_token_months(ctx, report, start, today, area, ink, record)
+                } else {
+                    None
+                }
+            })
+        }
+    }
+}
+
+/// One cell a day in a single row, oldest on the left.
+fn paint_token_strip(
+    ctx: &Context,
+    report: &usage::TokenReport,
+    first: i64,
+    today: i64,
+    area: &HeatArea,
+    ink: (f64, f64, f64),
+    record: &mut TokenRecorder,
+) -> Option<f64> {
+    let days = (today - first + 1) as usize;
+    let gap = if days > 7 { 2.0 } else { 3.0 };
+    let cell_width = (area.width - gap * (days - 1) as f64) / days as f64;
+    let cell_height = cell_width
+        .min(14.0)
+        .min(area.budget - TOKEN_HEAT_LABEL_GAP - TOKEN_HEAT_LABEL_HEIGHT)
+        .floor();
+    if cell_height < 5.0 || cell_width < 3.0 {
+        return None;
+    }
+    let spent: Vec<[u64; 3]> = (first..=today)
+        .map(|day| token_spent(report, day..=day))
+        .collect();
+    let peak = spent.iter().map(|day| day.iter().sum()).max().unwrap_or(0);
+    let baseline = area.top + cell_height + TOKEN_HEAT_LABEL_GAP + TOKEN_HEAT_LABEL;
+    for (index, day) in (first..=today).enumerate() {
+        let x = area.left + (cell_width + gap) * index as f64;
+        paint_token_cell(
+            ctx,
+            (x, area.top, cell_width, cell_height),
+            token_heat_level(spent[index].iter().sum(), peak),
+            token_ring((day, day), area.selected, today),
+            ink,
+        );
+        record(
+            x,
+            area.top,
+            cell_width + gap,
+            cell_height,
+            token_span_tooltip((day, day), spent[index]),
+            Some((day, day)),
+        );
+        // A week names every day; a month names only where it starts, or
+        // thirty labels would run into each other.
+        if days <= 7 {
+            let name = if day == today {
+                "Today"
+            } else {
+                WEEKDAYS[usage::weekday_from_days(day) as usize]
+            };
+            token_heat_label(ctx, area, x + cell_width / 2.0, baseline, name, 0.5, ink);
+        }
+    }
+    if days > 7 {
+        token_heat_label(
+            ctx,
+            area,
+            area.left,
+            baseline,
+            &token_short_date(first),
+            0.0,
+            ink,
+        );
+        token_heat_label(
+            ctx,
+            area,
+            area.left + area.width,
+            baseline,
+            "Today",
+            1.0,
+            ink,
+        );
+    }
+    Some(cell_height + TOKEN_HEAT_LABEL_GAP + TOKEN_HEAT_LABEL_HEIGHT)
+}
+
+/// A GitHub-style calendar from `start` to today: a column a week, Monday on
+/// top, months named over the week they begin in. It spans the card: a short
+/// record keeps a column of figures about the span beside it and stretches
+/// its cells into bricks to fill the rest, and a long one gives up the figures
+/// and shrinks its cells back to squares. Only drawn past a month of record,
+/// so there are always enough weeks to keep the bricks short.
+fn paint_token_weeks(
+    ctx: &Context,
+    report: &usage::TokenReport,
+    start: i64,
+    today: i64,
+    area: &HeatArea,
+    ink: (f64, f64, f64),
+    record: &mut TokenRecorder,
+) -> Option<f64> {
+    let first_monday = start - usage::weekday_from_days(start);
+    let columns = ((today - usage::weekday_from_days(today) - first_monday) / 7 + 1) as f64;
+    let head = TOKEN_HEAT_LABEL_HEIGHT + TOKEN_HEAT_LABEL_GAP;
+    let spent: Vec<[u64; 3]> = (start..=today)
+        .map(|day| token_spent(report, day..=day))
+        .collect();
+    let totals: Vec<u64> = spent.iter().map(|day| day.iter().sum()).collect();
+    let peak = totals.iter().copied().max().unwrap_or(0);
+
+    let days = today - start + 1;
+    let active = totals.iter().filter(|spent| **spent > 0).count();
+    let peak_day = start
+        + totals
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, spent)| **spent)
+            .map_or(0, |(index, _)| index as i64);
+    let figures = [
+        format!("Since {}", token_short_date(start)),
+        format!("{active} of {days} days active"),
+        format!(
+            "{} a day on average",
+            format_tokens(totals.iter().sum::<u64>() / days.max(1) as u64)
+        ),
+        format!(
+            "Peak {} on {}",
+            format_tokens(peak),
+            token_short_date(peak_day)
+        ),
+    ];
+    let figures_width = figures
+        .iter()
+        .map(|line| token_text_width(ctx, line, 8.0, FontWeight::Normal))
+        .fold(0.0, f64::max)
+        + 14.0;
+
+    // Rows are sized by the height, columns by whatever width is left.
+    let cell_height = |gap: f64| ((area.budget - head - 6.0 * gap) / 7.0).min(12.0);
+    let cell_width = |gap: f64, width: f64| (width + gap) / columns - gap;
+    let gap = if cell_height(2.0).min(cell_width(2.0, area.width)) >= 6.0 {
+        2.0
+    } else {
+        1.0
+    };
+    let height = cell_height(gap).floor();
+    // The figures stay only while the weeks beside them still get squares.
+    let with_figures = cell_width(gap, area.width - figures_width) >= height;
+    let grid_room = if with_figures {
+        area.width - figures_width
+    } else {
+        area.width
+    };
+    let height = height.min(cell_width(gap, grid_room)).floor();
+    let width = cell_width(gap, grid_room);
+    if height < 3.0 {
+        return None;
+    }
+    let grid_top = area.top + head;
+    let column_x = |column: i64| area.left + (width + gap) * column as f64;
+
+    // Month names go over the week holding the 1st, and the first column is
+    // named too so the grid says where it starts — unless the next name is
+    // so close the two would collide.
+    let mut names: Vec<(f64, &str)> = Vec::new();
+    for column in 0..columns as i64 {
+        let (_, month, date) = usage::civil_from_days(first_monday + 7 * column + 6);
+        if column == 0 || date <= 7 {
+            let month = if column == 0 {
+                usage::civil_from_days(start).1
+            } else {
+                month
+            };
+            names.push((column_x(column), usage::MONTHS[(month - 1) as usize]));
+        }
+    }
+    let mut name_end = f64::NEG_INFINITY;
+    for (index, (x, name)) in names.iter().enumerate() {
+        let name_width = token_text_width(ctx, name, TOKEN_HEAT_LABEL, FontWeight::Normal);
+        let crowded = *x < name_end + 4.0
+            || (index == 0
+                && names
+                    .get(1)
+                    .is_some_and(|(next, _)| *next < x + name_width + 4.0));
+        if !crowded {
+            name_end = token_heat_label(ctx, area, *x, area.top + TOKEN_HEAT_LABEL, name, 0.0, ink);
+        }
+    }
+
+    for day in start..=today {
+        let offset = day - first_monday;
+        let x = column_x(offset / 7);
+        let y = grid_top + (height + gap) * (offset % 7) as f64;
+        let index = (day - start) as usize;
+        paint_token_cell(
+            ctx,
+            (x, y, width, height),
+            token_heat_level(totals[index], peak),
+            token_ring((day, day), area.selected, today),
+            ink,
+        );
+        record(
+            x,
+            y,
+            width + gap,
+            height + gap,
+            token_span_tooltip((day, day), spent[index]),
+            Some((day, day)),
+        );
+    }
+
+    let grid_height = 7.0 * height + 6.0 * gap;
+    if with_figures {
+        let side = column_x(columns as i64) - gap + 14.0;
+        let line_height = 11.0;
+        let shown = ((grid_height + 2.0) / line_height).floor() as usize;
+        for (index, line) in figures.iter().take(shown).enumerate() {
+            draw_token_text(
+                ctx,
+                side,
+                grid_top + 8.0 + line_height * index as f64,
+                line,
+                8.0,
+                FontWeight::Normal,
+                ink,
+                if index == 0 { 0.5 } else { 0.72 },
+            );
+        }
+    }
+    Some(head + grid_height)
+}
+
+/// A row a year and a cell a month, for a record too long to give each day a
+/// square of its own. Only the latest years that fit are shown.
+fn paint_token_months(
+    ctx: &Context,
+    report: &usage::TokenReport,
+    start: i64,
+    today: i64,
+    area: &HeatArea,
+    ink: (f64, f64, f64),
+    record: &mut TokenRecorder,
+) -> Option<f64> {
+    let (first_year, first_month, _) = usage::civil_from_days(start);
+    let (this_year, this_month, _) = usage::civil_from_days(today);
+    let head = TOKEN_HEAT_LABEL_HEIGHT + TOKEN_HEAT_LABEL_GAP;
+    let gap = 2.0;
+    let fitting = ((area.budget - head + gap) / (5.0 + gap)).floor() as i64;
+    let rows = (this_year - first_year + 1).min(fitting);
+    if rows < 1 {
+        return None;
+    }
+    let cell_height = ((area.budget - head - gap * (rows - 1) as f64) / rows as f64)
+        .min(10.0)
+        .floor();
+    let year_width = token_text_width(ctx, "0000", TOKEN_HEAT_LABEL, FontWeight::Normal) + 6.0;
+    let grid_left = area.left + year_width;
+    let cell_width = ((area.width - year_width - 11.0 * gap) / 12.0).floor();
+    if cell_width < 4.0 {
+        return None;
+    }
+    let month_start = |year: i64, month: i64| usage::days_from_civil(year, month, 1).unwrap_or(0);
+    let span_of = |year: i64, month: i64| {
+        let next = if month == 12 {
+            month_start(year + 1, 1)
+        } else {
+            month_start(year, month + 1)
+        };
+        (month_start(year, month), next - 1)
+    };
+    let top_year = this_year - rows + 1;
+    let months: Vec<_> = (top_year..=this_year)
+        .flat_map(|year| (1..=12).map(move |month| (year, month)))
+        .filter(|(year, month)| {
+            (*year, *month) >= (first_year, first_month)
+                && (*year, *month) <= (this_year, this_month)
+        })
+        .map(|(year, month)| {
+            let span = span_of(year, month);
+            (year, month, span, token_spent(report, span.0..=span.1))
+        })
+        .collect();
+    let peak = months
+        .iter()
+        .map(|(_, _, _, spent)| spent.iter().sum())
+        .max()
+        .unwrap_or(0);
+    for month in 1..=12 {
+        let name = usage::MONTHS[(month - 1) as usize];
+        let name = if cell_width >= 18.0 { name } else { &name[..1] };
+        let x = grid_left + (cell_width + gap) * (month - 1) as f64;
+        token_heat_label(
+            ctx,
+            area,
+            x + cell_width / 2.0,
+            area.top + TOKEN_HEAT_LABEL,
+            name,
+            0.5,
+            ink,
+        );
+    }
+    for year in top_year..=this_year {
+        let y = area.top + head + (cell_height + gap) * (year - top_year) as f64;
+        token_heat_label(
+            ctx,
+            area,
+            area.left,
+            y + cell_height / 2.0 + TOKEN_HEAT_LABEL / 2.5,
+            &year.to_string(),
+            0.0,
+            ink,
+        );
+    }
+    for (year, month, span, spent) in months {
+        let x = grid_left + (cell_width + gap) * (month - 1) as f64;
+        let y = area.top + head + (cell_height + gap) * (year - top_year) as f64;
+        paint_token_cell(
+            ctx,
+            (x, y, cell_width, cell_height),
+            token_heat_level(spent.iter().sum(), peak),
+            (area.selected == Some(span)).then_some(0.95),
+            ink,
+        );
+        record(
+            x,
+            y,
+            cell_width + gap,
+            cell_height + gap,
+            token_span_tooltip(span, spent),
+            Some(span),
+        );
+    }
+    Some(head + rows as f64 * cell_height + (rows - 1) as f64 * gap)
 }
 
 fn render_token_tab(card: &UsageCard) {
@@ -3427,7 +4035,7 @@ fn render_token_tab(card: &UsageCard) {
         "Counted from this machine's session logs"
     });
     card.status.set_tooltip_text(Some(
-        "Tokens the Codex, Claude Code and OMP CLIs recorded in their own session logs. Nothing is fetched from a provider.",
+        "Tokens the Codex, Claude Code and OMP CLIs recorded in their own session logs, kept day by day in ~/.local/share/sysi/tokens.json so a CLI pruning its logs takes nothing back. Nothing is fetched from a provider.",
     ));
     card.updated.set_label(&if state.report.scanned_at_ms > 0 {
         usage_age_label(state.report.scanned_at_ms, usage_now_ms())
@@ -3588,12 +4196,15 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
         }) as Rc<dyn Fn(UsageTab)>
     };
     // Walking every transcript on the disk is disk-bound, so it runs on a
-    // thread of its own and only once what is on screen has gone stale.
+    // thread of its own and only once what is on screen has gone stale. The
+    // token tab asks for a scan while it is up; `anywhere` is the background
+    // pass that keeps the ledger filled on the days nobody opens it.
     let scan = {
         let card = card.clone();
         let tab = tab.clone();
-        Rc::new(move |manual: bool| {
-            if !matches!(tab.get(), UsageTab::Tokens) {
+        Rc::new(move |manual: bool, anywhere: bool| {
+            let shown = matches!(tab.get(), UsageTab::Tokens);
+            if !shown && !anywhere {
                 return;
             }
             {
@@ -3606,13 +4217,29 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
                 }
             }
             card.tokens.borrow_mut().scanning = true;
-            render_token_tab(&card);
+            // The status line and refresh button belong to whichever tab is up.
+            if shown {
+                render_token_tab(&card);
+            }
             let token_tx = token_tx.clone();
             std::thread::spawn(move || {
                 let _ = token_tx.send_blocking(usage::scan_tokens());
             });
-        }) as Rc<dyn Fn(bool)>
+        }) as Rc<dyn Fn(bool, bool)>
     };
+    // Sysi starts with the session, so one pass shortly after login and one an
+    // hour after that reach every transcript long before a CLI prunes it,
+    // whether or not the card is open. The delay keeps it off the busy startup.
+    {
+        let scan = scan.clone();
+        glib::timeout_add_seconds_local_once(TOKEN_LEDGER_FIRST_SECS, move || {
+            scan(false, true);
+            glib::timeout_add_seconds_local(TOKEN_LEDGER_EVERY_SECS, move || {
+                scan(false, true);
+                glib::ControlFlow::Continue
+            });
+        });
+    }
     let send = {
         let tab = tab.clone();
         let card = card.clone();
@@ -3621,7 +4248,7 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
         let scan = scan.clone();
         Rc::new(move |manual: bool| {
             let UsageTab::Source(which) = tab.get() else {
-                scan(manual);
+                scan(manual, false);
                 return;
             };
             let now = usage_now_ms();
@@ -17006,6 +17633,7 @@ mod usage_ui_tests {
         assert_eq!(TokenPeriod::Today.since_day(20_703), Some(20_703));
         assert_eq!(TokenPeriod::Week.since_day(20_703), Some(20_697));
         assert_eq!(TokenPeriod::Month.since_day(20_703), Some(20_674));
+        assert_eq!(TokenPeriod::Year.since_day(20_703), Some(20_339));
         assert_eq!(TokenPeriod::All.since_day(20_703), None);
         for period in TokenPeriod::ALL {
             assert_eq!(TokenPeriod::from_key(period.key()), period);
@@ -17132,5 +17760,232 @@ mod usage_ui_tests {
             &mut hits,
         );
         assert!(hits[0].tip.contains("24,042,831"), "{}", hits[0].tip);
+    }
+
+    #[test]
+    fn a_heatmap_step_follows_the_root_of_a_days_share() {
+        assert_eq!(token_heat_level(0, 100), 0);
+        assert_eq!(token_heat_level(5, 0), 0);
+        // A sliver of the busiest day still shows, and only the busiest days
+        // reach the darkest step.
+        assert_eq!(token_heat_level(1, 1_000_000), 1);
+        assert_eq!(token_heat_level(25, 100), 2);
+        assert_eq!(token_heat_level(50, 100), 3);
+        assert_eq!(token_heat_level(57, 100), 4);
+        assert_eq!(token_heat_level(100, 100), 4);
+        let day = usage::days_from_civil(2026, 9, 24).unwrap();
+        assert_eq!(token_span_label((day, day)), "Thu, Sep 24");
+        let september = (usage::days_from_civil(2026, 9, 1).unwrap(), day + 6);
+        assert_eq!(token_span_label(september), "Sep 2026");
+        let tip = token_span_tooltip((day, day), [0, 1_500_000, 0]);
+        assert!(
+            tip.starts_with("Thu, Sep 24\n1,500,000 tokens\nCLAUDE 1.5M\n"),
+            "{tip}"
+        );
+        assert!(token_span_tooltip((day, day), [0; 3]).ends_with("No tokens"));
+    }
+
+    fn token_report(entries: &[(UsageSource, i64, u64)]) -> usage::TokenReport {
+        let mut report = usage::TokenReport::default();
+        for (source, day, input) in entries {
+            report.days.entry(*source).or_default().insert(
+                *day,
+                usage::TokenTotals {
+                    input: *input,
+                    ..usage::TokenTotals::default()
+                },
+            );
+        }
+        report
+    }
+
+    fn paint_token_state(state: &TokenState, width: f64, height: f64) -> Vec<TokenHit> {
+        let surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, width as i32, height as i32)
+                .expect("a surface to draw the token tab into");
+        let ctx = Context::new(&surface).expect("a cairo context");
+        let mut hits = Vec::new();
+        paint_tokens(
+            &ctx,
+            state,
+            Foreground::Light,
+            1.0,
+            width,
+            height,
+            &mut hits,
+        );
+        hits
+    }
+
+    fn token_cells(hits: &[TokenHit]) -> Vec<&TokenHit> {
+        hits.iter().filter(|hit| hit.span.is_some()).collect()
+    }
+
+    fn token_tip_for(hits: &[TokenHit], span: (i64, i64)) -> String {
+        hits.iter()
+            .find(|hit| hit.span == Some(span))
+            .map(|hit| hit.tip.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every window longer than a day swaps the split bar for one cell per
+    /// day, each hovering to that day's figures; the calendars start on the
+    /// first day on record rather than a year back; and a card too short to
+    /// read them keeps the split bar instead.
+    #[test]
+    fn each_longer_window_draws_a_cell_per_day() {
+        let today = usage::local_day_now();
+        let report = token_report(&[
+            (UsageSource::Claude, today, 3_000),
+            (UsageSource::Codex, today, 1_000),
+            (UsageSource::Codex, today - 3, 2_000),
+            (UsageSource::Omp, today - 120, 9_999),
+        ]);
+        let paint = |period, height| {
+            let state = TokenState {
+                report: report.clone(),
+                period,
+                ..TokenState::default()
+            };
+            paint_token_state(&state, 280.0, height)
+        };
+
+        assert!(token_cells(&paint(TokenPeriod::Today, 130.0)).is_empty());
+        let week = paint(TokenPeriod::Week, 130.0);
+        assert_eq!(token_cells(&week).len(), 7);
+        assert!(
+            token_tip_for(&week, (today, today)).contains("4,000 tokens\nCODEX 1.0K · CLAUDE 3.0K")
+        );
+        assert!(token_tip_for(&week, (today - 3, today - 3)).contains("2,000 tokens"));
+        assert!(token_tip_for(&week, (today - 1, today - 1)).ends_with("No tokens"));
+        assert_eq!(token_cells(&paint(TokenPeriod::Month, 130.0)).len(), 30);
+
+        // Nothing before the first recorded day, and every day since.
+        for period in [TokenPeriod::Year, TokenPeriod::All] {
+            let calendar = paint(period, 130.0);
+            let cells = token_cells(&calendar);
+            assert_eq!(cells.len(), 121, "{period:?}");
+            assert_eq!(cells[0].span, Some((today - 120, today - 120)));
+            assert!(token_tip_for(&calendar, (today - 120, today - 120)).contains("OMP 10.0K"));
+            for hit in &calendar {
+                assert!(hit.x >= 0.0 && hit.x + hit.width <= 282.0, "{}", hit.tip);
+            }
+        }
+        // A year back is as far as 1Y reaches; ALL reaches the whole record.
+        let old = token_report(&[
+            (UsageSource::Codex, today - 500, 1),
+            (UsageSource::Codex, today, 1),
+        ]);
+        let year = TokenState {
+            report: old,
+            period: TokenPeriod::Year,
+            ..TokenState::default()
+        };
+        assert_eq!(
+            token_cells(&paint_token_state(&year, 280.0, 130.0)).len(),
+            365
+        );
+
+        // A short record still spans the card instead of huddling at the
+        // left: under a month it is one row, and past that the weeks stretch
+        // up to the figures beside them.
+        let reach = |days_back: i64| {
+            let state = TokenState {
+                report: token_report(&[
+                    (UsageSource::Codex, today - days_back, 1),
+                    (UsageSource::Codex, today, 1),
+                ]),
+                period: TokenPeriod::All,
+                ..TokenState::default()
+            };
+            let hits = paint_token_state(&state, 400.0, 130.0);
+            let cells = token_cells(&hits);
+            assert_eq!(cells.len() as i64, days_back + 1);
+            cells
+                .iter()
+                .map(|hit| hit.x + hit.width)
+                .fold(0.0, f64::max)
+        };
+        assert!(reach(20) > 390.0, "{}", reach(20));
+        let weeks = reach(40);
+        assert!(weeks > 200.0 && weeks < 400.0, "{weeks}");
+
+        // Squeezed short, the calendar gives way to the split bar.
+        let squeezed = paint(TokenPeriod::All, 72.0);
+        assert!(token_cells(&squeezed).is_empty());
+        assert_eq!(squeezed.len(), 1 + 3 + 3);
+    }
+
+    /// A record too long for a square a day turns into a calendar of months,
+    /// one row a year.
+    #[test]
+    fn a_long_record_is_drawn_a_month_to_a_cell() {
+        let today = usage::local_day_now();
+        let (year, month, _) = usage::civil_from_days(today);
+        let report = token_report(&[
+            (UsageSource::Codex, today - 3 * 365, 5),
+            (UsageSource::Claude, today, 7),
+        ]);
+        let state = TokenState {
+            report,
+            period: TokenPeriod::All,
+            ..TokenState::default()
+        };
+        let hits = paint_token_state(&state, 280.0, 130.0);
+        let cells = token_cells(&hits);
+        assert!(!cells.is_empty());
+        // Every cell is a whole month, ending on this one.
+        for cell in &cells {
+            let (first, last) = cell.span.unwrap();
+            assert_eq!(usage::civil_from_days(first).2, 1);
+            assert_eq!(usage::civil_from_days(last + 1).2, 1);
+        }
+        let (first, last) = cells.last().unwrap().span.unwrap();
+        assert_eq!(usage::civil_from_days(first), (year, month, 1));
+        assert!(last >= today);
+        assert!(
+            cells.last().unwrap().tip.contains("CLAUDE 7"),
+            "{}",
+            cells.last().unwrap().tip
+        );
+        assert!(cells.len() > 12 && cells.len() <= 4 * 12, "{}", cells.len());
+    }
+
+    /// Picking a cell narrows the headline and rows to it, and picking the
+    /// same cell or the headline puts the window back.
+    #[test]
+    fn a_picked_day_narrows_the_headline_and_rows() {
+        let today = usage::local_day_now();
+        let mut state = TokenState {
+            report: token_report(&[
+                (UsageSource::Codex, today, 1_000),
+                (UsageSource::Claude, today - 2, 20_000),
+            ]),
+            period: TokenPeriod::Week,
+            ..TokenState::default()
+        };
+        let whole = paint_token_state(&state, 280.0, 130.0);
+        assert!(whole[0].tip.contains("21,000 tokens"), "{}", whole[0].tip);
+        assert_eq!(whole[0].span, None, "the headline puts the window back");
+
+        state.selected = Some((today - 2, today - 2));
+        let picked = paint_token_state(&state, 280.0, 130.0);
+        assert!(picked[0].tip.contains("20,000 tokens"), "{}", picked[0].tip);
+        assert!(
+            picked[0].tip.contains(&token_date_label(today - 2)),
+            "{}",
+            picked[0].tip
+        );
+        // The heatmap stays whole so another day can be picked.
+        assert_eq!(token_cells(&picked).len(), 7);
+
+        // A pick carried into the TODAY tab is ignored rather than trapping it.
+        state.period = TokenPeriod::Today;
+        let today_tab = paint_token_state(&state, 280.0, 130.0);
+        assert!(
+            today_tab[0].tip.contains("1,000 tokens"),
+            "{}",
+            today_tab[0].tip
+        );
     }
 }

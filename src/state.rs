@@ -404,15 +404,18 @@ pub fn config_dir() -> PathBuf {
         .join("sysi")
 }
 
-// Pasted images are user data, not a cache: losing them would gut the note
-// that shows them, so they go under XDG_DATA_HOME rather than the cache dir.
-pub fn images_dir() -> PathBuf {
+// Pasted images and the token ledger are user data, not a cache: losing them
+// cannot be undone, so they go under XDG_DATA_HOME rather than the cache dir.
+pub fn data_dir() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("sysi")
-        .join("images")
+}
+
+pub fn images_dir() -> PathBuf {
+    data_dir().join("images")
 }
 
 pub fn cache_dir() -> PathBuf {
