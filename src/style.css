@@ -659,7 +659,18 @@ scrolledwindow overshoot.right:backdrop {
   background-color: transparent;
   border: none;
   border-radius: 5px;
-  padding: 5px 7px;
+}
+
+/* An event box paints its background but lays its child out edge to edge,
+   ignoring padding, so the air inside a row, and inside the header, is a
+   margin on what they hold. Row text, the search icon and the key hints all
+   start on the same line, 13px in from the palette's edge. */
+.notes-row-body {
+  margin: 5px 7px;
+}
+
+.notes-bar {
+  margin-left: 11px;
 }
 
 .notes-row:hover,
@@ -725,18 +736,22 @@ scrolledwindow overshoot.right:backdrop {
 }
 
 .notes-window .notes-list {
-  padding-bottom: 2px;
+  padding: 4px 6px 2px;
 }
 
 .notes-hint {
   min-height: 0;
-  padding: 0 6px 2px;
+  padding: 0 6px 2px 13px;
 }
 
 .notes-preview-view,
 .notes-preview-view text {
   background-color: transparent;
   color: currentColor;
+}
+
+.notes-preview-view {
+  padding: 8px 12px;
 }
 
 .notes-paned separator {

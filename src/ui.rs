@@ -5936,6 +5936,7 @@ fn note_row(
     );
 
     let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    body.style_context().add_class("notes-row-body");
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     // Only a pinned note gets a mark. An empty star reserved space on every
     // row and made the title sit off to the right of nothing.
@@ -8817,6 +8818,7 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     bar.set_hexpand(true);
     // Same path as the header buttons: a symbolic icon recolours to the
     // button's CSS, so it stays opposite the LIGHT / DARK plate.
+    bar.style_context().add_class("notes-bar");
     let find = icon_button("edit-find-symbolic", "Search notes");
     find.style_context().add_class("notes-find");
     let search = gtk::Entry::new();
