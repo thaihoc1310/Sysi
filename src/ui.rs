@@ -7606,6 +7606,42 @@ fn fill_note_content(
         let mut end = buffer.end_iter();
         buffer.insert(&mut end, chunk);
     }
+    mono_box_drawing_lines(buffer);
+}
+
+/// A table pasted from a terminal is drawn with box characters and padded
+/// with spaces, so it only lines up in a fixed-width face. Any line carrying a
+/// box-drawing character is set in one. Derived from the text on every edit
+/// rather than stored, so old notes and the Notes preview get it for free.
+// ponytail: rescans the whole note per edit; limit to the edited lines if a
+// note ever grows large enough to lag.
+fn mono_box_drawing_lines(buffer: &gtk::TextBuffer) {
+    const NAME: &str = "sysi-note-box-mono";
+    let Some(table) = buffer.tag_table() else {
+        return;
+    };
+    let tag = table.lookup(NAME).unwrap_or_else(|| {
+        let tag = gtk::TextTag::new(Some(NAME));
+        tag.set_family(Some("Noto Sans Mono, DejaVu Sans Mono, monospace"));
+        table.add(&tag);
+        tag
+    });
+    let (start, end) = buffer.bounds();
+    buffer.remove_tag(&tag, &start, &end);
+    for line in box_drawn_lines(&note_buffer_text(buffer)) {
+        let from = buffer.iter_at_line(line as i32);
+        let mut to = from.clone();
+        to.forward_to_line_end();
+        buffer.apply_tag(&tag, &from, &to);
+    }
+}
+
+fn box_drawn_lines(text: &str) -> Vec<usize> {
+    text.split('\n')
+        .enumerate()
+        .filter(|(_, line)| line.chars().any(|c| ('\u{2500}'..='\u{257F}').contains(&c)))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 fn fill_note_buffer(
@@ -8460,7 +8496,8 @@ fn attach_note_images(
             let focus = focus.clone();
             let resize = resize.clone();
             let editor = editor.clone();
-            move |_| {
+            move |buffer| {
+                mono_box_drawing_lines(buffer);
                 if resize.borrow().is_some() {
                     return;
                 }
@@ -17645,6 +17682,13 @@ mod usage_ui_tests {
     /// The token tab has to survive the two shapes a first run takes — nothing
     /// scanned yet, and a scan that came back empty — and then hand every mark
     /// it draws a hover target, because the chart carries no printed figures.
+    #[test]
+    fn only_box_drawn_lines_are_set_in_a_fixed_width_face() {
+        let note = "Lệnh:\n│ go vet ./... │ Bắt lỗi │\n├──────┼──────┤\n| markdown | pipes |\nghi chú";
+        assert_eq!(box_drawn_lines(note), vec![1, 2]);
+        assert!(box_drawn_lines("").is_empty());
+    }
+
     #[test]
     fn the_token_tab_swaps_in_and_hands_every_mark_a_tooltip() {
         if gtk::init().is_err() {
