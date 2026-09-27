@@ -43,7 +43,9 @@ const MAX_CARDS = 256;
 const MAX_SIDE = 16384;
 // Room around a card for its shadow and for the samples its rim bends in.
 const MARGIN = 32;
-const BLUR_SIGMA = 8;
+// Dual Kawase spread, in texels of the level being read. With four halvings
+// on a 2x display (three on 1x) this frosts about as far as Apple's glass.
+const KAWASE_OFFSET = 1.5;
 const APPEAR_MS = 280;
 const PRESS_IN_MS = 150;
 const PRESS_OUT_MS = 350;
@@ -55,28 +57,40 @@ const SHADER_COMMON = `
 float glass_luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 `;
 
-// Separable Gaussian: 13 bilinear taps reaching 2.4 sigma either side. The
-// first pass reads the full-size capture into a half-size buffer; sampling
-// at the half-size pixel centres averages each 2x2 block on the way down.
-const BLUR_DECLARATIONS = `
-uniform vec2 uStep;
+// Dual Kawase (Marius Bjorge, SIGGRAPH 2015): halve the picture a few times
+// with a five-tap filter, then double it back with an eight-tap one. Every
+// tap lands between texels, so each pass blends a wide, even patch; a
+// Gaussian with taps a few texels apart instead leaves a grid of ghost
+// copies over text. uHalf is half a texel of the level read, times the
+// spread.
+const KAWASE_DECLARATIONS = `
+uniform vec2 uHalf;
 `;
-const BLUR_MAIN = `
+const KAWASE_DOWN = `
 vec2 uv = cogl_tex_coord0_in.st;
-vec4 acc = texture2D(cogl_sampler0, uv);
-float total = 1.0;
-for (int i = 1; i <= 6; i++) {
-    float x = float(i) / 2.5;
-    float w = exp(-0.5 * x * x);
-    acc += (texture2D(cogl_sampler0, uv + uStep * float(i)) +
-            texture2D(cogl_sampler0, uv - uStep * float(i))) * w;
-    total += 2.0 * w;
-}
-cogl_color_out = acc / total;
+vec4 sum = texture2D(cogl_sampler0, uv) * 4.0;
+sum += texture2D(cogl_sampler0, uv - uHalf);
+sum += texture2D(cogl_sampler0, uv + uHalf);
+sum += texture2D(cogl_sampler0, uv + vec2(uHalf.x, -uHalf.y));
+sum += texture2D(cogl_sampler0, uv - vec2(uHalf.x, -uHalf.y));
+cogl_color_out = sum / 8.0;
+`;
+const KAWASE_UP = `
+vec2 uv = cogl_tex_coord0_in.st;
+vec4 sum = texture2D(cogl_sampler0, uv + vec2(-uHalf.x * 2.0, 0.0));
+sum += texture2D(cogl_sampler0, uv + vec2(-uHalf.x, uHalf.y)) * 2.0;
+sum += texture2D(cogl_sampler0, uv + vec2(0.0, uHalf.y * 2.0));
+sum += texture2D(cogl_sampler0, uv + vec2(uHalf.x, uHalf.y)) * 2.0;
+sum += texture2D(cogl_sampler0, uv + vec2(uHalf.x * 2.0, 0.0));
+sum += texture2D(cogl_sampler0, uv + vec2(uHalf.x, -uHalf.y)) * 2.0;
+sum += texture2D(cogl_sampler0, uv + vec2(0.0, -uHalf.y * 2.0));
+sum += texture2D(cogl_sampler0, uv + vec2(-uHalf.x, -uHalf.y)) * 2.0;
+cogl_color_out = sum / 12.0;
 `;
 
-// Layer 0 is the sharp backdrop, layer 1 the blurred one; both span the whole
-// actor, card plus margin. Every length is in logical pixels.
+// Layer 0 is the sharp backdrop, layer 1 the frosted one, layer 2 a lightly
+// softened one for the rim; all span the whole actor, card plus margin.
+// Every length is in logical pixels.
 const GLASS_DECLARATIONS = `${SHADER_COMMON}
 uniform vec2 uSize;
 uniform vec4 uRect;
@@ -128,24 +142,12 @@ vec3 soft = texture2D(cogl_sampler1, uv).rgb;
 vec4 result = vec4(0.0);
 
 if (cover < 1.0) {
-    // Adaptive shadow: deeper over detail (text, edges), lighter over a flat
-    // bright backdrop. Detail is how far the sharp copy strays from the blur.
-    vec2 c = (uRect.xy + half_size) / uSize;
-    vec2 k = half_size / uSize;
-    float detail = 0.0;
-    detail += abs(glass_luma(texture2D(cogl_sampler0, c + k * vec2(-0.6, -0.6)).rgb) - glass_luma(texture2D(cogl_sampler1, c + k * vec2(-0.6, -0.6)).rgb));
-    detail += abs(glass_luma(texture2D(cogl_sampler0, c + k * vec2( 0.6, -0.6)).rgb) - glass_luma(texture2D(cogl_sampler1, c + k * vec2( 0.6, -0.6)).rgb));
-    detail += abs(glass_luma(texture2D(cogl_sampler0, c + k * vec2(-0.6,  0.6)).rgb) - glass_luma(texture2D(cogl_sampler1, c + k * vec2(-0.6,  0.6)).rgb));
-    detail += abs(glass_luma(texture2D(cogl_sampler0, c + k * vec2( 0.6,  0.6)).rgb) - glass_luma(texture2D(cogl_sampler1, c + k * vec2( 0.6,  0.6)).rgb));
-    detail *= 0.25;
-    float bright = glass_luma(texture2D(cogl_sampler1, c).rgb);
-    float strength = mix(0.10, 0.28, smoothstep(0.03, 0.15, detail));
-    if (bright > 0.8 && detail < 0.03)
-        strength *= 0.6;
-    float sigma = clamp(min_dim * 0.12, 4.0, 14.0);
-    float lift = sigma * 0.3 * uAppear;
+    // A fixed, soft shadow. Weighing it by what lay behind the card made it
+    // flicker frame to frame while the card was dragged over text.
+    float sigma = clamp(min_dim * 0.06, 3.0, 8.0);
+    float lift = sigma * 0.35 * uAppear;
     float ds = max(glass_sd(p - vec2(0.0, lift), half_size, radius), 0.0);
-    float shade = strength * exp(-(ds * ds) / (2.0 * sigma * sigma));
+    float shade = 0.14 * exp(-(ds * ds) / (2.0 * sigma * sigma));
     // A hairline of darkness right at the rim keeps the edge crisp on light
     // backdrops.
     shade = max(shade, 0.14 * exp(-max(d, 0.0) * uScale));
@@ -170,10 +172,10 @@ if (cover > 0.0) {
         vec3 frosted = vec3(texture2D(cogl_sampler1, uv + offset * 0.94).r,
                             texture2D(cogl_sampler1, uv + offset).g,
                             texture2D(cogl_sampler1, uv + offset * 1.06).b);
-        vec3 crisp = vec3(texture2D(cogl_sampler0, uv + offset * 0.94).r,
-                          texture2D(cogl_sampler0, uv + offset).g,
-                          texture2D(cogl_sampler0, uv + offset * 1.06).b);
-        colour = mix(crisp, frosted, mix(0.5, 1.0, smoothstep(0.0, band, depth)));
+        vec3 crisp = vec3(texture2D(cogl_sampler2, uv + offset * 0.94).r,
+                          texture2D(cogl_sampler2, uv + offset).g,
+                          texture2D(cogl_sampler2, uv + offset * 1.06).b);
+        colour = mix(crisp, frosted, mix(0.6, 1.0, smoothstep(0.0, band, depth)));
     } else {
         colour = soft;
     }
@@ -286,19 +288,39 @@ class Surface {
     }
 }
 
-// Backdrop copies for one framebuffer: the sharp capture, the half-size
-// frosted copy, and the half-size buffer between the two blur passes.
+// Backdrop copies for one framebuffer: the sharp capture, the halvings the
+// blur goes down through, and the doublings it comes back up through. The
+// second halving doubles as the lightly softened rim; the last doubling is
+// the frosted copy, at half size.
 class Backdrop {
-    constructor(context, width, height) {
+    constructor(context, width, height, levels) {
         this.width = width;
         this.height = height;
         this.sharp = new Surface(context, width, height);
-        const halfWidth = Math.max(1, Math.ceil(width / 2));
-        const halfHeight = Math.max(1, Math.ceil(height / 2));
-        this.soft = new Surface(context, halfWidth, halfHeight);
-        this.spare = new Surface(context, halfWidth, halfHeight);
+        this.down = [];
+        for (let level = 1; level <= levels; level++) {
+            this.down.push(new Surface(context,
+                Math.max(1, Math.ceil(width / 2 ** level)),
+                Math.max(1, Math.ceil(height / 2 ** level))));
+        }
+        // up[i] matches down[i]; the deepest level is only ever read.
+        this.up = this.down.slice(0, -1).map(surface =>
+            new Surface(context, surface.width, surface.height));
+        // A quarter-size copy: soft enough that the rim bends colour rather
+        // than chopping every stripe behind it into dashes.
+        this.light = this.down[Math.min(1, this.down.length - 1)];
+        this.soft = this.up[0];
         this.valid = false;
     }
+}
+
+// Enough halvings for the frost to cover the same logical distance on any
+// display, but never down to a level with nothing left to blend.
+function blurLevels(width, height, scale) {
+    let levels = scale >= 1.5 ? 4 : 3;
+    while (levels > 2 && Math.min(width, height) / 2 ** levels < 4)
+        levels--;
+    return levels;
 }
 
 const GlassEffect = GObject.registerClass(
@@ -346,9 +368,11 @@ class SysiGlassEffect extends Clutter.Effect {
         const scale = width / actor.width;
 
         const context = framebuffer.get_context();
+        const levels = blurLevels(width, height, scale);
         let backdrop = this._backdrops.get(framebuffer);
-        if (!backdrop || backdrop.width !== width || backdrop.height !== height) {
-            backdrop = new Backdrop(context, width, height);
+        if (!backdrop || backdrop.width !== width || backdrop.height !== height ||
+            backdrop.down.length !== levels) {
+            backdrop = new Backdrop(context, width, height, levels);
             this._backdrops.set(framebuffer, backdrop);
             // A screenshot buffer is thrown away after one paint; do not let
             // them pile up.
@@ -380,6 +404,7 @@ class SysiGlassEffect extends Clutter.Effect {
         const pipeline = this._card.pipelines(context).glass;
         pipeline.set_layer_texture(0, backdrop.sharp.texture);
         pipeline.set_layer_texture(1, backdrop.soft.texture);
+        pipeline.set_layer_texture(2, backdrop.light.texture);
         this._card.setGlassUniforms(pipeline, scale);
         const glass = new Clutter.PipelineNode(pipeline);
         node.add_child(glass);
@@ -401,21 +426,27 @@ class SysiGlassEffect extends Clutter.Effect {
             sourceLeft, sourceTop, sourceLeft - left, sourceTop - top,
             right - sourceLeft, bottom - sourceTop);
 
-        // Each pass is a framebuffer switch, the dearest thing here; two is
-        // the fewest a separable blur takes.
-        const context = framebuffer.get_context();
-        const pipelines = this._card.pipelines(context);
-        const scale = backdrop.width / this.actor.width;
-        // Taps are spaced in the half-size buffer's pixels either way.
-        const step = BLUR_SIGMA * scale / 2 / 2.5;
+        // One pipeline per pass: a pass still queued must not see the next
+        // one's texture or uniforms.
+        const pipelines = this._card.blurPipelines(framebuffer.get_context(),
+            backdrop.down.length);
+        let source = backdrop.sharp;
+        backdrop.down.forEach((target, level) => {
+            this._pass(pipelines.down[level], source, target);
+            source = target;
+        });
+        for (let level = backdrop.up.length - 1; level >= 0; level--) {
+            const target = backdrop.up[level];
+            this._pass(pipelines.up[level], source, target);
+            source = target;
+        }
+    }
 
-        pipelines.across.set_layer_texture(0, backdrop.sharp.texture);
-        setUniform(pipelines.across, 'uStep', step / backdrop.spare.width, 0);
-        this._draw(backdrop.spare, pipelines.across);
-
-        pipelines.upright.set_layer_texture(0, backdrop.spare.texture);
-        setUniform(pipelines.upright, 'uStep', 0, step / backdrop.spare.height);
-        this._draw(backdrop.soft, pipelines.upright);
+    _pass(pipeline, source, target) {
+        pipeline.set_layer_texture(0, source.texture);
+        setUniform(pipeline, 'uHalf',
+            0.5 * KAWASE_OFFSET / source.width, 0.5 * KAWASE_OFFSET / source.height);
+        this._draw(target, pipeline);
     }
 
     // No flush here: Cogl records that the glass samples these textures and
@@ -448,6 +479,7 @@ const GlassCard = GObject.registerClass({
         this.leaving = false;
         this._forced = false;
         this._pipelines = null;
+        this._blur = null;
         this.destroyed = false;
         this.connect('destroy', () => (this.destroyed = true));
         this.add_effect(new GlassEffect(this));
@@ -534,12 +566,19 @@ const GlassCard = GObject.registerClass({
     // pipeline changed while an earlier card's draw is still queued would
     // repaint that card with this one's shape.
     pipelines(context) {
-        if (!this._pipelines) {
-            const templates = this._host.pipelines(context);
-            this._pipelines = Object.fromEntries(Object.entries(templates)
-                .map(([name, pipeline]) => [name, pipeline.copy()]));
-        }
+        this._pipelines ??= {glass: this._host.pipelines(context).glass.copy()};
         return this._pipelines;
+    }
+
+    blurPipelines(context, levels) {
+        if (this._blur?.down.length !== levels) {
+            const {down, up} = this._host.pipelines(context);
+            this._blur = {
+                down: Array.from({length: levels}, () => down.copy()),
+                up: Array.from({length: levels - 1}, () => up.copy()),
+            };
+        }
+        return this._blur;
     }
 
     takeForcedRepaint() {
@@ -678,12 +717,12 @@ class GlassHost {
     pipelines(context) {
         if (!this._pipelines) {
             this._pipelines = {
-                across: makePipeline(context, BLUR_DECLARATIONS, BLUR_MAIN, 1),
-                upright: makePipeline(context, BLUR_DECLARATIONS, BLUR_MAIN, 1),
-                glass: makePipeline(context, GLASS_DECLARATIONS, GLASS_MAIN, 2),
+                down: makePipeline(context, KAWASE_DECLARATIONS, KAWASE_DOWN, 1),
+                up: makePipeline(context, KAWASE_DECLARATIONS, KAWASE_UP, 1),
+                glass: makePipeline(context, GLASS_DECLARATIONS, GLASS_MAIN, 3),
             };
             // The blur passes overwrite their target outright.
-            for (const pipeline of [this._pipelines.across, this._pipelines.upright])
+            for (const pipeline of [this._pipelines.down, this._pipelines.up])
                 pipeline.set_blend('RGBA = ADD (SRC_COLOR, 0)');
         }
         return this._pipelines;

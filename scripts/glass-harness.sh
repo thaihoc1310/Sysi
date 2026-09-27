@@ -157,7 +157,7 @@ EOF
       "[(0, 0, 2.0, 0, true, [('Meta-0', '2560x1600@60.000', {})])]" "{}" >/dev/null
     export GDK_SCALE=2
   fi
-  DISPLAY=":$(grep -o 'public X11 display :[0-9]*' "$root/shell.log" | tail -1 | grep -o '[0-9]*$')"
+  DISPLAY=":$(grep -ao 'public X11 display :[0-9]*' "$root/shell.log" | tail -1 | grep -o '[0-9]*$')"
   XAUTHORITY="$(ls -t "$runtime"/.mutter-Xwaylandauth.* | head -1)"
   export DISPLAY XAUTHORITY
   setsid "$root/bin/sysi" >"$root/sysi.log" 2>&1 &

@@ -312,45 +312,77 @@ fn set_live(window: &gtk::Window, live: bool) {
     window.queue_draw();
 }
 
-/// Keep a card from painting where a glass card above it sits. Glass cards
-/// are clear, and the glass is drawn under the whole window, so without this
-/// the lower card's text would show straight through the upper card.
-pub fn clip_under_glass(widget: &gtk::Widget, cr: &Context) {
-    let Some(parent) = widget
-        .parent()
-        .and_then(|parent| parent.downcast::<gtk::Container>().ok())
-    else {
-        return;
+/// The children of the overlay in the order GTK really paints them. A card
+/// with GdkWindows of its own (a note, or the canvas inside SYSTEM) is painted
+/// with those windows, in their stacking order, after everything drawn
+/// straight onto the overlay's window; the container's child order only
+/// ranks the rest. Raising a card restacks its windows without always moving
+/// it in the child list, so the two part ways.
+pub fn paint_order(parent: &gtk::Container) -> Vec<gtk::Widget> {
+    let Some(surface) = parent.window() else {
+        return parent.children();
     };
-    let own = widget.allocation();
-    let siblings = parent.children();
-    let Some(index) = siblings.iter().position(|child| child == widget) else {
+    // Topmost first.
+    let stack = surface.children();
+    let mut ranked: Vec<(Option<usize>, gtk::Widget)> = parent
+        .children()
+        .into_iter()
+        .map(|child| {
+            let mut windows = Vec::new();
+            own_windows(&child, &mut windows);
+            let topmost = windows
+                .iter()
+                .filter_map(|window| stack.iter().position(|candidate| candidate == window))
+                .min();
+            (topmost.map(|index| stack.len() - index), child)
+        })
+        .collect();
+    // Stable: windowless cards keep their child order, beneath the rest.
+    ranked.sort_by_key(|(height, _)| height.unwrap_or(0));
+    ranked.into_iter().map(|(_, child)| child).collect()
+}
+
+/// The outermost GdkWindows a widget paints into: its own, or else those of
+/// its nearest descendants that have one.
+fn own_windows(widget: &gtk::Widget, out: &mut Vec<gdk::Window>) {
+    if widget.has_window() {
+        out.extend(widget.window());
         return;
-    };
-    for above in &siblings[index + 1..] {
-        if !above.is_visible() || !above.is_mapped() || above.widget_name() == "dictate" {
-            continue;
-        }
-        if !above.style_context().has_class("mode-glass") {
-            continue;
-        }
-        let rect = above.allocation();
-        if rect.width() <= 1 || rect.height() <= 1 || rect.intersect(&own).is_none() {
-            continue;
-        }
-        let outline = Outline::new(
-            Shape::of(above),
-            f64::from(rect.x() - own.x()),
-            f64::from(rect.y() - own.y()),
-            f64::from(rect.width()),
-            f64::from(rect.height()),
-        );
-        cr.rectangle(0.0, 0.0, f64::from(own.width()), f64::from(own.height()));
-        outline.trace(cr);
-        cr.set_fill_rule(gtk::cairo::FillRule::EvenOdd);
-        cr.clip();
     }
-    cr.set_fill_rule(gtk::cairo::FillRule::Winding);
+    if let Some(container) = widget.downcast_ref::<gtk::Container>() {
+        for child in container.children() {
+            own_windows(&child, out);
+        }
+    }
+}
+
+/// Wipe what the cards beneath painted where this glass card sits. Glass
+/// cards are clear and the glass is drawn under the whole window, so without
+/// this a lower card's text shows straight through the upper one.
+///
+/// Every card, windows and all, paints into the overlay's one surface in
+/// paint order, so clearing here, before this card paints anything of its
+/// own, removes exactly the lower cards' pixels. Clipping the lower cards
+/// instead cannot work: GTK paints their child windows with a clip of their
+/// own, and skips the draw signal of widgets nothing listens to.
+pub fn clear_below(card: &gtk::Widget, cr: &Context) {
+    if !card.style_context().has_class("mode-glass") {
+        return;
+    }
+    let rect = card.allocation();
+    cr.new_path();
+    Outline::new(
+        Shape::of(card),
+        0.0,
+        0.0,
+        f64::from(rect.width()),
+        f64::from(rect.height()),
+    )
+    .trace(cr);
+    cr.save().ok();
+    cr.set_operator(gtk::cairo::Operator::Clear);
+    let _ = cr.fill();
+    cr.restore().ok();
 }
 
 #[cfg(test)]

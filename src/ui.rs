@@ -11297,10 +11297,8 @@ fn register(
     mode: ColorMode,
 ) {
     apply_widget_palette(widget, &color_mode, palette_for_mode(mode));
-    // The card's own EventBox is the outermost node, so a clip set here holds
-    // for every child: canvases, labels, editors and their own GdkWindows.
     widget.connect_draw(|widget, cr| {
-        crate::glass::clip_under_glass(widget.upcast_ref(), cr);
+        crate::glass::clear_below(widget.upcast_ref(), cr);
         glib::Propagation::Proceed
     });
     registry.borrow_mut().push(RegisteredWidget {
@@ -14856,7 +14854,7 @@ fn glass_card_samples(
     let Ok(items) = registry.try_borrow() else {
         return Vec::new();
     };
-    root.children()
+    crate::glass::paint_order(root.upcast_ref())
         .iter()
         .filter(|child| {
             child.is_visible()
