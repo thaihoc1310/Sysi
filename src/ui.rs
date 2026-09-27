@@ -11406,6 +11406,20 @@ fn raise_widget_windows(widget: &impl IsA<gtk::Widget>) {
     for child in container.children() {
         raise_widget_windows(&child);
     }
+    // A windowless EventBox that sits above its child takes the child's
+    // clicks through an input-only window of its own, which is not the
+    // widget's window, so the loop above lifted the child's canvas over it:
+    // SYSTEM and the timer could be dragged once and then took no press at
+    // all. Setting above-child again is the public way to lift that window.
+    if let Some(event_box) = container.downcast_ref::<gtk::EventBox>() {
+        if event_box.is_realized()
+            && !event_box.is_visible_window()
+            && event_box.is_above_child()
+        {
+            event_box.set_above_child(false);
+            event_box.set_above_child(true);
+        }
+    }
     // An overlay's layers sit in windows the overlay owns, not the layer
     // widgets, so the loop above never lifts them: every raise buried a
     // note's resize edges under its own editor. Put the layers back on top.
