@@ -127,6 +127,13 @@ EOF
 
   local monitor=1280x800
   $scale2 && monitor=2560x1600
+  # HARNESS_MONITORS="3840x2160 1728x3072" gives several virtual monitors;
+  # HARNESS_LAYOUT then places them (an ApplyMonitorsConfig logical list).
+  local monitors="--virtual-monitor $monitor"
+  if [ -n "${HARNESS_MONITORS:-}" ]; then
+    monitors=""
+    for size in $HARNESS_MONITORS; do monitors="$monitors --virtual-monitor $size"; done
+  fi
   cat >"$root/env.sh" <<EOF
 export XDG_CONFIG_HOME=$root/config XDG_DATA_HOME=$root/data XDG_CACHE_HOME=$root/cache
 export XDG_RUNTIME_DIR=$runtime GSETTINGS_BACKEND=keyfile NO_AT_BRIDGE=1 PATH=$root/bin:\$PATH
@@ -139,7 +146,7 @@ EOF
       echo \"export DBUS_SESSION_BUS_ADDRESS='\$DBUS_SESSION_BUS_ADDRESS'\" >>'$root/env.sh'
       echo \$\$ >'$root/shell.pid'
       exec ${GDB:+gdb -batch -ex run -ex bt -ex 'call (void) gjs_dumpstack()' --args} gnome-shell --headless --wayland --wayland-display=sysi-harness \
-        --virtual-monitor $monitor" >"$root/shell.log" 2>&1 &
+        $monitors" >"$root/shell.log" 2>&1 &
   )
   for _ in $(seq 1 150); do
     [ -f "$root/cache/harness/ready.txt" ] && break
@@ -149,6 +156,8 @@ EOF
   # shellcheck source=/dev/null
   source "$root/env.sh"
   if $scale2; then
+    local layout="${HARNESS_LAYOUT:-}"
+    [ -n "$layout" ] || layout="[(0, 0, 2.0, 0, true, [('Meta-0', '2560x1600@60.000', {})])]"
     local serial
     serial="$(gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
       --object-path /org/gnome/Mutter/DisplayConfig \
@@ -156,7 +165,7 @@ EOF
     gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
       --object-path /org/gnome/Mutter/DisplayConfig \
       --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig "$serial" 1 \
-      "[(0, 0, 2.0, 0, true, [('Meta-0', '2560x1600@60.000', {})])]" "{}" >/dev/null
+      "$layout" "{}" >/dev/null
     export GDK_SCALE=2
   fi
   DISPLAY=":$(grep -ao 'public X11 display :[0-9]*' "$root/shell.log" | tail -1 | grep -o '[0-9]*$')"

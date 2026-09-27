@@ -2384,21 +2384,36 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     // Re-clamp widgets and re-cover the screen when monitors are added,
     // removed, or rescaled.
-    screen.connect_monitors_changed({
+    let fit_to_desktop = Rc::new({
         let window = window.clone();
         let root = root.clone();
         let registry = registry.clone();
         let state = state.clone();
-        move |screen| {
-            let root_window = screen.root_window().expect("display root window");
+        move || {
+            let Some(root_window) = gdk::Screen::default().and_then(|screen| screen.root_window())
+            else {
+                return;
+            };
             let display = root_display_size(&root_window);
             let scale = root_window.scale_factor().max(1);
             let desktop = logical_desktop_size(scale, display);
+            // The overlay is not resizable, so GTK sizes it from its default
+            // size and ignores resize() alone.
+            window.set_default_size(desktop.width, desktop.height);
             window.resize(desktop.width, desktop.height);
             window.move_(0, 0);
             clamp_registered_widgets(&root, &registry, &state);
         }
     });
+    screen.connect_monitors_changed({
+        let fit_to_desktop = fit_to_desktop.clone();
+        move |_| fit_to_desktop()
+    });
+    // At login Sysi can start before the settings daemon has told GTK the
+    // desktop is scaled. The overlay was then sized in unscaled pixels and,
+    // once the scale arrived, kept that size in scaled ones: twice the desk
+    // each way, and on three monitors a 400MB buffer per frame in Xwayland.
+    window.connect_scale_factor_notify(move |_| fit_to_desktop());
 
     // The signals blocked at startup are safe to deliver now: both handlers
     // are registered above, so a pending toggle dispatches instead of
