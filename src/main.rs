@@ -29,6 +29,13 @@ const PANEL_EXTENSION_CSS: &str = include_str!("../packaging/gnome-shell-extensi
 
 fn main() {
     prefer_x11_backend();
+    // Nothing here draws with OpenGL, but GDK's X11 backend opens a GL
+    // context at startup to rank visuals, which maps Mesa and its LLVM into
+    // the process: half of Sysi's memory, for nothing.
+    let gl_disabled_here = std::env::var_os("GDK_GL").is_none();
+    if gl_disabled_here {
+        std::env::set_var("GDK_GL", "disable");
+    }
     if std::env::args().any(|arg| arg == "--install-panel-extension") {
         if let Err(error) = install_panel_extension() {
             eprintln!("Could not install the Sysi panel extension: {error}");
@@ -121,7 +128,14 @@ fn main() {
     let state = Rc::new(RefCell::new(state::AppState::load()));
     application.connect_activate({
         let state = state.clone();
-        move |app| ui::build(app, state.clone())
+        move |app| {
+            // GDK read it when it started; the programs Sysi opens (a link, a
+            // folder) must not inherit it.
+            if gl_disabled_here {
+                std::env::remove_var("GDK_GL");
+            }
+            ui::build(app, state.clone())
+        }
     });
     application.connect_shutdown(move |_| {
         let _ = state.borrow().save();
