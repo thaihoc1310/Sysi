@@ -34,9 +34,10 @@
   text-shadow: 0 1px 3px rgba(255, 255, 255, 0.34);
 }
 
-/* LIGHT / DARK: one plate (.frost-body) flush under the header. AUTO / INVERT
-   leave the plate clear. Inner editors/viewports stay fully transparent so
-   GTK cannot restack a second wash on a clicked line or a caret blink.
+/* LIGHT / DARK: one plate (.frost-body) flush under the header. GLASS leaves
+   it clear for the shell's glass (see the end of this file). Inner
+   editors/viewports stay fully transparent so GTK cannot restack a second
+   wash on a clicked line or a caret blink.
    0.92 is opaque enough to read over a busy desktop; 0.6 left a hole in the
    middle of USAGE / DICTIONARY that showed the wallpaper through. */
 .frost-body,
@@ -317,7 +318,7 @@ textview, textview text, entry {
 }
 
 /* Same paint as the plate, so LIGHT / DARK is one slab instead of a bar,
-   a gap, and a wash. AUTO / INVERT keep the greyer grab-bar above. */
+   a gap, and a wash. */
 .mode-solid.mode-light .note-header {
   background-color: rgba(242, 242, 244, 0.92);
 }
@@ -1239,4 +1240,117 @@ scrolledwindow overshoot.right:backdrop {
 .sysi-menu button.font-step:hover,
 .sysi-menu button.font-step:focus {
   background-color: rgba(255, 255, 255, 0.18);
+}
+
+/* GLASS. The shell extension draws liquid glass under every card and Sysi
+   leaves the card clear over it. The glass dims itself behind white ink, so
+   the ink here is fixed. Until the extension says it is drawing (the window
+   carries .glass-live), the card wears a frosted plate of its own instead of
+   being left see-through and unreadable.
+
+   Glass borrows the dark chrome (.mode-dark), whose body ink is dark; these
+   rules come last so the white ink wins. */
+.mode-glass .card,
+.mode-glass.picker-widget {
+  color: #f5f5f7;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+
+.mode-glass .frost-body {
+  background-color: rgba(24, 24, 26, 0.86);
+  color: #f5f5f7;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  border-radius: 0 0 14px 14px;
+}
+
+.mode-glass .note-header,
+.mode-glass .notes-header,
+.mode-glass .history-header {
+  background-color: rgba(24, 24, 26, 0.86);
+  border-radius: 14px 14px 0 0;
+}
+
+/* The header's buttons sat 4px in; a 14px corner starts curving above them
+   and would leave them poking out of the glass. The header is an EventBox,
+   which ignores padding, so its row takes the inset as a margin. */
+.mode-glass .note-header > box {
+  margin-left: 6px;
+  margin-right: 6px;
+}
+
+window:not(.editing) .mode-glass.pinned-note:not(.notes-window) .frost-body {
+  border-radius: 14px;
+}
+
+.mode-glass .note-editor,
+.mode-glass .pinned-editor {
+  padding: 10px;
+}
+
+/* USAGE's rows and footer ran to 4-5px from the edge, over the rim where the
+   glass bends the backdrop. */
+.mode-glass .usage-tabs {
+  margin-left: 6px;
+  margin-right: 6px;
+}
+
+.mode-glass .usage-rows {
+  padding: 2px 10px 1px;
+}
+
+.mode-glass .usage-status {
+  padding: 2px 10px 0;
+}
+
+.mode-glass .usage-updated {
+  padding: 0 10px 6px;
+}
+
+/* Keep the scrollbar out of the rounded bottom corner. */
+.mode-glass.pinned-note scrollbar.vertical {
+  margin-bottom: 10px;
+}
+
+/* SYSTEM and TIMER have no plate of their own; in GLASS the card itself is
+   one. The timer's radius is clamped by GTK into a disc (ring, ticks, arc) or
+   a capsule (digital). */
+.glass-plate.mode-glass .card {
+  background-color: rgba(24, 24, 26, 0.86);
+  border-radius: 14px;
+}
+
+.timer-card.glass-plate.mode-glass .card {
+  border-radius: 9999px;
+}
+
+window.glass-live .mode-glass .frost-body,
+window.glass-live .mode-glass .note-header,
+window.glass-live .mode-glass .notes-header,
+window.glass-live .mode-glass .history-header,
+window.glass-live .glass-plate.mode-glass .card {
+  background-color: transparent;
+}
+
+window.glass-live .mode-glass .note-header,
+window.glass-live .mode-glass .notes-header,
+window.glass-live .mode-glass .history-header {
+  box-shadow: inset 0 -1px rgba(255, 255, 255, 0.10);
+}
+
+.mode-glass .translate-search-input,
+.mode-glass .translate-search-input text,
+.mode-glass .translate-suggestion,
+.mode-glass .translate-suggestion label,
+.mode-glass .translate-recent-toggle {
+  caret-color: #f5f5f7;
+  color: #f5f5f7;
+}
+
+.mode-glass .translate-search-input text selection {
+  background-color: rgba(255, 255, 255, 0.22);
+  color: #f5f5f7;
+}
+
+.mode-glass .usage-progress progress {
+  background-color: rgba(242, 242, 244, 0.55);
 }

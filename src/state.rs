@@ -4,33 +4,31 @@ use std::{collections::HashMap, fs, io, path::PathBuf};
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorMode {
-    #[default]
-    #[serde(alias = "gray")]
-    Auto,
     Light,
     Dark,
-    /// Painted as `Light`, then inverted cell by cell wherever the desktop
-    /// beneath is bright, so one widget can contrast with two backgrounds at
-    /// once.
-    Invert,
+    /// Liquid glass drawn by the GNOME Shell extension under a clear card,
+    /// with white text the glass dims itself to keep legible. The removed
+    /// AUTO and INVERT modes (and GRAY before them) were the see-through ones,
+    /// so they load as this.
+    #[default]
+    #[serde(alias = "auto", alias = "invert", alias = "gray")]
+    Glass,
 }
 
 impl ColorMode {
     pub fn next(self) -> Self {
         match self {
-            Self::Auto => Self::Light,
             Self::Light => Self::Dark,
-            Self::Dark => Self::Invert,
-            Self::Invert => Self::Auto,
+            Self::Dark => Self::Glass,
+            Self::Glass => Self::Light,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "AUTO",
             Self::Light => "LIGHT",
             Self::Dark => "DARK",
-            Self::Invert => "INVERT",
+            Self::Glass => "GLASS",
         }
     }
 
@@ -38,10 +36,9 @@ impl ColorMode {
     /// writes into the shared panel-state file.
     pub fn key(self) -> &'static str {
         match self {
-            Self::Auto => "auto",
             Self::Light => "light",
             Self::Dark => "dark",
-            Self::Invert => "invert",
+            Self::Glass => "glass",
         }
     }
 }
@@ -248,7 +245,7 @@ impl HighlightColor {
     }
 
     /// The wash itself. Translucent on purpose: the note's own background
-    /// shows through, so one set of colours reads on LIGHT, DARK and INVERT
+    /// shows through, so one set of colours reads on LIGHT, DARK and GLASS
     /// alike and nothing has to be repainted when a note changes mode.
     /// Each alpha is as bright as the wash goes while light text on a DARK
     /// plate still keeps 4.5:1 contrast; yellow is the one that runs out first.
@@ -571,30 +568,34 @@ mod tests {
     }
 
     #[test]
-    fn old_settings_default_to_auto_mode() {
+    fn old_settings_default_to_glass_mode() {
         let state: AppState = serde_json::from_str(
             r#"{"settings":{"mascot":true,"system":true,"timer":true,"settings_button":true}}"#,
         )
         .expect("legacy state should remain readable");
-        assert_eq!(state.settings.color_mode, ColorMode::Auto);
+        assert_eq!(state.settings.color_mode, ColorMode::Glass);
     }
 
     #[test]
     fn color_mode_cycles_through_every_mode() {
-        assert_eq!(ColorMode::Auto.next(), ColorMode::Light);
         assert_eq!(ColorMode::Light.next(), ColorMode::Dark);
-        assert_eq!(ColorMode::Dark.next(), ColorMode::Invert);
-        assert_eq!(ColorMode::Invert.next(), ColorMode::Auto);
+        assert_eq!(ColorMode::Dark.next(), ColorMode::Glass);
+        assert_eq!(ColorMode::Glass.next(), ColorMode::Light);
     }
 
     #[test]
-    fn legacy_gray_mode_migrates_to_auto() {
-        let state: AppState = serde_json::from_str(r#"{"settings":{"color_mode":"gray"}}"#)
-            .expect("the removed gray mode should remain readable");
-        assert_eq!(state.settings.color_mode, ColorMode::Auto);
-        assert!(serde_json::to_string(&state)
-            .expect("migrated state should serialize")
-            .contains(r#""color_mode":"auto""#));
+    fn removed_see_through_modes_migrate_to_glass() {
+        for old in ["gray", "auto", "invert"] {
+            let state: AppState = serde_json::from_str(&format!(
+                r#"{{"settings":{{"color_mode":"{old}"}},"widget_color_modes":{{"note:1":"{old}"}}}}"#
+            ))
+            .expect("a removed mode should remain readable");
+            assert_eq!(state.settings.color_mode, ColorMode::Glass);
+            assert_eq!(state.widget_color_modes["note:1"], ColorMode::Glass);
+            assert!(serde_json::to_string(&state)
+                .expect("migrated state should serialize")
+                .contains(r#""color_mode":"glass""#));
+        }
     }
 
     #[test]

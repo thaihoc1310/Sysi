@@ -208,9 +208,7 @@ struct TranslateContext {
     spawn: SpawnSlot,
 }
 
-/// The two foreground palettes that can actually be painted. `ColorMode::Auto`
-/// is a saved preference; it resolves to one of these after the pixels behind a
-/// widget have been sampled.
+/// The two foreground palettes a widget can be painted in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Foreground {
     Light,
@@ -226,237 +224,12 @@ impl Foreground {
     }
 }
 
-/// How many decisions one INVERT map may hold. A normal widget is far below
-/// this and gets one decision per screen pixel, which is what makes the edge
-/// between two windows land exactly where it really is. A widget grown to fill
-/// a monitor samples more coarsely rather than allocating without a bound.
-// ponytail: a flat ceiling. The compositor still photographs the whole widget,
-// so a monitor-sized note in INVERT costs a monitor-sized PNG every sample.
-const INVERT_MAP_BUDGET: i64 = 1 << 20;
-
-/// Which pixels of a widget sit over a background bright enough to want dark
-/// ink. Built from a compositor capture, consumed by `paint_inverted`.
-struct InvertMap {
-    width: i32,
-    height: i32,
-    /// Map pixels per logical pixel. Normally the display's own scale, so one
-    /// map pixel is one screen pixel.
-    scale: f64,
-    /// The widget rectangle this was built for. A widget that has moved since
-    /// is no longer described by it.
-    bounds: ScreenRect,
-    /// When the capture behind it was written, so an unchanged photograph is
-    /// not decoded again on every tick.
-    source: Option<SystemTime>,
-    /// Row-major, `width * height` long. `Foreground::Light` means the desktop
-    /// there is dark, so the light palette already contrasts and that pixel is
-    /// left alone.
-    cells: Vec<Foreground>,
-    /// The same decisions as a mask: opaque where the pixel must be inverted,
-    /// transparent where it must not. A8, since `mask` reads only alpha.
-    surface: cairo::ImageSurface,
-}
-
-impl InvertMap {
-    fn from_cells(
-        width: i32,
-        height: i32,
-        scale: f64,
-        bounds: ScreenRect,
-        cells: Vec<Foreground>,
-    ) -> Option<Self> {
-        if width < 1 || height < 1 || cells.len() != (width as i64 * height as i64) as usize {
-            return None;
-        }
-        let mut surface = cairo::ImageSurface::create(cairo::Format::A8, width, height).ok()?;
-        {
-            let stride = surface.stride() as usize;
-            let mut data = surface.data().ok()?;
-            for row in 0..height as usize {
-                let line = row * width as usize;
-                for column in 0..width as usize {
-                    data[row * stride + column] = match cells[line + column] {
-                        Foreground::Dark => 0xff,
-                        Foreground::Light => 0x00,
-                    };
-                }
-            }
-        }
-        Some(Self {
-            width,
-            height,
-            scale,
-            bounds,
-            source: None,
-            cells,
-            surface,
-        })
-    }
-}
-
-/// `linear()` for all 256 channel values. Deciding a widget pixel by pixel runs
-/// this a hundred thousand times a sample, where the power function it replaces
-/// would cost more than the rest of the pass put together.
-fn channel_linear() -> &'static [f64; 256] {
-    static TABLE: OnceLock<[f64; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = [0.0; 256];
-        for (channel, entry) in table.iter_mut().enumerate() {
-            let value = channel as f64 / 255.0;
-            *entry = if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            };
-        }
-        table
-    })
-}
-
-/// Draw `content`, then hand every pixel the map marks its inverted colours.
-/// The widget is painted with the light palette, so an inverted pixel reads as
-/// the dark palette: 0.97 ink becomes 0.03 and the black text shadow becomes a
-/// white one. Pixels the map leaves alone keep exactly what GTK drew.
-// ponytail: a partly transparent mark inverts towards grey rather than to the
-// exact colour the DARK palette would use, because the group stores colours
-// premultiplied. Opaque ink and the shadow come out right; faint token bars
-// come out weaker. The exact fix is to render the widget twice, once per
-// palette, which GTK cannot do inside a single draw.
-fn paint_inverted(
-    cr: &Context,
-    map: &InvertMap,
-    content: impl FnOnce(&Context),
-) -> Result<(), cairo::Error> {
-    cr.push_group();
-    content(cr);
-    let drawn = cr.pop_group()?;
-
-    cr.push_group();
-    cr.set_source(&drawn)?;
-    cr.paint()?;
-    cr.set_operator(cairo::Operator::Difference);
-    cr.set_source_rgb(1.0, 1.0, 1.0);
-    cr.paint()?;
-    // Difference leaves the whole group opaque, transparent corners included.
-    // DestIn puts the original alpha back over the whole clip.
-    cr.set_operator(cairo::Operator::DestIn);
-    cr.set_source(&drawn)?;
-    cr.paint()?;
-    cr.set_operator(cairo::Operator::Over);
-    let inverted = cr.pop_group()?;
-
-    let cells = cairo::SurfacePattern::create(&map.surface);
-    cells.set_filter(cairo::Filter::Nearest);
-    // Past the last whole map pixel the edge one carries on, so a rounded
-    // widget size still has its final column and row decided.
-    cells.set_extend(cairo::Extend::Pad);
-    // The map is in screen pixels and the context in logical ones, so the
-    // pattern is stretched back by the display scale.
-    let mut matrix = cairo::Matrix::identity();
-    matrix.scale(map.scale, map.scale);
-    cells.set_matrix(matrix);
-
-    cr.set_source(&drawn)?;
-    cr.paint()?;
-    cr.save()?;
-    // Source through a mask is a straight choice between the two versions, so
-    // an unmarked pixel is left byte for byte as it was drawn.
-    cr.set_operator(cairo::Operator::Source);
-    cr.set_source(&inverted)?;
-    cr.mask(&cells)?;
-    cr.restore()
-}
-
-/// Turn a capture of the desktop into a decision per screen pixel for a widget
-/// at `widget` on screen. `captured` says which screen rectangle the pixbuf
-/// holds, which the compositor may have clamped to a monitor. Pixels with
-/// nothing behind them keep whatever `previous` decided.
-fn invert_map(
-    pixbuf: &Pixbuf,
-    captured: ScreenRect,
-    widget: ScreenRect,
-    previous: Option<&InvertMap>,
-) -> Option<InvertMap> {
-    let channels = pixbuf.n_channels() as usize;
-    if channels < 3 || captured.width < 1 || captured.height < 1 {
-        return None;
-    }
-    if widget.width < 1 || widget.height < 1 {
-        return None;
-    }
-    // How many capture pixels the compositor painted per logical pixel. On a
-    // HiDPI display this is the display scale, so the map ends up one entry
-    // per screen pixel.
-    let scale = f64::from(pixbuf.width()) / f64::from(captured.width);
-    if !(scale.is_finite() && scale > 0.0) {
-        return None;
-    }
-    let scale = shrink_to_budget(scale, widget);
-    let width = ((f64::from(widget.width) * scale).round() as i32).max(1);
-    let height = ((f64::from(widget.height) * scale).round() as i32).max(1);
-
-    let carried = previous.filter(|map| map.width == width && map.height == height);
-    let capture_width = pixbuf.width().max(0) as usize;
-    let capture_height = pixbuf.height().max(0) as usize;
-    let rowstride = pixbuf.rowstride().max(0) as usize;
-    let bytes = pixbuf.read_pixel_bytes();
-    let pixels = bytes.as_ref();
-    let linear = channel_linear();
-    // Where this widget's top left sits inside the capture, in map pixels.
-    let offset_x = f64::from(widget.x - captured.x) * scale;
-    let offset_y = f64::from(widget.y - captured.y) * scale;
-    // The capture may be at a finer resolution than the map when the budget
-    // has coarsened it, so step through it rather than assuming one to one.
-    let step = f64::from(pixbuf.width()) / (f64::from(captured.width) * scale);
-
-    let mut cells = Vec::with_capacity((width as i64 * height as i64) as usize);
-    for row in 0..height {
-        let y = (offset_y + f64::from(row)) * step;
-        let y = if y < 0.0 { usize::MAX } else { y as usize };
-        for column in 0..width {
-            let carried_cell = carried.map_or(Foreground::Light, |map| {
-                map.cells[(row * width + column) as usize]
-            });
-            let x = (offset_x + f64::from(column)) * step;
-            let x = if x < 0.0 { usize::MAX } else { x as usize };
-            if x >= capture_width || y >= capture_height {
-                cells.push(carried_cell);
-                continue;
-            }
-            let at = y * rowstride + x * channels;
-            if at + 3 > pixels.len() {
-                cells.push(carried_cell);
-                continue;
-            }
-            let luminance = 0.2126 * linear[pixels[at] as usize]
-                + 0.7152 * linear[pixels[at + 1] as usize]
-                + 0.0722 * linear[pixels[at + 2] as usize];
-            cells.push(foreground_for_luminance(luminance, carried_cell));
-        }
-    }
-    InvertMap::from_cells(width, height, scale, widget, cells)
-}
-
-/// Halve the map resolution until it fits the budget. A widget of any ordinary
-/// size comes back unchanged.
-fn shrink_to_budget(scale: f64, widget: ScreenRect) -> f64 {
-    let mut scale = scale;
-    while (f64::from(widget.width) * scale) as i64 * (f64::from(widget.height) * scale) as i64
-        > INVERT_MAP_BUDGET
-    {
-        scale /= 2.0;
-    }
-    scale
-}
-
 struct DesktopCapture {
     root: gdk::Window,
     /// GTK keeps widget positions in the monitor coordinate space, whose
     /// origin can be negative when a monitor sits left of or above primary.
     /// Root-window readback starts at zero, so subtract this origin first.
     origin: Point,
-    width: i32,
-    height: i32,
 }
 
 struct SystemCard {
@@ -546,12 +319,8 @@ struct RegisteredWidget {
     key: String,
     widget: gtk::EventBox,
     color_mode: Rc<Cell<Foreground>>,
-    /// Set only in `ColorMode::Invert`, and only once the compositor has
-    /// handed back a capture of the desktop beneath this widget.
-    invert: Rc<RefCell<Option<InvertMap>>>,
     /// True from the moment the pointer takes hold of this widget to drag or
-    /// resize it until it lets go. INVERT paints plain light throughout, since
-    /// no photograph taken before the grab describes where it is heading.
+    /// resize it until it lets go. The glass lights up under it meanwhile.
     held: Rc<Cell<bool>>,
     edit_only: Option<gtk::EventBox>,
     editor: Option<gtk::TextView>,
@@ -2491,6 +2260,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     }
     window.present();
     window.move_(0, 0);
+    crate::glass::start(window.upcast_ref(), {
+        let root = root.clone();
+        let registry = registry.clone();
+        move || glass_card_samples(&root, &registry)
+    });
 
     glib::idle_add_local_once({
         let window = window.clone();
@@ -2623,7 +2397,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             window.resize(desktop.width, desktop.height);
             window.move_(0, 0);
             clamp_registered_widgets(&root, &registry, &state);
-            refresh_auto_colors(&registry, &state);
         }
     });
 
@@ -2645,7 +2418,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         .borrow_mut()
         .push(notes.preview_scroller.clone());
     track_widget_hover(registry.clone(), translate_scrollers.clone());
-    start_auto_color_updates(registry.clone(), state.clone());
     start_system_updates(system_card, state.clone());
     start_timer_updates(timer_card, state, window, registry, interactive);
 }
@@ -4397,6 +4169,8 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
 
 fn build_system_card(initial_color_mode: Foreground, initial_details: SystemDetails) -> SystemCard {
     let (card, body, _, color_mode, resize) = card_shell("", "", initial_color_mode);
+    // No plate in LIGHT / DARK; in GLASS the card is one.
+    card.style_context().add_class("glass-plate");
     let values = Rc::new(RefCell::new(SystemSnapshot::default()));
     let details = Rc::new(Cell::new(initial_details));
     let drag = gtk::EventBox::new();
@@ -5265,6 +5039,7 @@ fn build_timer_card(
 ) -> TimerCard {
     let (card, body, drag, color_mode, resize) = card_shell("", "", initial_color_mode);
     card.style_context().add_class("timer-card");
+    card.style_context().add_class("glass-plate");
     let style = Rc::new(Cell::new(state.borrow().timer_style));
     let style_size = Rc::new(Cell::new(style.get().default_size()));
     card.style_context().add_class(style.get().css_class());
@@ -9648,8 +9423,8 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     hint.style_context().add_class("notes-hint");
 
     // One plate under the header, same as a desk note or the dictionary:
-    // AUTO / INVERT stay clear, LIGHT / DARK fill it, and the bottom corners
-    // of the window are the plate's own corners.
+    // GLASS leaves it clear for the shell's glass, LIGHT / DARK fill it, and
+    // the bottom corners of the window are the plate's own corners.
     let plate = frost_plate();
     let inner = gtk::Box::new(gtk::Orientation::Vertical, 1);
     inner.set_hexpand(true);
@@ -11522,34 +11297,16 @@ fn register(
     mode: ColorMode,
 ) {
     apply_widget_palette(widget, &color_mode, palette_for_mode(mode));
-    let invert: Rc<RefCell<Option<InvertMap>>> = Rc::new(RefCell::new(None));
-    // The card's own EventBox is the outermost node, so one group here catches
-    // every child — canvases, labels, editors and their own GdkWindows alike.
-    // With no map the handler steps aside and GTK paints as usual.
-    widget.connect_draw({
-        let invert = invert.clone();
-        move |widget, cr| {
-            let map = invert.borrow();
-            let Some(map) = map.as_ref() else {
-                return glib::Propagation::Proceed;
-            };
-            let drawn = paint_inverted(cr, map, |cr| {
-                if let Some(child) = widget.child() {
-                    widget.propagate_draw(&child, cr);
-                }
-            });
-            if let Err(error) = drawn {
-                eprintln!("Could not invert {}: {error}", widget.widget_name());
-                return glib::Propagation::Proceed;
-            }
-            glib::Propagation::Stop
-        }
+    // The card's own EventBox is the outermost node, so a clip set here holds
+    // for every child: canvases, labels, editors and their own GdkWindows.
+    widget.connect_draw(|widget, cr| {
+        crate::glass::clip_under_glass(widget.upcast_ref(), cr);
+        glib::Propagation::Proceed
     });
     registry.borrow_mut().push(RegisteredWidget {
         key: key.into(),
         widget: widget.clone(),
         color_mode,
-        invert,
         held: Rc::new(Cell::new(false)),
         edit_only: None,
         editor: None,
@@ -11865,7 +11622,8 @@ fn foreground_for_mode(mode: ColorMode) -> Foreground {
 /// How a colour mode is painted: the CSS chrome (header bar, title), the
 /// cairo ink (meters, timers), and whether the card is a filled plate.
 /// LIGHT / DARK sit on a solid card, so the ink is the opposite of the plate.
-/// AUTO / INVERT stay transparent and keep ink and chrome in step.
+/// GLASS is clear over the compositor's glass: a dark bar and white ink, which
+/// the glass dims itself to keep legible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WidgetPalette {
     chrome: Foreground,
@@ -11875,11 +11633,6 @@ struct WidgetPalette {
 
 fn palette_for_mode(mode: ColorMode) -> WidgetPalette {
     match mode {
-        ColorMode::Auto => WidgetPalette {
-            chrome: Foreground::Light,
-            ink: Foreground::Light,
-            solid: false,
-        },
         ColorMode::Light => WidgetPalette {
             chrome: Foreground::Light,
             ink: Foreground::Dark,
@@ -11890,8 +11643,8 @@ fn palette_for_mode(mode: ColorMode) -> WidgetPalette {
             ink: Foreground::Light,
             solid: true,
         },
-        ColorMode::Invert => WidgetPalette {
-            chrome: Foreground::Light,
+        ColorMode::Glass => WidgetPalette {
+            chrome: Foreground::Dark,
             ink: Foreground::Light,
             solid: false,
         },
@@ -13257,11 +13010,9 @@ fn attach_resize(
             handle_hitbox.queue_draw();
             let window = window.clone();
             let registry = registry.clone();
-            let state = state.clone();
             let enabled = interactive.get();
             glib::idle_add_local_once(move || {
                 refresh_input_shape(&window, &registry, enabled);
-                refresh_auto_colors(&registry, &state);
             });
             glib::Propagation::Stop
         }
@@ -13600,11 +13351,9 @@ fn attach_edge_resize(
                 card.queue_resize();
                 let window = window.clone();
                 let registry = registry.clone();
-                let state = state.clone();
                 let enabled = interactive.get();
                 glib::idle_add_local_once(move || {
                     refresh_input_shape(&window, &registry, enabled);
-                    refresh_auto_colors(&registry, &state);
                 });
                 glib::Propagation::Stop
             }
@@ -13865,11 +13614,6 @@ fn attach_drag(
             drop(data);
             restack_overlay_card(&card);
             refresh_input_shape(&window, &registry, interactive.get());
-            glib::idle_add_local_once({
-                let registry = registry.clone();
-                let state = state.clone();
-                move || refresh_auto_colors(&registry, &state)
-            });
         }
     });
 
@@ -15062,109 +14806,7 @@ fn desktop_capture() -> Option<DesktopCapture> {
             x: bounds.x,
             y: bounds.y,
         },
-        width,
-        height,
     })
-}
-
-/// Pick a foreground from the desktop beneath a widget. Three thin horizontal
-/// strips keep the X11 readback small; their median is deliberately insensitive
-/// to the sparse text and rings Sysi itself may contribute to the screenshot.
-fn sample_widget_foreground(
-    widget: &gtk::EventBox,
-    previous: Foreground,
-    capture: &DesktopCapture,
-) -> Option<Foreground> {
-    if !widget.is_visible() || !widget.is_mapped() {
-        return None;
-    }
-    let allocation = widget.allocation();
-    if allocation.width() < 1 || allocation.height() < 1 {
-        return None;
-    }
-    let origin = overlay_origin(widget);
-    let capture_x = (allocation.x() + origin.x).saturating_sub(capture.origin.x);
-    let capture_y = (allocation.y() + origin.y).saturating_sub(capture.origin.y);
-    let left = capture_x.max(0);
-    let right = allocation
-        .width()
-        .saturating_add(capture_x)
-        .min(capture.width);
-    let top = capture_y.max(0);
-    let bottom = allocation
-        .height()
-        .saturating_add(capture_y)
-        .min(capture.height);
-    let width = right - left;
-    let height = bottom - top;
-    if width < 1 || height < 1 {
-        return None;
-    }
-
-    let mut luminances = Vec::new();
-    let strip_height = 2.min(height);
-    for numerator in [1, 2, 3] {
-        let y = (top + height * numerator / 4).min(bottom - strip_height);
-        if let Some(pixbuf) = capture.root.pixbuf(left, y, width, strip_height) {
-            append_pixbuf_luminances(&pixbuf, &mut luminances);
-        }
-    }
-    if luminances.is_empty() {
-        return None;
-    }
-    luminances.sort_by(f64::total_cmp);
-    let median = luminances[luminances.len() / 2];
-    Some(foreground_for_luminance(median, previous))
-}
-
-fn append_pixbuf_luminances(pixbuf: &Pixbuf, output: &mut Vec<f64>) {
-    let channels = pixbuf.n_channels() as usize;
-    if channels < 3 {
-        return;
-    }
-    let width = pixbuf.width().max(0) as usize;
-    let height = pixbuf.height().max(0) as usize;
-    let rowstride = pixbuf.rowstride().max(0) as usize;
-    let bytes = pixbuf.read_pixel_bytes();
-    let pixels = bytes.as_ref();
-    // At most a few hundred samples per strip. The server readback has already
-    // happened; this only avoids sorting thousands of effectively identical
-    // neighbouring wallpaper pixels.
-    let step = (width / 192).max(1);
-    for y in 0..height {
-        for x in (0..width).step_by(step) {
-            let offset = y
-                .saturating_mul(rowstride)
-                .saturating_add(x.saturating_mul(channels));
-            if offset + channels > pixels.len() {
-                continue;
-            }
-            if channels >= 4 && pixels[offset + 3] < 224 {
-                continue;
-            }
-            output.push(relative_luminance(
-                pixels[offset],
-                pixels[offset + 1],
-                pixels[offset + 2],
-            ));
-        }
-    }
-}
-
-fn relative_luminance(red: u8, green: u8, blue: u8) -> f64 {
-    let linear = channel_linear();
-    0.2126 * linear[red as usize] + 0.7152 * linear[green as usize] + 0.0722 * linear[blue as usize]
-}
-
-fn foreground_for_luminance(luminance: f64, previous: Foreground) -> Foreground {
-    // White and near-black have equal WCAG contrast at roughly 0.18 relative
-    // luminance. A margin either side stops patterned backgrounds from making
-    // AUTO flip every time it is sampled.
-    match previous {
-        Foreground::Light if luminance > 0.22 => Foreground::Dark,
-        Foreground::Dark if luminance < 0.14 => Foreground::Light,
-        _ => previous,
-    }
 }
 
 /// Read a file the shell extension writes, but only while it is recent enough
@@ -15182,218 +14824,6 @@ fn fresh_cache_file(name: &str) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Where the compositor put its capture of the desktop under each INVERT
-/// widget, and which screen rectangle that image actually covers.
-fn compositor_invert_captures() -> HashMap<String, (ScreenRect, std::path::PathBuf)> {
-    // The captures live on the session's tmpfs when there is one, so a widget
-    // left in INVERT all day writes nothing to the disk.
-    let mut roots = vec![crate::state::cache_dir()];
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        roots.push(std::path::PathBuf::from(runtime).join("sysi"));
-    }
-    fresh_cache_file("invert-result")
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split('\t');
-            let key = fields.next()?;
-            let geometry: Vec<i32> = fields
-                .next()?
-                .split(',')
-                .map(|value| value.trim().parse::<i32>())
-                .collect::<Result<_, _>>()
-                .ok()?;
-            let [x, y, width, height] = geometry[..] else {
-                return None;
-            };
-            let path = std::path::PathBuf::from(fields.next()?);
-            // Only ever open a file the extension put in one of our own
-            // directories. `starts_with` compares whole components and does
-            // not resolve `..`, so the path has to be free of parent hops
-            // before its prefix means anything.
-            let inside = !path
-                .components()
-                .any(|part| part == std::path::Component::ParentDir)
-                && roots.iter().any(|root| path.starts_with(root));
-            if !inside || width < 1 || height < 1 {
-                return None;
-            }
-            Some((
-                key.to_owned(),
-                (
-                    ScreenRect {
-                        x,
-                        y,
-                        width,
-                        height,
-                    },
-                    path,
-                ),
-            ))
-        })
-        .collect()
-}
-
-fn compositor_auto_luminances() -> HashMap<String, f64> {
-    fresh_cache_file("auto-color-result")
-        .lines()
-        .filter_map(|line| {
-            let (key, raw) = line.split_once('\t')?;
-            let luminance = raw.trim().parse::<f64>().ok()?;
-            luminance
-                .is_finite()
-                .then_some((key.to_owned(), luminance.clamp(0.0, 1.0)))
-        })
-        .collect()
-}
-
-thread_local! {
-    /// The request last handed to the shell; an empty request is only
-    /// written once so an idle desktop with no AUTO widget stays idle.
-    static LAST_AUTO_COLOR_REQUEST: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-fn publish_auto_color_request(request: &str) {
-    let unchanged = LAST_AUTO_COLOR_REQUEST.with(|last| last.borrow().as_deref() == Some(request));
-    if unchanged && request.is_empty() {
-        return;
-    }
-    LAST_AUTO_COLOR_REQUEST.with(|last| *last.borrow_mut() = Some(request.to_owned()));
-    let dir = crate::state::cache_dir();
-    if let Err(error) =
-        fs::create_dir_all(&dir).and_then(|_| fs::write(dir.join("auto-color-request"), request))
-    {
-        eprintln!("Could not request Sysi auto colours: {error}");
-    }
-}
-
-fn refresh_auto_colors(
-    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
-    state: &Rc<RefCell<AppState>>,
-) {
-    // A widget under the pointer paints plain light until it is dropped, and
-    // the desktop behind it is moving; recolouring now only stutters the drag.
-    if any_gesture_held(registry) {
-        return;
-    }
-    let items = registry.borrow().clone();
-    let (global, overrides) = {
-        let data = state.borrow();
-        (data.settings.color_mode, data.widget_color_modes.clone())
-    };
-    let compositor = compositor_auto_luminances();
-    let capture = desktop_capture();
-    let mut invert_captures = None;
-    let mut request = String::new();
-    for item in &items {
-        let mode = overrides.get(&item.key).copied().unwrap_or(global);
-        if !matches!(mode, ColorMode::Auto | ColorMode::Invert) {
-            continue;
-        }
-        let bounds = (item.widget.is_visible() && item.widget.is_mapped())
-            .then(|| item.widget.allocation())
-            .filter(|allocation| allocation.width() > 0 && allocation.height() > 0)
-            .map(|allocation| {
-                let origin = overlay_origin(&item.widget);
-                ScreenRect {
-                    x: allocation.x() + origin.x,
-                    y: allocation.y() + origin.y,
-                    width: allocation.width(),
-                    height: allocation.height(),
-                }
-            });
-        match mode {
-            ColorMode::Auto => {
-                if let Some(luminance) = compositor.get(&item.key) {
-                    let foreground = foreground_for_luminance(*luminance, item.color_mode.get());
-                    set_registered_foreground(item, foreground);
-                } else {
-                    apply_registered_color_mode(item, mode, capture.as_ref());
-                }
-            }
-            _ => {
-                set_registered_foreground(item, Foreground::Light);
-                // Still ask for a capture of where it is being dragged to, so
-                // the two tones can come back the moment it is dropped.
-                if !item.held.get() {
-                    let captures = invert_captures.get_or_insert_with(compositor_invert_captures);
-                    if let (Some(bounds), Some((captured, path))) =
-                        (bounds, captures.get(&item.key))
-                    {
-                        update_invert_map(item, *captured, bounds, path);
-                    }
-                }
-            }
-        }
-        if let Some(bounds) = bounds {
-            request.push_str(&format!(
-                "{}\t{},{},{},{}\t{}\n",
-                item.key,
-                bounds.x,
-                bounds.y,
-                bounds.width,
-                bounds.height,
-                if mode == ColorMode::Auto {
-                    "auto"
-                } else {
-                    "invert"
-                }
-            ));
-        }
-    }
-    publish_auto_color_request(&request);
-}
-
-/// Rebuild a widget's INVERT map from the compositor's latest capture, and
-/// repaint only when a cell actually changed side.
-fn update_invert_map(
-    item: &RegisteredWidget,
-    captured: ScreenRect,
-    bounds: ScreenRect,
-    path: &std::path::Path,
-) {
-    // A photograph only describes the widget while it is still where it was
-    // taken. A widget part way through a drag paints plain light rather than
-    // carrying the pattern of the place it came from.
-    if !covers(captured, bounds) {
-        let dropped = item.invert.borrow_mut().take().is_some();
-        if dropped {
-            item.widget.queue_draw();
-        }
-        return;
-    }
-    let source = fs::metadata(path).and_then(|data| data.modified()).ok();
-    let settled = {
-        let current = item.invert.borrow();
-        current
-            .as_ref()
-            .is_some_and(|map| map.bounds == bounds && source.is_some() && map.source == source)
-    };
-    // Nothing has moved and the compositor has not sent a new photograph, so
-    // decoding it again would rebuild exactly the map already in hand.
-    if settled {
-        return;
-    }
-    let Ok(pixbuf) = Pixbuf::from_file(path) else {
-        return;
-    };
-    let mut current = item.invert.borrow_mut();
-    let Some(mut next) = invert_map(&pixbuf, captured, bounds, current.as_ref()) else {
-        return;
-    };
-    next.source = source;
-    let unchanged = current
-        .as_ref()
-        .is_some_and(|previous| previous.cells == next.cells);
-    *current = Some(next);
-    drop(current);
-    if !unchanged {
-        item.widget.queue_draw();
-    }
-}
-
-/// Take or release the pointer's hold on a widget. Taking hold drops the
-/// INVERT map straight away, so the two tones go the instant the button goes
-/// down rather than once the widget has moved far enough to notice.
 /// True while the pointer has hold of a widget to drag or resize it.
 ///
 /// Everything a gesture repeats per frame is worth skipping for its duration:
@@ -15401,6 +14831,41 @@ fn update_invert_map(
 /// once instead of sixty times a second.
 fn any_gesture_held(registry: &Rc<RefCell<Vec<RegisteredWidget>>>) -> bool {
     registry.borrow().iter().any(|item| item.held.get())
+}
+
+/// Every visible GLASS card, bottom to top. The Fixed paints its children in
+/// order, so that is the order the glass has to stack in too.
+fn glass_card_samples(
+    root: &gtk::Fixed,
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+) -> Vec<crate::glass::CardSample> {
+    let Ok(items) = registry.try_borrow() else {
+        return Vec::new();
+    };
+    root.children()
+        .iter()
+        .filter(|child| {
+            child.is_visible()
+                && child.is_mapped()
+                && child.widget_name() != "dictate"
+                && child.style_context().has_class("mode-glass")
+        })
+        .filter_map(|child| {
+            let item = items
+                .iter()
+                .find(|item| item.widget.upcast_ref::<gtk::Widget>() == child)?;
+            let allocation = child.allocation();
+            Some(crate::glass::CardSample {
+                key: item.key.clone(),
+                x: allocation.x(),
+                y: allocation.y(),
+                width: allocation.width(),
+                height: allocation.height(),
+                shape: crate::glass::Shape::of(child),
+                pressed: item.held.get(),
+            })
+        })
+        .collect()
 }
 
 fn hold_widget(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, key: &str, held: bool) {
@@ -15412,45 +14877,16 @@ fn hold_widget(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, key: &str, held: b
     else {
         return;
     };
-    if !hold_clears_map(item.held.replace(held), held) {
-        return;
-    }
-    let dropped = item.invert.borrow_mut().take().is_some();
-    if dropped {
+    // A press that has not moved yet paints no frame of its own, and the glass
+    // only learns that the card is held when one is painted.
+    if item.held.replace(held) != held {
         item.widget.queue_draw();
     }
 }
 
-/// The map is thrown away the moment the pointer takes hold, and not again for
-/// as long as that hold lasts. Letting go throws nothing away: the next sample
-/// decides, once there is a photograph of where the widget actually landed.
-fn hold_clears_map(was_held: bool, now_held: bool) -> bool {
-    now_held && !was_held
-}
-
-/// Whether the capture holds every pixel of the widget.
-fn covers(captured: ScreenRect, widget: ScreenRect) -> bool {
-    captured.x <= widget.x
-        && captured.y <= widget.y
-        && captured.x + captured.width >= widget.x + widget.width
-        && captured.y + captured.height >= widget.y + widget.height
-}
-
-fn start_auto_color_updates(
-    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
-    state: Rc<RefCell<AppState>>,
-) {
-    refresh_auto_colors(&registry, &state);
-    glib::timeout_add_local(Duration::from_millis(1200), move || {
-        refresh_auto_colors(&registry, &state);
-        glib::ControlFlow::Continue
-    });
-}
-
 fn apply_color_mode(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, mode: ColorMode) {
-    let capture = (mode == ColorMode::Auto).then(desktop_capture).flatten();
     for item in registry.borrow().iter() {
-        apply_registered_color_mode(item, mode, capture.as_ref());
+        apply_widget_palette(&item.widget, &item.color_mode, palette_for_mode(mode));
     }
 }
 
@@ -15460,52 +14896,8 @@ fn apply_widget_color_mode(
     mode: ColorMode,
 ) {
     if let Some(item) = registry.borrow().iter().find(|item| item.key == key) {
-        let capture = (mode == ColorMode::Auto).then(desktop_capture).flatten();
-        apply_registered_color_mode(item, mode, capture.as_ref());
+        apply_widget_palette(&item.widget, &item.color_mode, palette_for_mode(mode));
     }
-}
-
-fn apply_registered_color_mode(
-    item: &RegisteredWidget,
-    mode: ColorMode,
-    capture: Option<&DesktopCapture>,
-) {
-    // Leaving INVERT has to drop the map straight away, or the widget keeps
-    // painting two-tone until the next tick.
-    if mode != ColorMode::Invert {
-        let dropped = item.invert.borrow_mut().take().is_some();
-        if dropped {
-            item.widget.queue_draw();
-        }
-    }
-    let palette = match mode {
-        ColorMode::Auto => {
-            let foreground = capture
-                .and_then(|capture| {
-                    sample_widget_foreground(&item.widget, item.color_mode.get(), capture)
-                })
-                .unwrap_or_else(|| item.color_mode.get());
-            WidgetPalette {
-                chrome: foreground,
-                ink: foreground,
-                solid: false,
-            }
-        }
-        ColorMode::Light | ColorMode::Dark | ColorMode::Invert => palette_for_mode(mode),
-    };
-    apply_widget_palette(&item.widget, &item.color_mode, palette);
-}
-
-fn set_registered_foreground(item: &RegisteredWidget, foreground: Foreground) {
-    apply_widget_palette(
-        &item.widget,
-        &item.color_mode,
-        WidgetPalette {
-            chrome: foreground,
-            ink: foreground,
-            solid: false,
-        },
-    );
 }
 
 fn apply_widget_palette(
@@ -15518,6 +14910,7 @@ fn apply_widget_palette(
     if color_mode.get() == palette.ink
         && context.has_class(chrome)
         && context.has_class("mode-solid") == palette.solid
+        && context.has_class("mode-glass") != palette.solid
     {
         return;
     }
@@ -15525,10 +14918,13 @@ fn apply_widget_palette(
     context.remove_class("mode-light");
     context.remove_class("mode-dark");
     context.add_class(chrome);
+    // Every card that is not a solid plate is glass.
     if palette.solid {
         context.add_class("mode-solid");
+        context.remove_class("mode-glass");
     } else {
         context.remove_class("mode-solid");
+        context.add_class("mode-glass");
     }
     widget.queue_draw();
 }
@@ -15885,25 +15281,25 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod timer_input_tests {
     use super::{
-        clamp_to_screens, clip_screen_to_overlay, covers, dictate_capture_answer,
+        clamp_to_screens, clip_screen_to_overlay, dictate_capture_answer,
         click_became_drag, dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area,
         fit_within_bounds, held_slide_point, top_child_at, top_raised_child_at,
-        foreground_for_luminance, foreground_for_mode, format_rate, highlight_at, hold_clears_map,
-        image_room, image_room_after_y, invert_map, monitor_coordinate_divisor,
+        foreground_for_mode, format_rate, highlight_at,
+        image_room, image_room_after_y, monitor_coordinate_divisor,
         monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
-        note_search_matches, note_size_for_image, padded_visual_rect, paint_inverted,
+        note_search_matches, note_size_for_image, padded_visual_rect,
         age_label, centre_on_screen, clamp_scroll_value, note_snippets, note_sort_key, notes_delete_eats_key,
         notes_pointer_global, notes_pointer_live, notes_place_point, palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
         fit_point_to_screens, read_compositor_pointer, NOTES_POINTER, PANEL_ANCHOR,
         parse_timer_input, pinned_note_sync, push_recent_search,
-        receives_input_when_locked, record_note_undo, relative_luminance, reopen_point,
+        receives_input_when_locked, record_note_undo, reopen_point,
         rescaled_from, resize_ceiling, resize_rect, resize_width_limit, ResizeBounds, ResizeEdges, resized_image_size, room_on_screen,
-        round_pixbuf_corners, sanitize_highlights, screen_in_overlay, shrink_to_budget,
+        round_pixbuf_corners, sanitize_highlights, screen_in_overlay,
         system_content_size, system_meter_columns, system_meter_gap, system_meter_ink_width,
         system_meter_row_width, system_meter_rows, system_meters, system_usage_rows,
-        temperature_meter, timer_style_size, Foreground, InvertMap, NoteSearchMatch,
+        temperature_meter, timer_style_size, Foreground, NoteSearchMatch,
         NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, WidgetPalette,
-        DRAG_REDRAW_INTERVAL, INVERT_MAP_BUDGET, NOTE_HEIGHT,
+        DRAG_REDRAW_INTERVAL, NOTE_HEIGHT,
         NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
         NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
         SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
@@ -16053,226 +15449,15 @@ mod timer_input_tests {
     }
 
     #[test]
-    fn an_invert_map_follows_the_edge_between_a_dark_and_a_bright_window() {
-        // A HiDPI capture: the compositor paints two pixels per logical one,
-        // left half black and right half white, under a 64x16 widget.
-        let capture = Pixbuf::new(Colorspace::Rgb, false, 8, 128, 32).expect("capture allocates");
-        capture.fill(0x0000_00ff);
-        capture.new_subpixbuf(64, 0, 64, 32).fill(0xffff_ffff);
-        let rect = ScreenRect {
-            x: 0,
-            y: 0,
-            width: 64,
-            height: 16,
-        };
-        let map = invert_map(&capture, rect, rect, None).expect("the map builds");
-        // One decision per screen pixel, not per logical pixel.
-        assert_eq!((map.width, map.height), (128, 32));
-        assert_eq!(map.scale, 2.0);
-        let at = |x: usize, y: usize| map.cells[y * map.width as usize + x];
-        // Left of the edge the desktop is dark, so the light palette stays.
-        assert_eq!(at(63, 0), Foreground::Light);
-        // One screen pixel further on it is bright and must be inverted.
-        assert_eq!(at(64, 0), Foreground::Dark);
-        assert_eq!(at(127, 31), Foreground::Dark);
-
-        // The hysteresis band is per pixel: a mid-grey capture keeps whatever
-        // the previous map decided rather than flickering.
-        let grey = Pixbuf::new(Colorspace::Rgb, false, 8, 128, 32).expect("grey allocates");
-        grey.fill(0x8080_80ff);
-        let held = invert_map(&grey, rect, rect, Some(&map)).expect("the second map builds");
-        assert_eq!(held.cells, map.cells);
-    }
-
-    #[test]
-    fn a_widget_too_big_to_map_pixel_by_pixel_is_sampled_more_coarsely() {
-        // A note grown to a 4K monitor would want 33 million decisions.
-        let huge = ScreenRect {
-            x: 0,
-            y: 0,
-            width: 3840,
-            height: 2160,
-        };
-        let scale = shrink_to_budget(2.0, huge);
-        assert!(scale < 2.0, "the map has to be coarsened to fit the budget");
-        let cells =
-            (f64::from(huge.width) * scale) as i64 * (f64::from(huge.height) * scale) as i64;
-        assert!(cells <= INVERT_MAP_BUDGET);
-        // An ordinary card is left at one decision per screen pixel.
-        let card = ScreenRect {
-            x: 0,
-            y: 0,
-            width: 318,
-            height: 106,
-        };
-        assert_eq!(shrink_to_budget(2.0, card), 2.0);
-    }
-
-    #[test]
-    fn only_taking_hold_throws_the_invert_map_away() {
-        assert!(
-            hold_clears_map(false, true),
-            "the pattern of the old place goes as the drag starts"
-        );
-        assert!(
-            !hold_clears_map(true, true),
-            "a hold already taken has nothing left to throw away"
-        );
-        assert!(
-            !hold_clears_map(true, false),
-            "letting go waits for the next photograph rather than clearing again"
-        );
-        assert!(!hold_clears_map(false, false));
-    }
-
-    #[test]
-    fn a_capture_is_only_trusted_while_the_widget_is_still_inside_it() {
-        let captured = ScreenRect {
-            x: 100,
-            y: 100,
-            width: 200,
-            height: 100,
-        };
-        assert!(covers(captured, captured), "a still widget is described");
-        assert!(covers(
-            captured,
-            ScreenRect {
-                x: 150,
-                y: 120,
-                width: 20,
-                height: 20,
-            }
-        ));
-        // Dragged a little to the right: its right edge was never photographed.
-        assert!(!covers(
-            captured,
-            ScreenRect {
-                x: 110,
-                y: 100,
-                width: 200,
-                height: 100,
-            }
-        ));
-        // Dragged up out of the frame.
-        assert!(!covers(
-            captured,
-            ScreenRect {
-                x: 100,
-                y: 90,
-                width: 200,
-                height: 100,
-            }
-        ));
-    }
-
-    #[test]
-    fn a_coarsened_map_still_reads_the_part_of_the_capture_it_covers() {
-        // A widget so wide that the budget halves the map resolution, with a
-        // capture covering only its top left corner because the compositor
-        // clamped the grab to the monitor.
-        let capture = Pixbuf::new(Colorspace::Rgb, false, 8, 200, 200).expect("capture allocates");
-        capture.fill(0xffff_ffff);
-        let widget = ScreenRect {
-            x: 0,
-            y: 0,
-            width: 1024,
-            height: 512,
-        };
-        let captured = ScreenRect {
-            x: 0,
-            y: 0,
-            width: 100,
-            height: 100,
-        };
-        let map = invert_map(&capture, captured, widget, None).expect("the map builds");
-        // Scale 2 would need two million entries, so it drops to one.
-        assert_eq!(map.scale, 1.0);
-        assert_eq!((map.width, map.height), (1024, 512));
-        let at = |x: usize, y: usize| map.cells[y * map.width as usize + x];
-        // Inside the captured corner the bright desktop is seen.
-        assert_eq!(at(0, 0), Foreground::Dark);
-        assert_eq!(at(99, 99), Foreground::Dark);
-        // Beyond it nothing was photographed, so the light palette stands.
-        assert_eq!(at(1023, 511), Foreground::Light);
-    }
-
-    #[test]
-    fn inverting_flips_only_the_marked_pixels_and_leaves_the_rest_untouched() {
-        // Two pixels side by side: leave the first, invert the second.
-        let pair = ScreenRect {
-            x: 0,
-            y: 0,
-            width: 2,
-            height: 1,
-        };
-        let map = InvertMap::from_cells(2, 1, 1.0, pair, vec![Foreground::Light, Foreground::Dark])
-            .expect("the map builds");
-        let render = |paint: &dyn Fn(&cairo::Context)| {
-            let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 2, 1)
-                .expect("the surface allocates");
-            {
-                let cr = cairo::Context::new(&surface).expect("the context builds");
-                paint_inverted(&cr, &map, |cr| paint(cr)).expect("inverting succeeds");
-            }
-            let data = surface.data().expect("the pixels are readable");
-            let read = |x: usize| {
-                let offset = x * 4;
-                (
-                    data[offset + 3],
-                    data[offset + 2],
-                    data[offset + 1],
-                    data[offset],
-                )
-            };
-            (read(0), read(1))
-        };
-
-        // Opaque white across both: the marked pixel comes out black.
-        let (kept, flipped) = render(&|cr: &cairo::Context| {
-            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-            cr.paint().expect("the paint succeeds");
-        });
-        assert_eq!(kept, (255, 255, 255, 255));
-        assert_eq!(flipped, (255, 0, 0, 0));
-
-        // Where nothing was drawn the widget stays transparent, rather than
-        // the inversion filling the corner in.
-        let (kept, flipped) = render(&|cr: &cairo::Context| {
-            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-            cr.rectangle(0.0, 0.0, 1.0, 1.0);
-            cr.fill().expect("the fill succeeds");
-        });
-        assert_eq!(kept, (255, 255, 255, 255));
-        assert_eq!(flipped.0, 0);
-
-        // A half-transparent mark in an untouched pixel keeps its own alpha:
-        // masking the light half twice would fade every anti-aliased edge.
-        let (kept, _) = render(&|cr: &cairo::Context| {
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.5);
-            cr.paint().expect("the paint succeeds");
-        });
-        assert_eq!(kept.0, 128);
-        assert_eq!(kept.1, 128);
-    }
-
-    #[test]
-    fn light_and_dark_modes_fill_the_card_and_auto_stays_clear() {
-        let auto = palette_for_mode(ColorMode::Auto);
+    fn light_and_dark_modes_fill_the_card_and_glass_stays_clear() {
         let light = palette_for_mode(ColorMode::Light);
         let dark = palette_for_mode(ColorMode::Dark);
-        let invert = palette_for_mode(ColorMode::Invert);
+        // Glass is clear, with the dark bar and white ink the glass dims
+        // itself to keep legible.
         assert_eq!(
-            auto,
+            palette_for_mode(ColorMode::Glass),
             WidgetPalette {
-                chrome: Foreground::Light,
-                ink: Foreground::Light,
-                solid: false,
-            }
-        );
-        assert_eq!(
-            invert,
-            WidgetPalette {
-                chrome: Foreground::Light,
+                chrome: Foreground::Dark,
                 ink: Foreground::Light,
                 solid: false,
             }
@@ -16297,28 +15482,6 @@ mod timer_input_tests {
         );
         assert_eq!(foreground_for_mode(ColorMode::Light), Foreground::Dark);
         assert_eq!(foreground_for_mode(ColorMode::Dark), Foreground::Light);
-    }
-
-    #[test]
-    fn auto_color_uses_relative_luminance_with_a_stable_middle_band() {
-        assert!((relative_luminance(255, 255, 255) - 1.0).abs() < 0.000_001);
-        assert_eq!(relative_luminance(0, 0, 0), 0.0);
-        assert_eq!(
-            foreground_for_luminance(1.0, Foreground::Light),
-            Foreground::Dark
-        );
-        assert_eq!(
-            foreground_for_luminance(0.0, Foreground::Dark),
-            Foreground::Light
-        );
-        assert_eq!(
-            foreground_for_luminance(0.18, Foreground::Light),
-            Foreground::Light
-        );
-        assert_eq!(
-            foreground_for_luminance(0.18, Foreground::Dark),
-            Foreground::Dark
-        );
     }
 
     #[test]
