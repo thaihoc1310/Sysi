@@ -8,8 +8,10 @@ package_root="$(mktemp -d)"
 trap 'rm -rf "$package_root"' EXIT
 
 if command -v node >/dev/null; then
-  node --check --input-type=module \
-    <"$project_dir/packaging/gnome-shell-extension/extension.js"
+  for script in extension.js glass.js; do
+    node --check --input-type=module \
+      <"$project_dir/packaging/gnome-shell-extension/$script"
+  done
 fi
 
 cargo build --manifest-path "$project_dir/Cargo.toml" --release --locked
@@ -25,6 +27,8 @@ install -Dm644 "$project_dir/packaging/gnome-shell-extension/metadata.json" \
   "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/metadata.json"
 install -Dm644 "$project_dir/packaging/gnome-shell-extension/extension.js" \
   "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/extension.js"
+install -Dm644 "$project_dir/packaging/gnome-shell-extension/glass.js" \
+  "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/glass.js"
 install -Dm644 "$project_dir/packaging/gnome-shell-extension/stylesheet.css" \
   "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/stylesheet.css"
 install -Dm644 "$project_dir/README.md" \

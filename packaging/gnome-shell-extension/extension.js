@@ -10,9 +10,10 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
+import {GlassManager} from './glass.js';
+
 const UUID = 'sysi-panel@thaihoc';
 
-Gio._promisify(Shell.Screenshot.prototype, 'pick_color');
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
 
 export default class SysiPanelExtension extends Extension {
@@ -109,36 +110,7 @@ export default class SysiPanelExtension extends Extension {
         }
         const cacheDir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi']);
         GLib.mkdir_with_parents(cacheDir, 0o700);
-        // One PNG per INVERT widget, rewritten every sample. The runtime dir
-        // is a tmpfs, so a mode left on all day never touches the disk, and
-        // the pictures go away with the session. GLib falls back to the cache
-        // directory when there is no runtime one.
-        this._invertDir = GLib.build_filenamev([
-            GLib.get_user_runtime_dir(), 'sysi', 'invert',
-        ]);
-        GLib.mkdir_with_parents(this._invertDir, 0o700);
-        this._autoColorRequestFile = Gio.File.new_for_path(
-            GLib.build_filenamev([cacheDir, 'auto-color-request']),
-        );
-        if (!this._autoColorRequestFile.query_exists(null))
-            GLib.file_set_contents(this._autoColorRequestFile.get_path(), '');
-        this._autoColorGeneration = (this._autoColorGeneration ?? 0) + 1;
-        this._autoColorSampling = false;
-        this._autoColorPending = false;
-        try {
-            this._autoColorRequestMonitor = this._autoColorRequestFile.monitor_file(
-                Gio.FileMonitorFlags.NONE,
-                null,
-            );
-            this._autoColorRequestMonitor.connect('changed', () => {
-                this._queueAutoColorSampling();
-            });
-        } catch (error) {
-            logError(error, 'Sysi could not watch auto-colour requests');
-        }
-        // DICTATE asks for one rectangle at a time, on its own file rather than
-        // on the auto-colour one: that request is rewritten on every sampling
-        // pass and would scrub a pending region away before it was grabbed.
+        // DICTATE asks for one rectangle at a time, on its own file.
         this._dictateRequestFile = Gio.File.new_for_path(
             GLib.build_filenamev([cacheDir, 'dictate-request']),
         );
@@ -196,32 +168,17 @@ export default class SysiPanelExtension extends Extension {
         this._syncOcrEscape();
         this._syncPanelState();
         this._syncVisibility();
-        // Sampling before the shell has laid out its monitors makes
-        // Shell.Screenshot paint a 0x0 buffer, and pick_color_finish then
-        // dereferences the missing image and takes the whole shell down.
-        if (Main.layoutManager._startingUp) {
-            this._startupCompleteId = Main.layoutManager.connect('startup-complete', () => {
-                Main.layoutManager.disconnect(this._startupCompleteId);
-                this._startupCompleteId = 0;
-                this._queueAutoColorSampling();
-            });
-        } else {
-            this._queueAutoColorSampling();
-        }
+        this._glass = new GlassManager();
+        this._glass.enable();
     }
 
     disable() {
+        this._glass?.destroy();
+        this._glass = null;
         this._pidMonitor?.cancel();
         this._pidMonitor = null;
         this._panelStateMonitor?.cancel();
         this._panelStateMonitor = null;
-        if (this._startupCompleteId) {
-            Main.layoutManager.disconnect(this._startupCompleteId);
-            this._startupCompleteId = 0;
-        }
-        this._autoColorRequestMonitor?.cancel();
-        this._autoColorRequestMonitor = null;
-        this._autoColorRequestFile = null;
         this._unbindNotesHotkey();
         this._unbindOcrHotkey();
         for (const grab of this._plainGrabs ?? [])
@@ -239,9 +196,6 @@ export default class SysiPanelExtension extends Extension {
         this._dictateRequestFile = null;
         this._dictateCapturing = false;
         this._dictateNonce = null;
-        this._autoColorGeneration++;
-        this._autoColorSampling = false;
-        this._autoColorPending = false;
         this._settingsMenu?.destroy();
         this._settingsMenu = null;
         this._fontLabel = null;
@@ -257,7 +211,6 @@ export default class SysiPanelExtension extends Extension {
         this._hideLabel = null;
         this._pidFile = null;
         this._panelStateFile = null;
-        this._invertDir = null;
     }
 
     _buildSettings() {
@@ -349,9 +302,9 @@ export default class SysiPanelExtension extends Extension {
             const mode = ok
                 ? JSON.parse(new TextDecoder().decode(contents))?.settings?.color_mode
                 : null;
-            return ['auto', 'light', 'dark', 'invert'].includes(mode) ? mode : 'auto';
+            return ['light', 'dark', 'glass'].includes(mode) ? mode : 'glass';
         } catch (_) {
-            return 'auto';
+            return 'glass';
         }
     }
 
@@ -794,7 +747,7 @@ export default class SysiPanelExtension extends Extension {
         }
     }
 
-    // `<editing|locked> <auto|light|dark|invert> <font-size>`, written by Sysi whenever
+    // `<editing|locked> <light|dark|glass> <font-size>`, written by Sysi whenever
     // one changes and removed when it exits. With no file to read — Sysi is not
     // running — labels fall back to saved settings or defaults.
     _readPanelState() {
@@ -806,7 +759,7 @@ export default class SysiPanelExtension extends Extension {
                 new TextDecoder().decode(contents).trim().split(/\s+/);
             return [
                 interaction === 'locked' || interaction === 'editing' ? interaction : null,
-                ['auto', 'light', 'dark', 'invert'].includes(mode) ? mode : null,
+                ['light', 'dark', 'glass'].includes(mode) ? mode : null,
                 Math.min(26, Math.max(8, Number(fontSize) || 13)),
             ];
         } catch (_) {
@@ -829,150 +782,11 @@ export default class SysiPanelExtension extends Extension {
             this._modeLabel.text = mode ?? this._readColorMode();
     }
 
-    _queueAutoColorSampling() {
-        if (!this._autoColorRequestFile || Main.layoutManager._startingUp)
-            return;
-        if (this._autoColorSampling) {
-            this._autoColorPending = true;
-            return;
-        }
-        this._autoColorSampling = true;
-        const generation = this._autoColorGeneration;
-        this._sampleAutoColors(generation)
-            .catch(error => logError(error, 'Sysi auto-colour sampling failed'))
-            .finally(() => {
-                if (generation !== this._autoColorGeneration)
-                    return;
-                this._autoColorSampling = false;
-                if (this._autoColorPending) {
-                    this._autoColorPending = false;
-                    this._queueAutoColorSampling();
-                }
-            });
-    }
-
-    async _sampleAutoColors(generation) {
-        let raw;
-        try {
-            const [ok, contents] = GLib.file_get_contents(
-                this._autoColorRequestFile.get_path(),
-            );
-            if (!ok)
-                return;
-            raw = new TextDecoder().decode(contents);
-        } catch (_) {
-            return;
-        }
-
-        const requests = raw.split('\n').flatMap(line => {
-            const [key, geometry, kind] = line.trim().split('\t');
-            const values = geometry?.split(',').map(Number) ?? [];
-            if (!key || values.length !== 4 || !values.every(Number.isFinite))
-                return [];
-            const [x, y, width, height] = values;
-            return width > 0 && height > 0
-                ? [{key, x, y, width, height, kind: kind === 'invert' ? 'invert' : 'auto'}]
-                : [];
-        });
-        if (requests.length === 0)
-            return;
-
-        // The INVERT captures all start inside one hidden window, so do them
-        // before the AUTO picks rather than interleaving the two.
-        await this._captureInvertRects(
-            requests.filter(request => request.kind === 'invert'),
-            generation,
-        );
-
-        const results = [];
-        for (const request of requests.filter(request => request.kind === 'auto')) {
-            const luminance = await this._sampleRectLuminance(request);
-            if (Number.isFinite(luminance))
-                results.push(`${request.key}\t${luminance.toFixed(6)}`);
-        }
-        if (generation !== this._autoColorGeneration)
-            return;
-        if (results.length === 0)
-            return;
-        this._writeCacheFile('auto-color-result', `${results.join('\n')}\n`);
-    }
-
     _writeCacheFile(name, contents) {
         GLib.file_set_contents(
             GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi', name]),
             contents,
         );
-    }
-
-    // Hand Sysi a picture of the desktop under each of its INVERT widgets, so
-    // it can contrast with two different windows at once instead of picking one
-    // foreground for the whole card.
-    async _captureInvertRects(requests, generation) {
-        if (requests.length === 0 || !this._invertDir)
-            return;
-        // Every grab is started with Sysi's own window invisible, so the
-        // picture holds the desktop and not Sysi's own glyphs — sampling those
-        // would feed the widget's colours straight back into the decision.
-        const captures = this._withSysiHidden(() => requests.flatMap(request => {
-            const rect = this._clampToMonitor(request);
-            if (!rect)
-                return [];
-            const file = Gio.File.new_for_path(GLib.build_filenamev([
-                this._invertDir,
-                this._invertFileName(request.key),
-            ]));
-            let stream = null;
-            try {
-                // REPLACE_DESTINATION writes a temporary and renames on close,
-                // so Sysi never opens a half-written picture.
-                stream = file.replace(
-                    null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
-                // One Shell.Screenshot per grab: each owns the single image
-                // buffer its own capture painted into.
-                const done = new Shell.Screenshot().screenshot_area(
-                    rect.x, rect.y, rect.width, rect.height, stream);
-                return [{request, file, stream, done}];
-            } catch (error) {
-                // The grab never started, so nothing downstream will ever
-                // close the stream that was opened for it.
-                this._closeQuietly(stream);
-                logError(error, 'Sysi could not start an invert capture');
-                return [];
-            }
-        }));
-
-        const index = [];
-        for (const capture of captures) {
-            try {
-                // Only the PNG encoding is still outstanding here; the pixels
-                // were painted synchronously while the window was hidden.
-                const [area] = await capture.done;
-                index.push([
-                    capture.request.key,
-                    `${area.x},${area.y},${area.width},${area.height}`,
-                    capture.file.get_path(),
-                ].join('\t'));
-            } catch (error) {
-                logError(error, 'Sysi could not finish an invert capture');
-            } finally {
-                // The rename onto the real name only happens on close, and an
-                // unclosed stream holds a descriptor inside the compositor for
-                // as long as it lives.
-                this._closeQuietly(capture.stream);
-            }
-        }
-        // Every grab has finished, so anything else in there belongs to a
-        // widget that has left INVERT or stopped existing. The pictures sit on
-        // a tmpfs, which is memory.
-        this._pruneInvertCaptures(new Set(
-            requests.map(request => this._invertFileName(request.key))));
-        if (generation !== this._autoColorGeneration || index.length === 0)
-            return;
-        this._writeCacheFile('invert-result', `${index.join('\n')}\n`);
-    }
-
-    _invertFileName(key) {
-        return `${key.replace(/[^\w-]/g, '_')}.png`;
     }
 
     // Photograph the rectangle Sysi has just been dragged out over, so its
@@ -1066,32 +880,6 @@ export default class SysiPanelExtension extends Extension {
         }
     }
 
-    _pruneInvertCaptures(keep) {
-        const directory = Gio.File.new_for_path(this._invertDir);
-        let children;
-        try {
-            children = directory.enumerate_children(
-                'standard::name', Gio.FileQueryInfoFlags.NONE, null);
-        } catch (_) {
-            return;
-        }
-        try {
-            let info;
-            while ((info = children.next_file(null)) !== null) {
-                const name = info.get_name();
-                if (keep.has(name))
-                    continue;
-                try {
-                    directory.get_child(name).delete(null);
-                } catch (_) {
-                    // Something else removed it first.
-                }
-            }
-        } finally {
-            this._closeQuietly(children);
-        }
-    }
-
     // Run `fn` with every Sysi window painted at zero opacity. Clutter skips a
     // fully transparent actor, and Shell.Screenshot paints the stage inside the
     // call rather than on a later frame, so a grab started here sees the
@@ -1134,50 +922,5 @@ export default class SysiPanelExtension extends Extension {
         return right > left && bottom > top
             ? {x: left, y: top, width: right - left, height: bottom - top}
             : null;
-    }
-
-    async _sampleRectLuminance({x, y, width, height}) {
-        // Only pixels that a monitor really shows can be painted to a buffer;
-        // a point in the gap between monitors would fail the grab and crash
-        // the shell inside pick_color_finish.
-        const monitors = Main.layoutManager.monitors;
-        const shown = ([px, py]) => monitors.some(monitor =>
-            px >= monitor.x && py >= monitor.y &&
-            px < monitor.x + monitor.width && py < monitor.y + monitor.height);
-        // Read just outside the transparent widget. That sees the same nearby
-        // browser/wallpaper without accidentally sampling Sysi's own glyphs.
-        const xs = [0.2, 0.5, 0.8].map(fraction => Math.round(x + width * fraction));
-        const above = Math.round(y - 3);
-        const below = Math.round(y + height + 3);
-        const points = [
-            ...xs.map(px => [px, above]),
-            ...xs.map(px => [px, below]),
-        ].filter(shown);
-        if (points.length === 0)
-            return null;
-        // One Shell.Screenshot, one pick at a time: each pick overwrites the
-        // object's single image buffer, so they must not overlap.
-        const screenshot = new Shell.Screenshot();
-        const samples = [];
-        for (const [px, py] of points) {
-            try {
-                const [color] = await screenshot.pick_color(px, py);
-                samples.push(this._relativeLuminance(color.red, color.green, color.blue));
-            } catch (_) {
-                // A failed pick leaves this point out of the median.
-            }
-        }
-        samples.sort((a, b) => a - b);
-        return samples.length > 0 ? samples[Math.floor(samples.length / 2)] : null;
-    }
-
-    _relativeLuminance(red, green, blue) {
-        const linear = channel => {
-            const value = channel / 255;
-            return value <= 0.04045
-                ? value / 12.92
-                : ((value + 0.055) / 1.055) ** 2.4;
-        };
-        return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
     }
 }

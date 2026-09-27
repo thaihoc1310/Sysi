@@ -23,6 +23,7 @@ const PANEL_EXTENSION_UUID: &str = "sysi-panel@thaihoc";
 const PANEL_EXTENSION_METADATA: &str =
     include_str!("../packaging/gnome-shell-extension/metadata.json");
 const PANEL_EXTENSION_JS: &str = include_str!("../packaging/gnome-shell-extension/extension.js");
+const PANEL_EXTENSION_GLASS_JS: &str = include_str!("../packaging/gnome-shell-extension/glass.js");
 const PANEL_EXTENSION_CSS: &str = include_str!("../packaging/gnome-shell-extension/stylesheet.css");
 
 fn main() {
@@ -165,6 +166,7 @@ fn install_panel_extension() -> io::Result<()> {
         PANEL_EXTENSION_METADATA,
     )?;
     write_if_changed(&extension_dir.join("extension.js"), PANEL_EXTENSION_JS)?;
+    write_if_changed(&extension_dir.join("glass.js"), PANEL_EXTENSION_GLASS_JS)?;
     // GNOME loads stylesheet.css from the extension directory on its own; the
     // strip's whole look lives there rather than in inline styles.
     write_if_changed(&extension_dir.join("stylesheet.css"), PANEL_EXTENSION_CSS)
