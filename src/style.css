@@ -766,8 +766,14 @@ scrolledwindow overshoot.right:backdrop {
 }
 
 .notes-paned separator {
-  background-color: alpha(currentColor, 0.18);
-  min-width: 4px;
+  /* Yaru draws a wide handle as a pair of dark rules; this is one faint line,
+     kept clear of the header and the bottom corner. */
+  background-color: alpha(currentColor, 0.14);
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  margin: 8px 3px 14px;
+  min-width: 1px;
 }
 
 /* The translate window shares the history chrome (.history-header, the search
@@ -1270,12 +1276,19 @@ scrolledwindow overshoot.right:backdrop {
   border-radius: 14px 14px 0 0;
 }
 
-/* The header's buttons sat 4px in; a 14px corner starts curving above them
-   and would leave them poking out of the glass. The header is an EventBox,
+/* A little air above every title bar's buttons. The header is an EventBox,
    which ignores padding, so its row takes the inset as a margin. */
+.note-header > box {
+  margin-top: 3px;
+  margin-bottom: 1px;
+}
+
+/* In GLASS the buttons also move in from the sides: a 14px corner starts
+   curving above them and would leave them poking out of the glass. */
 .mode-glass .note-header > box {
   margin-left: 6px;
   margin-right: 6px;
+  margin-top: 4px;
 }
 
 window:not(.editing) .mode-glass.pinned-note:not(.notes-window) .frost-body {
