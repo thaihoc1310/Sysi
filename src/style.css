@@ -1324,23 +1324,17 @@ window:not(.editing) .mode-glass.pinned-note:not(.notes-window) .frost-body {
   margin-bottom: 10px;
 }
 
-/* SYSTEM and TIMER have no plate of their own; in GLASS the card itself is
-   one. The timer's radius is clamped by GTK into a disc (ring, ticks, arc) or
-   a capsule (digital). */
-.glass-plate.mode-glass .card {
-  background-color: rgba(24, 24, 26, 0.86);
-  border-radius: 14px;
-}
-
-.timer-card.glass-plate.mode-glass .card {
-  border-radius: 9999px;
+/* SYSTEM and the timer are widgets on the desk, not windows, and get no
+   glass: they stay clear, with the heavier halo that keeps white ink readable
+   over whatever lies behind. */
+.no-glass.mode-glass .card {
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.86);
 }
 
 window.glass-live .mode-glass .frost-body,
 window.glass-live .mode-glass .note-header,
 window.glass-live .mode-glass .notes-header,
-window.glass-live .mode-glass .history-header,
-window.glass-live .glass-plate.mode-glass .card {
+window.glass-live .mode-glass .history-header {
   background-color: transparent;
 }
 

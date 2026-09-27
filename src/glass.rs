@@ -21,28 +21,12 @@ const OBJECT_PATH: &str = "/io/sysi/Glass";
 const INTERFACE: &str = "io.sysi.Glass1";
 const LIVE_CLASS: &str = "glass-live";
 
-/// How a card's glass is cut.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Shape {
-    /// A rounded plate: notes, usage, dictionaries, the system card.
-    Plate,
-    /// The disc behind the ring, ticks and arc timers.
-    Round,
-    /// The capsule behind the digital timer.
-    Pill,
-}
-
-impl Shape {
-    pub fn of(widget: &impl IsA<gtk::Widget>) -> Self {
-        let context = widget.style_context();
-        if !context.has_class("timer-card") {
-            Self::Plate
-        } else if context.has_class("timer-style-digital") {
-            Self::Pill
-        } else {
-            Self::Round
-        }
-    }
+/// Whether a card sits on glass. SYSTEM and the timer carry `no-glass`: they
+/// are widgets on the desk rather than windows, and a plate did not suit
+/// them, so in GLASS they stay clear the way they always were.
+pub fn has_glass(widget: &impl IsA<gtk::Widget>) -> bool {
+    let context = widget.style_context();
+    context.has_class("mode-glass") && !context.has_class("no-glass")
 }
 
 /// The rounded rectangle one card's glass occupies, in the card's own
@@ -57,34 +41,13 @@ pub struct Outline {
 }
 
 impl Outline {
-    pub fn new(shape: Shape, x: f64, y: f64, width: f64, height: f64) -> Self {
-        match shape {
-            Shape::Plate => Self {
-                x,
-                y,
-                width,
-                height,
-                radius: RADIUS.min(width / 2.0).min(height / 2.0),
-            },
-            // The disc inscribed in the card: a timer is square, but a card
-            // mid-resize need not be.
-            Shape::Round => {
-                let side = width.min(height);
-                Self {
-                    x: x + (width - side) / 2.0,
-                    y: y + (height - side) / 2.0,
-                    width: side,
-                    height: side,
-                    radius: side / 2.0,
-                }
-            }
-            Shape::Pill => Self {
-                x,
-                y,
-                width,
-                height,
-                radius: width.min(height) / 2.0,
-            },
+    pub fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            radius: RADIUS.min(width / 2.0).min(height / 2.0),
         }
     }
 
@@ -127,7 +90,6 @@ pub struct CardSample {
     pub y: i32,
     pub width: i32,
     pub height: i32,
-    pub shape: Shape,
     pub pressed: bool,
 }
 
@@ -142,7 +104,6 @@ pub fn wire_cards(samples: &[CardSample], scale: f64) -> Vec<WireCard> {
         .filter(|card| card.width > 1 && card.height > 1)
         .map(|card| {
             let outline = Outline::new(
-                card.shape,
                 f64::from(card.x),
                 f64::from(card.y),
                 f64::from(card.width),
@@ -366,19 +327,12 @@ fn own_windows(widget: &gtk::Widget, out: &mut Vec<gdk::Window>) {
 /// instead cannot work: GTK paints their child windows with a clip of their
 /// own, and skips the draw signal of widgets nothing listens to.
 pub fn clear_below(card: &gtk::Widget, cr: &Context) {
-    if !card.style_context().has_class("mode-glass") {
+    if !has_glass(card) {
         return;
     }
     let rect = card.allocation();
     cr.new_path();
-    Outline::new(
-        Shape::of(card),
-        0.0,
-        0.0,
-        f64::from(rect.width()),
-        f64::from(rect.height()),
-    )
-    .trace(cr);
+    Outline::new(0.0, 0.0, f64::from(rect.width()), f64::from(rect.height())).trace(cr);
     cr.save().ok();
     cr.set_operator(gtk::cairo::Operator::Clear);
     let _ = cr.fill();
@@ -389,14 +343,13 @@ pub fn clear_below(card: &gtk::Widget, cr: &Context) {
 mod tests {
     use super::*;
 
-    fn card(key: &str, x: i32, y: i32, width: i32, height: i32, shape: Shape) -> CardSample {
+    fn card(key: &str, x: i32, y: i32, width: i32, height: i32) -> CardSample {
         CardSample {
             key: key.into(),
             x,
             y,
             width,
             height,
-            shape,
             pressed: false,
         }
     }
@@ -405,8 +358,8 @@ mod tests {
     fn cards_go_out_in_paint_order_in_x11_pixels() {
         let cards = wire_cards(
             &[
-                card("note:1", 10, 20, 218, 124, Shape::Plate),
-                card("system", 0, 0, 196, 76, Shape::Plate),
+                card("note:1", 10, 20, 218, 124),
+                card("usage", 0, 0, 196, 76),
             ],
             2.0,
         );
@@ -414,31 +367,20 @@ mod tests {
             cards,
             vec![
                 ("note:1".into(), 20.0, 40.0, 436.0, 248.0, 28.0, false),
-                ("system".into(), 0.0, 0.0, 392.0, 152.0, 28.0, false),
+                ("usage".into(), 0.0, 0.0, 392.0, 152.0, 28.0, false),
             ]
         );
     }
 
     #[test]
     fn hidden_cards_are_left_out() {
-        let cards = wire_cards(&[card("usage", 5, 5, 1, 1, Shape::Plate)], 1.0);
+        let cards = wire_cards(&[card("usage", 5, 5, 1, 1)], 1.0);
         assert!(cards.is_empty());
     }
 
     #[test]
-    fn timers_get_a_disc_or_a_capsule() {
-        let disc = Outline::new(Shape::Round, 0.0, 0.0, 120.0, 116.0);
-        assert_eq!(
-            (disc.x, disc.y, disc.width, disc.radius),
-            (2.0, 0.0, 116.0, 58.0)
-        );
-        let pill = Outline::new(Shape::Pill, 0.0, 0.0, 84.0, 36.0);
-        assert_eq!((pill.width, pill.height, pill.radius), (84.0, 36.0, 18.0));
-    }
-
-    #[test]
     fn a_small_plate_never_rounds_past_its_own_middle() {
-        let plate = Outline::new(Shape::Plate, 0.0, 0.0, 40.0, 20.0);
+        let plate = Outline::new(0.0, 0.0, 40.0, 20.0);
         assert_eq!(plate.radius, 10.0);
     }
 
@@ -448,7 +390,7 @@ mod tests {
             7,
             1280.0,
             768.0,
-            wire_cards(&[card("a", 1, 2, 30, 40, Shape::Plate)], 1.0),
+            wire_cards(&[card("a", 1, 2, 30, 40)], 1.0),
         );
         assert_eq!(message.to_variant().type_().as_str(), "(tdda(sdddddb))");
     }

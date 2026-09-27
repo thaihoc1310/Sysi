@@ -207,8 +207,8 @@ if (cover > 0.0) {
 
     // Pressing lights the glass from within, spreading from the pointer.
     vec2 m = px - uPressAt;
-    float spot = 0.35 * min_dim;
-    colour += uPress * 0.15 * exp(-dot(m, m) / (2.0 * spot * spot));
+    float spot = min(0.18 * min_dim, 40.0);
+    colour += uPress * 0.12 * exp(-dot(m, m) / (2.0 * spot * spot));
 
     colour += (glass_hash(px * uScale) - 0.5) / 255.0;
     colour = clamp(colour, 0.0, 1.0);
@@ -328,8 +328,7 @@ class SysiGlassEffect extends Clutter.Effect {
     _init(card) {
         super._init();
         this._card = card;
-        // One backdrop per framebuffer drawn into: each monitor, plus
-        // whatever transient buffer a screenshot paints the stage to.
+        // One backdrop per monitor framebuffer drawn into.
         this._backdrops = new Map();
     }
 
@@ -369,15 +368,17 @@ class SysiGlassEffect extends Clutter.Effect {
 
         const context = framebuffer.get_context();
         const levels = blurLevels(width, height, scale);
+        // A monitor's framebuffer is painted every frame, so its copies are
+        // kept. A screenshot's is painted once: its copies (tens of MB of
+        // video memory for a large card) are dropped as soon as it is done.
+        const onMonitor = global.stage.peek_stage_views()
+            .some(view => view.get_framebuffer() === framebuffer);
         let backdrop = this._backdrops.get(framebuffer);
         if (!backdrop || backdrop.width !== width || backdrop.height !== height ||
             backdrop.down.length !== levels) {
             backdrop = new Backdrop(context, width, height, levels);
-            this._backdrops.set(framebuffer, backdrop);
-            // A screenshot buffer is thrown away after one paint; do not let
-            // them pile up.
-            while (this._backdrops.size > 4)
-                this._backdrops.delete(this._backdrops.keys().next().value);
+            if (onMonitor)
+                this._backdrops.set(framebuffer, backdrop);
         }
 
         // Only the damaged part of this frame has been repainted underneath;
@@ -422,9 +423,16 @@ class SysiGlassEffect extends Clutter.Effect {
         const bottom = Math.min(framebuffer.get_height(), top + backdrop.height);
         if (right <= sourceLeft || bottom <= sourceTop)
             return;
-        framebuffer.blit(backdrop.sharp.framebuffer,
-            sourceLeft, sourceTop, sourceLeft - left, sourceTop - top,
-            right - sourceLeft, bottom - sourceTop);
+        try {
+            framebuffer.blit(backdrop.sharp.framebuffer,
+                sourceLeft, sourceTop, sourceLeft - left, sourceTop - top,
+                right - sourceLeft, bottom - sourceTop);
+        } catch (_) {
+            // A framebuffer whose pixels cannot be copied into ours (a
+            // floating-point HDR screenshot, say) just keeps the last copy;
+            // it is no reason to give up the glass everywhere else.
+            return;
+        }
 
         // One pipeline per pass: a pass still queued must not see the next
         // one's texture or uniforms.

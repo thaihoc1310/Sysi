@@ -320,8 +320,11 @@ struct RegisteredWidget {
     widget: gtk::EventBox,
     color_mode: Rc<Cell<Foreground>>,
     /// True from the moment the pointer takes hold of this widget to drag or
-    /// resize it until it lets go. The glass lights up under it meanwhile.
+    /// resize it until it lets go.
     held: Rc<Cell<bool>>,
+    /// True while a mouse button is down anywhere on the card, body included.
+    /// The glass lights up under it meanwhile.
+    pressed: Rc<Cell<bool>>,
     edit_only: Option<gtk::EventBox>,
     editor: Option<gtk::TextView>,
     note_search: Option<NoteSearchControls>,
@@ -627,6 +630,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         move |gesture, _, x, y| {
             if let Some(card) = overlay_card_at(&root, x, y) {
+                press_card(&registry, &card);
                 raise_card_windows(&card);
                 glib::idle_add_local_once({
                     let card = card.clone();
@@ -4169,8 +4173,7 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
 
 fn build_system_card(initial_color_mode: Foreground, initial_details: SystemDetails) -> SystemCard {
     let (card, body, _, color_mode, resize) = card_shell("", "", initial_color_mode);
-    // No plate in LIGHT / DARK; in GLASS the card is one.
-    card.style_context().add_class("glass-plate");
+    card.style_context().add_class("no-glass");
     let values = Rc::new(RefCell::new(SystemSnapshot::default()));
     let details = Rc::new(Cell::new(initial_details));
     let drag = gtk::EventBox::new();
@@ -5039,7 +5042,7 @@ fn build_timer_card(
 ) -> TimerCard {
     let (card, body, drag, color_mode, resize) = card_shell("", "", initial_color_mode);
     card.style_context().add_class("timer-card");
-    card.style_context().add_class("glass-plate");
+    card.style_context().add_class("no-glass");
     let style = Rc::new(Cell::new(state.borrow().timer_style));
     let style_size = Rc::new(Cell::new(style.get().default_size()));
     card.style_context().add_class(style.get().css_class());
@@ -11306,6 +11309,7 @@ fn register(
         widget: widget.clone(),
         color_mode,
         held: Rc::new(Cell::new(false)),
+        pressed: Rc::new(Cell::new(false)),
         edit_only: None,
         editor: None,
         note_search: None,
@@ -14860,7 +14864,7 @@ fn glass_card_samples(
             child.is_visible()
                 && child.is_mapped()
                 && child.widget_name() != "dictate"
-                && child.style_context().has_class("mode-glass")
+                && crate::glass::has_glass(*child)
         })
         .filter_map(|child| {
             let item = items
@@ -14873,11 +14877,54 @@ fn glass_card_samples(
                 y: allocation.y(),
                 width: allocation.width(),
                 height: allocation.height(),
-                shape: crate::glass::Shape::of(child),
-                pressed: item.held.get(),
+                pressed: item.held.get() || item.pressed.get(),
             })
         })
         .collect()
+}
+
+/// Light the card's glass for as long as the button that went down on it
+/// stays down. The press may land in an editor or a list that keeps the
+/// release to itself, so the release is read off the pointer instead.
+fn press_card(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, card: &gtk::EventBox) {
+    let Some(item) = registry
+        .borrow()
+        .iter()
+        .find(|item| item.widget == *card)
+        .cloned()
+    else {
+        return;
+    };
+    if item.pressed.replace(true) {
+        return;
+    }
+    item.widget.queue_draw();
+    glib::timeout_add_local(Duration::from_millis(40), move || {
+        if any_button_down() {
+            return glib::ControlFlow::Continue;
+        }
+        item.pressed.set(false);
+        item.widget.queue_draw();
+        glib::ControlFlow::Break
+    });
+}
+
+fn any_button_down() -> bool {
+    let Some(display) = gdk::Display::default() else {
+        return false;
+    };
+    let Some(pointer) = display.default_seat().and_then(|seat| seat.pointer()) else {
+        return false;
+    };
+    let Some(root) = display.default_screen().root_window() else {
+        return false;
+    };
+    let (_, _, _, mask) = root.device_position_double(&pointer);
+    mask.intersects(
+        gdk::ModifierType::BUTTON1_MASK
+            | gdk::ModifierType::BUTTON2_MASK
+            | gdk::ModifierType::BUTTON3_MASK,
+    )
 }
 
 fn hold_widget(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, key: &str, held: bool) {
