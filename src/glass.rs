@@ -126,6 +126,8 @@ type Message = (u64, f64, f64, Vec<WireCard>);
 
 struct Link {
     window: gtk::Window,
+    /// The container the cards sit in.
+    root: gtk::Container,
     connection: RefCell<Option<gio::DBusConnection>>,
     last: RefCell<Option<Message>>,
     /// Bumped on every send; only the newest reply may change `glass-live`.
@@ -148,10 +150,15 @@ fn with_link(action: impl FnOnce(&Rc<Link>)) {
 }
 
 /// Start watching for the extension. `collect` is asked for the glass cards
-/// after every painted frame.
-pub fn start(window: &gtk::Window, collect: impl Fn() -> Vec<CardSample> + 'static) {
+/// on `root` after every painted frame.
+pub fn start(
+    window: &gtk::Window,
+    root: &gtk::Container,
+    collect: impl Fn() -> Vec<CardSample> + 'static,
+) {
     let link = Rc::new(Link {
         window: window.clone(),
+        root: root.clone(),
         connection: RefCell::new(None),
         last: RefCell::new(None),
         serial: Cell::new(0),
@@ -197,7 +204,7 @@ pub fn start(window: &gtk::Window, collect: impl Fn() -> Vec<CardSample> + 'stat
             xid,
             f64::from(link.window.allocated_width()) * scale,
             f64::from(link.window.allocated_height()) * scale,
-            wire_cards(&collect(), scale),
+            wire_cards(&[collect(), popover_samples(&link.root)].concat(), scale),
         );
         if link.last.borrow().as_ref() == Some(&message) {
             return;
@@ -273,6 +280,243 @@ fn set_live(window: &gtk::Window, live: bool) {
     window.queue_draw();
 }
 
+/// Popups (a card's context menu, its search options) take on the glass of
+/// the card they belong to.
+const GLASS_POPUP: &str = "glass-popup";
+/// The inset a popover's glass keeps around its content.
+const POPOVER_PAD: i32 = 6;
+/// Matches `.sysi-menu`'s corner radius.
+const MENU_RADIUS: f64 = 8.0;
+
+thread_local! {
+    static POPOVERS: RefCell<Vec<(String, glib::WeakRef<gtk::Popover>)>> =
+        const { RefCell::new(Vec::new()) };
+    static NEXT_POPOVER: Cell<u64> = const { Cell::new(0) };
+}
+
+fn glass_is_live() -> bool {
+    LINK.with(|link| {
+        link.borrow()
+            .as_ref()
+            .is_some_and(|link| link.window.style_context().has_class(LIVE_CLASS))
+    })
+}
+
+fn root() -> Option<gtk::Container> {
+    LINK.with(|link| link.borrow().as_ref().map(|link| link.root.clone()))
+}
+
+/// The card `widget` sits in: its ancestor placed straight on the root.
+fn card_of(widget: &gtk::Widget, root: &gtk::Container) -> Option<gtk::Widget> {
+    let root: &gtk::Widget = root.upcast_ref();
+    let mut card = widget.clone();
+    loop {
+        let parent = card.parent()?;
+        if &parent == root {
+            return Some(card);
+        }
+        card = parent;
+    }
+}
+
+fn set_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool) {
+    let context = widget.style_context();
+    if on {
+        context.add_class(class);
+    } else {
+        context.remove_class(class);
+    }
+}
+
+/// Give a popover glass of its own while the card it belongs to is glass.
+/// A popover lives inside the overlay window, so its glass travels with the
+/// cards' as one more card, painted last.
+pub fn glass_popover(popover: &gtk::Popover) {
+    POPOVERS.with(|list| {
+        let mut list = list.borrow_mut();
+        let serial = NEXT_POPOVER.with(|next| next.replace(next.get() + 1));
+        list.push((format!("popover:{serial}"), popover.downgrade()));
+    });
+    popover.connect_map(|popover| {
+        let glass = glass_is_live()
+            && root()
+                .zip(popover.relative_to())
+                .and_then(|(root, anchor)| card_of(&anchor, &root))
+                .is_some_and(|card| has_glass(&card));
+        set_class(popover, GLASS_POPUP, glass);
+    });
+    popover.connect_draw(|popover, cr| {
+        if let Some(outline) = popover_outline(popover) {
+            clear(cr, &outline);
+        }
+        glib::Propagation::Proceed
+    });
+}
+
+/// The rounded rectangle a glass popover's glass fills, in its own
+/// coordinates: its content plus a margin, not the room left for the arrow.
+fn popover_outline(popover: &gtk::Popover) -> Option<Outline> {
+    if !popover.style_context().has_class(GLASS_POPUP) {
+        return None;
+    }
+    let content = popover.child()?.allocation();
+    Some(Outline::new(
+        f64::from(content.x() - POPOVER_PAD),
+        f64::from(content.y() - POPOVER_PAD),
+        f64::from(content.width() + 2 * POPOVER_PAD),
+        f64::from(content.height() + 2 * POPOVER_PAD),
+    ))
+}
+
+fn popover_samples(root: &gtk::Container) -> Vec<CardSample> {
+    POPOVERS.with(|list| {
+        let mut list = list.borrow_mut();
+        list.retain(|(_, popover)| popover.upgrade().is_some());
+        list.iter()
+            .filter_map(|(key, popover)| {
+                let popover = popover.upgrade()?;
+                if !popover.is_visible() || !popover.is_mapped() {
+                    return None;
+                }
+                let outline = popover_outline(&popover)?;
+                let (x, y) = popover.translate_coordinates(root, 0, 0)?;
+                Some(CardSample {
+                    key: key.clone(),
+                    x: x + outline.x as i32,
+                    y: y + outline.y as i32,
+                    width: outline.width as i32,
+                    height: outline.height as i32,
+                    pressed: false,
+                })
+            })
+            .collect()
+    })
+}
+
+/// Give a context menu glass while it was opened on a glass card; a
+/// submenu follows the menu it hangs off. A menu is a window of its own, so
+/// its glass goes to the extension under the menu's own X window.
+pub fn glass_menu(menu: &gtk::Menu) {
+    menu.connect_map(|menu| {
+        let glass = glass_is_live() && menu_opened_on_glass(menu);
+        set_class(menu, GLASS_POPUP, glass);
+        if glass {
+            let menu = menu.clone();
+            glib::idle_add_local_once(move || send_menu(&menu, 6));
+        }
+    });
+}
+
+fn menu_opened_on_glass(menu: &gtk::Menu) -> bool {
+    if let Some(parent) = menu
+        .attach_widget()
+        .and_then(|item| item.parent())
+        .and_then(|parent| parent.downcast::<gtk::Menu>().ok())
+    {
+        return parent.style_context().has_class(GLASS_POPUP);
+    }
+    let Some(root) = root() else {
+        return false;
+    };
+    // Menus open under the pointer, on the card it is over.
+    let Some(surface) = root.window() else {
+        return false;
+    };
+    let Some(pointer) = root
+        .display()
+        .default_seat()
+        .and_then(|seat| seat.pointer())
+    else {
+        return false;
+    };
+    let (_, x, y, _) = surface.device_position(&pointer);
+    paint_order(&root)
+        .into_iter()
+        .rev()
+        .find(|card| {
+            let rect = card.allocation();
+            card.is_mapped()
+                && x >= rect.x()
+                && y >= rect.y()
+                && x < rect.x() + rect.width()
+                && y < rect.y() + rect.height()
+        })
+        .is_some_and(|card| has_glass(&card))
+}
+
+/// Ask for glass under a menu's window. The extension only finds the window
+/// once the compositor has mapped it, a moment after GTK has, so a miss is
+/// asked again a few times before the menu falls back to its own plate.
+fn send_menu(menu: &gtk::Menu, tries: u32) {
+    let Some(connection) = LINK.with(|link| {
+        link.borrow()
+            .as_ref()
+            .and_then(|link| link.connection.borrow().clone())
+    }) else {
+        set_class(menu, GLASS_POPUP, false);
+        return;
+    };
+    let Some(top) = menu.toplevel().filter(|top| top.is_mapped()) else {
+        return;
+    };
+    let Some(xid) = top
+        .window()
+        .and_then(|window| window.downcast::<gdkx11::X11Window>().ok())
+        .map(|window| window.xid())
+    else {
+        return;
+    };
+    let scale = f64::from(top.scale_factor().max(1));
+    // The popup window leaves the theme room for a shadow around the menu;
+    // the glass goes under the menu itself.
+    let Some((x, y)) = menu.translate_coordinates(&top, 0, 0) else {
+        return;
+    };
+    let body = menu.allocation();
+    let message: Message = (
+        xid,
+        f64::from(top.allocated_width()) * scale,
+        f64::from(top.allocated_height()) * scale,
+        vec![(
+            "menu".into(),
+            f64::from(x) * scale,
+            f64::from(y) * scale,
+            f64::from(body.width()) * scale,
+            f64::from(body.height()) * scale,
+            MENU_RADIUS * scale,
+            false,
+        )],
+    );
+    let menu = menu.clone();
+    connection.call(
+        Some(BUS_NAME),
+        OBJECT_PATH,
+        INTERFACE,
+        "SetCards",
+        Some(&message.to_variant()),
+        Some(glib::VariantTy::new("(b)").expect("valid reply type")),
+        gio::DBusCallFlags::NONE,
+        1000,
+        None::<&gio::Cancellable>,
+        move |reply| {
+            let attached = reply
+                .ok()
+                .and_then(|reply| reply.get::<(bool,)>())
+                .is_some_and(|(attached,)| attached);
+            if attached || !menu.is_mapped() {
+                return;
+            }
+            if tries == 0 {
+                set_class(&menu, GLASS_POPUP, false);
+                return;
+            }
+            glib::timeout_add_local_once(Duration::from_millis(30), move || {
+                send_menu(&menu, tries - 1)
+            });
+        },
+    );
+}
+
 /// The children of the overlay in the order GTK really paints them. A card
 /// with GdkWindows of its own (a note, or the canvas inside SYSTEM) is painted
 /// with those windows, in their stacking order, after everything drawn
@@ -331,8 +575,15 @@ pub fn clear_below(card: &gtk::Widget, cr: &Context) {
         return;
     }
     let rect = card.allocation();
+    clear(
+        cr,
+        &Outline::new(0.0, 0.0, f64::from(rect.width()), f64::from(rect.height())),
+    );
+}
+
+fn clear(cr: &Context, outline: &Outline) {
     cr.new_path();
-    Outline::new(0.0, 0.0, f64::from(rect.width()), f64::from(rect.height())).trace(cr);
+    outline.trace(cr);
     cr.save().ok();
     cr.set_operator(gtk::cairo::Operator::Clear);
     let _ = cr.fill();

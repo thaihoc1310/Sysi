@@ -320,11 +320,8 @@ struct RegisteredWidget {
     widget: gtk::EventBox,
     color_mode: Rc<Cell<Foreground>>,
     /// True from the moment the pointer takes hold of this widget to drag or
-    /// resize it until it lets go.
+    /// resize it until it lets go. The glass lights up under it meanwhile.
     held: Rc<Cell<bool>>,
-    /// True while a mouse button is down anywhere on the card, body included.
-    /// The glass lights up under it meanwhile.
-    pressed: Rc<Cell<bool>>,
     edit_only: Option<gtk::EventBox>,
     editor: Option<gtk::TextView>,
     note_search: Option<NoteSearchControls>,
@@ -630,7 +627,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         move |gesture, _, x, y| {
             if let Some(card) = overlay_card_at(&root, x, y) {
-                press_card(&registry, &card);
                 raise_card_windows(&card);
                 glib::idle_add_local_once({
                     let card = card.clone();
@@ -2264,7 +2260,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     }
     window.present();
     window.move_(0, 0);
-    crate::glass::start(window.upcast_ref(), {
+    crate::glass::start(window.upcast_ref(), root.upcast_ref(), {
         let root = root.clone();
         let registry = registry.clone();
         move || glass_card_samples(&root, &registry)
@@ -8007,6 +8003,7 @@ fn build_note_search(
     options_popover
         .style_context()
         .add_class("note-search-popover");
+    crate::glass::glass_popover(&options_popover);
     let options_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     options_box.set_border_width(3);
     let case_sensitive = gtk::CheckButton::with_label("Case sensitive");
@@ -11309,7 +11306,6 @@ fn register(
         widget: widget.clone(),
         color_mode,
         held: Rc::new(Cell::new(false)),
-        pressed: Rc::new(Cell::new(false)),
         edit_only: None,
         editor: None,
         note_search: None,
@@ -14877,54 +14873,10 @@ fn glass_card_samples(
                 y: allocation.y(),
                 width: allocation.width(),
                 height: allocation.height(),
-                pressed: item.held.get() || item.pressed.get(),
+                pressed: item.held.get(),
             })
         })
         .collect()
-}
-
-/// Light the card's glass for as long as the button that went down on it
-/// stays down. The press may land in an editor or a list that keeps the
-/// release to itself, so the release is read off the pointer instead.
-fn press_card(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, card: &gtk::EventBox) {
-    let Some(item) = registry
-        .borrow()
-        .iter()
-        .find(|item| item.widget == *card)
-        .cloned()
-    else {
-        return;
-    };
-    if item.pressed.replace(true) {
-        return;
-    }
-    item.widget.queue_draw();
-    glib::timeout_add_local(Duration::from_millis(40), move || {
-        if any_button_down() {
-            return glib::ControlFlow::Continue;
-        }
-        item.pressed.set(false);
-        item.widget.queue_draw();
-        glib::ControlFlow::Break
-    });
-}
-
-fn any_button_down() -> bool {
-    let Some(display) = gdk::Display::default() else {
-        return false;
-    };
-    let Some(pointer) = display.default_seat().and_then(|seat| seat.pointer()) else {
-        return false;
-    };
-    let Some(root) = display.default_screen().root_window() else {
-        return false;
-    };
-    let (_, _, _, mask) = root.device_position_double(&pointer);
-    mask.intersects(
-        gdk::ModifierType::BUTTON1_MASK
-            | gdk::ModifierType::BUTTON2_MASK
-            | gdk::ModifierType::BUTTON3_MASK,
-    )
 }
 
 fn hold_widget(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, key: &str, held: bool) {
@@ -15063,6 +15015,7 @@ fn timer_style_size(size: Size, from: TimerStyle, to: TimerStyle) -> Size {
 fn context_menu() -> gtk::Menu {
     let menu = gtk::Menu::new();
     menu.style_context().add_class("sysi-menu");
+    crate::glass::glass_menu(&menu);
     // Nothing to tick in most menus, and the reserved gutter left them looking
     // like a list with a missing column. The system menu turns it back on.
     menu.set_reserve_toggle_size(false);

@@ -1361,3 +1361,24 @@ window.glass-live .mode-glass .history-header {
 .mode-glass .usage-progress progress {
   background-color: rgba(242, 242, 244, 0.55);
 }
+
+/* A context menu opened on a glass card, and a glass note's search options,
+   sit on glass of their own: the extension draws it under them. */
+.sysi-menu.glass-popup {
+  background-color: transparent;
+  border-color: transparent;
+}
+
+.note-search-popover.glass-popup box {
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+
+.note-search-popover.glass-popup .note-search-option check {
+  border-color: rgba(245, 245, 247, 0.6);
+}
+
+.mode-glass .note-search-entry {
+  background-color: rgba(255, 255, 255, 0.06);
+  border-color: alpha(currentColor, 0.22);
+  border-radius: 7px;
+}

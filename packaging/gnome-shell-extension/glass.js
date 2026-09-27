@@ -777,7 +777,8 @@ class GlassHost {
 export class GlassManager {
     enable() {
         this._hosts = new Map();
-        this._state = null;
+        // The last cards sent for each window, newest last.
+        this._states = new Map();
         this._failed = false;
         this._settings = St.Settings.get();
         this._contrastId = this._settings.connect('notify::high-contrast', () => this._syncOwnership());
@@ -845,7 +846,11 @@ export class GlassManager {
             const clampedRadius = Math.max(0, Math.min(radius, w / 2, h / 2));
             clean.push([key, x, y, w, h, clampedRadius, Boolean(pressed)]);
         }
-        this._state = {xid, width, height, cards: clean};
+        this._states.delete(xid);
+        this._states.set(xid, {xid, width, height, cards: clean});
+        // Every menu Sysi opens is a new window; keep only the recent ones.
+        while (this._states.size > 16)
+            this._states.delete(this._states.keys().next().value);
         const host = this._hostFor(xid);
         if (!host)
             return false;
@@ -867,13 +872,13 @@ export class GlassManager {
     }
 
     // Anything on the session bus may call SetCards, so the xid alone is not
-    // trusted to name Sysi's overlay: the window has to be it as well.
+    // trusted to name one of Sysi's windows (the overlay, or a menu it has
+    // opened): the window has to be Sysi's as well.
     _matches(actor, xid) {
         const window = actor.meta_window;
         if (!window || window.get_client_type() !== Meta.WindowClientType.X11)
             return false;
-        if (window.get_title() !== 'Sysi Overlay' ||
-            (window.get_wm_class() ?? '').toLowerCase() !== 'sysi')
+        if ((window.get_wm_class() ?? '').toLowerCase() !== 'sysi')
             return false;
         const [token] = (window.get_description() ?? '').split(' ');
         return token === `0x${xid.toString(16)}`;
@@ -883,8 +888,11 @@ export class GlassManager {
     // again brings a new window actor and no new rects (none changed), so the
     // last ones Sysi sent are put straight back.
     _reattach(actor) {
-        const state = this._state;
-        if (!state || this._failed || !this._matches(actor, state.xid))
+        if (this._failed)
+            return;
+        const state = [...this._states.values()].find(candidate =>
+            this._matches(actor, candidate.xid));
+        if (!state)
             return;
         this._hosts.get(state.xid)?.destroy();
         this._hosts.delete(state.xid);
