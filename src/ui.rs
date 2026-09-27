@@ -15884,7 +15884,7 @@ mod timer_input_tests {
         let run = |start, end| NoteHighlight {
             start,
             end,
-            color: HighlightColor::Pink,
+            color: HighlightColor::Red,
         };
         // A note that lost its tail keeps the part of the stretch it still has.
         assert_eq!(sanitize_highlights(&[run(2, 40)], 10), vec![run(2, 10)]);

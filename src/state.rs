@@ -220,18 +220,20 @@ pub enum HighlightColor {
     #[default]
     Yellow,
     Green,
-    Pink,
+    // Pink until it was swapped for red; old notes still say "pink".
+    #[serde(alias = "pink")]
+    Red,
     Blue,
 }
 
 impl HighlightColor {
-    pub const ALL: [Self; 4] = [Self::Yellow, Self::Green, Self::Pink, Self::Blue];
+    pub const ALL: [Self; 4] = [Self::Yellow, Self::Green, Self::Red, Self::Blue];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Yellow => "YELLOW",
             Self::Green => "GREEN",
-            Self::Pink => "PINK",
+            Self::Red => "RED",
             Self::Blue => "BLUE",
         }
     }
@@ -240,7 +242,7 @@ impl HighlightColor {
         match self {
             Self::Yellow => "yellow",
             Self::Green => "green",
-            Self::Pink => "pink",
+            Self::Red => "red",
             Self::Blue => "blue",
         }
     }
@@ -248,12 +250,14 @@ impl HighlightColor {
     /// The wash itself. Translucent on purpose: the note's own background
     /// shows through, so one set of colours reads on LIGHT, DARK and INVERT
     /// alike and nothing has to be repainted when a note changes mode.
+    /// Each alpha is as bright as the wash goes while light text on a DARK
+    /// plate still keeps 4.5:1 contrast; yellow is the one that runs out first.
     pub fn rgba(self) -> (f64, f64, f64, f64) {
         match self {
-            Self::Yellow => (0.98, 0.78, 0.20, 0.42),
-            Self::Green => (0.36, 0.82, 0.44, 0.40),
-            Self::Pink => (0.96, 0.44, 0.70, 0.38),
-            Self::Blue => (0.36, 0.66, 0.98, 0.40),
+            Self::Yellow => (1.00, 0.84, 0.16, 0.46),
+            Self::Green => (0.30, 0.90, 0.42, 0.48),
+            Self::Red => (1.00, 0.26, 0.24, 0.60),
+            Self::Blue => (0.30, 0.66, 1.00, 0.56),
         }
     }
 
@@ -263,7 +267,7 @@ impl HighlightColor {
         match self {
             Self::Yellow => "#e8b41f",
             Self::Green => "#3fbf5f",
-            Self::Pink => "#ea5f9e",
+            Self::Red => "#ef4444",
             Self::Blue => "#4aa3f5",
         }
     }
@@ -523,7 +527,14 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, ColorMode, TimerStyle};
+    use super::{AppState, ColorMode, HighlightColor, TimerStyle};
+
+    #[test]
+    fn a_pink_highlight_saved_before_red_loads_as_red() {
+        let old: HighlightColor = serde_json::from_str("\"pink\"").unwrap();
+        assert_eq!(old, HighlightColor::Red);
+        assert_eq!(serde_json::to_string(&old).unwrap(), "\"red\"");
+    }
 
     #[test]
     fn font_overrides_reset_on_global_change_and_survive_save() {
