@@ -11649,6 +11649,19 @@ fn raise_widget_windows(widget: &impl IsA<gtk::Widget>) {
     for child in container.children() {
         raise_widget_windows(&child);
     }
+    // An overlay's layers sit in windows the overlay owns, not the layer
+    // widgets, so the loop above never lifts them: every raise buried a
+    // note's resize edges under its own editor. Put the layers back on top.
+    if let Some(overlay) = container.downcast_ref::<gtk::Overlay>() {
+        let main = overlay.child();
+        for layer in overlay.children() {
+            if Some(&layer) != main.as_ref() && !layer.has_window() {
+                if let Some(window) = layer.window() {
+                    window.raise();
+                }
+            }
+        }
+    }
 }
 
 fn raise_card_windows(card: &gtk::EventBox) {
@@ -13017,6 +13030,23 @@ fn attach_resize(
     window: gtk::ApplicationWindow,
     bounds: ResizeBounds,
 ) {
+    let free = bounds.aspect_ratio.is_none()
+        && !bounds.preserve_current_aspect
+        && bounds.height_for_width.is_none();
+    if free {
+        attach_edge_resize(
+            handle,
+            card,
+            root,
+            key,
+            state,
+            registry,
+            interactive,
+            window,
+            bounds,
+        );
+        return;
+    }
     handle.hitbox.set_tooltip_text(Some("Drag to resize"));
     handle.hitbox.connect_enter_notify_event({
         let interactive = interactive.clone();
@@ -13236,6 +13266,394 @@ fn attach_resize(
             glib::Propagation::Stop
         }
     });
+}
+
+/// Which sides of a card one resize zone moves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResizeEdges {
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+}
+
+impl ResizeEdges {
+    fn cursor(self) -> gdk::CursorType {
+        match (self.left, self.right, self.top, self.bottom) {
+            (true, _, true, _) => gdk::CursorType::TopLeftCorner,
+            (_, true, true, _) => gdk::CursorType::TopRightCorner,
+            (true, _, _, true) => gdk::CursorType::BottomLeftCorner,
+            (_, true, _, true) => gdk::CursorType::BottomRightCorner,
+            (true, ..) | (_, true, ..) => gdk::CursorType::SbHDoubleArrow,
+            _ => gdk::CursorType::SbVDoubleArrow,
+        }
+    }
+}
+
+/// How thick the grab band along each side is, and how far a corner's
+/// diagonal reaches. The top corners stay small: the note header puts its
+/// hide and search buttons right there.
+const RESIZE_EDGE: i32 = 5;
+const RESIZE_CORNER: i32 = 12;
+const RESIZE_TOP_CORNER: i32 = 8;
+
+/// The card's rectangle once `edges` have been dragged by (dx, dy). The sides
+/// not being dragged stay exactly where they were, and each size stays between
+/// its floor and the room `area` leaves on the side that is growing.
+fn resize_rect(
+    start: ScreenRect,
+    edges: ResizeEdges,
+    delta: (i32, i32),
+    bounds: &ResizeBounds,
+    area: ScreenRect,
+) -> ScreenRect {
+    let right_room = area.x + area.width - start.x;
+    let left_room = start.x + start.width - area.x;
+    let bottom_room = area.y + area.height - start.y;
+    let top_room = start.y + start.height - area.y;
+    let width = if edges.left {
+        start.width - delta.0
+    } else if edges.right {
+        start.width + delta.0
+    } else {
+        start.width
+    };
+    let height = if edges.top {
+        start.height - delta.1
+    } else if edges.bottom {
+        start.height + delta.1
+    } else {
+        start.height
+    };
+    let max_width = resize_ceiling(
+        bounds.max_width,
+        if edges.left { left_room } else { right_room },
+        bounds.min_width,
+    );
+    let max_height = resize_ceiling(
+        bounds.max_height,
+        if edges.top { top_room } else { bottom_room },
+        bounds.min_height,
+    );
+    let width = width.clamp(bounds.min_width, max_width);
+    let height = height.clamp(bounds.min_height, max_height);
+    ScreenRect {
+        x: if edges.left { start.x + start.width - width } else { start.x },
+        y: if edges.top { start.y + start.height - height } else { start.y },
+        width,
+        height,
+    }
+}
+
+/// A card whose size is free on both axes resizes from every side and corner,
+/// the way a window does. Each zone is a thin band inside the card's edge:
+/// outside the card the overlay lets clicks through to the desktop.
+#[allow(clippy::too_many_arguments)]
+fn attach_edge_resize(
+    handle: &ResizeHandle,
+    card: &gtk::EventBox,
+    root: &gtk::Fixed,
+    key: String,
+    state: Rc<RefCell<AppState>>,
+    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
+    interactive: Rc<Cell<bool>>,
+    window: gtk::ApplicationWindow,
+    bounds: ResizeBounds,
+) {
+    let Some(overlay) = handle.hitbox.parent().and_then(|p| p.downcast::<gtk::Overlay>().ok())
+    else {
+        return;
+    };
+    // Every side does the corner arc's job now.
+    handle.hitbox.set_no_show_all(true);
+    handle.hitbox.hide();
+    let bounds = Rc::new(bounds);
+    // (card rectangle, pointer x, pointer y) at the press.
+    let start = Rc::new(Cell::new(None::<(ScreenRect, f64, f64)>));
+    let latest = Rc::new(Cell::new(None::<ScreenRect>));
+    let area = Rc::new(Cell::new(None::<ScreenRect>));
+    let mut zones = Vec::new();
+    let layout = [
+        (false, false, true, false, gtk::Align::Fill, gtk::Align::Start),
+        (false, false, false, true, gtk::Align::Fill, gtk::Align::End),
+        (true, false, false, false, gtk::Align::Start, gtk::Align::Fill),
+        (false, true, false, false, gtk::Align::End, gtk::Align::Fill),
+        (true, false, true, false, gtk::Align::Start, gtk::Align::Start),
+        (false, true, true, false, gtk::Align::End, gtk::Align::Start),
+        (true, false, false, true, gtk::Align::Start, gtk::Align::End),
+        (false, true, false, true, gtk::Align::End, gtk::Align::End),
+    ];
+    for (left, right, top, bottom, halign, valign) in layout {
+        let edges = ResizeEdges {
+            left,
+            right,
+            top,
+            bottom,
+        };
+        let zone = gtk::EventBox::new();
+        zone.style_context().add_class("resize-zone");
+        zone.set_visible_window(false);
+        zone.set_above_child(true);
+        zone.set_halign(halign);
+        zone.set_valign(valign);
+        let corner = (left || right) && (top || bottom);
+        if corner {
+            let reach = if top { RESIZE_TOP_CORNER } else { RESIZE_CORNER };
+            zone.set_size_request(reach, reach);
+        } else if left || right {
+            zone.set_size_request(RESIZE_EDGE, -1);
+            zone.set_margin_top(RESIZE_TOP_CORNER);
+            zone.set_margin_bottom(RESIZE_CORNER);
+        } else {
+            zone.set_size_request(-1, RESIZE_EDGE);
+            let reach = if top { RESIZE_TOP_CORNER } else { RESIZE_CORNER };
+            zone.set_margin_start(reach);
+            zone.set_margin_end(reach);
+        }
+        zone.add_events(
+            gdk::EventMask::ENTER_NOTIFY_MASK
+                | gdk::EventMask::LEAVE_NOTIFY_MASK
+                | gdk::EventMask::BUTTON_PRESS_MASK
+                | gdk::EventMask::POINTER_MOTION_MASK
+                | gdk::EventMask::BUTTON_RELEASE_MASK,
+        );
+        // Asked on every motion, not just on entry: an enter that never
+        // arrived (the pointer resting there while typing hid it) used to
+        // leave the corner without its cursor until the pointer left and came
+        // back. Lock mode gets the plain pointer.
+        let showing = Rc::new(Cell::new(false));
+        let sync_cursor: Rc<dyn Fn(&gtk::EventBox)> = Rc::new({
+            let interactive = interactive.clone();
+            let showing = showing.clone();
+            move |zone| {
+                let want = interactive.get();
+                if showing.replace(want) == want {
+                    return;
+                }
+                if let Some(window) = zone.window() {
+                    let cursor = want
+                        .then(|| gdk::Cursor::for_display(&window.display(), edges.cursor()))
+                        .flatten();
+                    window.set_cursor(cursor.as_ref());
+                }
+            }
+        });
+        zone.connect_enter_notify_event({
+            let sync_cursor = sync_cursor.clone();
+            move |zone, _| {
+                sync_cursor(zone);
+                glib::Propagation::Proceed
+            }
+        });
+        zone.connect_leave_notify_event({
+            let showing = showing.clone();
+            let start = start.clone();
+            move |zone, _| {
+                // Mid-drag the pointer runs ahead of the edge; keep the cursor.
+                if start.get().is_none() {
+                    showing.set(false);
+                    if let Some(window) = zone.window() {
+                        window.set_cursor(None);
+                    }
+                }
+                glib::Propagation::Proceed
+            }
+        });
+        zone.connect_button_press_event({
+            let start = start.clone();
+            let latest = latest.clone();
+            let area = area.clone();
+            let card = card.clone();
+            let root = root.clone();
+            let interactive = interactive.clone();
+            let registry = registry.clone();
+            let key = key.clone();
+            move |_, event| {
+                if !interactive.get() || event.button() != 1 {
+                    return glib::Propagation::Proceed;
+                }
+                let allocation = card.allocation();
+                let rect = ScreenRect {
+                    x: allocation.x(),
+                    y: allocation.y(),
+                    width: allocation.width(),
+                    height: allocation.height(),
+                };
+                let (pointer_x, pointer_y) = event.root();
+                // Taken once per drag: asking every monitor for its work area
+                // on each motion event is far too slow, and it cannot change.
+                let screens = overlay_screen_rects(&root);
+                area.set(
+                    host_screen(Point { x: rect.x, y: rect.y }, rect.width, rect.height, &screens)
+                        .or(Some(rect)),
+                );
+                start.set(Some((rect, pointer_x, pointer_y)));
+                latest.set(Some(rect));
+                hold_widget(&registry, &key, true);
+                glib::Propagation::Stop
+            }
+        });
+        zone.connect_motion_notify_event({
+            let start = start.clone();
+            let latest = latest.clone();
+            let area = area.clone();
+            let card = card.clone();
+            let card_widget = card.clone().upcast::<gtk::Widget>();
+            let root = root.clone();
+            let window = window.clone();
+            let registry = registry.clone();
+            let key = key.clone();
+            let bounds = bounds.clone();
+            let sync_cursor = sync_cursor.clone();
+            move |zone, event| {
+                let Some((from, pointer_x, pointer_y)) = start.get() else {
+                    sync_cursor(zone);
+                    return glib::Propagation::Proceed;
+                };
+                // A release outside the overlay (a broken grab) leaves the
+                // press behind; without this, hovering would keep resizing.
+                if !event.state().contains(gdk::ModifierType::BUTTON1_MASK) {
+                    start.set(None);
+                    hold_widget(&registry, &key, false);
+                    return glib::Propagation::Proceed;
+                }
+                let (x, y) = event.root();
+                let delta = ((x - pointer_x).round() as i32, (y - pointer_y).round() as i32);
+                let Some(area) = area.get() else {
+                    return glib::Propagation::Stop;
+                };
+                let next = resize_rect(from, edges, delta, &bounds, area);
+                let Some(previous) = latest.replace(Some(next)) else {
+                    return glib::Propagation::Stop;
+                };
+                if next == previous {
+                    return glib::Propagation::Stop;
+                }
+                refresh_visual_shape(&window, &root, Some((&card_widget, next)));
+                if next.x != previous.x || next.y != previous.y {
+                    root.move_(&card, next.x, next.y);
+                }
+                card.set_size_request(next.width, next.height);
+                card.queue_resize();
+                let left = next.x.min(previous.x);
+                let top = next.y.min(previous.y);
+                root.queue_draw_area(
+                    left - 3,
+                    top - 3,
+                    (next.x + next.width).max(previous.x + previous.width) - left + 6,
+                    (next.y + next.height).max(previous.y + previous.height) - top + 6,
+                );
+                glib::Propagation::Stop
+            }
+        });
+        zone.connect_button_release_event({
+            let start = start.clone();
+            let latest = latest.clone();
+            let card = card.clone();
+            let window = window.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            let interactive = interactive.clone();
+            let key = key.clone();
+            move |_, event| {
+                if event.button() != 1 {
+                    return glib::Propagation::Proceed;
+                }
+                hold_widget(&registry, &key, false);
+                let Some((from, ..)) = start.replace(None) else {
+                    return glib::Propagation::Proceed;
+                };
+                let Some(rect) = latest.replace(None) else {
+                    return glib::Propagation::Stop;
+                };
+                // A click on an edge that never moved changes nothing.
+                if rect == from {
+                    return glib::Propagation::Stop;
+                }
+                {
+                    let mut data = state.borrow_mut();
+                    data.sizes.insert(
+                        key.clone(),
+                        Size {
+                            width: rect.width,
+                            height: rect.height,
+                        },
+                    );
+                    let point = Point {
+                        x: rect.x,
+                        y: rect.y,
+                    };
+                    if point.x != from.x || point.y != from.y {
+                        let note = key
+                            .strip_prefix("note:")
+                            .and_then(|id| id.parse::<u64>().ok());
+                        match note.and_then(|id| data.notes.iter_mut().find(|n| n.id == id)) {
+                            Some(note) => note.position = point,
+                            None => {
+                                data.positions.insert(key.clone(), point);
+                            }
+                        }
+                    }
+                    let _ = data.save();
+                }
+                restack_overlay_card(&card);
+                card.queue_resize();
+                let window = window.clone();
+                let registry = registry.clone();
+                let state = state.clone();
+                let enabled = interactive.get();
+                glib::idle_add_local_once(move || {
+                    refresh_input_shape(&window, &registry, enabled);
+                    refresh_auto_colors(&registry, &state);
+                });
+                glib::Propagation::Stop
+            }
+        });
+        overlay.add_overlay(&zone);
+        zone.show();
+        zones.push(zone);
+    }
+    keep_zones_on_top(card, Rc::new(zones));
+}
+
+/// A zone only takes clicks and shows its cursor while its window is the top
+/// one at that spot. GTK puts a window on top whenever it is mapped, so the
+/// note header coming back with Edit Mode, or the editor being realized after
+/// the zones, buried a side under it: it took no clicks and showed no cursor
+/// until something else happened to restack it. Lift the zones again after
+/// any window inside the card is mapped.
+fn keep_zones_on_top(card: &gtk::EventBox, zones: Rc<Vec<gtk::EventBox>>) {
+    let queued = Rc::new(Cell::new(false));
+    let lift: Rc<dyn Fn()> = Rc::new(move || {
+        if queued.replace(true) {
+            return;
+        }
+        let zones = zones.clone();
+        let queued = queued.clone();
+        glib::idle_add_local_once(move || {
+            queued.set(false);
+            for zone in zones.iter() {
+                if let Some(window) = zone.window() {
+                    window.raise();
+                }
+            }
+        });
+    });
+    fn watch(widget: &gtk::Widget, lift: &Rc<dyn Fn()>) {
+        // Not only widgets with windows of their own: buttons, scrollbars
+        // and entries stack an input-only window there too.
+        let lifted = lift.clone();
+        widget.connect_map(move |_| lifted());
+        if let Some(container) = widget.downcast_ref::<gtk::Container>() {
+            container.forall(|child| {
+                if !child.style_context().has_class("resize-zone") {
+                    watch(child, lift);
+                }
+            });
+        }
+    }
+    watch(card.upcast_ref(), &lift);
+    lift();
 }
 
 fn drag_frame_due(last: Option<Instant>, now: Instant) -> bool {
@@ -15479,7 +15897,7 @@ mod timer_input_tests {
         fit_point_to_screens, read_compositor_pointer, NOTES_POINTER, PANEL_ANCHOR,
         parse_timer_input, pinned_note_sync, push_recent_search,
         receives_input_when_locked, record_note_undo, relative_luminance, reopen_point,
-        rescaled_from, resize_ceiling, resize_width_limit, resized_image_size, room_on_screen,
+        rescaled_from, resize_ceiling, resize_rect, resize_width_limit, ResizeBounds, ResizeEdges, resized_image_size, room_on_screen,
         round_pixbuf_corners, sanitize_highlights, screen_in_overlay, shrink_to_budget,
         system_content_size, system_meter_columns, system_meter_gap, system_meter_ink_width,
         system_meter_row_width, system_meter_rows, system_meters, system_usage_rows,
@@ -17396,6 +17814,48 @@ mod timer_input_tests {
         // draggable rather than collapsing to nothing.
         assert_eq!(resize_ceiling(None, 40, 92), 92);
         assert_eq!(resize_ceiling(Some(440), 40, 92), 92);
+    }
+
+    #[test]
+    fn a_note_resizes_from_any_side_and_keeps_the_far_side_still() {
+        let bounds = ResizeBounds {
+            min_width: 75,
+            min_height: 92,
+            max_width: None,
+            max_height: None,
+            aspect_ratio: None,
+            preserve_current_aspect: false,
+            height_for_width: None,
+        };
+        let area = ScreenRect { x: 0, y: 29, width: 1280, height: 691 };
+        let note = ScreenRect { x: 300, y: 200, width: 220, height: 160 };
+        let edges = |left, right, top, bottom| ResizeEdges { left, right, top, bottom };
+        let drag = |e, dx, dy| resize_rect(note, e, (dx, dy), &bounds, area);
+        // Left edge out by 50: wider, and the right edge stays at 520.
+        assert_eq!(drag(edges(true, false, false, false), -50, 30), ScreenRect { x: 250, y: 200, width: 270, height: 160 });
+        // Top-left in: the bottom-right corner never moves.
+        let r = drag(edges(true, false, true, false), 40, 20);
+        assert_eq!((r.x + r.width, r.y + r.height), (520, 360));
+        assert_eq!((r.width, r.height), (180, 140));
+        // Bottom edge only changes the height.
+        assert_eq!(drag(edges(false, false, false, true), 99, 40), ScreenRect { x: 300, y: 200, width: 220, height: 200 });
+        // Too small stops at the floor, still pinned to the far side.
+        let r = drag(edges(true, false, true, false), 500, 500);
+        assert_eq!(r, ScreenRect { x: 445, y: 268, width: 75, height: 92 });
+        // Never past the monitor: not over the left edge, not under the top bar.
+        let r = drag(edges(true, false, true, false), -900, -900);
+        assert_eq!((r.x, r.y, r.x + r.width, r.y + r.height), (0, 29, 520, 360));
+        let r = drag(edges(false, true, false, true), 5000, 5000);
+        assert_eq!((r.x + r.width, r.y + r.height), (1280, 720));
+    }
+
+    #[test]
+    fn each_resize_zone_shows_the_cursor_for_its_direction() {
+        let edges = |left, right, top, bottom| ResizeEdges { left, right, top, bottom };
+        assert_eq!(edges(true, false, true, false).cursor(), gdk::CursorType::TopLeftCorner);
+        assert_eq!(edges(false, true, false, true).cursor(), gdk::CursorType::BottomRightCorner);
+        assert_eq!(edges(false, true, false, false).cursor(), gdk::CursorType::SbHDoubleArrow);
+        assert_eq!(edges(false, false, true, false).cursor(), gdk::CursorType::SbVDoubleArrow);
     }
 
     #[test]

@@ -516,6 +516,16 @@ scrolledwindow overshoot.right:backdrop {
   box-shadow: none;
 }
 
+/* The card's outer 5px is its resize edge; keep the scrollbar inside it so
+   grabbing the slider scrolls rather than resizes. */
+.pinned-note scrollbar.vertical {
+  margin-right: 5px;
+}
+
+.pinned-note scrollbar.horizontal {
+  margin-bottom: 5px;
+}
+
 .pinned-note scrollbar trough {
   background-color: transparent;
   border: none;
