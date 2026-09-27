@@ -2286,7 +2286,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let state = state.clone();
         let queued = Rc::new(Cell::new(false));
-        move |_, _| {
+        move |window, _| {
+            let window = window.clone();
             if !queued.replace(true) {
                 glib::idle_add_local_once({
                     let root = root.clone();
@@ -2297,6 +2298,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         queued.set(false);
                         clamp_registered_widgets(&root, &registry, &state);
                     }
+                });
+                // At login the scale can arrive after Sysi has sized the
+                // overlay; GTK then resizes it to the old size in the new
+                // scale, which is what this catches.
+                glib::idle_add_local_once({
+                    let window = window.clone();
+                    move || fit_overlay_to_desktop(&window)
                 });
             }
             false
@@ -2390,18 +2398,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let state = state.clone();
         move || {
-            let Some(root_window) = gdk::Screen::default().and_then(|screen| screen.root_window())
-            else {
-                return;
-            };
-            let display = root_display_size(&root_window);
-            let scale = root_window.scale_factor().max(1);
-            let desktop = logical_desktop_size(scale, display);
-            // The overlay is not resizable, so GTK sizes it from its default
-            // size and ignores resize() alone.
-            window.set_default_size(desktop.width, desktop.height);
-            window.resize(desktop.width, desktop.height);
-            window.move_(0, 0);
+            fit_overlay_to_desktop(&window);
             clamp_registered_widgets(&root, &registry, &state);
         }
     });
@@ -12252,6 +12249,32 @@ fn logical_desktop_size(scale: i32, fallback: Size) -> Size {
         width: (max_x - min_x).max(1),
         height: (max_y - min_y).max(1),
     }
+}
+
+/// Size the overlay to the whole desktop, in logical pixels at the scale GTK
+/// has now. Does nothing when it already fits, so it is safe to call from a
+/// configure event.
+fn fit_overlay_to_desktop(window: &gtk::ApplicationWindow) {
+    let Some(root_window) = gdk::Screen::default().and_then(|screen| screen.root_window()) else {
+        return;
+    };
+    let display = root_display_size(&root_window);
+    let scale = root_window.scale_factor().max(1);
+    let desktop = logical_desktop_size(scale, display);
+    // Only ever too big is wrong: the shell may keep the overlay a little
+    // smaller than the desk (clear of the top bar), and chasing that would
+    // resize on every configure event.
+    if window.default_size() == (desktop.width, desktop.height)
+        && window.allocated_width() <= desktop.width
+        && window.allocated_height() <= desktop.height
+    {
+        return;
+    }
+    // The overlay is not resizable, so GTK sizes it from its default size
+    // and ignores resize() alone.
+    window.set_default_size(desktop.width, desktop.height);
+    window.resize(desktop.width, desktop.height);
+    window.move_(0, 0);
 }
 
 /// The whole display in the logical pixels every widget coordinate is in.
