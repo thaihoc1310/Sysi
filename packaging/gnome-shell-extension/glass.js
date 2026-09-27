@@ -52,6 +52,14 @@ const PRESS_OUT_MS = 350;
 // A rect update waits for the window's next commit so glass and text move in
 // the same frame; this is how long it waits before giving up on one.
 const LATCH_TIMEOUT_MS = 50;
+// A card the damage only partly covered (a caret, a line of typing, a card
+// dragged across it) keeps its last copy and is copied whole this long
+// after. The glass is frosted: a moment's lag behind what moves under it
+// does not show, and copying and blurring a large card for every keystroke
+// did.
+const REPAINT_DELAY_MS = 120;
+// How long a screenshot's or recording's spare backdrop outlives its use.
+const SPARE_KEEP_MS = 2000;
 
 const SHADER_COMMON = `
 float glass_luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -62,29 +70,33 @@ float glass_luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // tap lands between texels, so each pass blends a wide, even patch; a
 // Gaussian with taps a few texels apart instead leaves a grid of ghost
 // copies over text. uHalf is half a texel of the level read, times the
-// spread.
+// spread. uMax is the last texel centre of the part this frame's copy
+// fills: the textures are bigger than the copy, and CLAMP_TO_EDGE only
+// stops at the texture's own edge.
 const KAWASE_DECLARATIONS = `
 uniform vec2 uHalf;
+uniform vec2 uMax;
+vec4 kawase_tap(vec2 uv) { return texture2D(cogl_sampler0, min(uv, uMax)); }
 `;
 const KAWASE_DOWN = `
 vec2 uv = cogl_tex_coord0_in.st;
-vec4 sum = texture2D(cogl_sampler0, uv) * 4.0;
-sum += texture2D(cogl_sampler0, uv - uHalf);
-sum += texture2D(cogl_sampler0, uv + uHalf);
-sum += texture2D(cogl_sampler0, uv + vec2(uHalf.x, -uHalf.y));
-sum += texture2D(cogl_sampler0, uv - vec2(uHalf.x, -uHalf.y));
+vec4 sum = kawase_tap(uv) * 4.0;
+sum += kawase_tap(uv - uHalf);
+sum += kawase_tap(uv + uHalf);
+sum += kawase_tap(uv + vec2(uHalf.x, -uHalf.y));
+sum += kawase_tap(uv - vec2(uHalf.x, -uHalf.y));
 cogl_color_out = sum / 8.0;
 `;
 const KAWASE_UP = `
 vec2 uv = cogl_tex_coord0_in.st;
-vec4 sum = texture2D(cogl_sampler0, uv + vec2(-uHalf.x * 2.0, 0.0));
-sum += texture2D(cogl_sampler0, uv + vec2(-uHalf.x, uHalf.y)) * 2.0;
-sum += texture2D(cogl_sampler0, uv + vec2(0.0, uHalf.y * 2.0));
-sum += texture2D(cogl_sampler0, uv + vec2(uHalf.x, uHalf.y)) * 2.0;
-sum += texture2D(cogl_sampler0, uv + vec2(uHalf.x * 2.0, 0.0));
-sum += texture2D(cogl_sampler0, uv + vec2(uHalf.x, -uHalf.y)) * 2.0;
-sum += texture2D(cogl_sampler0, uv + vec2(0.0, -uHalf.y * 2.0));
-sum += texture2D(cogl_sampler0, uv + vec2(-uHalf.x, -uHalf.y)) * 2.0;
+vec4 sum = kawase_tap(uv + vec2(-uHalf.x * 2.0, 0.0));
+sum += kawase_tap(uv + vec2(-uHalf.x, uHalf.y)) * 2.0;
+sum += kawase_tap(uv + vec2(0.0, uHalf.y * 2.0));
+sum += kawase_tap(uv + vec2(uHalf.x, uHalf.y)) * 2.0;
+sum += kawase_tap(uv + vec2(uHalf.x * 2.0, 0.0));
+sum += kawase_tap(uv + vec2(uHalf.x, -uHalf.y)) * 2.0;
+sum += kawase_tap(uv + vec2(0.0, -uHalf.y * 2.0));
+sum += kawase_tap(uv + vec2(-uHalf.x, -uHalf.y)) * 2.0;
 cogl_color_out = sum / 12.0;
 `;
 
@@ -94,6 +106,9 @@ cogl_color_out = sum / 12.0;
 const GLASS_DECLARATIONS = `${SHADER_COMMON}
 uniform vec2 uSize;
 uniform vec2 uUvScale;
+// The last texel centre of the copy in the coarsest layer: nothing past it
+// belongs to this frame.
+uniform vec2 uUvMax;
 uniform vec4 uRect;
 uniform float uRadius;
 uniform float uScale;
@@ -122,6 +137,8 @@ vec3 glass_saturate(vec3 c, float amount) {
     return mix(vec3(glass_luma(c)), c, amount);
 }
 
+vec2 glass_uv(vec2 uv) { return min(uv, uUvMax); }
+
 float glass_linear(float v) { return pow(max(v, 0.0), 2.2); }
 
 float glass_hash(vec2 p) {
@@ -142,8 +159,8 @@ float radius = min(uRadius, min(half_size.x, half_size.y));
 float d = glass_sd(p, half_size, radius);
 float cover = clamp(0.5 - d * uScale, 0.0, 1.0);
 float min_dim = min(uRect.z, uRect.w);
-vec3 sharp = texture2D(cogl_sampler0, uv).rgb;
-vec3 soft = texture2D(cogl_sampler1, uv).rgb;
+vec3 sharp = texture2D(cogl_sampler0, glass_uv(uv)).rgb;
+vec3 soft = texture2D(cogl_sampler1, glass_uv(uv)).rgb;
 vec4 result = vec4(0.0);
 
 if (cover < 1.0) {
@@ -174,12 +191,12 @@ if (cover > 0.0) {
     if (bend > 0.05) {
         // The rim bends a crisper picture than the middle frosts, so the
         // lensing reads as lensing and not as more blur.
-        vec3 frosted = vec3(texture2D(cogl_sampler1, uv + offset * 0.94).r,
-                            texture2D(cogl_sampler1, uv + offset).g,
-                            texture2D(cogl_sampler1, uv + offset * 1.06).b);
-        vec3 crisp = vec3(texture2D(cogl_sampler2, uv + offset * 0.94).r,
-                          texture2D(cogl_sampler2, uv + offset).g,
-                          texture2D(cogl_sampler2, uv + offset * 1.06).b);
+        vec3 frosted = vec3(texture2D(cogl_sampler1, glass_uv(uv + offset * 0.94)).r,
+                            texture2D(cogl_sampler1, glass_uv(uv + offset)).g,
+                            texture2D(cogl_sampler1, glass_uv(uv + offset * 1.06)).b);
+        vec3 crisp = vec3(texture2D(cogl_sampler2, glass_uv(uv + offset * 0.94)).r,
+                          texture2D(cogl_sampler2, glass_uv(uv + offset)).g,
+                          texture2D(cogl_sampler2, glass_uv(uv + offset * 1.06)).b);
         colour = mix(crisp, frosted, mix(0.6, 1.0, smoothstep(0.0, band, depth)));
     } else {
         colour = soft;
@@ -193,10 +210,10 @@ if (cover > 0.0) {
     // 0.16 so the glow added afterwards cannot tip it over.
     vec2 spread = vec2(20.0) * to_tex;
     float lum = glass_linear(glass_luma(colour));
-    lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, uv + spread * vec2(-1.0, 0.0)).rgb)));
-    lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, uv + spread * vec2( 1.0, 0.0)).rgb)));
-    lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, uv + spread * vec2(0.0, -1.0)).rgb)));
-    lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, uv + spread * vec2(0.0,  1.0)).rgb)));
+    lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, glass_uv(uv + spread * vec2(-1.0, 0.0))).rgb)));
+    lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, glass_uv(uv + spread * vec2( 1.0, 0.0))).rgb)));
+    lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, glass_uv(uv + spread * vec2(0.0, -1.0))).rgb)));
+    lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, glass_uv(uv + spread * vec2(0.0,  1.0))).rgb)));
     float keep = pow(clamp(0.14 / max(lum, 1e-4), 0.0, 1.0), 1.0 / 2.2);
     float dim = clamp(max(0.20, 1.0 - keep), 0.0, 0.85) * uAppear;
     colour = colour * (1.0 - dim) + vec3(0.02, 0.02, 0.03) * dim;
@@ -363,6 +380,9 @@ class SysiGlassEffect extends Clutter.Effect {
         this._card = card;
         // One backdrop per monitor framebuffer drawn into.
         this._backdrops = new Map();
+        this._spare = null;
+        this._spareUsed = 0;
+        this._spareTimeout = 0;
     }
 
     vfunc_paint_node(node, paintContext) {
@@ -399,38 +419,44 @@ class SysiGlassEffect extends Clutter.Effect {
             return;
         const scale = width / actor.width;
 
+        // The part of the actor on this framebuffer, in stage coordinates,
+        // shrunk to whole pixels. A monitor's redraw clip never reaches past
+        // the monitor, so asking it to hold the whole actor would answer PART
+        // for any card near an edge, and for one across two monitors ask for
+        // a repaint every frame, forever.
+        const fbWidth = framebuffer.get_width();
+        const fbHeight = framebuffer.get_height();
+        const toStageX = stageWidth / (bottomRight[0] - topLeft[0]);
+        const toStageY = stageHeight / (bottomRight[1] - topLeft[1]);
+        const visible = {
+            x1: Math.ceil(stageX + (Math.max(0, topLeft[0]) - topLeft[0]) * toStageX),
+            y1: Math.ceil(stageY + (Math.max(0, topLeft[1]) - topLeft[1]) * toStageY),
+            x2: Math.floor(stageX + (Math.min(fbWidth, bottomRight[0]) - topLeft[0]) * toStageX),
+            y2: Math.floor(stageY + (Math.min(fbHeight, bottomRight[1]) - topLeft[1]) * toStageY),
+        };
+        if (visible.x2 <= visible.x1 || visible.y2 <= visible.y1)
+            return;
+
         const context = framebuffer.get_context();
         const levels = blurLevels(width, height, scale);
-        // A monitor's framebuffer is painted every frame, so its copies are
-        // kept. A screenshot's is painted once: its copies (tens of MB of
-        // video memory for a large card) are dropped as soon as it is done.
-        const onMonitor = global.stage.peek_stage_views()
-            .some(view => view.get_framebuffer() === framebuffer);
-        let backdrop = this._backdrops.get(framebuffer);
-        if (!backdrop || !backdropFits(backdrop, width, height, levels)) {
-            backdrop = new Backdrop(context,
-                backdropSize(width), backdropSize(height), levels);
-            if (onMonitor)
-                this._backdrops.set(framebuffer, backdrop);
-        }
+        const backdrop = this._backdropFor(framebuffer, context, width, height, levels);
         backdrop.usedWidth = width;
         backdrop.usedHeight = height;
 
         // Only the damaged part of this frame has been repainted underneath;
         // copying beyond it would copy last frame's glass. When the damage
         // covers part of the card, keep the previous copy for now and repaint
-        // the whole card next frame.
+        // the whole card shortly.
         const clip = paintContext.get_redraw_clip();
         const overlap = clip
             ? clip.contains_rectangle(new Mtk.Rectangle({
-                x: Math.floor(stageX), y: Math.floor(stageY),
-                width: Math.ceil(stageWidth), height: Math.ceil(stageHeight),
+                x: visible.x1, y: visible.y1,
+                width: visible.x2 - visible.x1, height: visible.y2 - visible.y1,
             }))
             : Mtk.RegionOverlap.IN;
         // A repaint this card asked for itself is taken as whole even if
         // rounding leaves the clip a pixel short, or it would ask forever.
-        const forced = this._card.takeForcedRepaint();
-        if (overlap === Mtk.RegionOverlap.IN || !backdrop.valid || forced) {
+        if (overlap === Mtk.RegionOverlap.IN || !backdrop.valid || this._card.forced) {
             this._capture(framebuffer, backdrop, left, top);
             backdrop.valid = true;
         } else if (overlap === Mtk.RegionOverlap.PART) {
@@ -442,12 +468,52 @@ class SysiGlassEffect extends Clutter.Effect {
         pipeline.set_layer_texture(1, backdrop.soft.texture);
         pipeline.set_layer_texture(2, backdrop.light.texture);
         this._card.setGlassUniforms(pipeline, scale,
-            width / backdrop.width, height / backdrop.height);
+            width / backdrop.width, height / backdrop.height,
+            (width / backdrop.width) - 0.5 / backdrop.light.width,
+            (height / backdrop.height) - 0.5 / backdrop.light.height);
         const glass = new Clutter.PipelineNode(pipeline);
         node.add_child(glass);
         glass.add_texture_rectangle(
             new Clutter.ActorBox({x1: 0, y1: 0, x2: actor.width, y2: actor.height}),
             0, 0, 1, 1);
+    }
+
+    // A monitor's framebuffer is painted every frame, so its copies are kept,
+    // and dropped once the monitor's view is gone (a hotplug, a new scale or
+    // layout): otherwise each change left a set behind for good. Anything
+    // else (a screenshot, a screen recording, a screencast) shares one spare
+    // set, since a recording can paint into a new framebuffer every frame;
+    // the spare is let go once nothing has painted with it for a while.
+    _backdropFor(framebuffer, context, width, height, levels) {
+        const views = global.stage.peek_stage_views().map(view => view.get_framebuffer());
+        if (views.includes(framebuffer)) {
+            let backdrop = this._backdrops.get(framebuffer);
+            if (!backdrop || !backdropFits(backdrop, width, height, levels)) {
+                for (const key of this._backdrops.keys()) {
+                    if (!views.includes(key))
+                        this._backdrops.delete(key);
+                }
+                backdrop = new Backdrop(context,
+                    backdropSize(width), backdropSize(height), levels);
+                this._backdrops.set(framebuffer, backdrop);
+            }
+            return backdrop;
+        }
+        if (!this._spare || !backdropFits(this._spare, width, height, levels)) {
+            this._spare = new Backdrop(context,
+                backdropSize(width), backdropSize(height), levels);
+        }
+        this._spareUsed = GLib.get_monotonic_time();
+        this._spareTimeout ||= GLib.timeout_add(GLib.PRIORITY_DEFAULT, SPARE_KEEP_MS, () => {
+            if (GLib.get_monotonic_time() - this._spareUsed < SPARE_KEEP_MS * 1000)
+                return GLib.SOURCE_CONTINUE;
+            this._spare = null;
+            this._spareTimeout = 0;
+            return GLib.SOURCE_REMOVE;
+        });
+        // Every paint here is its own picture: never trust a spare's copy.
+        this._spare.valid = false;
+        return this._spare;
     }
 
     _capture(framebuffer, backdrop, left, top) {
@@ -497,6 +563,8 @@ class SysiGlassEffect extends Clutter.Effect {
         pipeline.set_layer_texture(0, source.texture);
         setUniform(pipeline, 'uHalf',
             0.5 * KAWASE_OFFSET / source.width, 0.5 * KAWASE_OFFSET / source.height);
+        setUniform(pipeline, 'uMax',
+            shareX - 0.5 / source.width, shareY - 0.5 / source.height);
         target.framebuffer.draw_textured_rectangle(pipeline,
             0, 0, target.width * shareX, target.height * shareY,
             0, 0, shareX, shareY);
@@ -626,10 +694,14 @@ const GlassCard = GObject.registerClass({
         return this._blur;
     }
 
-    takeForcedRepaint() {
-        const forced = this._forced;
+    // Set until the frame that repaints the card is over, so each monitor it
+    // spans takes the whole card.
+    get forced() {
+        return this._forced;
+    }
+
+    endFrame() {
         this._forced = false;
-        return forced;
     }
 
     forceRepaint() {
@@ -637,9 +709,10 @@ const GlassCard = GObject.registerClass({
         this.queue_redraw();
     }
 
-    setGlassUniforms(pipeline, scale, shareX, shareY) {
+    setGlassUniforms(pipeline, scale, shareX, shareY, maxX, maxY) {
         setUniform(pipeline, 'uSize', this.width, this.height);
         setUniform(pipeline, 'uUvScale', shareX, shareY);
+        setUniform(pipeline, 'uUvMax', maxX, maxY);
         setUniform(pipeline, 'uRect', ...this._rect);
         setUniform(pipeline, 'uRadius', this._radius);
         setUniform(pipeline, 'uScale', scale);
@@ -672,7 +745,7 @@ class GlassHost {
         this._fresh = true;
         this._pipelines = null;
         this._repaint = new Set();
-        this._laterId = 0;
+        this._repaintId = 0;
         this._signals = [
             // Xwayland adds the surface actor after the window actor exists,
             // and it has to stay above the glass.
@@ -689,6 +762,8 @@ class GlassHost {
         ];
         this._afterPaintId = global.stage.connect('after-paint', () => {
             this._damaged = false;
+            for (const card of this._cards.values())
+                card.endFrame();
         });
     }
 
@@ -744,9 +819,11 @@ class GlassHost {
             }
             card.place(x * scaleX, y * scaleY, w * scaleX, h * scaleY,
                 radius * Math.min(scaleX, scaleY), pressed);
-            if (below)
+            // Restacking every card on every update (sixty a second while one
+            // is dragged) relayouts the layer for nothing.
+            if (below && card.get_previous_sibling() !== below)
                 this._layer.set_child_above_sibling(card, below);
-            else
+            else if (!below && this._layer.get_first_child() !== card)
                 this._layer.set_child_below_sibling(card, null);
             below = card;
         }
@@ -776,10 +853,10 @@ class GlassHost {
 
     repaintSoon(card) {
         this._repaint.add(card);
-        if (this._laterId)
+        if (this._repaintId)
             return;
-        this._laterId = global.compositor.get_laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
-            this._laterId = 0;
+        this._repaintId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, REPAINT_DELAY_MS, () => {
+            this._repaintId = 0;
             for (const pending of this._repaint) {
                 if (!pending.destroyed)
                     pending.forceRepaint();
@@ -797,9 +874,9 @@ class GlassHost {
         if (this._latchTimeout)
             GLib.source_remove(this._latchTimeout);
         this._latchTimeout = 0;
-        if (this._laterId)
-            global.compositor.get_laters().remove(this._laterId);
-        this._laterId = 0;
+        if (this._repaintId)
+            GLib.source_remove(this._repaintId);
+        this._repaintId = 0;
         global.stage.disconnect(this._afterPaintId);
         if (!this.windowActor.is_destroyed?.()) {
             for (const id of this._signals)

@@ -129,11 +129,21 @@ struct Link {
     /// The container the cards sit in.
     root: gtk::Container,
     connection: RefCell<Option<gio::DBusConnection>>,
+    /// The newest cards, sent or waiting to be.
     last: RefCell<Option<Message>>,
-    /// Bumped on every send; only the newest reply may change `glass-live`.
-    serial: Cell<u64>,
-    retry: Cell<bool>,
+    /// Whether a call is on the bus. One at a time: while a card is dragged
+    /// Sysi paints faster than a busy shell answers, and every frame's call
+    /// would queue up behind the last.
+    in_flight: Cell<bool>,
+    /// Cards painted while a call was on the bus; only the newest is kept.
+    waiting: RefCell<Option<Message>>,
+    /// Retries since the extension last took the cards.
+    retries: Cell<u32>,
+    retry_pending: Cell<bool>,
 }
+
+/// How often a refusal is asked again before Sysi keeps its own plates.
+const MAX_RETRIES: u32 = 8;
 
 thread_local! {
     // The bus watcher's callbacks must be Send, so they reach the link
@@ -161,8 +171,10 @@ pub fn start(
         root: root.clone(),
         connection: RefCell::new(None),
         last: RefCell::new(None),
-        serial: Cell::new(0),
-        retry: Cell::new(false),
+        in_flight: Cell::new(false),
+        waiting: RefCell::new(None),
+        retries: Cell::new(0),
+        retry_pending: Cell::new(false),
     });
     LINK.with(|slot| *slot.borrow_mut() = Some(link.clone()));
     gio::bus_watch_name(
@@ -173,6 +185,7 @@ pub fn start(
             with_link(|link| {
                 link.connection.replace(Some(connection));
                 link.last.replace(None);
+                link.retries.set(0);
                 link.window.queue_draw();
             })
         },
@@ -180,6 +193,7 @@ pub fn start(
             with_link(|link| {
                 link.connection.replace(None);
                 link.last.replace(None);
+                link.waiting.replace(None);
                 set_live(&link.window, false);
             })
         },
@@ -209,6 +223,11 @@ pub fn start(
         if link.last.borrow().as_ref() == Some(&message) {
             return;
         }
+        link.last.replace(Some(message.clone()));
+        if link.in_flight.get() {
+            link.waiting.replace(Some(message));
+            return;
+        }
         send(&link, message);
     });
 }
@@ -217,17 +236,14 @@ fn send(link: &Rc<Link>, message: Message) {
     let Some(connection) = link.connection.borrow().clone() else {
         return;
     };
-    let serial = link.serial.get() + 1;
-    link.serial.set(serial);
-    let parameters = message.to_variant();
-    link.last.replace(Some(message));
+    link.in_flight.set(true);
     let weak = Rc::downgrade(link);
     connection.call(
         Some(BUS_NAME),
         OBJECT_PATH,
         INTERFACE,
         "SetCards",
-        Some(&parameters),
+        Some(&message.to_variant()),
         Some(glib::VariantTy::new("(b)").expect("valid reply type")),
         gio::DBusCallFlags::NONE,
         1000,
@@ -236,33 +252,55 @@ fn send(link: &Rc<Link>, message: Message) {
             let Some(link) = weak.upgrade() else {
                 return;
             };
-            if link.serial.get() != serial {
+            link.in_flight.set(false);
+            // Newer cards were painted meanwhile; only their answer counts.
+            if let Some(waiting) = link.waiting.take() {
+                send(&link, waiting);
                 return;
             }
-            let attached = reply
-                .ok()
-                .and_then(|reply| reply.get::<(bool,)>())
-                .is_some_and(|(attached,)| attached);
-            set_live(&link.window, attached);
-            if !attached {
-                retry_once(&link);
+            match reply.map(|reply| reply.get::<(bool,)>()) {
+                Ok(Some((true,))) => {
+                    link.retries.set(0);
+                    set_live(&link.window, true);
+                }
+                // A refusal: the extension has not found the window (yet).
+                Ok(_) => {
+                    set_live(&link.window, false);
+                    retry(&link);
+                }
+                // A slow or busy shell is no reason to drop the glass it is
+                // drawing; ask again. If the extension really went away, the
+                // bus watcher says so.
+                Err(_) => retry(&link),
             }
         },
     );
 }
 
 /// The extension may not have found the window yet (it maps a moment after
-/// Sysi first paints). Ask again once, a little later.
-fn retry_once(link: &Rc<Link>) {
-    if link.retry.replace(true) {
+/// Sysi first paints). Ask again a little later, less and less often, and
+/// give up after a while rather than asking for ever.
+fn retry(link: &Rc<Link>) {
+    let tries = link.retries.get();
+    if tries >= MAX_RETRIES || link.retry_pending.replace(true) {
         return;
     }
+    link.retries.set(tries + 1);
+    let delay = Duration::from_millis(250 << tries.min(4));
     let weak = Rc::downgrade(link);
-    glib::timeout_add_local_once(Duration::from_millis(250), move || {
-        if let Some(link) = weak.upgrade() {
-            link.retry.set(false);
-            link.last.replace(None);
-            link.window.queue_draw();
+    glib::timeout_add_local_once(delay, move || {
+        let Some(link) = weak.upgrade() else {
+            return;
+        };
+        link.retry_pending.set(false);
+        // Only the cards are asked again; repainting the whole window for it
+        // made the shell copy every card's glass afresh too.
+        if link.in_flight.get() {
+            return;
+        }
+        let last = link.last.borrow().clone();
+        if let Some(message) = last {
+            send(&link, message);
         }
     });
 }
