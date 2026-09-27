@@ -11,6 +11,8 @@
 #                                               holds Clutter, Cogl, Main, ...
 #   scripts/glass-harness.sh shot out.png       the whole stage
 #   scripts/glass-harness.sh stop
+#   GDB=1 scripts/glass-harness.sh start ...   run the shell under gdb; a crash
+#                                              leaves a backtrace in shell.log
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -136,7 +138,7 @@ EOF
     setsid dbus-run-session -- bash -c "
       echo \"export DBUS_SESSION_BUS_ADDRESS='\$DBUS_SESSION_BUS_ADDRESS'\" >>'$root/env.sh'
       echo \$\$ >'$root/shell.pid'
-      exec gnome-shell --headless --wayland --wayland-display=sysi-harness \
+      exec ${GDB:+gdb -batch -ex run -ex bt -ex 'call (void) gjs_dumpstack()' --args} gnome-shell --headless --wayland --wayland-display=sysi-harness \
         --virtual-monitor $monitor" >"$root/shell.log" 2>&1 &
   )
   for _ in $(seq 1 150); do

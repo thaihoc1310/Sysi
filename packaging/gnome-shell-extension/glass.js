@@ -93,6 +93,7 @@ cogl_color_out = sum / 12.0;
 // Every length is in logical pixels.
 const GLASS_DECLARATIONS = `${SHADER_COMMON}
 uniform vec2 uSize;
+uniform vec2 uUvScale;
 uniform vec4 uRect;
 uniform float uRadius;
 uniform float uScale;
@@ -129,8 +130,12 @@ float glass_hash(vec2 p) {
 `;
 
 const GLASS_MAIN = `
-vec2 uv = cogl_tex_coord0_in.st;
-vec2 px = uv * uSize;
+// The backdrop textures are allocated with room to spare; uUvScale is the
+// share of them this frame's copy fills.
+vec2 local = cogl_tex_coord0_in.st;
+vec2 uv = local * uUvScale;
+vec2 px = local * uSize;
+vec2 to_tex = uUvScale / uSize;
 vec2 half_size = uRect.zw * 0.5;
 vec2 p = px - (uRect.xy + half_size);
 float radius = min(uRadius, min(half_size.x, half_size.y));
@@ -164,7 +169,7 @@ if (cover > 0.0) {
     // nothing swims behind the text.
     float x = band > 0.001 ? clamp(1.0 - depth / band, 0.0, 1.0) : 0.0;
     float bend = (1.0 - sqrt(1.0 - x * x)) * reach;
-    vec2 offset = -n * bend / uSize;
+    vec2 offset = -n * bend * to_tex;
     vec3 colour;
     if (bend > 0.05) {
         // The rim bends a crisper picture than the middle frosts, so the
@@ -186,7 +191,7 @@ if (cover > 0.0) {
     // White text must stay at 5:1 or better. Dim just enough for the
     // brightest of this pixel and its neighbourhood, aiming a little under
     // 0.16 so the glow added afterwards cannot tip it over.
-    vec2 spread = vec2(20.0) / uSize;
+    vec2 spread = vec2(20.0) * to_tex;
     float lum = glass_linear(glass_luma(colour));
     lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, uv + spread * vec2(-1.0, 0.0)).rgb)));
     lum = max(lum, glass_linear(glass_luma(texture2D(cogl_sampler1, uv + spread * vec2( 1.0, 0.0)).rgb)));
@@ -286,16 +291,26 @@ class Surface {
         this.framebuffer.allocate();
         this.framebuffer.orthographic(0, 0, width, height, -1, 1);
     }
+
 }
 
 // Backdrop copies for one framebuffer: the sharp capture, the halvings the
 // blur goes down through, and the doublings it comes back up through. The
 // second halving doubles as the lightly softened rim; the last doubling is
 // the frosted copy, at half size.
+//
+// The textures are sized up to a multiple of BACKDROP_STEP and reused for as
+// long as the card fits: a card being dragged lands on half pixels, so the
+// copy it needs grows and shrinks by a pixel frame to frame, and allocating
+// afresh each time left a whole set of large textures behind every frame
+// until the shell next collected garbage (a gigabyte for a large note).
 class Backdrop {
     constructor(context, width, height, levels) {
         this.width = width;
         this.height = height;
+        // The part of the textures the current copy covers.
+        this.usedWidth = width;
+        this.usedHeight = height;
         this.sharp = new Surface(context, width, height);
         this.down = [];
         for (let level = 1; level <= levels; level++) {
@@ -312,6 +327,24 @@ class Backdrop {
         this.soft = this.up[0];
         this.valid = false;
     }
+
+}
+
+const BACKDROP_STEP = 256;
+
+// Room for the card to grow into: a quarter more than it needs, so a card
+// being resized outgrows its textures a handful of times, not every frame.
+function backdropSize(needed) {
+    return Math.ceil(needed * 1.25 / BACKDROP_STEP) * BACKDROP_STEP;
+}
+
+// Whether a backdrop allocated for one size still serves another: big
+// enough, and not so much bigger that it wastes the memory.
+function backdropFits(backdrop, width, height, levels) {
+    return backdrop.down.length === levels &&
+        width <= backdrop.width && height <= backdrop.height &&
+        backdrop.width < width * 1.6 + BACKDROP_STEP &&
+        backdrop.height < height * 1.6 + BACKDROP_STEP;
 }
 
 // Enough halvings for the frost to cover the same logical distance on any
@@ -374,12 +407,14 @@ class SysiGlassEffect extends Clutter.Effect {
         const onMonitor = global.stage.peek_stage_views()
             .some(view => view.get_framebuffer() === framebuffer);
         let backdrop = this._backdrops.get(framebuffer);
-        if (!backdrop || backdrop.width !== width || backdrop.height !== height ||
-            backdrop.down.length !== levels) {
-            backdrop = new Backdrop(context, width, height, levels);
+        if (!backdrop || !backdropFits(backdrop, width, height, levels)) {
+            backdrop = new Backdrop(context,
+                backdropSize(width), backdropSize(height), levels);
             if (onMonitor)
                 this._backdrops.set(framebuffer, backdrop);
         }
+        backdrop.usedWidth = width;
+        backdrop.usedHeight = height;
 
         // Only the damaged part of this frame has been repainted underneath;
         // copying beyond it would copy last frame's glass. When the damage
@@ -406,7 +441,8 @@ class SysiGlassEffect extends Clutter.Effect {
         pipeline.set_layer_texture(0, backdrop.sharp.texture);
         pipeline.set_layer_texture(1, backdrop.soft.texture);
         pipeline.set_layer_texture(2, backdrop.light.texture);
-        this._card.setGlassUniforms(pipeline, scale);
+        this._card.setGlassUniforms(pipeline, scale,
+            width / backdrop.width, height / backdrop.height);
         const glass = new Clutter.PipelineNode(pipeline);
         node.add_child(glass);
         glass.add_texture_rectangle(
@@ -419,8 +455,8 @@ class SysiGlassEffect extends Clutter.Effect {
         // the framebuffer is never seen either.
         const sourceLeft = Math.max(0, left);
         const sourceTop = Math.max(0, top);
-        const right = Math.min(framebuffer.get_width(), left + backdrop.width);
-        const bottom = Math.min(framebuffer.get_height(), top + backdrop.height);
+        const right = Math.min(framebuffer.get_width(), left + backdrop.usedWidth);
+        const bottom = Math.min(framebuffer.get_height(), top + backdrop.usedHeight);
         if (right <= sourceLeft || bottom <= sourceTop)
             return;
         try {
@@ -438,31 +474,32 @@ class SysiGlassEffect extends Clutter.Effect {
         // one's texture or uniforms.
         const pipelines = this._card.blurPipelines(framebuffer.get_context(),
             backdrop.down.length);
+        // Every level is the same share of its texture, since each is an
+        // exact halving of a multiple of BACKDROP_STEP.
+        const share = [backdrop.usedWidth / backdrop.width,
+            backdrop.usedHeight / backdrop.height];
         let source = backdrop.sharp;
         backdrop.down.forEach((target, level) => {
-            this._pass(pipelines.down[level], source, target);
+            this._pass(pipelines.down[level], source, target, share);
             source = target;
         });
         for (let level = backdrop.up.length - 1; level >= 0; level--) {
             const target = backdrop.up[level];
-            this._pass(pipelines.up[level], source, target);
+            this._pass(pipelines.up[level], source, target, share);
             source = target;
         }
-    }
-
-    _pass(pipeline, source, target) {
-        pipeline.set_layer_texture(0, source.texture);
-        setUniform(pipeline, 'uHalf',
-            0.5 * KAWASE_OFFSET / source.width, 0.5 * KAWASE_OFFSET / source.height);
-        this._draw(target, pipeline);
     }
 
     // No flush here: Cogl records that the glass samples these textures and
     // flushes their framebuffers first, in order. Flushing each pass by hand
     // made the glass three times as dear on the CPU.
-    _draw(surface, pipeline) {
-        surface.framebuffer.draw_textured_rectangle(pipeline,
-            0, 0, surface.width, surface.height, 0, 0, 1, 1);
+    _pass(pipeline, source, target, [shareX, shareY]) {
+        pipeline.set_layer_texture(0, source.texture);
+        setUniform(pipeline, 'uHalf',
+            0.5 * KAWASE_OFFSET / source.width, 0.5 * KAWASE_OFFSET / source.height);
+        target.framebuffer.draw_textured_rectangle(pipeline,
+            0, 0, target.width * shareX, target.height * shareY,
+            0, 0, shareX, shareY);
     }
 });
 
@@ -600,8 +637,9 @@ const GlassCard = GObject.registerClass({
         this.queue_redraw();
     }
 
-    setGlassUniforms(pipeline, scale) {
+    setGlassUniforms(pipeline, scale, shareX, shareY) {
         setUniform(pipeline, 'uSize', this.width, this.height);
+        setUniform(pipeline, 'uUvScale', shareX, shareY);
         setUniform(pipeline, 'uRect', ...this._rect);
         setUniform(pipeline, 'uRadius', this._radius);
         setUniform(pipeline, 'uScale', scale);
