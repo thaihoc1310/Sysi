@@ -24,6 +24,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
   of them for the exact count and the input / output / cache breakdown. The
   window is `TODAY`, `7D`, `30D`, or everything the logs still hold.
 - Create multiple independent notes from the `NOTE` action. Hiding a blank note deletes it; notes containing text or images stay in Notes.
+- A chatbot answer pasted as Markdown comes in as the text it reads as: `**bold**`, `*italics*`, headings, `<br>` and HTML entities are unwrapped, bullets become `•`, links keep their URL in brackets, and LaTeX such as `$\rightarrow$` or `x^2` becomes `→` and `x²`. A pipe table is redrawn with box characters in a fixed-width face, its columns wrapped to fit the note; a table too wide even for that becomes one short block per row. Code fences and inline code come in verbatim. Text without an unmistakable Markdown mark (a table, `**bold**`, `<br>`, TeX, a link, or a fence) pastes unchanged, so code with `# comments` or `**kwargs` is safe. `Ctrl+Shift+V` pastes exactly what was copied, and `Ctrl+Z` undoes a cleaned paste in one step.
 - The panel’s final `settings` button opens colour mode, font size (`− number +`), lock/unlock, and quit. Each window also has its own font-size controls in its right-click menu. Changing the global font size clears the individual overrides; sizes persist across restarts.
 - Click-through lock mode. Mouse events pass through everywhere except the timer circle, which keeps its hover and click control.
 - `AUTO` samples the background beneath each widget and chooses a contrasting `LIGHT` or `DARK` foreground. In Edit Mode, right-click any widget to override it; the single colour entry cycles AUTO → LIGHT → DARK → INVERT → AUTO. Using the Settings mode button resets every widget to the selected global mode.
@@ -44,6 +45,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 - `Super+Shift+H` — hide or show every Sysi window at once (also `hide` / `show` in the panel's settings menu). The timer keeps running while hidden, and any other panel action or hotkey shows Sysi again first.
 - `Ctrl+Alt+N` — open or close the Notes palette. Search, move with Up/Down, Enter to open on the desk, Ctrl+P to pin, Delete to delete, Escape to close.
 - `Super+Shift+A` — start OCR (same as the panel `ocr` button). Drag a rectangle; the text is copied. Press again, right-click, or Escape to cancel. Super+Shift+A rather than Super+Shift+D: Super+A is Show Apps, Super+Shift+S is the screenshot UI, and Super+D is often “hide windows”.
+- `Ctrl+Shift+V` — paste into a note exactly as copied, skipping the Markdown clean-up.
 - `Ctrl+F` — find text in the focused note. Use `Enter` / `Shift+Enter` (or
   `F3` / `Shift+F3`) to move between matches and `Escape` to close the panel.
 - `Escape` — cancel an OCR selection if one is up; otherwise close the Notes palette if it is open; otherwise return to click-through lock mode.

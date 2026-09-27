@@ -1,3 +1,4 @@
+mod markdown;
 mod platform;
 mod state;
 mod system;

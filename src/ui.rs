@@ -7615,6 +7615,8 @@ fn fill_note_content(
 /// rather than stored, so old notes and the Notes preview get it for free.
 // ponytail: rescans the whole note per edit; limit to the edited lines if a
 // note ever grows large enough to lag.
+const NOTE_MONO_FAMILY: &str = "Noto Sans Mono, DejaVu Sans Mono, monospace";
+
 fn mono_box_drawing_lines(buffer: &gtk::TextBuffer) {
     const NAME: &str = "sysi-note-box-mono";
     let Some(table) = buffer.tag_table() else {
@@ -7622,7 +7624,7 @@ fn mono_box_drawing_lines(buffer: &gtk::TextBuffer) {
     };
     let tag = table.lookup(NAME).unwrap_or_else(|| {
         let tag = gtk::TextTag::new(Some(NAME));
-        tag.set_family(Some("Noto Sans Mono, DejaVu Sans Mono, monospace"));
+        tag.set_family(Some(NOTE_MONO_FAMILY));
         table.add(&tag);
         tag
     });
@@ -7826,6 +7828,53 @@ fn copy_focused_image(
         .clipboard(&gdk::SELECTION_CLIPBOARD)
         .set_image(&pixbuf);
     true
+}
+
+/// A chatbot answer copied as Markdown goes in as the text it reads as, its
+/// tables drawn to fit this note. Anything that is not Markdown is left to
+/// GTK's own paste.
+fn paste_note_markdown(editor: &gtk::TextView) -> bool {
+    if !editor.is_editable() {
+        return false;
+    }
+    let clipboard = editor.clipboard(&gdk::SELECTION_CLIPBOARD);
+    let Some(text) = clipboard.wait_for_text() else {
+        return false;
+    };
+    let Some(cleaned) = crate::markdown::clean_pasted_markdown(&text, note_mono_columns(editor))
+    else {
+        return false;
+    };
+    let Some(buffer) = editor.buffer() else {
+        return false;
+    };
+    buffer.delete_selection(true, true);
+    buffer.insert_interactive_at_cursor(&cleaned, true);
+    if let Some(insert) = buffer.get_insert() {
+        editor.scroll_mark_onscreen(&insert);
+    }
+    true
+}
+
+/// How many fixed-width cells fit on one line of this note right now, less
+/// one so a table never touches the edge and wraps. 0 when it cannot be told.
+fn note_mono_columns(editor: &gtk::TextView) -> usize {
+    let mut font = editor.pango_context().font_description().unwrap_or_default();
+    font.set_family(NOTE_MONO_FAMILY);
+    let sample = "0".repeat(20);
+    let layout = editor.create_pango_layout(Some(&sample));
+    layout.set_font_description(Some(&font));
+    let cell = f64::from(layout.pixel_size().0) / 20.0;
+    let padding = editor.style_context().padding(gtk::StateFlags::NORMAL);
+    let text = editor.allocation().width()
+        - i32::from(padding.left)
+        - i32::from(padding.right)
+        - editor.left_margin()
+        - editor.right_margin();
+    if cell <= 0.0 || text <= 0 {
+        return 0;
+    }
+    ((f64::from(text) / cell).floor() as usize).saturating_sub(1)
 }
 
 fn paste_note_image(
@@ -8468,20 +8517,26 @@ fn attach_note_images(
             | gdk::EventMask::LEAVE_NOTIFY_MASK,
     );
 
+    // Ctrl+Shift+V pastes the clipboard exactly as copied, Markdown and all.
+    let raw_paste = Rc::new(Cell::new(false));
     editor.connect_paste_clipboard({
         let state = state.clone();
         let originals = originals.clone();
         let target = target.clone();
+        let raw_paste = raw_paste.clone();
         move |editor| {
+            let raw = raw_paste.replace(false);
             let Some(buffer) = editor.buffer() else {
                 return;
             };
             buffer.begin_user_action();
-            let pasted = paste_note_image(editor, &target, &state, &originals);
+            let pasted = paste_note_image(editor, &target, &state, &originals)
+                || (!raw && paste_note_markdown(editor));
             buffer.end_user_action();
             if pasted {
                 // The default handler would paste the clipboard's text form of
-                // the same image next to it — a file URL, or an HTML img tag.
+                // the same image next to it — a file URL, or an HTML img tag —
+                // or the Markdown we just cleaned up.
                 glib::signal_stop_emission_by_name(editor, "paste-clipboard");
             }
         }
@@ -8547,6 +8602,7 @@ fn attach_note_images(
         let state = state.clone();
         let originals = originals.clone();
         let focus = focus.clone();
+        let raw_paste = raw_paste.clone();
         move |editor, event| {
             if !editor.is_editable() {
                 return glib::Propagation::Proceed;
@@ -8555,6 +8611,12 @@ fn attach_note_images(
                 return glib::Propagation::Proceed;
             }
             let key = event.keyval();
+            let v = key == gdk::keys::constants::v || key == gdk::keys::constants::V;
+            if v && event.state().contains(gdk::ModifierType::SHIFT_MASK) {
+                raw_paste.set(true);
+                editor.emit_paste_clipboard();
+                return glib::Propagation::Stop;
+            }
             let c = key == gdk::keys::constants::c || key == gdk::keys::constants::C;
             if c {
                 return if copy_focused_image(editor, &focus, &originals) {
