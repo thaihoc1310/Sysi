@@ -115,3 +115,91 @@
 .sysi-settings-menu .sysi-font-row {
   spacing: 2px;
 }
+
+/* SYSTEM in the top bar: a caption and a value per reading, a little way
+   past the gear. The digits are tabular, so a value changing from 9% to 10%
+   does not nudge the readings after it. */
+#panel .sysi-system-readout {
+  margin-left: 10px;
+  spacing: 14px;
+}
+
+#panel .sysi-system-item {
+  spacing: 5px;
+}
+
+#panel .sysi-system-caption {
+  color: rgba(242, 242, 242, 0.55);
+  font-family: "Noto Sans", sans-serif;
+  font-size: 9px;
+  font-weight: 700;
+  text-shadow: none;
+}
+
+#panel .sysi-system-value {
+  color: #f2f2f2;
+  font-family: "Noto Sans", sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  font-feature-settings: "tnum";
+  text-shadow: none;
+}
+
+/* SYSTEM's menu: the switch for the whole row, then a chip per reading. A
+   chip is filled while its reading is in the bar, outlined while it is not,
+   and faint when there is no room left for it before the clock. */
+.sysi-system-menu .popup-menu-content {
+  min-width: 212px;
+}
+
+.sysi-system-menu .sysi-system-chips-item {
+  padding: 4px 8px;
+}
+
+.sysi-system-menu .sysi-system-chips {
+  spacing: 6px;
+}
+
+.sysi-system-menu .sysi-system-chip-row {
+  spacing: 6px;
+}
+
+.sysi-system-menu .sysi-system-chip {
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background-color: transparent;
+  color: rgba(244, 244, 244, 0.86);
+  font-size: 11px;
+  font-weight: 500;
+  transition-duration: 0ms;
+}
+
+.sysi-system-menu .sysi-system-chip:hover,
+.sysi-system-menu .sysi-system-chip:focus {
+  background-color: rgba(255, 255, 255, 0.10);
+  color: #ffffff;
+}
+
+.sysi-system-menu .sysi-system-chip:checked {
+  background-color: rgba(244, 244, 244, 0.90);
+  border-color: rgba(244, 244, 244, 0.90);
+  color: #161618;
+}
+
+.sysi-system-menu .sysi-system-chip:checked:hover,
+.sysi-system-menu .sysi-system-chip:checked:focus {
+  background-color: #ffffff;
+  color: #161618;
+}
+
+.sysi-system-menu .sysi-system-chip-full {
+  border-color: rgba(255, 255, 255, 0.07);
+  color: rgba(244, 244, 244, 0.30);
+}
+
+.sysi-system-menu .sysi-system-hint {
+  padding: 2px 4px 4px;
+  color: rgba(244, 244, 244, 0.55);
+  font-size: 10px;
+}

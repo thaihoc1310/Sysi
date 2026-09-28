@@ -8,8 +8,6 @@ use std::{
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SystemReadOptions {
-    pub processes: bool,
-    pub cores: bool,
     pub gpus: bool,
     pub cpu_temp: bool,
     pub gpu_temp: bool,
@@ -56,7 +54,6 @@ pub struct GpuSnapshot {
 pub struct SystemSnapshot {
     pub cpu_percent: f64,
     pub memory_percent: f64,
-    pub memory: Usage,
     /// `None` on a machine with no swap configured at all.
     pub swap: Option<Usage>,
     pub gpus: Vec<GpuSnapshot>,
@@ -66,26 +63,14 @@ pub struct SystemSnapshot {
     pub storage_temperatures: Vec<(String, f64)>,
     pub root_disk: Option<Usage>,
     pub home_disk: Option<Usage>,
-    pub cores: Vec<f64>,
-    pub processes: Vec<ProcessSnapshot>,
     /// `None` until a second sample exists, since a rate needs two counters.
     pub network: Option<NetworkRates>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ProcessSnapshot {
-    pub name: String,
-    pub pid: u32,
-    pub cpu_percent: f64,
-    pub memory_kib: u64,
 }
 
 #[derive(Default)]
 pub struct SystemReader {
     previous_total: u64,
     previous_idle: u64,
-    previous_cores: Vec<(u64, u64)>,
-    previous_process_ticks: HashMap<u32, u64>,
     /// Set once `nvidia-smi` turns out not to be installed. Without it a
     /// machine with no NVIDIA driver pays for spawning a missing process every
     /// two seconds for as long as the GPU meters are on.
@@ -129,36 +114,6 @@ impl SystemReader {
 
         let memory_info = read_memory().unwrap_or_default();
         let memory_percent = memory_info.memory.percent();
-        let cores = if options.cores {
-            let mut result = Vec::with_capacity(cpu_lines.len().saturating_sub(1));
-            for (index, (core_total, core_idle)) in cpu_lines.iter().skip(1).copied().enumerate() {
-                let (previous_total, previous_idle) = self
-                    .previous_cores
-                    .get(index)
-                    .copied()
-                    .unwrap_or((core_total, core_idle));
-                let delta_total = core_total.saturating_sub(previous_total);
-                let delta_idle = core_idle.saturating_sub(previous_idle);
-                let percent = if delta_total == 0 {
-                    0.0
-                } else {
-                    delta_total.saturating_sub(delta_idle) as f64 * 100.0 / delta_total as f64
-                };
-                result.push(percent);
-            }
-            self.previous_cores = cpu_lines.iter().skip(1).copied().collect();
-            result
-        } else {
-            self.previous_cores.clear();
-            Vec::new()
-        };
-        let processes = if options.processes {
-            self.read_processes(delta_total)
-        } else {
-            self.previous_process_ticks.clear();
-            Vec::new()
-        };
-
         // The temperature of a card is read from the same place its load is,
         // so the GPU readers run for either meter.
         let gpus = if options.gpus || options.gpu_temp {
@@ -188,15 +143,12 @@ impl SystemReader {
         SystemSnapshot {
             cpu_percent,
             memory_percent,
-            memory: memory_info.memory,
             swap: memory_info.swap,
             gpus,
             cpu_temperature,
             storage_temperatures,
             root_disk: options.root_disk.then(|| read_disk_usage("/")).flatten(),
             home_disk: options.home_disk.then(read_home_disk).flatten(),
-            cores,
-            processes,
             network,
         }
     }
@@ -246,60 +198,6 @@ impl SystemReader {
             elapsed,
         ))
     }
-
-    fn read_processes(&mut self, total_delta: u64) -> Vec<ProcessSnapshot> {
-        let mut next_ticks = HashMap::new();
-        let mut processes = Vec::new();
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return processes;
-        };
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|value| value.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let Some((comm, ticks)) = read_process_stat(pid) else {
-                continue;
-            };
-            let name = read_process_name(pid, comm);
-            let memory_kib = read_process_memory(pid).unwrap_or(0);
-            let previous = self
-                .previous_process_ticks
-                .get(&pid)
-                .copied()
-                .unwrap_or(ticks);
-            let cpu_percent = if total_delta == 0 {
-                0.0
-            } else {
-                ticks.saturating_sub(previous) as f64 * 100.0 / total_delta as f64
-            };
-            next_ticks.insert(pid, ticks);
-            processes.push(ProcessSnapshot {
-                name,
-                pid,
-                cpu_percent,
-                memory_kib,
-            });
-        }
-        self.previous_process_ticks = next_ticks;
-        sort_processes(&mut processes);
-        processes
-    }
-}
-
-fn sort_processes(processes: &mut [ProcessSnapshot]) {
-    // "TOP PROCESSES" means active now, not merely the five largest address
-    // spaces. Memory remains the stable tie-breaker for the first sample, when
-    // every CPU delta is necessarily zero.
-    processes.sort_by(|left, right| {
-        right
-            .cpu_percent
-            .total_cmp(&left.cpu_percent)
-            .then_with(|| right.memory_kib.cmp(&left.memory_kib))
-    });
 }
 
 impl SystemReader {
@@ -830,175 +728,12 @@ fn network_rates(previous: (u64, u64), current: (u64, u64), elapsed_seconds: f64
     }
 }
 
-fn read_process_stat(pid: u32) -> Option<(String, u64)> {
-    let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let open = raw.find('(')?;
-    let close = raw.rfind(')')?;
-    let name = raw.get(open + 1..close)?.to_owned();
-    let fields: Vec<&str> = raw.get(close + 1..)?.split_whitespace().collect();
-    let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
-    let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
-    Some((name, user_ticks.saturating_add(system_ticks)))
-}
-
-/// `/proc/<pid>/stat` truncates the command to 15 characters, which is how a
-/// Firefox content process ends up listed as "Isolated Web Co" and a Chromium
-/// helper as "Chrome_ChildIO". argv[0]'s file name is both complete and the
-/// name the user knows the program by, so it wins wherever a process has one.
-fn read_process_name(pid: u32, comm: String) -> String {
-    fs::read(format!("/proc/{pid}/cmdline"))
-        .ok()
-        .as_deref()
-        .and_then(process_name_from_cmdline)
-        .unwrap_or(comm)
-}
-
-fn process_name_from_cmdline(raw: &[u8]) -> Option<String> {
-    // Arguments are meant to be NUL-separated, but Chromium and every Electron
-    // app built on it rewrite their argv into one contiguous blob with spaces
-    // between the arguments instead. Splitting on the NUL alone hands back that
-    // whole command line, and taking the part after its last '/' then lands
-    // somewhere inside --user-data-dir or a crash-reporter GUID. Treat
-    // whitespace as a separator too and the first token is the executable
-    // either way.
-    let text = String::from_utf8_lossy(raw);
-    let argv0 = text
-        .split(|character: char| character == '\0' || character.is_whitespace())
-        .find(|token| !token.is_empty())?;
-    // Servers such as postgres rewrite argv[0] into a status line — "postgres:
-    // checkpointer" — with no path in it. There is nothing to strip there, and
-    // the bare program name is still the useful half.
-    let name = argv0.rsplit('/').next()?.trim_end_matches(':');
-    (!name.is_empty()).then(|| name.to_owned())
-}
-
-fn read_process_memory(pid: u32) -> Option<u64> {
-    // Match GNOME System Monitor's process-memory column: libgtop exposes
-    // `resident - shared`, both from /proc/<pid>/statm. Raw VmRSS charges all
-    // shared Chromium/Electron pages to every child process and looks far too
-    // high in a per-process list.
-    let raw = fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
-    parse_process_memory_statm(&raw, page_size_kib())
-}
-
-fn page_size_kib() -> u64 {
-    let bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(bytes).unwrap_or(4096).max(1) / 1024
-}
-
-fn parse_process_memory_statm(raw: &str, page_kib: u64) -> Option<u64> {
-    let mut fields = raw.split_whitespace();
-    let _virtual_pages = fields.next()?;
-    let resident_pages = fields.next()?.parse::<u64>().ok()?;
-    let shared_pages = fields.next()?.parse::<u64>().ok()?;
-    Some(
-        resident_pages
-            .saturating_sub(shared_pages)
-            .saturating_mul(page_kib.max(1)),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         drive_vendor, format_drive_capacity, home_disk_row, network_rates, number_repeated_labels,
-        parse_memory, parse_network_counters, parse_nvidia_gpus, parse_process_memory_statm,
-        process_name_from_cmdline, sort_processes, GpuSnapshot, ProcessSnapshot, Usage,
+        parse_memory, parse_network_counters, parse_nvidia_gpus, GpuSnapshot, Usage,
     };
-
-    #[test]
-    fn process_memory_matches_system_monitor_resident_minus_shared() {
-        assert_eq!(
-            parse_process_memory_statm("1000 200 50 0 0 0 0", 4),
-            Some(600)
-        );
-    }
-
-    #[test]
-    fn process_memory_never_underflows_when_kernel_reports_more_shared_pages() {
-        assert_eq!(parse_process_memory_statm("1000 20 50", 4), Some(0));
-    }
-
-    #[test]
-    fn top_processes_are_ranked_by_current_cpu_then_memory() {
-        let mut processes = vec![
-            ProcessSnapshot {
-                name: "large-idle".into(),
-                cpu_percent: 0.0,
-                memory_kib: 8_000,
-                ..ProcessSnapshot::default()
-            },
-            ProcessSnapshot {
-                name: "busy".into(),
-                cpu_percent: 12.0,
-                memory_kib: 200,
-                ..ProcessSnapshot::default()
-            },
-            ProcessSnapshot {
-                name: "busier".into(),
-                cpu_percent: 30.0,
-                memory_kib: 100,
-                ..ProcessSnapshot::default()
-            },
-        ];
-        sort_processes(&mut processes);
-        assert_eq!(processes[0].name, "busier");
-        assert_eq!(processes[1].name, "busy");
-        assert_eq!(processes[2].name, "large-idle");
-    }
-
-    #[test]
-    fn a_process_is_named_after_argv0_rather_than_the_truncated_comm() {
-        // What the kernel would have called "Isolated Web Co".
-        assert_eq!(
-            process_name_from_cmdline(b"/usr/lib/firefox/firefox\0-contentproc\0").as_deref(),
-            Some("firefox")
-        );
-        assert_eq!(
-            process_name_from_cmdline(b"/usr/bin/python3\0script.py\0").as_deref(),
-            Some("python3")
-        );
-        // A rewritten argv[0] has no path to strip; the program name is the
-        // half worth keeping.
-        assert_eq!(
-            process_name_from_cmdline(b"postgres: checkpointer\0").as_deref(),
-            Some("postgres")
-        );
-    }
-
-    #[test]
-    fn a_chromium_style_cmdline_is_not_mistaken_for_one_long_argument() {
-        // Both observed verbatim. Chromium and Electron write every argument
-        // into a single NUL-terminated blob, so splitting on the NUL alone used
-        // to take the last '/' out of --user-data-dir or a crash-reporter GUID
-        // and call the process "VQ6BtEUZqoCU04zoRU=--c" or "Codex --owl-...".
-        assert_eq!(
-            process_name_from_cmdline(
-                b"/opt/brave.com/brave/brave --type=renderer \
---enable-crash-reporter=254aa1ef-75fb-4888-b266-41763658ad75,VQ6BtEUZqoCU04zoRU=\0"
-            )
-            .as_deref(),
-            Some("brave")
-        );
-        assert_eq!(
-            process_name_from_cmdline(
-                b"/usr/lib/chatgpt/ChatGPT --type=renderer \
---user-data-dir=/home/someone/.config/Codex --owl-electron-scheme\0"
-            )
-            .as_deref(),
-            Some("ChatGPT")
-        );
-    }
-
-    #[test]
-    fn a_process_with_no_cmdline_keeps_the_name_the_kernel_gave_it() {
-        // Kernel threads, and anything whose argv[0] is unusable, fall back to
-        // `comm` rather than showing an empty row.
-        assert_eq!(process_name_from_cmdline(b""), None);
-        assert_eq!(process_name_from_cmdline(b"\0\0"), None);
-        assert_eq!(process_name_from_cmdline(b"   \0"), None);
-        assert_eq!(process_name_from_cmdline(b"/usr/bin/\0"), None);
-    }
 
     #[test]
     fn nvidia_csv_keeps_every_gpu_and_clamps_what_the_driver_reports() {

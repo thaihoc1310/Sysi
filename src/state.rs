@@ -146,6 +146,7 @@ impl Default for Settings {
     }
 }
 
+/// Which readings SYSTEM shows in the top bar (see `panel_system`).
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct SystemDetails {
     #[serde(default = "default_true")]
@@ -155,10 +156,6 @@ pub struct SystemDetails {
     #[serde(default)]
     pub swap: bool,
     #[serde(default)]
-    pub processes: bool,
-    #[serde(default)]
-    pub cores: bool,
-    #[serde(default)]
     pub gpus: bool,
     #[serde(default)]
     pub cpu_temp: bool,
@@ -166,8 +163,6 @@ pub struct SystemDetails {
     pub gpu_temp: bool,
     #[serde(default)]
     pub ssd_temp: bool,
-    #[serde(default)]
-    pub memory_detail: bool,
     #[serde(default)]
     pub root_disk: bool,
     #[serde(default)]
@@ -182,13 +177,10 @@ impl Default for SystemDetails {
             cpu: true,
             ram: true,
             swap: false,
-            processes: false,
-            cores: false,
             gpus: false,
             cpu_temp: false,
             gpu_temp: false,
             ssd_temp: false,
-            memory_detail: false,
             root_disk: false,
             home_disk: false,
             network: false,
@@ -660,7 +652,8 @@ mod tests {
     fn a_state_saved_before_the_new_sensors_keeps_the_sections_it_had() {
         // What a card with the disk meters on used to save. The sections it
         // never knew about have to come back off rather than switch themselves
-        // on for someone who never asked.
+        // on for someone who never asked, and the ones SYSTEM no longer has
+        // (processes, cores) are simply dropped.
         let state: AppState = serde_json::from_str(
             r#"{"settings":{"system_details":{"cpu":true,"ram":true,"gpus":true,"root_disk":true,"home_disk":true,"processes":false,"cores":false}}}"#,
         )
@@ -670,7 +663,6 @@ mod tests {
         assert!(details.root_disk && details.home_disk);
         assert!(!details.swap);
         assert!(!details.cpu_temp && !details.gpu_temp && !details.ssd_temp);
-        assert!(!details.memory_detail);
         assert!(!details.network);
     }
 }

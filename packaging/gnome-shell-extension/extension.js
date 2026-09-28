@@ -11,6 +11,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import {GlassManager} from './glass.js';
+import {SystemPanel} from './system.js';
 
 const UUID = 'sysi-panel@thaihoc';
 // Opens and closes the Notes palette. Ctrl+Alt+N until 0.1.77.
@@ -65,7 +66,8 @@ export default class SysiPanelExtension extends Extension {
         this._content.add_child(this._strip);
         this._strip.visible = false;
 
-        this._system = this._addAction('system', 'toggle-system');
+        // Opens SYSTEM's menu; see system.js.
+        this._system = this._buildPanelButton('system');
         this._timer = this._addAction('timer', 'toggle-timer');
         this._addAction('+ note', 'new-note');
         this._addAction('notes', 'toggle-notes');
@@ -79,10 +81,19 @@ export default class SysiPanelExtension extends Extension {
             this._strip.visible = !this._strip.visible;
             if (!this._strip.visible)
                 this._settingsMenu.close();
+            this._systemPanel?.setStripOpen(this._strip.visible);
         });
 
         // Append after Ubuntu's left-side indicator instead of prepending it.
         Main.panel.addToStatusArea(UUID, this._indicator, -1, 'left');
+        // After the indicator is on the panel: the readings are measured with
+        // the panel's own style.
+        this._systemPanel = new SystemPanel({
+            row: this._content,
+            button: this._system,
+            gear: this._gear,
+            runAction: (action, button) => this._runAction(action, button),
+        });
         this._pidFile = Gio.File.new_for_path(
             GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi', 'pid']),
         );
@@ -180,6 +191,8 @@ export default class SysiPanelExtension extends Extension {
     disable() {
         this._glass?.destroy();
         this._glass = null;
+        this._systemPanel?.destroy();
+        this._systemPanel = null;
         this._pidMonitor?.cancel();
         this._pidMonitor = null;
         this._panelStateMonitor?.cancel();
@@ -751,6 +764,7 @@ export default class SysiPanelExtension extends Extension {
         if (!running) {
             this._strip.visible = false;
             this._settingsMenu?.close();
+            this._systemPanel?.setStripOpen(false);
             this._unbindOcrEscape();
         } else {
             this._syncOcrEscape();

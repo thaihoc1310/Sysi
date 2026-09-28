@@ -2,9 +2,8 @@ use crate::{
     platform,
     state::{
         AppState, ColorMode, DictionaryWindow, HighlightColor, Note, NoteHighlight, NoteImage,
-        Point, Size, SystemDetails, TimerStyle, IMAGE_PLACEHOLDER,
+        Point, Size, TimerStyle, IMAGE_PLACEHOLDER,
     },
-    system::{NetworkRates, SystemReadOptions, SystemReader, SystemSnapshot, Usage},
     translate,
     usage::{self, Source as UsageSource},
 };
@@ -32,58 +31,6 @@ use std::{
 /// couple of thousand words, and nothing that is dropped costs more than one
 /// re-download.
 const AUDIO_CACHE_LIMIT: u64 = 64 * 1024 * 1024;
-const SYSTEM_WIDTH: i32 = 196;
-const SYSTEM_HEIGHT: i32 = 76;
-const SYSTEM_SINGLE_WIDTH: i32 = 76;
-/// One meter's share of a row. Two of them make up the classic CPU + RAM card.
-const SYSTEM_METER_CELL: f64 = 94.0;
-/// The ring inside that cell: where its centre sits, how far the arc is swept
-/// from it, and the stroke that straddles the arc. Everything that measures the
-/// card is derived from these, so the box can never drift from the paint.
-const SYSTEM_METER_RING_CENTER_Y: f64 = 35.0;
-const SYSTEM_METER_RING_RADIUS: f64 = 28.0;
-const SYSTEM_METER_RING_STROKE: f64 = 6.5;
-/// How far the painted ring reaches from its centre: the radius, plus the half
-/// of the stroke that falls outside it.
-const SYSTEM_METER_RING_EXTENT: f64 = SYSTEM_METER_RING_RADIUS + SYSTEM_METER_RING_STROKE / 2.0;
-/// The box one ring paints into, stroke included. This is a fixed size: the
-/// card responds to a drag by moving the rings apart, not by growing them.
-const SYSTEM_METER_RING: f64 = 2.0 * SYSTEM_METER_RING_EXTENT;
-/// The space a card left alone puts between its rings — one cell less one
-/// ring, which is exactly how far apart the classic card's rings sit.
-const SYSTEM_METER_GAP: f64 = SYSTEM_METER_CELL - SYSTEM_METER_RING;
-/// How close together the rings may be squeezed before one of them is moved
-/// down to the next row instead.
-const SYSTEM_METER_GAP_MIN: f64 = 10.0;
-const SYSTEM_METER_INK_TOP: f64 = SYSTEM_METER_RING_CENTER_Y - SYSTEM_METER_RING_EXTENT;
-const SYSTEM_METER_INK_BOTTOM: f64 =
-    SYSTEM_HEIGHT as f64 - (SYSTEM_METER_RING_CENTER_Y + SYSTEM_METER_RING_EXTENT);
-/// Rings stay legible at this size, so a row never holds more than three.
-const SYSTEM_METERS_PER_ROW: usize = 3;
-/// Where a caption sits inside its ring, measured from the top of the meter.
-/// Four above the ring's widest point, which is what buys the caption enough
-/// clear room for a word as long as "NVIDIA".
-const SYSTEM_METER_LABEL_BASELINE: f64 = 52.0;
-/// How wide a caption can be at that baseline before it crosses the stroke:
-/// the ring's inner edge is 18 either side of centre there, and a centred
-/// caption has to clear both.
-const SYSTEM_METER_LABEL_WIDTH: f64 = 34.0;
-/// The widest a ring's own number may be drawn: the clear span inside its
-/// stroke. Only a five-character reading such as "100\u{b0}C" ever comes close,
-/// and shrinking that beats letting it cross the ring it belongs to.
-const SYSTEM_METER_VALUE_WIDTH: f64 = 2.0 * SYSTEM_METER_RING_RADIUS - SYSTEM_METER_RING_STROKE;
-/// Where a temperature stops being worth a glance and starts being worth a
-/// warning. Consumer CPUs throttle somewhere above 95 °C, so this is hot
-/// enough to mean something and cool enough to see it coming.
-const SYSTEM_HOT_CELSIUS: f64 = 85.0;
-/// The one colour on an otherwise monochrome card. Warm enough to read as a
-/// warning against either foreground, and dark enough to stay legible on the
-/// light one.
-const SYSTEM_HOT_INK: (f64, f64, f64) = (0.86, 0.34, 0.24);
-/// A row that is one line of text: a capacity row or the throughput row.
-const SYSTEM_ROW_HEIGHT: f64 = 17.0;
-/// The gap that separates a block of rows from whatever is above it.
-const SYSTEM_ROW_TOP_GAP: f64 = 16.0;
 const TIMER_SIZE: i32 = 116;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
@@ -136,7 +83,6 @@ type LookupSlot = Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>;
 /// A recursive lookup callback must be weak or the callback and its slot keep
 /// an already-closed dictionary window alive forever.
 type WeakLookupSlot = Rc<RefCell<Option<Weak<dyn Fn(&str)>>>>;
-type SystemValues = Rc<RefCell<SystemSnapshot>>;
 /// Opens a dictionary window, going straight to a word when one is given.
 type SpawnDictionary = Rc<dyn Fn(Option<&str>)>;
 /// Runs a query in one window. The flag says whether it joins that window's
@@ -232,23 +178,6 @@ struct DesktopCapture {
     origin: Point,
 }
 
-struct SystemCard {
-    card: gtk::EventBox,
-    drag: gtk::EventBox,
-    color_mode: Rc<Cell<Foreground>>,
-    canvas: gtk::DrawingArea,
-    values: SystemValues,
-    details: Rc<Cell<SystemDetails>>,
-    /// The last size the layout itself asked for. Compared against rather than
-    /// against the allocation, so a card whose natural size never quite matches
-    /// its request is not re-requested on every sample.
-    auto_size: Rc<Cell<Option<Size>>>,
-    /// Asks the sampler for a reading now. Filled in by `start_system_updates`,
-    /// which runs after the details menu has already been attached.
-    resample: CallbackSlot,
-    resize: ResizeHandle,
-}
-
 #[derive(Clone)]
 struct UsageCard {
     card: gtk::EventBox,
@@ -276,16 +205,6 @@ struct UsageController {
     request: Rc<dyn Fn()>,
     refresh: Rc<dyn Fn()>,
     show: Rc<dyn Fn(UsageTab)>,
-}
-
-#[derive(Clone)]
-struct SystemDetailsPreview {
-    card: gtk::EventBox,
-    canvas: gtk::DrawingArea,
-    values: SystemValues,
-    details: Rc<Cell<SystemDetails>>,
-    auto_size: Rc<Cell<Option<Size>>>,
-    resample: CallbackSlot,
 }
 
 #[derive(Clone)]
@@ -407,13 +326,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let mut data = state.borrow_mut();
         if data.layout_version < 3 {
             data.positions.insert(
-                "system".into(),
-                Point {
-                    x: primary_screen.x + 28,
-                    y: primary_screen.y + 78,
-                },
-            );
-            data.positions.insert(
                 "timer".into(),
                 Point {
                     x: primary_screen.x + primary_screen.width - TIMER_SIZE - 30,
@@ -487,26 +399,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let _ = data.save();
         }
         if data.layout_version < 6 {
-            let details = data.settings.system_details;
-            // Frozen at what version 6 knew about: CPU and RAM were the only
-            // two meters that existed when this migration was written.
-            if usize::from(details.cpu) + usize::from(details.ram) == 1
-                && !details.processes
-                && !details.cores
-                && data.sizes.get("system").copied()
-                    == Some(Size {
-                        width: SYSTEM_WIDTH,
-                        height: SYSTEM_HEIGHT,
-                    })
-            {
-                data.sizes.insert(
-                    "system".into(),
-                    Size {
-                        width: SYSTEM_SINGLE_WIDTH,
-                        height: SYSTEM_HEIGHT,
-                    },
-                );
-            }
             data.layout_version = 6;
             let _ = data.save();
         }
@@ -536,26 +428,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             let _ = data.save();
         }
         if data.layout_version < 8 {
-            // The system card used to be measured to the cells its rings sit
-            // in, which left a blank margin all the way round: the widget
-            // stopped short of the left, right, and bottom edges of the screen
-            // even when it was clamped flush against them. It is measured to
-            // the rings themselves now, so a width saved under the old measure
-            // has to hand those margins back — left alone it would keep the
-            // gap it was dragged to.
-            if let Some(size) = data.sizes.get("system").copied() {
-                let columns =
-                    ((f64::from(size.width.max(1)) / SYSTEM_METER_CELL).floor() as usize).max(1);
-                data.sizes.insert(
-                    "system".into(),
-                    Size {
-                        width: system_meter_ink_width(columns).ceil() as i32,
-                        // The height follows from the width on its own, so
-                        // whatever is here is replaced on the first layout.
-                        height: size.height,
-                    },
-                );
-            }
             data.layout_version = 8;
             let _ = data.save();
         }
@@ -676,104 +548,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     );
     window.set_accept_focus(true);
     window.style_context().add_class("editing");
-    let (system_color_mode, timer_color_mode, picker_color_mode, system_details) = {
+    let (timer_color_mode, picker_color_mode) = {
         let data = state.borrow();
-        (
-            saved_color_mode(&data, "system"),
-            saved_color_mode(&data, "timer"),
-            saved_color_mode(&data, "picker"),
-            data.settings.system_details,
-        )
+        (saved_color_mode(&data, "timer"), saved_color_mode(&data, "picker"))
     };
-
-    let system_card = build_system_card(foreground_for_mode(system_color_mode), system_details);
-    apply_widget_size(
-        &system_card.card,
-        "system",
-        &state,
-        system_card_size(system_details, &SystemSnapshot::default(), &state.borrow()),
-    );
-    place_card(
-        &root,
-        &system_card.card,
-        state
-            .borrow()
-            .positions
-            .get("system")
-            .copied()
-            .unwrap_or(Point { x: 34, y: 52 }),
-    );
-    register(
-        &registry,
-        "system",
-        &system_card.card,
-        system_card.color_mode.clone(),
-        system_color_mode,
-    );
-    let system_preview = SystemDetailsPreview {
-        card: system_card.card.clone(),
-        canvas: system_card.canvas.clone(),
-        values: system_card.values.clone(),
-        details: system_card.details.clone(),
-        auto_size: system_card.auto_size.clone(),
-        resample: system_card.resample.clone(),
-    };
-    attach_color_mode_menu(
-        &system_card.card,
-        "system".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        None,
-        Some(system_preview.clone()),
-        None,
-        None,
-        None,
-    );
-    attach_drag(
-        &system_card.drag,
-        &system_card.card,
-        &root,
-        "system".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        window.clone(),
-    );
-    attach_resize(
-        &system_card.resize,
-        &system_card.card,
-        &root,
-        "system".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        window.clone(),
-        ResizeBounds {
-            min_width: 62,
-            min_height: 62,
-            // Room for eight rings side by side, so a card dragged wide really
-            // can put every meter on one row.
-            max_width: Some(system_meter_ink_width(8).ceil() as i32),
-            max_height: Some(640),
-            aspect_ratio: None,
-            preserve_current_aspect: false,
-            height_for_width: Some(Rc::new({
-                let details = system_card.details.clone();
-                let values = system_card.values.clone();
-                let state = state.clone();
-                move |width| {
-                    scaled_system_content_size(
-                        details.get(),
-                        &values.borrow(),
-                        Some(width),
-                        state.borrow().font_size("system"),
-                    )
-                    .height
-                }
-            })),
-        },
-    );
 
     let timer_card = build_timer_card(
         state.clone(),
@@ -818,7 +596,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             typography: timer_card.typography.clone(),
             open_edit: timer_card.open_edit.clone(),
         }),
-        None,
         None,
         None,
         None,
@@ -876,7 +653,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         None,
         None,
         None,
-        None,
     );
     attach_drag(
         &widget_picker.drag,
@@ -904,7 +680,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
-        None,
         None,
         Some(lookup_actions.clone()),
         Some(notes_row_menu),
@@ -953,7 +728,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
-        None,
         None,
         None,
         None,
@@ -1889,41 +1663,18 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     widget_picker.timer.set_active(timer_enabled);
     widget_picker.mode.set_label(color_mode.label());
 
+    // SYSTEM lives in the GNOME top bar now; see `panel_system`.
+    let panel_system = crate::panel_system::PanelSystem::start(state.clone());
     widget_picker.system.connect_toggled({
-        let target = system_card.card.clone();
+        let panel_system = panel_system.clone();
         let state = state.clone();
-        let window = window.clone();
-        let registry = registry.clone();
-        let interactive = interactive.clone();
-        let root = root.clone();
-        let picker = widget_picker.card.clone();
-        let resample = system_card.resample.clone();
         move |button| {
-            let enabled = button.is_active();
-            if enabled {
-                reopen_widget(
-                    &target,
-                    "system",
-                    &root,
-                    &state,
-                    Size {
-                        width: SYSTEM_WIDTH,
-                        height: SYSTEM_HEIGHT,
-                    },
-                    Some(&picker),
-                );
-                target.show_all();
-                if let Some(request) = resample.borrow().clone() {
-                    request();
-                }
-            } else {
-                target.hide();
+            if button.is_active() != state.borrow().settings.system {
+                panel_system.toggle_on();
             }
-            state.borrow_mut().settings.system = enabled;
-            let _ = state.borrow().save();
-            refresh_input_shape(&window, &registry, interactive.get());
         }
     });
+
     widget_picker.timer.connect_toggled({
         let target = timer_card.card.clone();
         let state = state.clone();
@@ -2142,7 +1893,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     );
 
     let dispatch_panel_action: Rc<dyn Fn()> = {
-        let system = widget_picker.system.clone();
+        let panel_system = panel_system.clone();
         let timer = widget_picker.timer.clone();
         let mode = widget_picker.mode.clone();
         let lock = widget_picker.lock.clone();
@@ -2158,7 +1909,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let interactive = interactive.clone();
         let state = state.clone();
         let registry = registry.clone();
-        let system_preview = system_preview.clone();
         let dictate_start = dictate.start.clone();
         let dictate_cancel = dictate.cancel.clone();
         let window = window.clone();
@@ -2176,11 +1926,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     } else {
                         window.show();
                     }
-                } else if action.name != "quit" && !window.is_visible() {
+                } else if !window.is_visible() && !leaves_the_desk_alone(&action.name) {
                     window.show();
                 }
                 match action.name.as_str() {
-                    "toggle-system" => system.set_active(!system.is_active()),
+                    "toggle-system" => panel_system.toggle_on(),
+                    name if name.starts_with("system-metric:") => {
+                        panel_system.toggle_metric(&name["system-metric:".len()..]);
+                    }
                     "toggle-timer" => timer.set_active(!timer.is_active()),
                     "next-color-mode" => mode.clicked(),
                     "font-smaller" | "font-larger" => {
@@ -2189,7 +1942,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         for item in registry.borrow().iter() {
                             apply_widget_font(&item.widget, state.borrow().font_size(&item.key));
                         }
-                        refit_system_font(&system_preview, &state);
                         let _ = state.borrow().save();
                         publish_panel_state(interactive.get(), &state.borrow());
                     }
@@ -2327,9 +2079,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // Likewise the dictionary: show_all() dropped its query panel down, but a
     // window restored from the last session was not asked for just now.
     translate_after_show();
-    if !system_enabled {
-        system_card.card.hide();
-    }
     if !timer_enabled {
         timer_card.card.hide();
     }
@@ -2505,7 +2254,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         .borrow_mut()
         .push(notes.preview_scroller.clone());
     track_widget_hover(registry.clone(), translate_scrollers.clone());
-    start_system_updates(system_card, state.clone());
     start_timer_updates(timer_card, state, window, registry, interactive);
 }
 
@@ -4251,837 +3999,6 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
         request,
         refresh,
         show,
-    }
-}
-
-fn build_system_card(initial_color_mode: Foreground, initial_details: SystemDetails) -> SystemCard {
-    let (card, body, _, color_mode, resize) = card_shell("", "", initial_color_mode);
-    card.style_context().add_class("no-glass");
-    let values = Rc::new(RefCell::new(SystemSnapshot::default()));
-    let details = Rc::new(Cell::new(initial_details));
-    let drag = gtk::EventBox::new();
-    drag.set_visible_window(false);
-    drag.set_above_child(true);
-    drag.set_hexpand(true);
-    drag.set_vexpand(true);
-    let canvas = gtk::DrawingArea::new();
-    canvas.set_size_request(1, 1);
-    canvas.set_hexpand(true);
-    canvas.set_vexpand(true);
-    drag.add(&canvas);
-    body.pack_start(&drag, true, true, 0);
-    canvas.connect_draw({
-        let values = values.clone();
-        let color_mode = color_mode.clone();
-        let details = details.clone();
-        move |area, ctx| {
-            draw_system(area, ctx, &values.borrow(), color_mode.get(), details.get());
-            glib::Propagation::Proceed
-        }
-    });
-    SystemCard {
-        card,
-        drag,
-        color_mode,
-        canvas,
-        values,
-        details,
-        auto_size: Rc::new(Cell::new(None)),
-        resample: Rc::new(RefCell::new(None)),
-        resize,
-    }
-}
-
-fn start_system_updates(system: SystemCard, state: Rc<RefCell<AppState>>) {
-    // /proc is cheap most of the time, but TOP PROCESSES walks every PID and
-    // NVIDIA sampling starts a helper process. Keep all of it off GTK's main
-    // loop so a slow driver or a machine with many processes cannot freeze the
-    // overlay every two seconds.
-    let (request_tx, request_rx) = async_channel::bounded::<SystemReadOptions>(1);
-    let (snapshot_tx, snapshot_rx) = async_channel::bounded::<SystemSnapshot>(1);
-    let _ = std::thread::Builder::new()
-        .name("sysi-system-sampler".into())
-        .spawn(move || {
-            let mut reader = SystemReader::default();
-            while let Ok(options) = request_rx.recv_blocking() {
-                if snapshot_tx.send_blocking(reader.read(options)).is_err() {
-                    break;
-                }
-            }
-        });
-
-    glib::MainContext::default().spawn_local({
-        let canvas = system.canvas.clone();
-        let values = system.values.clone();
-        let card = system.card.clone();
-        let state = state.clone();
-        let details = system.details.clone();
-        let auto_size = system.auto_size.clone();
-        async move {
-            while let Ok(snapshot) = snapshot_rx.recv().await {
-                // Re-fit whenever what the card has to show changes: a core
-                // grid that grew a row, or a GPU that only appeared once the
-                // first sample came back. The width the user dragged to is
-                // kept; the height that follows from it is not theirs to set.
-                let desired = system_card_size(details.get(), &snapshot, &state.borrow());
-                if auto_size.get() != Some(desired) {
-                    auto_size.set(Some(desired));
-                    card.set_size_request(desired.width, desired.height);
-                    card.queue_resize();
-                    // Keep the stored height honest too, or the next launch
-                    // lays the card out at a height it will only correct once
-                    // the first sample comes back.
-                    let mut data = state.borrow_mut();
-                    if data
-                        .sizes
-                        .get("system")
-                        .is_some_and(|stored| stored.height != desired.height)
-                    {
-                        data.sizes.insert("system".into(), desired);
-                        let _ = data.save();
-                    }
-                }
-                *values.borrow_mut() = snapshot;
-                canvas.queue_draw();
-            }
-        }
-    });
-
-    let request: Rc<dyn Fn()> = Rc::new({
-        let details = system.details.clone();
-        move || {
-            let details = details.get();
-            let _ = request_tx.try_send(SystemReadOptions {
-                processes: details.processes,
-                cores: details.cores,
-                gpus: details.gpus,
-                cpu_temp: details.cpu_temp,
-                gpu_temp: details.gpu_temp,
-                ssd_temp: details.ssd_temp,
-                root_disk: details.root_disk,
-                home_disk: details.home_disk,
-                network: details.network,
-            });
-        }
-    });
-    if system.card.is_visible() {
-        request();
-    }
-    // Toggling a section on should not leave the card a sample behind, so the
-    // details menu gets a way to ask for one straight away.
-    *system.resample.borrow_mut() = Some(request.clone());
-    let card = system.card.clone();
-    glib::timeout_add_local(Duration::from_secs(2), move || {
-        if card.is_visible() {
-            request();
-        }
-        glib::ControlFlow::Continue
-    });
-}
-
-fn draw_system(
-    area: &gtk::DrawingArea,
-    ctx: &Context,
-    values: &SystemSnapshot,
-    color_mode: Foreground,
-    details: SystemDetails,
-) {
-    let allocation = area.allocation();
-    let font_scale = widget_font_scale(area);
-    ctx.scale(font_scale, font_scale);
-    let width = f64::from(allocation.width().max(1)) / font_scale;
-    let meters = system_meters(details, values);
-    let rows = system_meter_rows(meters.len(), system_meter_columns(meters.len(), width));
-    let widest = rows.iter().copied().max().unwrap_or(0);
-    // The rings keep their size and the room left over becomes the space
-    // between them, so dragging the card spreads or tightens the row rather
-    // than resizing it. Only a card too narrow for a single ring scales.
-    let gap = system_meter_gap(widest, width);
-    let content_width = system_meter_row_width(widest, gap);
-    let scale = (width / content_width).clamp(0.1, 1.0);
-    let (ink, muted, accent) = match color_mode {
-        Foreground::Light => ((0.97, 0.97, 0.97), (0.72, 0.72, 0.72), (0.9, 0.9, 0.9)),
-        Foreground::Dark => ((0.08, 0.08, 0.08), (0.24, 0.24, 0.24), (0.14, 0.14, 0.14)),
-    };
-    if !meters.is_empty() {
-        let _ = ctx.save();
-        ctx.translate(
-            (width - content_width * scale) / 2.0,
-            -SYSTEM_METER_INK_TOP * scale,
-        );
-        ctx.scale(scale, scale);
-        let mut meters = meters.iter();
-        for (row, count) in rows.iter().copied().enumerate() {
-            let y = row as f64 * f64::from(SYSTEM_HEIGHT);
-            // Every row is centred on the card, so a last row that came up
-            // short sits under the middle of the one above it.
-            let left = (content_width - system_meter_row_width(count, gap)) / 2.0;
-            for column in 0..count {
-                let Some(meter) = meters.next() else {
-                    break;
-                };
-                let x = left + column as f64 * (SYSTEM_METER_RING + gap) + SYSTEM_METER_RING / 2.0;
-                ctx.set_line_width(SYSTEM_METER_RING_STROKE);
-                ctx.set_line_cap(cairo::LineCap::Round);
-                ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
-                ctx.new_sub_path();
-                ctx.arc(
-                    x,
-                    y + SYSTEM_METER_RING_CENTER_Y,
-                    SYSTEM_METER_RING_RADIUS,
-                    -PI * 0.75,
-                    PI * 0.75,
-                );
-                let _ = ctx.stroke();
-                // The card is monochrome on purpose, so the one colour it has
-                // means one thing: something is running too hot.
-                let fill = if meter.hot { SYSTEM_HOT_INK } else { accent };
-                ctx.set_source_rgba(fill.0, fill.1, fill.2, 0.96);
-                ctx.new_sub_path();
-                ctx.arc(
-                    x,
-                    y + SYSTEM_METER_RING_CENTER_Y,
-                    SYSTEM_METER_RING_RADIUS,
-                    -PI * 0.75,
-                    -PI * 0.75 + PI * 1.5 * (meter.fill / 100.0).clamp(0.0, 1.0),
-                );
-                let _ = ctx.stroke();
-                center_text_fitted(
-                    ctx,
-                    x,
-                    y + 37.0,
-                    &meter.text,
-                    18.0,
-                    SYSTEM_METER_VALUE_WIDTH,
-                    FontWeight::Bold,
-                    if meter.hot { SYSTEM_HOT_INK } else { ink },
-                );
-                center_text_fitted(
-                    ctx,
-                    x,
-                    y + SYSTEM_METER_LABEL_BASELINE,
-                    &meter.title,
-                    8.5,
-                    SYSTEM_METER_LABEL_WIDTH,
-                    FontWeight::Bold,
-                    muted,
-                );
-            }
-        }
-        let _ = ctx.restore();
-    }
-    let mut cursor_y = if rows.is_empty() {
-        2.0
-    } else {
-        (rows.len() as f64 * f64::from(SYSTEM_HEIGHT) - SYSTEM_METER_INK_TOP) * scale
-    };
-    let rows = system_usage_rows(details, values);
-    if !rows.is_empty() {
-        draw_system_usage_rows(ctx, &rows, width, cursor_y, ink, muted, accent);
-        cursor_y += system_usage_block_height(rows.len());
-    }
-    if details.processes {
-        draw_system_processes(ctx, values, width, cursor_y, ink, muted);
-        cursor_y += 108.0;
-    }
-    if details.cores {
-        draw_system_cores(ctx, &values.cores, width, cursor_y, ink, muted, accent);
-        cursor_y += system_cores_height(values.cores.len());
-    }
-    if details.network {
-        draw_system_network(ctx, values.network, width, cursor_y, ink, muted);
-    }
-}
-
-/// How tall a block of capacity rows is: its heading, then a line each.
-fn system_usage_block_height(rows: usize) -> f64 {
-    SYSTEM_ROW_TOP_GAP + rows as f64 * SYSTEM_ROW_HEIGHT
-}
-
-/// How tall the per-core grid is. Four cores to a line, and a machine that
-/// reported none yet still keeps the one line its heading needs.
-fn system_cores_height(cores: usize) -> f64 {
-    SYSTEM_ROW_TOP_GAP + cores.max(1).div_ceil(4) as f64 * SYSTEM_ROW_HEIGHT
-}
-
-fn system_network_height() -> f64 {
-    SYSTEM_ROW_TOP_GAP + SYSTEM_ROW_HEIGHT
-}
-
-/// One ring: how far round it is filled, the reading printed inside it, and
-/// the caption under it. A load is its own percentage, while a temperature is
-/// filled against a fixed scale and printed in degrees, so the fill and the
-/// text cannot be the same number.
-#[derive(Clone, Debug, PartialEq)]
-struct SystemMeter {
-    fill: f64,
-    text: String,
-    title: String,
-    hot: bool,
-}
-
-fn percent_meter(percent: f64, title: &str) -> SystemMeter {
-    SystemMeter {
-        fill: percent,
-        text: format!("{percent:.0}%"),
-        title: title.into(),
-        hot: false,
-    }
-}
-
-/// A temperature ring, filled on a fixed 0–100 °C scale. That covers the range
-/// every part of a desktop machine works in, and it means two temperature
-/// rings can be read against each other at a glance.
-fn temperature_meter(celsius: f64, title: &str) -> SystemMeter {
-    SystemMeter {
-        fill: celsius.clamp(0.0, 100.0),
-        text: format!("{celsius:.0}\u{b0}C"),
-        title: title.into(),
-        hot: celsius >= SYSTEM_HOT_CELSIUS,
-    }
-}
-
-/// Every ring the card shows, in the order they are laid out. Both the drawing
-/// and the sizing read this one list, so what is measured is always what ends
-/// up on screen — a machine with no NVIDIA card contributes no ring and no row.
-fn system_meters(details: SystemDetails, values: &SystemSnapshot) -> Vec<SystemMeter> {
-    let mut meters = Vec::new();
-    if details.cpu {
-        meters.push(percent_meter(values.cpu_percent, "CPU"));
-    }
-    if details.ram {
-        meters.push(percent_meter(values.memory_percent, "RAM"));
-    }
-    if details.swap {
-        if let Some(swap) = values.swap {
-            meters.push(percent_meter(swap.percent(), "SWAP"));
-        }
-    }
-    if details.gpus {
-        meters.extend(values.gpus.iter().filter_map(|gpu| {
-            gpu.percent
-                .map(|percent| percent_meter(percent, &gpu.label))
-        }));
-    }
-    // Temperatures come after every load, so switching them on never moves the
-    // rings the card already had.
-    if details.cpu_temp {
-        if let Some(celsius) = values.cpu_temperature {
-            meters.push(temperature_meter(celsius, "CPU"));
-        }
-    }
-    if details.gpu_temp {
-        meters.extend(values.gpus.iter().filter_map(|gpu| {
-            // One card of each vendor is captioned by vendor; a machine with
-            // a single card has no ambiguity to resolve, so it reads "GPU".
-            let title = if values.gpus.len() > 1 {
-                gpu.label.clone()
-            } else {
-                "GPU".to_owned()
-            };
-            gpu.temperature
-                .map(|celsius| temperature_meter(celsius, &title))
-        }));
-    }
-    if details.ssd_temp {
-        meters.extend(
-            values
-                .storage_temperatures
-                .iter()
-                .map(|(label, celsius)| temperature_meter(*celsius, label)),
-        );
-    }
-    meters
-}
-
-/// One capacity row: what it is, and how full it is. A percentage alone does
-/// not answer the question a disk row is read for, which is whether the next
-/// thing will fit.
-#[derive(Clone, Debug, PartialEq)]
-struct SystemUsageRow {
-    label: String,
-    usage: Usage,
-}
-
-/// The capacity rows under the rings, in the order they are drawn. Memory
-/// comes first because it changes minute to minute; the mounts follow.
-fn system_usage_rows(details: SystemDetails, values: &SystemSnapshot) -> Vec<SystemUsageRow> {
-    let mut rows = Vec::new();
-    let mut push = |label: &str, usage: Usage| {
-        rows.push(SystemUsageRow {
-            label: label.into(),
-            usage,
-        });
-    };
-    if details.memory_detail {
-        push("RAM", values.memory);
-        if let Some(swap) = values.swap {
-            push("SWAP", swap);
-        }
-    }
-    if details.root_disk {
-        if let Some(usage) = values.root_disk {
-            push("/", usage);
-        }
-    }
-    if details.home_disk {
-        if let Some(usage) = values.home_disk {
-            push("/HOME", usage);
-        }
-    }
-    rows
-}
-
-/// How many rings a card this wide can put side by side. The card reflows: drag
-/// it out and six meters end up on one row, pull it in and they stack. Never
-/// more columns than there are meters, and never fewer than one — below a
-/// single cell the rings scale down instead of disappearing.
-fn system_meter_columns(count: usize, card_width: f64) -> usize {
-    if count == 0 {
-        return 0;
-    }
-    // Fewest rows first, so the widest row the card can still hold wins. A row
-    // is held as long as its rings fit at their tightest spacing; squeeze the
-    // card past that and the search drops to one more row, which is what moves
-    // a ring down. Widen it back and the same test brings the ring up again.
-    for rows in 1..=count {
-        let widest = count.div_ceil(rows);
-        if system_meter_row_width(widest, SYSTEM_METER_GAP_MIN) <= card_width {
-            return widest;
-        }
-    }
-    1
-}
-
-/// How wide a row of rings is at a given spacing.
-fn system_meter_row_width(columns: usize, gap: f64) -> f64 {
-    let columns = columns.max(1);
-    columns as f64 * SYSTEM_METER_RING + (columns - 1) as f64 * gap
-}
-
-/// The spacing the rings take on a card this wide: whatever is left once the
-/// rings themselves are accounted for, shared equally between them. This is
-/// what lets the card answer a drag smoothly — the row keeps filling the card
-/// until it is too tight to hold, and only then does the layout change.
-fn system_meter_gap(widest: usize, card_width: f64) -> f64 {
-    if widest <= 1 {
-        return 0.0;
-    }
-    ((card_width - widest as f64 * SYSTEM_METER_RING) / (widest - 1) as f64)
-        .max(SYSTEM_METER_GAP_MIN)
-}
-
-/// How many meters go on each row, given how many fit across. Rows divide as
-/// evenly as they can, so four rings over two rows read as two and two rather
-/// than three and a lone one.
-fn system_meter_rows(count: usize, columns: usize) -> Vec<usize> {
-    if count == 0 || columns == 0 {
-        return Vec::new();
-    }
-    let rows = count.div_ceil(columns);
-    let per_row = count / rows;
-    let leftover = count % rows;
-    (0..rows)
-        .map(|row| per_row + usize::from(row < leftover))
-        .collect()
-}
-
-/// The width the rings are laid out in, before the card scales them to fit.
-/// `widest` is the busiest row's meter count.
-/// The width the card wants when nobody has dragged it: its rings at the
-/// spacing they take by default, and no margin beyond the outermost strokes.
-fn system_meter_ink_width(widest: usize) -> f64 {
-    system_meter_row_width(widest, SYSTEM_METER_GAP).max(1.0)
-}
-
-/// The size the card wants.
-///
-/// `card_width` is the width the user dragged it to, when they have dragged it.
-/// The height is always ours: every part of this card stacks at a fixed height,
-/// so a card widened until its rings fit on one row has to give the rows it no
-/// longer needs back rather than keep them as blank space.
-fn system_content_size(
-    details: SystemDetails,
-    values: &SystemSnapshot,
-    card_width: Option<i32>,
-) -> Size {
-    // A hidden card allocates 1x1, and that stub reaches the saved sizes the
-    // width comes from. One pixel is not a width anyone dragged to, so the
-    // card reflows from scratch instead of being pinned to a column too narrow
-    // to see -- which it then saved again, and no toggle could reopen.
-    let card_width = card_width.filter(|width| *width > 1);
-    let meter_count = system_meters(details, values).len();
-    let usage_rows = system_usage_rows(details, values).len();
-    // Everything that stacks under the rings, and so has to be measured as
-    // well as drawn.
-    let has_sections = usage_rows > 0 || details.processes || details.cores || details.network;
-    let columns = match card_width {
-        Some(width) => system_meter_columns(meter_count, f64::from(width.max(1))),
-        // Nothing to reflow into yet, so fall back to the default shape.
-        None => meter_count.min(SYSTEM_METERS_PER_ROW),
-    };
-    let rows = system_meter_rows(meter_count, columns);
-    let mut height = if rows.is_empty() {
-        10
-    } else {
-        // The margin above the first row is always slack. The one below the
-        // last row is only slack when the rings are what the card ends with;
-        // with a section under them it is the gap that separates the two.
-        let block = rows.len() as f64 * f64::from(SYSTEM_HEIGHT) - SYSTEM_METER_INK_TOP;
-        let block = if has_sections {
-            block
-        } else {
-            block - SYSTEM_METER_INK_BOTTOM
-        };
-        block.ceil() as i32
-    };
-    if usage_rows > 0 {
-        height += system_usage_block_height(usage_rows).ceil() as i32;
-    }
-    if details.processes {
-        height += 108;
-    }
-    if details.cores {
-        height += system_cores_height(values.cores.len()).ceil() as i32;
-    }
-    if details.network {
-        height += system_network_height().ceil() as i32;
-    }
-    let width = match card_width {
-        Some(width) => width,
-        None if has_sections => 318,
-        // No meters at all still leaves a strip to right-click on.
-        None if meter_count == 0 => SYSTEM_WIDTH,
-        // Exactly the rings and nothing else, so the card can go flush against
-        // a screen edge on every side the way it already could against the top.
-        None => system_meter_ink_width(rows.iter().copied().max().unwrap_or(1)).ceil() as i32,
-    };
-    Size { width, height }
-}
-
-fn scaled_system_content_size(
-    details: SystemDetails,
-    values: &SystemSnapshot,
-    card_width: Option<i32>,
-    font_size: i32,
-) -> Size {
-    let scale = f64::from(font_size.clamp(8, 26)) / 13.0;
-    let size = system_content_size(
-        details,
-        values,
-        card_width.map(|width| (f64::from(width) / scale).round() as i32),
-    );
-    Size {
-        width: (f64::from(size.width) * scale).round() as i32,
-        height: (f64::from(size.height) * scale).round() as i32,
-    }
-}
-
-/// What the card should measure right now: the width the user chose if they
-/// chose one, and a height that follows from how the rings reflow into it.
-fn system_card_size(details: SystemDetails, values: &SystemSnapshot, state: &AppState) -> Size {
-    scaled_system_content_size(
-        details,
-        values,
-        state.sizes.get("system").map(|size| size.width),
-        state.font_size("system"),
-    )
-}
-
-fn draw_system_processes(
-    ctx: &Context,
-    values: &SystemSnapshot,
-    width: f64,
-    top: f64,
-    ink: (f64, f64, f64),
-    muted: (f64, f64, f64),
-) {
-    draw_left_text(
-        ctx,
-        5.0,
-        top + 11.0,
-        "PROCESS",
-        8.0,
-        FontWeight::Bold,
-        muted,
-    );
-    draw_right_text(
-        ctx,
-        width - 96.0,
-        top + 11.0,
-        "CPU",
-        8.0,
-        FontWeight::Bold,
-        muted,
-    );
-    draw_right_text(
-        ctx,
-        width - 57.0,
-        top + 11.0,
-        "ID",
-        8.0,
-        FontWeight::Bold,
-        muted,
-    );
-    draw_right_text(
-        ctx,
-        width - 5.0,
-        top + 11.0,
-        "MEM",
-        8.0,
-        FontWeight::Bold,
-        muted,
-    );
-    ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.18);
-    ctx.set_line_width(1.0);
-    ctx.move_to(4.0, top + 15.0);
-    ctx.line_to(width - 4.0, top + 15.0);
-    let _ = ctx.stroke();
-    for (row, process) in values.processes.iter().take(5).enumerate() {
-        let baseline = top + 29.0 + row as f64 * 17.0;
-        let label = truncate_text(&process.name, 23);
-        draw_left_text(ctx, 5.0, baseline, &label, 9.5, FontWeight::Normal, ink);
-        draw_right_text(
-            ctx,
-            width - 96.0,
-            baseline,
-            &format!("{:.1}%", process.cpu_percent),
-            9.5,
-            FontWeight::Normal,
-            ink,
-        );
-        draw_right_text(
-            ctx,
-            width - 57.0,
-            baseline,
-            &process.pid.to_string(),
-            9.5,
-            FontWeight::Normal,
-            ink,
-        );
-        draw_right_text(
-            ctx,
-            width - 5.0,
-            baseline,
-            &format_memory(process.memory_kib),
-            9.5,
-            FontWeight::Normal,
-            ink,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_system_cores(
-    ctx: &Context,
-    cores: &[f64],
-    width: f64,
-    top: f64,
-    ink: (f64, f64, f64),
-    muted: (f64, f64, f64),
-    accent: (f64, f64, f64),
-) {
-    let column_width = (width - 10.0) / 4.0;
-    for (index, value) in cores.iter().enumerate() {
-        let column = index % 4;
-        let row = index / 4;
-        let x = 5.0 + column as f64 * column_width;
-        let y = top + 11.0 + row as f64 * 17.0;
-        draw_left_text(
-            ctx,
-            x,
-            y,
-            &format!("C{:02}", index + 1),
-            8.0,
-            FontWeight::Bold,
-            muted,
-        );
-        ctx.set_line_width(2.3);
-        ctx.set_line_cap(cairo::LineCap::Round);
-        ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
-        ctx.move_to(x + 23.0, y - 3.0);
-        ctx.line_to(x + 48.0, y - 3.0);
-        let _ = ctx.stroke();
-        ctx.set_source_rgb(accent.0, accent.1, accent.2);
-        ctx.move_to(x + 23.0, y - 3.0);
-        ctx.line_to(x + 23.0 + 25.0 * (value / 100.0).clamp(0.0, 1.0), y - 3.0);
-        let _ = ctx.stroke();
-        draw_right_text(
-            ctx,
-            x + column_width - 2.0,
-            y,
-            &format!("{value:.0}%"),
-            8.0,
-            FontWeight::Bold,
-            ink,
-        );
-    }
-}
-
-/// The capacity rows: a label, a bar, how much of the space is gone, and the
-/// percentage that works out to. Same line height and bar as the core grid, so
-/// the two sections read as one list when both are on.
-#[allow(clippy::too_many_arguments)]
-fn draw_system_usage_rows(
-    ctx: &Context,
-    rows: &[SystemUsageRow],
-    width: f64,
-    top: f64,
-    ink: (f64, f64, f64),
-    muted: (f64, f64, f64),
-    accent: (f64, f64, f64),
-) {
-    // The bar gives up whatever the two number columns on its right need, and
-    // never shrinks past the point where a fill would be invisible.
-    let bar_left = 46.0;
-    let bar_right = (width - 116.0).max(bar_left + 12.0);
-    for (index, row) in rows.iter().enumerate() {
-        let baseline = top + 11.0 + index as f64 * SYSTEM_ROW_HEIGHT;
-        draw_left_text(ctx, 5.0, baseline, &row.label, 8.0, FontWeight::Bold, muted);
-        if bar_right > bar_left {
-            ctx.set_line_width(2.3);
-            ctx.set_line_cap(cairo::LineCap::Round);
-            ctx.set_source_rgba(muted.0, muted.1, muted.2, 0.22);
-            ctx.move_to(bar_left, baseline - 3.0);
-            ctx.line_to(bar_right, baseline - 3.0);
-            let _ = ctx.stroke();
-            let filled = (bar_right - bar_left) * (row.usage.percent() / 100.0);
-            if filled > 0.0 {
-                ctx.set_source_rgb(accent.0, accent.1, accent.2);
-                ctx.move_to(bar_left, baseline - 3.0);
-                ctx.line_to(bar_left + filled, baseline - 3.0);
-                let _ = ctx.stroke();
-            }
-        }
-        draw_right_text(
-            ctx,
-            width - 42.0,
-            baseline,
-            &format!(
-                "{} / {}",
-                format_memory(row.usage.used_kib),
-                format_memory(row.usage.total_kib)
-            ),
-            9.0,
-            FontWeight::Normal,
-            ink,
-        );
-        draw_right_text(
-            ctx,
-            width - 5.0,
-            baseline,
-            &format!("{:.0}%", row.usage.percent()),
-            8.0,
-            FontWeight::Bold,
-            ink,
-        );
-    }
-}
-
-/// What the network is carrying right now, down on the left and up on the
-/// right. Before the second sample there is no rate to state yet, and a zero
-/// there would be a claim rather than a blank.
-///
-/// The directions are spelt out rather than drawn as arrows: the card asks
-/// Cairo for "Sans", which on a bare Ubuntu install has no glyph for
-/// `\u{2193}` and would put an empty box where the arrow should be.
-fn draw_system_network(
-    ctx: &Context,
-    rates: Option<NetworkRates>,
-    width: f64,
-    top: f64,
-    ink: (f64, f64, f64),
-    muted: (f64, f64, f64),
-) {
-    let baseline = top + 11.0;
-    draw_left_text(ctx, 5.0, baseline, "NET", 8.0, FontWeight::Bold, muted);
-    let (down, up) = match rates {
-        Some(rates) => (
-            format_rate(rates.down_bytes_per_sec),
-            format_rate(rates.up_bytes_per_sec),
-        ),
-        None => ("--".to_owned(), "--".to_owned()),
-    };
-    draw_left_text(
-        ctx,
-        46.0,
-        baseline,
-        &format!("DOWN {down}"),
-        9.0,
-        FontWeight::Normal,
-        ink,
-    );
-    draw_right_text(
-        ctx,
-        width - 5.0,
-        baseline,
-        &format!("UP {up}"),
-        9.0,
-        FontWeight::Normal,
-        ink,
-    );
-}
-
-fn draw_left_text(
-    ctx: &Context,
-    x: f64,
-    baseline: f64,
-    text: &str,
-    size: f64,
-    weight: FontWeight,
-    color: (f64, f64, f64),
-) {
-    ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
-    ctx.set_font_size(size);
-    ctx.set_source_rgb(color.0, color.1, color.2);
-    ctx.move_to(x, baseline);
-    let _ = ctx.show_text(text);
-}
-
-fn draw_right_text(
-    ctx: &Context,
-    right: f64,
-    baseline: f64,
-    text: &str,
-    size: f64,
-    weight: FontWeight,
-    color: (f64, f64, f64),
-) {
-    ctx.select_font_face("Noto Sans", FontSlant::Normal, weight);
-    ctx.set_font_size(size);
-    let width = ctx
-        .text_extents(text)
-        .map(|metrics| metrics.x_advance())
-        .unwrap_or(0.0);
-    draw_left_text(ctx, right - width, baseline, text, size, weight, color);
-}
-
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    let mut result: String = text.chars().take(max_chars).collect();
-    if text.chars().count() > max_chars {
-        result.push('…');
-    }
-    result
-}
-
-fn format_memory(kib: u64) -> String {
-    if kib >= 1024 * 1024 {
-        format!("{:.1}G", kib as f64 / 1_048_576.0)
-    } else {
-        format!("{:.0}M", kib as f64 / 1024.0)
-    }
-}
-
-/// A throughput, in as few characters as the row can spare. A decimal is worth
-/// it once the number is small enough to lose meaning without one.
-fn format_rate(bytes_per_sec: f64) -> String {
-    let rate = bytes_per_sec.max(0.0);
-    if rate >= 1_048_576.0 {
-        format!("{:.1} MB/s", rate / 1_048_576.0)
-    } else if rate >= 1024.0 {
-        format!("{:.0} KB/s", rate / 1024.0)
-    } else {
-        format!("{rate:.0} B/s")
     }
 }
 
@@ -9299,7 +8216,6 @@ fn rebuild_pinned_notes(
             registry.clone(),
             interactive.clone(),
             None,
-            None,
             Some(lookup.clone()),
             None,
             Some(highlight_menu.clone()),
@@ -10477,7 +9393,6 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         ctx.registry.clone(),
         ctx.interactive.clone(),
         None,
-        None,
         Some(LookupActions {
             here: Rc::new(RefCell::new(Some(lookup.clone()))),
             new_window: ctx.lookup_new_window.clone(),
@@ -11389,6 +10304,12 @@ struct PanelAction {
     anchor: Option<Point>,
 }
 
+/// Actions that do nothing on the desk, so a hidden Sysi stays hidden for
+/// them: quitting, and SYSTEM, which lives in the top bar.
+fn leaves_the_desk_alone(action: &str) -> bool {
+    action == "quit" || action == "toggle-system" || action.starts_with("system-metric:")
+}
+
 fn take_panel_actions() -> Vec<PanelAction> {
     let dir = crate::state::cache_dir();
     let taken = dir.join("panel-action.taken");
@@ -12020,7 +10941,6 @@ fn attach_color_mode_menu(
     registry: Rc<RefCell<Vec<RegisteredWidget>>>,
     interactive: Rc<Cell<bool>>,
     timer_style: Option<TimerStylePreview>,
-    system_details: Option<SystemDetailsPreview>,
     lookup: Option<LookupActions>,
     // Pops a menu for whatever the click landed on inside the widget, and says
     // whether it did. Only the history window has one (its note rows).
@@ -12155,15 +11075,11 @@ fn attach_color_mode_menu(
             let state = state.clone();
             let widget = widget.clone();
             let key = key.clone();
-            let system_preview = system_details.clone();
             let font_value = font_value.clone();
             move |_| {
                 state.borrow_mut().change_font_size(Some(&key), delta);
                 let size = state.borrow().font_size(&key);
                 apply_widget_font(&widget, size);
-                if let Some(preview) = &system_preview {
-                    refit_system_font(preview, &state);
-                }
                 font_value.set_text(&size.to_string());
                 let _ = state.borrow().save();
             }
@@ -12219,70 +11135,6 @@ fn attach_color_mode_menu(
             }
         });
         menu.append(&edit_time);
-    }
-    if let Some(system_details) = system_details {
-        menu.set_reserve_toggle_size(true);
-        menu.append(&gtk::SeparatorMenuItem::new());
-        // Every one of these does the same thing to a different flag, so they
-        // are built from one description rather than a dozen copies.
-        let toggle = |target: &gtk::Menu,
-                      label: &str,
-                      read: fn(&SystemDetails) -> bool,
-                      write: fn(&mut SystemDetails, bool)| {
-            let item = gtk::CheckMenuItem::with_label(label);
-            item.set_active(read(&system_details.details.get()));
-            item.connect_toggled({
-                let preview = system_details.clone();
-                let state = state.clone();
-                move |item| {
-                    let mut details = preview.details.get();
-                    write(&mut details, item.is_active());
-                    apply_system_details(&preview, &state, details);
-                }
-            });
-            target.append(&item);
-        };
-
-        toggle(&menu, "CPU", |d| d.cpu, |d, on| d.cpu = on);
-        toggle(&menu, "RAM", |d| d.ram, |d, on| d.ram = on);
-        toggle(&menu, "SWAP", |d| d.swap, |d, on| d.swap = on);
-        toggle(&menu, "GPUS", |d| d.gpus, |d, on| d.gpus = on);
-
-        // Three sensors of one kind, so they fold into a submenu rather than
-        // taking a third of the menu for themselves.
-        let temperature = gtk::MenuItem::with_label("TEMPERATURE");
-        let sensors = context_menu();
-        sensors.set_reserve_toggle_size(true);
-        toggle(&sensors, "CPU", |d| d.cpu_temp, |d, on| d.cpu_temp = on);
-        toggle(&sensors, "GPU", |d| d.gpu_temp, |d, on| d.gpu_temp = on);
-        toggle(&sensors, "SSD", |d| d.ssd_temp, |d, on| d.ssd_temp = on);
-        temperature.set_submenu(Some(&sensors));
-        menu.append(&temperature);
-
-        // Above this line are rings; below it are the rows that stack under
-        // them.
-        menu.append(&gtk::SeparatorMenuItem::new());
-        toggle(
-            &menu,
-            "MEMORY DETAIL",
-            |d| d.memory_detail,
-            |d, on| d.memory_detail = on,
-        );
-        toggle(&menu, "DISK /", |d| d.root_disk, |d, on| d.root_disk = on);
-        toggle(
-            &menu,
-            "DISK /HOME",
-            |d| d.home_disk,
-            |d, on| d.home_disk = on,
-        );
-        toggle(
-            &menu,
-            "TOP PROCESSES",
-            |d| d.processes,
-            |d, on| d.processes = on,
-        );
-        toggle(&menu, "CPU CORES", |d| d.cores, |d, on| d.cores = on);
-        toggle(&menu, "NETWORK", |d| d.network, |d, on| d.network = on);
     }
     menu.show_all();
 
@@ -12368,50 +11220,6 @@ fn attach_color_mode_menu(
     // GTK detaches event controllers when their final strong reference is dropped.
     unsafe {
         widget.set_data("sysi-color-menu-gesture", gesture);
-    }
-}
-
-fn apply_system_details(
-    preview: &SystemDetailsPreview,
-    state: &Rc<RefCell<AppState>>,
-    details: SystemDetails,
-) {
-    preview.details.set(details);
-    let size = system_card_size(details, &preview.values.borrow(), &state.borrow());
-    preview.auto_size.set(Some(size));
-    preview.card.set_size_request(size.width, size.height);
-    preview.card.queue_resize();
-    preview.canvas.queue_draw();
-    // A section switched on has nothing sampled behind it yet. Ask for a
-    // reading now so the card settles in one step instead of two seconds later.
-    let resample = preview.resample.borrow().clone();
-    if let Some(resample) = resample {
-        resample();
-    }
-    let mut data = state.borrow_mut();
-    data.settings.system_details = details;
-    // A width the user dragged to survives; the height belongs to whatever the
-    // card now has to show. Turning CPU CORES on computes that height from the
-    // cores read so far — none, because the reader was not collecting them —
-    // so the periodic update corrects it as soon as the first sample lands.
-    if let Some(stored) = data.sizes.get_mut("system") {
-        stored.height = size.height;
-    }
-    let _ = data.save();
-}
-
-fn refit_system_font(preview: &SystemDetailsPreview, state: &Rc<RefCell<AppState>>) {
-    let size = system_card_size(
-        preview.details.get(),
-        &preview.values.borrow(),
-        &state.borrow(),
-    );
-    preview.auto_size.set(Some(size));
-    preview.card.set_size_request(size.width, size.height);
-    preview.card.queue_resize();
-    preview.canvas.queue_draw();
-    if let Some(stored) = state.borrow_mut().sizes.get_mut("system") {
-        *stored = size;
     }
 }
 
@@ -15517,47 +14325,6 @@ fn center_text(
     let _ = ctx.show_text(text);
 }
 
-/// A meter caption sits in the gap at the bottom of its ring, which is only so
-/// wide. Anything longer than that ("DISK /HOME", a spelt-out GPU model) is
-/// stepped down in size until it fits rather than being drawn over the stroke.
-#[allow(clippy::too_many_arguments)]
-fn center_text_fitted(
-    ctx: &Context,
-    x: f64,
-    y: f64,
-    text: &str,
-    size: f64,
-    max_width: f64,
-    weight: FontWeight,
-    color: (f64, f64, f64),
-) {
-    center_text(
-        ctx,
-        x,
-        y,
-        text,
-        fitted_font_size(ctx, text, size, max_width),
-        weight,
-        color,
-    );
-}
-
-fn fitted_font_size(ctx: &Context, text: &str, size: f64, max_width: f64) -> f64 {
-    let mut chosen = size;
-    while chosen > 6.0 {
-        ctx.set_font_size(chosen);
-        let width = ctx
-            .text_extents(text)
-            .map(|extents| extents.x_advance())
-            .unwrap_or(0.0);
-        if width <= max_width {
-            break;
-        }
-        chosen -= 0.25;
-    }
-    chosen
-}
-
 fn install_css(screen: &gdk::Screen) {
     let css = include_str!("style.css");
     let provider = gtk::CssProvider::new();
@@ -15577,7 +14344,7 @@ mod timer_input_tests {
         clamp_to_screens, clip_screen_to_overlay, dictate_capture_answer,
         click_became_drag, dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area,
         fit_within_bounds, held_slide_point, top_child_at, top_raised_child_at,
-        foreground_for_mode, format_rate, highlight_at,
+        foreground_for_mode, highlight_at,
         image_room, monitor_coordinate_divisor, pasted_image_size, repaired_image_size,
         monitor_root_bounds, normalize_monitor_rect, note_headline,
         note_search_matches, note_size_for_image, padded_visual_rect,
@@ -15588,20 +14355,16 @@ mod timer_input_tests {
         receives_input_when_locked, record_note_undo, reopen_point,
         rescaled_from, resize_ceiling, resize_rect, resize_width_limit, ResizeBounds, ResizeEdges, resized_image_size, room_on_screen,
         round_pixbuf_corners, sanitize_highlights, screen_in_overlay,
-        system_content_size, system_meter_columns, system_meter_gap, system_meter_ink_width,
-        system_meter_row_width, system_meter_rows, system_meters, system_usage_rows,
-        temperature_meter, timer_style_size, Foreground, NoteSearchMatch,
+        timer_style_size, Foreground, NoteSearchMatch,
         NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, WidgetPalette,
         DRAG_REDRAW_INTERVAL, NOTE_HEIGHT,
         NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_IMAGE_PASTE_MAX,
-        NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
-        SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
+        NOTE_WIDTH,
     };
     use crate::state::{
-        ColorMode, HighlightColor, Note, NoteHighlight, NoteImage, Point, Size, SystemDetails,
-        TimerStyle, IMAGE_PLACEHOLDER,
+        ColorMode, HighlightColor, Note, NoteHighlight, NoteImage, Point, Size, TimerStyle,
+        IMAGE_PLACEHOLDER,
     };
-    use crate::system::{SystemSnapshot, Usage};
     use gdk_pixbuf::{Colorspace, Pixbuf};
     use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
@@ -16811,441 +15574,6 @@ mod timer_input_tests {
     }
 
     #[test]
-    fn a_single_system_meter_uses_a_tight_square_container() {
-        let size = system_content_size(
-            SystemDetails {
-                cpu: true,
-                ram: false,
-                processes: false,
-                cores: false,
-                ..SystemDetails::default()
-            },
-            &SystemSnapshot::default(),
-            None,
-        );
-        // The ring plus its stroke, and not a pixel of margin around it.
-        assert_eq!(
-            size,
-            Size {
-                width: 63,
-                height: 63
-            }
-        );
-    }
-
-    #[test]
-    fn the_card_hugs_its_rings_rather_than_the_cells_around_them() {
-        // What a ring actually paints: the arc plus the half of its stroke that
-        // falls outside. The card has to measure exactly this, on every side.
-        // Measured to the cell instead, the widget kept a blank margin left,
-        // right and below, and could not be pushed flush against a screen edge
-        // the way it already could against the top.
-        let ring = 2.0 * (SYSTEM_METER_RING_RADIUS + SYSTEM_METER_RING_STROKE / 2.0);
-        assert_eq!(system_meter_ink_width(1), ring);
-        // Each further ring adds one whole cell and no margin of its own.
-        for columns in 1..8 {
-            assert_eq!(
-                system_meter_ink_width(columns + 1) - system_meter_ink_width(columns),
-                SYSTEM_METER_CELL
-            );
-        }
-        // A one-ring card is that same square in both directions, and a row of
-        // rings is no taller than one of them.
-        let one_meter = SystemDetails {
-            cpu: true,
-            ram: false,
-            processes: false,
-            cores: false,
-            ..SystemDetails::default()
-        };
-        let size = system_content_size(one_meter, &SystemSnapshot::default(), None);
-        assert_eq!(size.width, ring.ceil() as i32);
-        assert_eq!(size.height, ring.ceil() as i32);
-        // The row still occupies its full cell height internally; only the
-        // slack above and below the outermost rows is given back.
-        assert!(f64::from(size.height) < f64::from(SYSTEM_HEIGHT));
-    }
-
-    #[test]
-    fn meters_split_evenly_across_their_rows_rather_than_leaving_a_stray() {
-        let default_rows = |count: usize| system_meter_rows(count, count.min(3));
-        assert!(default_rows(0).is_empty());
-        assert_eq!(default_rows(1), [1]);
-        assert_eq!(default_rows(2), [2]);
-        assert_eq!(default_rows(3), [3]);
-        // Four rings read as two over two, not three over one.
-        assert_eq!(default_rows(4), [2, 2]);
-        assert_eq!(default_rows(5), [3, 2]);
-        assert_eq!(default_rows(6), [3, 3]);
-        assert_eq!(default_rows(7), [3, 2, 2]);
-        assert_eq!(default_rows(8), [3, 3, 2]);
-        // A row never carries more than fits across, and the split stays even.
-        assert_eq!(system_meter_rows(6, 6), [6]);
-        assert_eq!(system_meter_rows(6, 4), [3, 3]);
-        assert_eq!(system_meter_rows(6, 1), [1, 1, 1, 1, 1, 1]);
-        assert_eq!(system_meter_rows(7, 4), [4, 3]);
-    }
-
-    #[test]
-    fn the_rings_reflow_into_whatever_width_the_card_was_dragged_to() {
-        // Six meters on the default card: three across, two rows.
-        assert_eq!(system_meter_columns(6, 290.0), 3);
-        // Dragged wide enough for all six, they take one row.
-        assert_eq!(system_meter_columns(6, 564.0), 6);
-        // A row is kept as long as its rings still fit at their tightest
-        // spacing, so the sixth ring comes up well before the card is wide
-        // enough to give it a whole cell of its own.
-        let six_across = system_meter_row_width(6, SYSTEM_METER_GAP_MIN);
-        assert_eq!(system_meter_columns(6, six_across), 6);
-        assert_eq!(system_meter_columns(6, six_across - 1.0), 3);
-        // Never more columns than there are rings, however wide it gets.
-        assert_eq!(system_meter_columns(2, 900.0), 2);
-        // Narrower than one ring still draws that ring, scaled down.
-        assert_eq!(system_meter_columns(4, 76.0), 1);
-        assert_eq!(system_meter_columns(0, 900.0), 0);
-    }
-
-    #[test]
-    fn a_row_of_meters_stays_centred_on_the_card_it_is_drawn_in() {
-        // Ring centres on an untouched card, measured from its left edge. At
-        // the default spacing they land one cell apart, starting half a ring
-        // in — the geometry the card has always drawn.
-        let centres = |count: usize, columns: usize, gap: f64| -> Vec<f64> {
-            let rows = system_meter_rows(count, columns);
-            let widest = rows.iter().copied().max().unwrap_or(0);
-            let content = system_meter_row_width(widest, gap);
-            let mut result = Vec::new();
-            for row in rows {
-                let left = (content - system_meter_row_width(row, gap)) / 2.0;
-                for column in 0..row {
-                    result.push(
-                        left + column as f64 * (SYSTEM_METER_RING + gap) + SYSTEM_METER_RING / 2.0,
-                    );
-                }
-            }
-            result
-        };
-        let half = SYSTEM_METER_RING / 2.0;
-        let step = SYSTEM_METER_CELL;
-        assert_eq!(centres(1, 1, SYSTEM_METER_GAP), [half]);
-        assert_eq!(centres(2, 2, SYSTEM_METER_GAP), [half, half + step]);
-        assert_eq!(
-            centres(3, 3, SYSTEM_METER_GAP),
-            [half, half + step, half + 2.0 * step]
-        );
-        // Five rings: three across, then two centred underneath them.
-        assert_eq!(
-            centres(5, 3, SYSTEM_METER_GAP),
-            [
-                half,
-                half + step,
-                half + 2.0 * step,
-                half + step / 2.0,
-                half + 1.5 * step,
-            ]
-        );
-        // Spread the same three rings over a wider card and only the spacing
-        // changes: the first ring stays flush against the left edge and the
-        // last against the right.
-        let wide = 400.0;
-        let gap = system_meter_gap(3, wide);
-        let spread = centres(3, 3, gap);
-        assert_eq!(spread[0], half);
-        assert_eq!(spread[2], wide - half);
-    }
-
-    #[test]
-    fn dragging_the_card_spreads_the_rings_before_it_reflows_them() {
-        // Widening the card moves the rings apart and leaves them filling it
-        // edge to edge. It never resizes them, and never leaves a margin at
-        // either end for the card to hang off a screen edge by.
-        let natural = system_meter_ink_width(6);
-        for width in [natural, natural + 40.0, natural + 160.0] {
-            let gap = system_meter_gap(6, width);
-            assert_eq!(system_meter_row_width(6, gap), width);
-            assert!(gap >= SYSTEM_METER_GAP_MIN);
-        }
-        // The spacing tracks the width continuously rather than in jumps.
-        assert!(system_meter_gap(6, 560.0) > system_meter_gap(6, 460.0));
-        // Left alone, that spacing is the one the card has always used.
-        assert_eq!(system_meter_gap(6, natural), SYSTEM_METER_GAP);
-
-        // Squeezed past the point where the rings would sit closer than they
-        // are allowed to, the row gives one up instead of overlapping them.
-        let tightest = system_meter_row_width(6, SYSTEM_METER_GAP_MIN);
-        assert_eq!(system_meter_columns(6, tightest), 6);
-        assert_eq!(system_meter_columns(6, tightest - 1.0), 3);
-        // Whatever row takes over fills the card the same way, so the widget
-        // stays flush through the change.
-        let gap = system_meter_gap(3, tightest - 1.0);
-        assert_eq!(system_meter_row_width(3, gap), tightest - 1.0);
-    }
-
-    #[test]
-    fn the_card_grows_a_row_at_a_time_as_meters_are_switched_on() {
-        let details = SystemDetails {
-            cpu: true,
-            ram: true,
-            swap: true,
-            gpus: true,
-            cpu_temp: true,
-            ..SystemDetails::default()
-        };
-        let values = SystemSnapshot {
-            gpus: vec![
-                crate::system::GpuSnapshot {
-                    label: "RTX 4060".into(),
-                    percent: Some(12.0),
-                    temperature: Some(43.0),
-                },
-                crate::system::GpuSnapshot {
-                    label: "AMD GPU".into(),
-                    percent: Some(4.0),
-                    temperature: Some(44.0),
-                },
-            ],
-            swap: Some(Usage {
-                used_kib: 5_427_360,
-                total_kib: 16_777_212,
-            }),
-            cpu_temperature: Some(45.0),
-            ..SystemSnapshot::default()
-        };
-        // Six meters, untouched card: two rows of three, wide enough for three.
-        assert_eq!(
-            system_content_size(details, &values, None),
-            Size {
-                width: 251,
-                height: 139
-            }
-        );
-        // A machine where nothing answered for the GPUs must not be left
-        // holding an empty row.
-        assert_eq!(
-            system_content_size(
-                details,
-                &SystemSnapshot {
-                    swap: values.swap,
-                    cpu_temperature: values.cpu_temperature,
-                    ..SystemSnapshot::default()
-                },
-                None
-            ),
-            Size {
-                width: 157,
-                height: 139
-            }
-        );
-        // Dragged out to six across, the second row has to be handed back
-        // rather than left behind as empty space.
-        assert_eq!(
-            system_content_size(details, &values, Some(572)),
-            Size {
-                width: 572,
-                height: 63
-            }
-        );
-        // And pulled in to one across, the card has to find five more rows.
-        assert_eq!(
-            system_content_size(details, &values, Some(76)),
-            Size {
-                width: 76,
-                height: 443
-            }
-        );
-        // The process table keeps its own 108 on top of whatever the rings need.
-        assert_eq!(
-            system_content_size(
-                SystemDetails {
-                    processes: true,
-                    ..details
-                },
-                &values,
-                Some(572)
-            ),
-            Size {
-                width: 572,
-                height: 181
-            }
-        );
-    }
-
-    #[test]
-    fn the_capacity_rows_and_the_network_row_each_add_their_own_block() {
-        let values = SystemSnapshot {
-            memory: Usage {
-                used_kib: 6_000_000,
-                total_kib: 16_777_216,
-            },
-            swap: Some(Usage {
-                used_kib: 5_427_360,
-                total_kib: 16_777_212,
-            }),
-            root_disk: Some(Usage {
-                used_kib: 327_155_712,
-                total_kib: 499_122_176,
-            }),
-            ..SystemSnapshot::default()
-        };
-        let rings = SystemDetails::default();
-        let bare = system_content_size(rings, &values, Some(318)).height;
-
-        // RAM and SWAP are two rows behind one menu item.
-        let memory = SystemDetails {
-            memory_detail: true,
-            ..rings
-        };
-        assert_eq!(
-            system_usage_rows(memory, &values)
-                .iter()
-                .map(|row| row.label.as_str())
-                .collect::<Vec<_>>(),
-            ["RAM", "SWAP"]
-        );
-        // The block is a gap plus a line each, and the rings give back the
-        // slack under them once something sits there.
-        assert_eq!(
-            system_content_size(memory, &values, Some(318)).height,
-            bare + 10 + 50
-        );
-
-        // A mount that answered gets a row; one that did not is not a blank.
-        let disks = SystemDetails {
-            root_disk: true,
-            home_disk: true,
-            ..rings
-        };
-        assert_eq!(
-            system_usage_rows(disks, &values)
-                .iter()
-                .map(|row| row.label.as_str())
-                .collect::<Vec<_>>(),
-            ["/"]
-        );
-        assert_eq!(
-            system_content_size(disks, &values, Some(318)).height,
-            bare + 10 + 33
-        );
-
-        let network = SystemDetails {
-            network: true,
-            ..rings
-        };
-        assert_eq!(
-            system_content_size(network, &values, Some(318)).height,
-            bare + 10 + 33
-        );
-    }
-
-    #[test]
-    fn a_temperature_ring_is_filled_on_its_own_scale_and_reads_in_degrees() {
-        let meter = temperature_meter(45.0, "CPU");
-        // The unit rides on the reading rather than being repeated in every
-        // caption, where it would shrink a name such as "SAMSUNG" to fit.
-        assert_eq!(meter.text, "45\u{b0}C");
-        assert_eq!(meter.fill, 45.0);
-        assert!(!meter.hot);
-        // A sensor past the warning point colours its ring, and one past the
-        // top of the scale still stops at a full ring.
-        assert!(temperature_meter(85.0, "CPU").hot);
-        assert_eq!(temperature_meter(112.0, "CPU").fill, 100.0);
-    }
-
-    #[test]
-    fn a_machine_with_no_swap_gets_neither_a_swap_ring_nor_a_swap_row() {
-        let details = SystemDetails {
-            swap: true,
-            memory_detail: true,
-            ..SystemDetails::default()
-        };
-        let values = SystemSnapshot {
-            memory: Usage {
-                used_kib: 6_000_000,
-                total_kib: 16_777_216,
-            },
-            swap: None,
-            ..SystemSnapshot::default()
-        };
-        assert_eq!(
-            system_meters(details, &values)
-                .iter()
-                .map(|meter| meter.title.as_str())
-                .collect::<Vec<_>>(),
-            ["CPU", "RAM"]
-        );
-        assert_eq!(
-            system_usage_rows(details, &values)
-                .iter()
-                .map(|row| row.label.as_str())
-                .collect::<Vec<_>>(),
-            ["RAM"]
-        );
-    }
-
-    #[test]
-    fn a_single_card_is_captioned_gpu_and_a_pair_is_captioned_by_vendor() {
-        let details = SystemDetails {
-            cpu: false,
-            ram: false,
-            gpu_temp: true,
-            ..SystemDetails::default()
-        };
-        let gpu = |label: &str, temperature| crate::system::GpuSnapshot {
-            label: label.into(),
-            percent: Some(0.0),
-            temperature,
-        };
-        let one = SystemSnapshot {
-            gpus: vec![gpu("NVIDIA", Some(43.0))],
-            ..SystemSnapshot::default()
-        };
-        assert_eq!(system_meters(details, &one)[0].title, "GPU");
-        let two = SystemSnapshot {
-            gpus: vec![gpu("NVIDIA", Some(43.0)), gpu("AMD", Some(44.0))],
-            ..SystemSnapshot::default()
-        };
-        let meters = system_meters(details, &two);
-        let titles: Vec<&str> = meters.iter().map(|meter| meter.title.as_str()).collect();
-        assert_eq!(titles, ["NVIDIA", "AMD"]);
-        // A card whose driver reports no temperature contributes no ring.
-        let quiet = SystemSnapshot {
-            gpus: vec![gpu("NVIDIA", None)],
-            ..SystemSnapshot::default()
-        };
-        assert!(system_meters(details, &quiet).is_empty());
-        // Nor does a card with no load contribute a load ring, which is the
-        // same card from the other side.
-        let loadless = SystemSnapshot {
-            gpus: vec![crate::system::GpuSnapshot {
-                label: "NVIDIA".into(),
-                percent: None,
-                temperature: Some(43.0),
-            }],
-            ..SystemSnapshot::default()
-        };
-        assert_eq!(
-            system_meters(
-                SystemDetails {
-                    gpus: true,
-                    ..details
-                },
-                &loadless
-            )
-            .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn a_throughput_reads_in_the_largest_unit_that_keeps_it_meaningful() {
-        assert_eq!(format_rate(0.0), "0 B/s");
-        assert_eq!(format_rate(900.0), "900 B/s");
-        assert_eq!(format_rate(1024.0), "1 KB/s");
-        assert_eq!(format_rate(49_152.0), "48 KB/s");
-        assert_eq!(format_rate(1_258_291.2), "1.2 MB/s");
-    }
-
-    #[test]
     fn a_repeated_search_moves_to_the_front_instead_of_being_listed_twice() {
         let mut recents = vec!["beta".to_owned(), "alpha".to_owned()];
         assert!(push_recent_search(&mut recents, "alpha", 10));
@@ -17596,17 +15924,6 @@ mod usage_ui_tests {
             }
         );
         assert_eq!(restored_size(fallback, stub), fallback);
-        // The same stub reaching the system card must not pin it one pixel
-        // wide: it is the width the card lays itself out against.
-        assert!(
-            system_content_size(
-                SystemDetails::default(),
-                &SystemSnapshot::default(),
-                Some(stub.width),
-            )
-            .width
-                > 1
-        );
     }
 
     #[test]
