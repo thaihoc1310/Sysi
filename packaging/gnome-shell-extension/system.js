@@ -83,9 +83,11 @@ export class SystemPanel {
         this._menu.actor.hide();
         Main.panel.menuManager.addMenu(this._menu);
         this._buildMenu();
-        button.connect('clicked', () => {
-            this._render();
-            this._menu.toggle();
+        button.connect('clicked', () => this._menu.toggle());
+        // The menu is only brought up to date while it is open.
+        this._menu.connect('open-state-changed', (_menu, open) => {
+            if (open)
+                this._render();
         });
 
         this._file = Gio.File.new_for_path(GLib.build_filenamev([
@@ -93,7 +95,13 @@ export class SystemPanel {
         ]));
         try {
             this._monitor = this._file.monitor_file(Gio.FileMonitorFlags.NONE, null);
-            this._monitor.connect('changed', () => this._reload());
+            // Once per write: a write arrives as several change events, and
+            // only the last says the file is whole.
+            this._monitor.connect('changed', (_monitor, _file, _other, event) => {
+                if (event === Gio.FileMonitorEvent.CHANGES_DONE_HINT ||
+                    event === Gio.FileMonitorEvent.CREATED)
+                    this._reload();
+            });
         } catch (error) {
             logError(error, 'Sysi could not watch SYSTEM readings');
         }
@@ -312,12 +320,13 @@ export class SystemPanel {
         for (const metric of this._data.metrics) {
             const item = this._item(metric);
             item.box.visible = shown.includes(metric.key);
-            if (item.box.visible)
+            if (item.box.visible && item.box.width !== this._width(metric))
                 item.box.width = this._width(metric);
             setValue(item.value, metric.value ?? '–');
         }
         this._readout.visible = this._isOn('system') && !this._stripOpen && shown.length > 0;
-        this._renderMenu(shown, fits);
+        if (this._menu.isOpen)
+            this._renderMenu(shown, fits);
     }
 
     _renderMenu(shown, fits) {
@@ -333,8 +342,11 @@ export class SystemPanel {
             // mistaken for off.
             const squeezed = on && !shown.includes(metric.key);
             const full = !on && !fits(metric);
-            row.label.text = squeezed ? `${metric.name} · no room` : metric.name;
-            row.setSensitive(!full);
+            const text = squeezed ? `${metric.name} · no room` : metric.name;
+            if (row.label.text !== text)
+                row.label.text = text;
+            if (row.getSensitive() === full)
+                row.setSensitive(!full);
             for (const [name, active] of [
                 ['sysi-system-on', on],
                 ['sysi-system-full', full],

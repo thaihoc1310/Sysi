@@ -1340,6 +1340,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // scroll if refitting mid-read ever gets annoying.
     notes.preview.connect_size_allocate({
         let fitted = Rc::new(Cell::new(0));
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         let last_preview = last_preview.clone();
         let fill_preview = fill_preview.clone();
         let selected = notes_view.selected.clone();
@@ -1348,13 +1349,21 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             if fitted.replace(width) == width || !preview_images_misfit(preview, width) {
                 return;
             }
+            // Once the pane stops moving: refilling decodes every image
+            // again, and a dragged pane changes width on every frame.
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
             let last_preview = last_preview.clone();
             let fill_preview = fill_preview.clone();
             let selected = selected.clone();
-            glib::idle_add_local_once(move || {
+            let done = pending.clone();
+            let source = glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                done.borrow_mut().take();
                 *last_preview.borrow_mut() = (None, String::new(), 0);
                 fill_preview(selected.get());
             });
+            *pending.borrow_mut() = Some(source);
         }
     });
 
@@ -6436,6 +6445,10 @@ fn fill_note_content(
         buffer.insert(&mut end, chunk);
     }
     mono_box_drawing_lines(buffer);
+    // Scaling each image decoded its full-size original into the cache, and a
+    // pinned note kept every one for as long as it lived: 4MB a screenshot.
+    // Only a resize drag needs them, and it loads what it drags.
+    originals.borrow_mut().clear();
     repaired
 }
 

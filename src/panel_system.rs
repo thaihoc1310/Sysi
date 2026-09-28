@@ -19,6 +19,9 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(2);
 pub struct PanelSystem {
     state: Rc<RefCell<AppState>>,
     last: RefCell<Option<SystemSnapshot>>,
+    /// What the file holds, so a sample that changed nothing is not written
+    /// and wakes nobody in the shell.
+    written: RefCell<String>,
     available: RefCell<Option<Vec<(&'static str, usize)>>>,
     request: async_channel::Sender<SystemReadOptions>,
 }
@@ -42,6 +45,7 @@ impl PanelSystem {
         let this = Rc::new(Self {
             state,
             last: RefCell::new(None),
+            written: RefCell::new(String::new()),
             available: RefCell::new(None),
             request,
         });
@@ -87,12 +91,18 @@ impl PanelSystem {
     fn publish(&self) {
         let data = self.state.borrow();
         let available = self.available.borrow();
-        let _ = publish(
+        let contents = render(
             data.settings.system,
             &data.settings.system_details,
             self.last.borrow().as_ref(),
             available.as_deref(),
         );
+        if *self.written.borrow() == contents {
+            return;
+        }
+        if write(&contents).is_ok() {
+            *self.written.borrow_mut() = contents;
+        }
     }
 
     /// SYSTEM in the bar on or off; `None` flips it. The menu says which it
@@ -402,20 +412,14 @@ fn path() -> PathBuf {
         .join("system.json")
 }
 
-/// Write what the bar should show. The extension reads the file whenever it
-/// changes; it is rewritten whole each time, and a torn read just waits for
-/// the next one.
-pub fn publish(
-    on: bool,
-    details: &SystemDetails,
-    snapshot: Option<&SystemSnapshot>,
-    available: Option<&[(&str, usize)]>,
-) -> io::Result<()> {
+/// Write what the bar should show. The extension reads the file each time a
+/// write to it is done; it is rewritten whole.
+fn write(contents: &str) -> io::Result<()> {
     let path = path();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(path, render(on, details, snapshot, available))
+    fs::write(path, contents)
 }
 
 #[cfg(test)]
