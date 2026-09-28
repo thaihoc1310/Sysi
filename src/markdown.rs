@@ -17,6 +17,16 @@ const HOLD_CLOSE: char = '\u{E001}';
 /// spaces through the tidy-up that running text gets.
 const VERBATIM: char = '\u{E002}';
 
+/// Everything a paste into a note is tidied with: Markdown rendered as text,
+/// and a drawing's first line given back the indent the copy left behind.
+/// `None` means "paste the text as it is".
+pub fn clean_paste(text: &str, width: usize) -> Option<String> {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let rendered = clean_pasted_markdown(&text, width).unwrap_or_else(|| text.clone());
+    let restored = restore_drawing_indent(&rendered).unwrap_or(rendered);
+    (restored != text).then_some(restored)
+}
+
 /// `width` is the note's line length in fixed-width cells; 0 means unknown,
 /// and a table is then drawn at its natural width. `None` means "paste the
 /// text as it is".
@@ -101,6 +111,7 @@ fn looks_like_markdown(text: &str) -> bool {
 
 fn render_blocks(text: &str, width: usize) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
+    let drawing = diagram_lines(text);
     let mut out: Vec<String> = Vec::new();
     // Whether the last source line was running paragraph text, which makes a
     // following `---` a setext underline rather than a rule.
@@ -146,6 +157,14 @@ fn render_blocks(text: &str, width: usize) -> String {
             out.extend(block);
             i = next;
             after_paragraph = false;
+            continue;
+        }
+        // A drawing pasted without its fence carries no Markdown, and its
+        // spacing is the picture: `*` or `_` inside a box is not emphasis.
+        if drawing.binary_search(&i).is_ok() {
+            out.push(format!("{VERBATIM}{line}"));
+            after_paragraph = false;
+            i += 1;
             continue;
         }
         if trimmed.is_empty() {
@@ -248,6 +267,116 @@ fn clean_line_kind(line: &str) -> (String, bool) {
         body = task[2].to_owned();
     }
     (format!("{indent}{bullet} {}", clean_inline(&body)), true)
+}
+
+// ---------------------------------------------------------------- drawings
+
+fn is_box_stroke(c: char) -> bool {
+    ('\u{2500}'..='\u{257F}').contains(&c)
+}
+
+/// Arrows, and the triangles chatbots draw arrowheads with (`▼`, `►`).
+fn is_arrow(c: char) -> bool {
+    matches!(c, '\u{2190}'..='\u{21FF}' | '\u{25A0}'..='\u{25FF}' | '\u{27F0}'..='\u{27FF}')
+}
+
+/// A line with strokes in it: box-drawing characters, or an ASCII box corner
+/// (`+--`, `--+`).
+fn is_drawn(line: &str) -> bool {
+    line.chars().any(is_box_stroke) || regex!(r"\+[-=]{2,}|[-=]{2,}\+").is_match(line)
+}
+
+/// A line that may sit inside a drawing without strokes of its own: a row
+/// of arrows, or labels laid out with runs of spaces. Four spaces in a row
+/// is the usual tell of text art; running prose never has them.
+fn fits_drawing(line: &str) -> bool {
+    !line.trim().is_empty()
+        && (is_drawn(line) || line.chars().any(is_arrow) || line.contains("    "))
+}
+
+/// The lines of `text` that belong to a drawing and only line up in a
+/// fixed-width face: every line with strokes, and the arrow rows and spaced
+/// labels next to them, up to the first blank or ordinary line.
+pub fn diagram_lines(text: &str) -> Vec<usize> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_drawn(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let first = found.last().map_or(0, |last: &usize| last + 1);
+        let mut start = i;
+        while start > first && fits_drawing(lines[start - 1]) {
+            start -= 1;
+        }
+        let mut end = i;
+        while end + 1 < lines.len() && fits_drawing(lines[end + 1]) {
+            end += 1;
+        }
+        found.extend(start..=end);
+        i = end + 1;
+    }
+    found
+}
+
+/// Strokes that go on into the line below, and ones that come from above.
+fn reaches_down(c: char) -> bool {
+    matches!(c, '┌' | '┐' | '┬' | '├' | '┤' | '┼' | '│' | '╭' | '╮' | '╔' | '╗' | '╦' | '╠'
+        | '╣' | '╬' | '║' | '┏' | '┓' | '┳' | '┣' | '┫' | '╋' | '┃' | '+' | '|')
+}
+
+fn reaches_up(c: char) -> bool {
+    matches!(c, '│' | '├' | '┤' | '┼' | '┴' | '└' | '┘' | '╰' | '╯' | '║' | '╚' | '╝' | '╩'
+        | '╠' | '╣' | '╬' | '┃' | '┗' | '┛' | '┻' | '┣' | '┫' | '╋' | '▼' | '▲' | '↓' | '+' | '|')
+}
+
+/// The character in each fixed-width cell of a line (`None` for the second
+/// half of a wide character).
+fn cells(line: &str) -> Vec<Option<char>> {
+    let mut out = Vec::new();
+    for c in line.chars() {
+        match char_width(c) {
+            0 => {}
+            1 => out.push(Some(c)),
+            _ => out.extend([Some(c), None]),
+        }
+    }
+    out
+}
+
+/// A copy that starts at the first thing drawn leaves the first line's indent
+/// behind: the selection begins at its `┌`, not at the spaces before it, so
+/// the top of a box lands at the margin while its sides stay where they were.
+/// Put the indent back where the strokes of the line below say it was.
+pub fn restore_drawing_indent(text: &str) -> Option<String> {
+    let mut lines = text.split('\n');
+    let first = lines.next()?;
+    let below = cells(lines.next()?);
+    if first.starts_with([' ', '\t']) || !first.chars().any(is_box_stroke) {
+        return None;
+    }
+    let strokes: Vec<usize> = cells(first)
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_some_and(reaches_down))
+        .map(|(x, _)| x)
+        .collect();
+    // One stroke lines up with something almost anywhere.
+    if strokes.len() < 2 {
+        return None;
+    }
+    let meets = |shift: usize| {
+        strokes
+            .iter()
+            .all(|x| below.get(x + shift).copied().flatten().is_some_and(reaches_up))
+    };
+    if meets(0) {
+        return None;
+    }
+    let shift = (1..below.len()).find(|&shift| meets(shift))?;
+    Some(format!("{}{text}", " ".repeat(shift)))
 }
 
 // ---------------------------------------------------------------- tables
@@ -537,7 +666,7 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn display_width(text: &str) -> usize {
+pub fn display_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
@@ -1419,6 +1548,75 @@ Mẹo so sánh:
         assert_eq!(clean_pasted_markdown("**Note:** x", 40).unwrap(), "Note: x");
         assert_eq!(clean_pasted_markdown("Try \\(x^2\\) now **ok**", 40).unwrap(), "Try x² now ok");
         assert_eq!(clean_pasted_markdown("**A** and __bold words__ and __init__", 40).unwrap(), "A and bold words and __init__");
+    }
+
+    /// The diagram a chatbot answer carried, as it reached a note: the copy
+    /// began at the first `┌`, so the top of the first box lost its indent.
+    fn copied_diagram() -> Vec<&'static str> {
+        vec![
+            "┌──────────────────────────────┐",
+            "               │         Kubernetes           │",
+            "               └──────────────┬───────────────┘",
+            "                              │",
+            "         ┌────────────────────┴────────────────────┐",
+            "         ▼                                         ▼",
+            "┌────────────────────────┐               ┌────────────────────────┐",
+            "│   Datashim Operator    │               │     AWS EBS CSI        │",
+            "│ (csi-s3.example.com)   │               │   (ebs.csi.aws.com)    │",
+            "└──────────┬─────────────┘               └──────────┬─────────────┘",
+            "           │                                        │",
+            "           ▼ (Mount S3 Dataset)                     ▼ (Mount Block Storage)",
+            "    /mnt/datasets/...                         /mnt/checkpoints/...",
+            "           │                                        │",
+            "           └──────────────────┬─────────────────────┘",
+            "                              ▼",
+            "                     ┌──────────────────┐",
+            "                     │   Training Pod   │",
+            "                     └──────────────────",
+        ]
+    }
+
+    #[test]
+    fn a_copied_diagram_gets_its_first_line_back_in_place() {
+        let lines = copied_diagram();
+        let pasted = lines.join("\n");
+        let restored = restore_drawing_indent(&pasted).expect("the first line moved");
+        let first = restored.split('\n').next().unwrap();
+        // The top of the box now sits over its sides, fifteen cells in.
+        assert_eq!(first, format!("{}{}", " ".repeat(15), lines[0]));
+        assert_eq!(restored.split('\n').skip(1).collect::<Vec<_>>(), lines[1..]);
+        // Already in place, or not a drawing: left alone.
+        assert_eq!(restore_drawing_indent(&restored), None);
+        assert_eq!(restore_drawing_indent("┌──┐\n│ok│\n└──┘"), None);
+        assert_eq!(restore_drawing_indent("hello\n  │ x │"), None);
+        // One stroke is not enough to tell where it belonged.
+        assert_eq!(restore_drawing_indent("─── a │\n      │"), None);
+        // The paste path does the same, Markdown or not.
+        assert_eq!(clean_paste(&pasted, 80), Some(restored));
+    }
+
+    #[test]
+    fn every_line_of_a_diagram_is_set_in_the_fixed_width_face() {
+        let lines = copied_diagram();
+        let note = format!("Sơ đồ kiến trúc:\n{}\n\nKết luận: xong.", lines.join("\n"));
+        // The arrow rows and the /mnt labels between the boxes too, but not
+        // the sentence above it or the one after the blank line.
+        assert_eq!(diagram_lines(&note), (1..=lines.len()).collect::<Vec<_>>());
+        // A table's rows and rules, but not a pipe table or plain notes.
+        let table = "Lệnh:\n│ go vet ./... │ Bắt lỗi │\n├──────┼──────┤\n| markdown | pipes |\nghi chú";
+        assert_eq!(diagram_lines(table), vec![1, 2]);
+        assert!(diagram_lines("").is_empty());
+        // An ASCII box counts as a drawing as well.
+        assert_eq!(diagram_lines("+-----+\n| app |\n+-----+"), vec![0, 2]);
+    }
+
+    #[test]
+    fn a_diagram_in_a_markdown_answer_keeps_its_spacing_and_underscores() {
+        let answer = "**Luồng:**\n┌──────────┐\n│ my_pod_a │    │ *x* │\n└──────────┘";
+        assert_eq!(
+            clean_pasted_markdown(answer, 80).unwrap(),
+            "Luồng:\n┌──────────┐\n│ my_pod_a │    │ *x* │\n└──────────┘"
+        );
     }
 
     #[test]

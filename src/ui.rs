@@ -6908,9 +6908,15 @@ fn resize_width_limit(room: Size, aspect: f64) -> i32 {
         .clamp(NOTE_IMAGE_MIN, NOTE_IMAGE_MAX)
 }
 
-// The size an edge drag lands on. The larger of the two deltas drives a corner,
-// dragging down enlarges as readily as dragging right, and the aspect ratio of
-// the pasted image is never distorted.
+// The size a corner drag lands on. The pointer's travel is measured in width
+// either way (down counts `aspect` times over), and the axis that went further
+// drives the corner, so dragging down enlarges as readily as dragging right;
+// the aspect ratio of the image is never distorted.
+//
+// The two axes are compared in those same units. Comparing raw pixels while
+// driving with the scaled one made the size leap by the difference whenever
+// the lead changed hands mid-drag. When they pull opposite ways (right but up)
+// they are added, which meets the leading axis where the other is still.
 fn resized_image_size(
     start_width: i32,
     aspect: f64,
@@ -6923,10 +6929,13 @@ fn resized_image_size(
     } else {
         1.0
     };
-    let delta = if dx.abs() >= dy.abs() {
+    let down = dy * aspect;
+    let delta = if dx * down < 0.0 {
+        dx + down
+    } else if dx.abs() >= down.abs() {
         dx
     } else {
-        dy * aspect
+        down
     };
     let max_width = max_width.clamp(NOTE_IMAGE_MIN, NOTE_IMAGE_MAX);
     let width = ((f64::from(start_width) + delta).round() as i32).clamp(NOTE_IMAGE_MIN, max_width);
@@ -7506,10 +7515,11 @@ fn settle_repaired_images(
     let _ = state.borrow().save();
 }
 
-/// A table pasted from a terminal is drawn with box characters and padded
-/// with spaces, so it only lines up in a fixed-width face. Any line carrying a
-/// box-drawing character is set in one. Derived from the text on every edit
-/// rather than stored, so old notes and the Notes preview get it for free.
+/// A table or a diagram is drawn with box characters and laid out with
+/// spaces, so it only lines up in a fixed-width face. Every line of one is set
+/// in it: the strokes, and the arrow rows and labels between them (see
+/// `markdown::diagram_lines`). Derived from the text on every edit rather than
+/// stored, so old notes and the Notes preview get it for free.
 // ponytail: rescans the whole note per edit; limit to the edited lines if a
 // note ever grows large enough to lag.
 const NOTE_MONO_FAMILY: &str = "Noto Sans Mono, DejaVu Sans Mono, monospace";
@@ -7527,20 +7537,12 @@ fn mono_box_drawing_lines(buffer: &gtk::TextBuffer) {
     });
     let (start, end) = buffer.bounds();
     buffer.remove_tag(&tag, &start, &end);
-    for line in box_drawn_lines(&note_buffer_text(buffer)) {
+    for line in crate::markdown::diagram_lines(&note_buffer_text(buffer)) {
         let from = buffer.iter_at_line(line as i32);
         let mut to = from.clone();
         to.forward_to_line_end();
         buffer.apply_tag(&tag, &from, &to);
     }
-}
-
-fn box_drawn_lines(text: &str) -> Vec<usize> {
-    text.split('\n')
-        .enumerate()
-        .filter(|(_, line)| line.chars().any(|c| ('\u{2500}'..='\u{257F}').contains(&c)))
-        .map(|(index, _)| index)
-        .collect()
 }
 
 fn fill_note_buffer(
@@ -7740,7 +7742,14 @@ fn copy_focused_image(
 /// A chatbot answer copied as Markdown goes in as the text it reads as, its
 /// tables drawn to fit this note. Anything that is not Markdown is left to
 /// GTK's own paste.
-fn paste_note_markdown(editor: &gtk::TextView) -> bool {
+/// Paste text tidied by `markdown::clean_paste`, and widen the note for a
+/// drawing in it: a diagram wrapped at the note's edge is no diagram at all.
+/// False leaves the paste to GTK, as it came.
+fn paste_note_text(
+    editor: &gtk::TextView,
+    target: &NoteImageTarget,
+    state: &Rc<RefCell<AppState>>,
+) -> bool {
     if !editor.is_editable() {
         return false;
     }
@@ -7748,30 +7757,49 @@ fn paste_note_markdown(editor: &gtk::TextView) -> bool {
     let Some(text) = clipboard.wait_for_text() else {
         return false;
     };
-    let Some(cleaned) = crate::markdown::clean_pasted_markdown(&text, note_mono_columns(editor))
-    else {
+    let cleaned = crate::markdown::clean_paste(&text, note_mono_columns(editor));
+    let pasted = cleaned.as_deref().unwrap_or(&text);
+    let drawing = crate::markdown::diagram_lines(pasted);
+    if cleaned.is_none() && drawing.is_empty() {
         return false;
-    };
+    }
     let Some(buffer) = editor.buffer() else {
         return false;
     };
     buffer.delete_selection(true, true);
-    buffer.insert_interactive_at_cursor(&cleaned, true);
+    buffer.insert_interactive_at_cursor(pasted, true);
+    let lines: Vec<&str> = pasted.split('\n').collect();
+    let widest = drawing
+        .iter()
+        .map(|&line| crate::markdown::display_width(lines[line].trim_end()))
+        .max()
+        .unwrap_or(0);
+    let cell = note_mono_cell(editor);
+    if widest > 0 && cell > 0.0 {
+        // One cell of slack, the same the table layout keeps off the edge.
+        let width = ((widest + 1) as f64 * cell).ceil() as i32;
+        grow_note_for_image(editor, target, state, Size { width, height: 0 });
+    }
     if let Some(insert) = buffer.get_insert() {
         editor.scroll_mark_onscreen(&insert);
     }
     true
 }
 
-/// How many fixed-width cells fit on one line of this note right now, less
-/// one so a table never touches the edge and wraps. 0 when it cannot be told.
-fn note_mono_columns(editor: &gtk::TextView) -> usize {
+/// The width of one fixed-width cell in this note, in logical pixels.
+fn note_mono_cell(editor: &gtk::TextView) -> f64 {
     let mut font = editor.pango_context().font_description().unwrap_or_default();
     font.set_family(NOTE_MONO_FAMILY);
     let sample = "0".repeat(20);
     let layout = editor.create_pango_layout(Some(&sample));
     layout.set_font_description(Some(&font));
-    let cell = f64::from(layout.pixel_size().0) / 20.0;
+    f64::from(layout.pixel_size().0) / 20.0
+}
+
+/// How many fixed-width cells fit on one line of this note right now, less
+/// one so a table never touches the edge and wraps. 0 when it cannot be told.
+fn note_mono_columns(editor: &gtk::TextView) -> usize {
+    let cell = note_mono_cell(editor);
     let padding = editor.style_context().padding(gtk::StateFlags::NORMAL);
     let text = editor.allocation().width()
         - i32::from(padding.left)
@@ -8436,7 +8464,7 @@ fn attach_note_images(
             };
             buffer.begin_user_action();
             let pasted = paste_note_image(editor, &target, &state, &originals)
-                || (!raw && paste_note_markdown(editor));
+                || (!raw && paste_note_text(editor, &target, &state));
             buffer.end_user_action();
             if pasted {
                 // The default handler would paste the clipboard's text form of
@@ -16140,6 +16168,32 @@ mod timer_input_tests {
     }
 
     #[test]
+    fn a_corner_drag_never_jumps_whichever_way_the_pointer_wanders() {
+        // The pointer drawn along a wobbly diagonal, both ways across the
+        // point where the vertical travel takes the lead, and out through
+        // right-but-up. A one-pixel step of the pointer may move the corner
+        // at most `aspect` pixels (a step down counts that much width).
+        let aspect = 600.0 / 340.0;
+        // Roughly 45 degrees, the way a hand drags a corner, so the lead
+        // changes hands again and again; it starts out right-but-up.
+        let pointer = |t: f64| (t * 0.5, t * 0.5 + 12.0 * (t / 9.0).sin() - 20.0);
+        let mut previous: Option<(i32, f64, f64)> = None;
+        for step in 0..=400 {
+            let (dx, dy) = pointer(f64::from(step));
+            let (width, height) = resized_image_size(600, aspect, dx, dy, NOTE_IMAGE_MAX);
+            assert_eq!(height, (f64::from(width) / aspect).round() as i32);
+            if let Some((last, last_dx, last_dy)) = previous {
+                let travel = (dx - last_dx).abs() + aspect * (dy - last_dy).abs();
+                assert!(
+                    f64::from((width - last).abs()) <= travel + 1.0,
+                    "step {step}: {last} -> {width} for {travel:.1}px of travel"
+                );
+            }
+            previous = Some((width, dx, dy));
+        }
+    }
+
+    #[test]
     fn a_note_image_loses_its_sharp_corners_on_every_side() {
         // The focus outline is drawn after the text and cannot erase what is
         // under it, so the corners have to be gone from the image itself.
@@ -17640,13 +17694,6 @@ mod usage_ui_tests {
     /// The token tab has to survive the two shapes a first run takes — nothing
     /// scanned yet, and a scan that came back empty — and then hand every mark
     /// it draws a hover target, because the chart carries no printed figures.
-    #[test]
-    fn only_box_drawn_lines_are_set_in_a_fixed_width_face() {
-        let note = "Lệnh:\n│ go vet ./... │ Bắt lỗi │\n├──────┼──────┤\n| markdown | pipes |\nghi chú";
-        assert_eq!(box_drawn_lines(note), vec![1, 2]);
-        assert!(box_drawn_lines("").is_empty());
-    }
-
     #[test]
     fn the_token_tab_swaps_in_and_hands_every_mark_a_tooltip() {
         if gtk::init().is_err() {
