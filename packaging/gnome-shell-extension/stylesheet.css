@@ -145,61 +145,25 @@
   text-shadow: none;
 }
 
-/* SYSTEM's menu: the switch for the whole row, then a chip per reading. A
-   chip is filled while its reading is in the bar, outlined while it is not,
-   and faint when there is no room left for it before the clock. */
+/* SYSTEM's menu, in the style of settings: centred words, the reading bright
+   while it is in the bar and faint while it is not, fainter still when there
+   is no room left for it before the clock. */
 .sysi-system-menu .popup-menu-content {
-  min-width: 212px;
+  min-width: 118px;
 }
 
-.sysi-system-menu .sysi-system-chips-item {
-  padding: 4px 8px;
+.sysi-system-menu .popup-separator-menu-item {
+  padding: 2px 8px;
 }
 
-.sysi-system-menu .sysi-system-chips {
-  spacing: 6px;
+.sysi-system-menu .sysi-system-row {
+  color: rgba(244, 244, 244, 0.42);
 }
 
-.sysi-system-menu .sysi-system-chip-row {
-  spacing: 6px;
+.sysi-system-menu .sysi-system-row.sysi-system-on {
+  color: #f4f4f4;
 }
 
-.sysi-system-menu .sysi-system-chip {
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  background-color: transparent;
-  color: rgba(244, 244, 244, 0.86);
-  font-size: 11px;
-  font-weight: 500;
-  transition-duration: 0ms;
-}
-
-.sysi-system-menu .sysi-system-chip:hover,
-.sysi-system-menu .sysi-system-chip:focus {
-  background-color: rgba(255, 255, 255, 0.10);
-  color: #ffffff;
-}
-
-.sysi-system-menu .sysi-system-chip:checked {
-  background-color: rgba(244, 244, 244, 0.90);
-  border-color: rgba(244, 244, 244, 0.90);
-  color: #161618;
-}
-
-.sysi-system-menu .sysi-system-chip:checked:hover,
-.sysi-system-menu .sysi-system-chip:checked:focus {
-  background-color: #ffffff;
-  color: #161618;
-}
-
-.sysi-system-menu .sysi-system-chip-full {
-  border-color: rgba(255, 255, 255, 0.07);
-  color: rgba(244, 244, 244, 0.30);
-}
-
-.sysi-system-menu .sysi-system-hint {
-  padding: 2px 4px 4px;
-  color: rgba(244, 244, 244, 0.55);
-  font-size: 10px;
+.sysi-system-menu .sysi-system-row.sysi-system-full {
+  color: rgba(244, 244, 244, 0.18);
 }

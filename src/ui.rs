@@ -1667,11 +1667,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     let panel_system = crate::panel_system::PanelSystem::start(state.clone());
     widget_picker.system.connect_toggled({
         let panel_system = panel_system.clone();
-        let state = state.clone();
         move |button| {
-            if button.is_active() != state.borrow().settings.system {
-                panel_system.toggle_on();
-            }
+            panel_system.set_on(Some(button.is_active()));
         }
     });
 
@@ -1930,10 +1927,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     window.show();
                 }
                 match action.name.as_str() {
-                    "toggle-system" => panel_system.toggle_on(),
-                    name if name.starts_with("system-metric:") => {
-                        panel_system.toggle_metric(&name["system-metric:".len()..]);
-                    }
+                    name if crate::panel_system::apply_action(&panel_system, name) => {}
                     "toggle-timer" => timer.set_active(!timer.is_active()),
                     "next-color-mode" => mode.clicked(),
                     "font-smaller" | "font-larger" => {
@@ -10307,7 +10301,7 @@ struct PanelAction {
 /// Actions that do nothing on the desk, so a hidden Sysi stays hidden for
 /// them: quitting, and SYSTEM, which lives in the top bar.
 fn leaves_the_desk_alone(action: &str) -> bool {
-    action == "quit" || action == "toggle-system" || action.starts_with("system-metric:")
+    action == "quit" || action == "toggle-system" || action.starts_with("system")
 }
 
 fn take_panel_actions() -> Vec<PanelAction> {
