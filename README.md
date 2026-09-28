@@ -12,7 +12,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
   Every sensor, `/proc` walk, and `nvidia-smi` call runs only while its section is enabled, and all of it on a sampler thread rather than the GTK main loop.
 - Focus countdown with four visual styles, hover controls in both modes, and a persistent animated alarm that must be dismissed.
 - A compact gear menu with persistent SYSTEM and timer visibility toggles.
-- Notes palette: `Ctrl+Alt+N` opens a centred command palette of every note on the monitor of the window you last clicked. Search shows the matching passage, a preview reads the note in place, and Enter pins it on the desk.
+- Notes palette: `Super+Shift+L` opens a centred command palette of every note on the monitor of the window you last clicked. Search shows the matching passage, a preview reads the note in place, and Enter pins it on the desk.
 - A small transparent `USAGE` card for Codex, Claude Code, and Oh My Pi (OMP). It
   shows the remaining percentage, the server-provided reset time, and the age
   of the last snapshot. The card polls only while visible, keeps the previous
@@ -40,14 +40,16 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 ## Controls
 
 - `Super+Shift+O` — lock or unlock interaction.
-- `Super+Shift+N` — create a new note, ready to type into (same as the panel `NOTE` button).
+- `Super+Shift+N` — create a new note, ready to type into (same as the panel `NOTE` button). There is only ever one new note: until something is written in it, pressing again brings that note to the pointer instead of making another.
 - `Super+Shift+H` — hide or show every Sysi window at once (also `hide` / `show` in the panel's settings menu). The timer keeps running while hidden, and any other panel action or hotkey shows Sysi again first.
-- `Ctrl+Alt+N` — open or close the Notes palette. Search, move with Up/Down, Enter to open on the desk, Ctrl+P to pin, Delete to delete, Escape to close.
-- `Super+Shift+A` — start OCR (same as the panel `ocr` button). Drag a rectangle; the text is copied. Press again, right-click, or Escape to cancel. Super+Shift+A rather than Super+Shift+D: Super+A is Show Apps, Super+Shift+S is the screenshot UI, and Super+D is often “hide windows”.
+- `Super+Shift+L` — open or close the Notes palette (it was `Ctrl+Alt+N` before 0.1.77). Search, move with Up/Down, Enter to open on the desk, Ctrl+P to pin, Delete to delete, Escape to close.
+- `Super+Shift+A` — start OCR (same as the panel `ocr` button). Drag a rectangle; the text is copied. Press again, right-click, or Escape to cancel. Super+Shift+A because Super+A is Show Apps and Super+Shift+S is the screenshot UI.
+- `Super+Shift+D` — open a new dictionary, ready to type a word into. Like a new note, a dictionary that has not looked anything up yet is still the new one and is brought back rather than doubled.
+- `Super+Shift+U` — open or close USAGE.
 - `Ctrl+Shift+V` — paste into a note exactly as copied, skipping the Markdown clean-up.
 - `Ctrl+F` — find text in the focused note. Use `Enter` / `Shift+Enter` (or
   `F3` / `Shift+F3`) to move between matches and `Escape` to close the panel.
-- `Escape` — cancel an OCR selection if one is up; otherwise close the Notes palette if it is open; otherwise return to click-through lock mode.
+- `Escape` — cancel an OCR selection if one is up; otherwise close the Notes palette, a note's find panel or a dictionary's query panel. It never locks the overlay; that is `Super+Shift+O` or the panel's `LOCK`.
 - `sysi --toggle` — toggle interaction from a terminal or a custom desktop shortcut.
 - `sysi --quit` — stop the running overlay.
 
@@ -95,4 +97,4 @@ Sysi is an X11 overlay: always-on-top placement, sticky multi-monitor coverage, 
 
 Ubuntu 26.04 (GNOME 50) ships no Xorg session at all — `/usr/share/xsessions` is gone — so this is the path every 26.04 desktop takes.
 
-Xwayland cannot grab a key while a Wayland window is focused, and an Xwayland client cannot take the keyboard from a native Wayland app either. The panel extension therefore grabs `Ctrl+Alt+N`, `Super+Shift+O`, `Super+Shift+A`, `Super+Shift+H` and `Super+Shift+N` inside the compositor and activates the overlay before Notes or OCR starts. If the extension is off, Sysi falls back to GNOME custom shortcuts (`sysi --panel-action toggle-notes` / `sysi --panel-action ocr`). Notes opened that way may leave the caret outside the search field; OCR still starts, but on Wayland it cannot photograph native windows without the extension. Without the extension `Super+Shift+O`, `Super+Shift+H` and `Super+Shift+N` do nothing on Wayland; bind `sysi --toggle` / `sysi --panel-action toggle-hidden` yourself. The panel strip's `LOCK` / `UNLOCK`, `NOTES`, and `OCR` buttons and `Escape` are unaffected.
+Xwayland cannot grab a key while a Wayland window is focused, and an Xwayland client cannot take the keyboard from a native Wayland app either. The panel extension therefore grabs `Super+Shift+L`, `Super+Shift+O`, `Super+Shift+A`, `Super+Shift+H`, `Super+Shift+N`, `Super+Shift+D` and `Super+Shift+U` inside the compositor and activates the overlay before Notes or OCR starts. If the extension is off, Sysi falls back to GNOME custom shortcuts (`sysi --panel-action toggle-notes` / `sysi --panel-action ocr`). Notes opened that way may leave the caret outside the search field; OCR still starts, but on Wayland it cannot photograph native windows without the extension. Without the extension `Super+Shift+O`, `Super+Shift+H`, `Super+Shift+N`, `Super+Shift+D` and `Super+Shift+U` do nothing on Wayland; bind `sysi --toggle` / `sysi --panel-action toggle-hidden` / `new-note` / `new-dictionary` / `toggle-usage` yourself. The panel strip's `LOCK` / `UNLOCK`, `NOTES`, and `OCR` buttons are unaffected.

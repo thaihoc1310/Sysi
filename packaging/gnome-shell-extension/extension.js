@@ -13,6 +13,9 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {GlassManager} from './glass.js';
 
 const UUID = 'sysi-panel@thaihoc';
+// Opens and closes the Notes palette. Ctrl+Alt+N until 0.1.77.
+const NOTES_BINDING = '<Super><Shift>l';
+const NOTES_LEGACY_BINDING = '<control><alt>n';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
 
@@ -93,7 +96,7 @@ export default class SysiPanelExtension extends Extension {
             logError(error, 'Sysi panel gear could not watch the app state');
         }
         // Both labels describe state Sysi owns, and either can be changed
-        // without going near this strip — locking with Escape or the hotkey,
+        // without going near this strip — locking with the hotkey,
         // cycling the colour from the widget picker. So the strip never guesses
         // from its own clicks; it reads what Sysi published.
         this._panelStateFile = Gio.File.new_for_path(
@@ -159,11 +162,13 @@ export default class SysiPanelExtension extends Extension {
         }
         this._bindNotesHotkey();
         this._bindOcrHotkey();
-        // Xwayland never sees Super while a Wayland app has focus. Grab both here instead.
+        // Xwayland never sees Super while a Wayland app has focus. Grab these here instead.
         this._plainGrabs = [
             this._grabKey('<Super><Shift>o', 'toggle-lock'),
             this._grabKey('<Super><Shift>h', 'toggle-hidden'),
             this._grabKey('<Super><Shift>n', 'new-note'),
+            this._grabKey('<Super><Shift>d', 'new-dictionary'),
+            this._grabKey('<Super><Shift>u', 'toggle-usage'),
         ].filter(Boolean);
         this._syncOcrEscape();
         this._syncPanelState();
@@ -321,8 +326,8 @@ export default class SysiPanelExtension extends Extension {
         // walk the palette to the other monitor a frame later.
         const notes = action === 'toggle-notes' || action === 'toggle-history';
         const ocr = action === 'ocr' || action === 'dictate';
-        // A new note is for typing into straight away.
-        const typing = action === 'new-note';
+        // A new note or dictionary is for typing into straight away.
+        const typing = action === 'new-note' || action === 'new-dictionary';
         const cancelOcr = action === 'cancel-ocr';
         const anchor = button
             ? this._anchorOf(button)
@@ -409,8 +414,13 @@ export default class SysiPanelExtension extends Extension {
         const settings = this._notesShortcutSettings();
         if (!settings || !this._notesShortcutBinding)
             return;
+        // Ctrl+Alt+N was the default before Super+Shift+L; hand the fallback
+        // the new one rather than the key Notes no longer answers to.
+        const binding = this._notesShortcutBinding.toLowerCase() === NOTES_LEGACY_BINDING
+            ? NOTES_BINDING
+            : this._notesShortcutBinding;
         if (!settings.get_string('binding'))
-            settings.set_string('binding', this._notesShortcutBinding);
+            settings.set_string('binding', binding);
         this._notesShortcutBinding = null;
     }
 
@@ -423,11 +433,11 @@ export default class SysiPanelExtension extends Extension {
         this._silenceCustomNotesShortcut();
         try {
             this._notesAccelAction = global.display.grab_accelerator(
-                '<Control><Alt>n',
+                NOTES_BINDING,
                 Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
             );
         } catch (error) {
-            logError(error, 'Sysi could not grab Ctrl+Alt+N');
+            logError(error, 'Sysi could not grab Super+Shift+L');
             this._notesAccelAction = 0;
             this._restoreCustomNotesShortcut();
             return;

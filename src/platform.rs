@@ -63,12 +63,12 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
             }
             let root = xlib::XDefaultRootWindow(display);
             let toggle_keycode = xlib::XKeysymToKeycode(display, b'o' as u64);
-            let notes_keycode = xlib::XKeysymToKeycode(display, b'n' as u64);
-            // On Wayland the compositor shortcut owns Ctrl+Alt+N. Grabbing N
-            // here would swallow the key whenever an X11 window is focused
+            let notes_keycode = xlib::XKeysymToKeycode(display, b'l' as u64);
+            // On Wayland the compositor shortcut owns Super+Shift+L. Grabbing
+            // L here would swallow the key whenever an X11 window is focused
             // and then throw the event away.
             let grab_notes = std::env::var_os("WAYLAND_DISPLAY").is_none();
-            let base = xlib::ControlMask | xlib::Mod1Mask;
+            let base = xlib::ShiftMask | xlib::Mod4Mask;
             for extra in [
                 0,
                 xlib::LockMask,
@@ -101,7 +101,7 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
                 eprintln!(
                     "Sysi could not take Super+Shift+O{}: another application already holds it. \
                      Lock, unlock, and open notes from the panel strip instead.",
-                    if grab_notes { " or Ctrl+Alt+N" } else { "" }
+                    if grab_notes { " or Super+Shift+L" } else { "" }
                 );
             }
             let connection = xlib::XConnectionNumber(display);

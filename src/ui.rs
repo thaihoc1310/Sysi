@@ -1122,21 +1122,42 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             if !ctx.interactive.get() {
                 lock.clicked();
             }
+            // One blank dictionary at a time, the way a new note is: one
+            // that has never looked anything up is still the new one, so
+            // asking for another brings it to the pointer instead.
+            let blank = query
+                .is_none()
+                .then(|| {
+                    let data = ctx.state.borrow();
+                    ctx.instances
+                        .borrow()
+                        .iter()
+                        .find(|instance| {
+                            data.dictionaries
+                                .iter()
+                                .any(|saved| saved.id == instance.id && saved.history.is_empty())
+                        })
+                        .cloned()
+                })
+                .flatten();
             // Past the cap, reuse the most recent window rather than burying
             // the desk in cards.
-            if ctx.instances.borrow().len() >= TRANSLATE_WINDOW_LIMIT {
-                let recent = ctx
-                    .recent
-                    .get()
-                    .and_then(|id| {
-                        ctx.instances
-                            .borrow()
-                            .iter()
-                            .find(|instance| instance.id == id)
-                            .cloned()
-                    })
-                    .or_else(|| ctx.instances.borrow().last().cloned());
+            let full = ctx.instances.borrow().len() >= TRANSLATE_WINDOW_LIMIT;
+            if blank.is_some() || full {
+                let recent = blank.or_else(|| {
+                    ctx.recent
+                        .get()
+                        .and_then(|id| {
+                            ctx.instances
+                                .borrow()
+                                .iter()
+                                .find(|instance| instance.id == id)
+                                .cloned()
+                        })
+                        .or_else(|| ctx.instances.borrow().last().cloned())
+                });
                 if let Some(instance) = recent {
+                    place_translate_near_click(&ctx, instance.id, &instance.window.card);
                     instance.window.card.show_all();
                     raise_card(&instance.window.card);
                     instance.window.chrome.set_visible(ctx.interactive.get());
@@ -1274,8 +1295,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         })
     };
 
-    // Escape closes the query panel of whichever dictionary has one open,
-    // before it is allowed to lock the overlay.
+    // Escape closes the query panel of whichever dictionary has one open.
     let translate_close_search: Rc<dyn Fn() -> bool> = {
         let instances = translate_ctx.instances.clone();
         let recent = translate_ctx.recent.clone();
@@ -1667,7 +1687,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 // The palette is usable in lock mode: take keyboard focus
                 // even when the rest of the overlay is click-through.
                 window.set_accept_focus(true);
-                // grab_focus only moves GTK's caret. Ctrl+Alt+N arrives as a
+                // grab_focus only moves GTK's caret. Super+Shift+L arrives as a
                 // GNOME shortcut or a grab on another X connection, so this
                 // display has no current user_time and mutter will not focus
                 // a Utility overlay from a stale present(). Ask the shell to
@@ -1990,21 +2010,52 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     &screens,
                 ),
             };
-            let mut data = state.borrow_mut();
-            let id = data.next_note_id;
-            data.next_note_id += 1;
-            data.notes.push(Note {
-                id,
-                text: String::new(),
-                pinned: true,
-                starred: false,
-                updated_at: now_ms(),
-                position,
-                images: Vec::new(),
-                highlights: Vec::new(),
+            // One new note at a time. A note stays new until something is
+            // written in it, so asking again brings that one to the pointer
+            // instead of stacking up empty notes on every press.
+            let blank = state
+                .borrow()
+                .notes
+                .iter()
+                .find(|note| note.pinned && note_is_blank(note))
+                .map(|note| note.id);
+            let key = |id: u64| format!("note:{id}");
+            let mounted = blank.and_then(|id| {
+                registry
+                    .borrow()
+                    .iter()
+                    .find(|item| item.key == key(id))
+                    .map(|item| item.widget.clone())
             });
-            let _ = data.save();
-            drop(data);
+            let id = match (blank, mounted) {
+                (Some(id), Some(card)) => {
+                    if let Some(note) = state.borrow_mut().notes.iter_mut().find(|note| note.id == id)
+                    {
+                        note.position = position;
+                    }
+                    let _ = state.borrow().save();
+                    root.move_(&card, position.x, position.y);
+                    raise_card(&card);
+                    id
+                }
+                _ => {
+                    let mut data = state.borrow_mut();
+                    let id = data.next_note_id;
+                    data.next_note_id += 1;
+                    data.notes.push(Note {
+                        id,
+                        text: String::new(),
+                        pinned: true,
+                        starred: false,
+                        updated_at: now_ms(),
+                        position,
+                        images: Vec::new(),
+                        highlights: Vec::new(),
+                    });
+                    let _ = data.save();
+                    id
+                }
+            };
             revealer.set_reveal_child(false);
             refresh();
             // Focus the fresh editor once the rebuilt card is mapped, so the
@@ -2012,7 +2063,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             glib::idle_add_local_once({
                 let registry = registry.clone();
                 let window = window.clone();
-                let key = format!("note:{id}");
+                let key = key(id);
                 move || {
                     let registry = registry.borrow();
                     if let Some(editor) = registry
@@ -2025,7 +2076,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     }
                 }
             });
-            let _ = &root;
         }
     });
     widget_picker.quit.connect_clicked({
@@ -2103,6 +2153,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let notes_opened_at = notes_opened_at.clone();
         let toggle_usage = toggle_usage.clone();
         let toggle_translate = toggle_translate.clone();
+        let translate_spawn = translate_spawn.clone();
         let translate_any_visible = translate_any_visible.clone();
         let interactive = interactive.clone();
         let state = state.clone();
@@ -2174,6 +2225,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         }
                         toggle_translate();
                     }
+                    // Always a dictionary to type into, never a toggle: it
+                    // unlocks on its own, like the one a note looks up in.
+                    "new-dictionary" => translate_spawn(None),
                     // OCR needs no edit chrome, so unlike a note or a
                     // dictionary it runs the same in lock mode.
                     "ocr" | "dictate" => dictate_start(),
@@ -2189,7 +2243,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     };
 
     window.connect_key_press_event({
-        let toggle_action = toggle_action.clone();
         let interactive = interactive.clone();
         let registry = registry.clone();
         let notes_card = notes.card.clone();
@@ -2216,17 +2269,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     (search.close)();
                     return glib::Propagation::Stop;
                 }
-                // Same for the dictionary's query panel: the first Escape puts
-                // it away, and only a second one locks the overlay. In lock
-                // mode the panel is already hidden as edit chrome, so there is
-                // nothing to put away.
+                // Same for the dictionary's query panel. In lock mode it is
+                // already hidden as edit chrome, so there is nothing to put
+                // away.
                 if interactive.get() && translate_close_search() {
                     return glib::Propagation::Stop;
                 }
-                if interactive.get() {
-                    toggle_action();
-                    return glib::Propagation::Stop;
-                }
+                // Escape used to lock the overlay once nothing else wanted
+                // it, so leaving a note with Escape locked the whole desk.
+                // Locking is the hotkey's and the panel's job only.
             }
             glib::Propagation::Proceed
         }
@@ -7515,6 +7566,12 @@ fn settle_repaired_images(
     let _ = state.borrow().save();
 }
 
+/// Whether a note has nothing in it yet: no text but whitespace, no image.
+/// Such a note is still the new one; see the new-note button.
+fn note_is_blank(note: &Note) -> bool {
+    note.text.trim().is_empty() && note.images.is_empty()
+}
+
 /// A table or a diagram is drawn with box characters and laid out with
 /// spaces, so it only lines up in a fixed-width face. Every line of one is set
 /// in it: the strokes, and the arrow rows and labels between them (see
@@ -11368,8 +11425,8 @@ fn parse_panel_anchor(raw: &str) -> Option<Point> {
 /// accepting edits, and which colour mode it is in.
 ///
 /// The extension used to flip its own two labels on click, which was wrong the
-/// moment either was changed from anywhere else — locking with Escape or the
-/// hotkey, or cycling the colour from the widget picker. Sysi owns both facts,
+/// moment either was changed from anywhere else — locking with the hotkey, or
+/// cycling the colour from the widget picker. Sysi owns both facts,
 /// so it publishes them and the panel just reads. A tiny file of its own rather
 /// than state.json: the shell would otherwise re-parse every note on the
 /// overlay's every save.
@@ -14101,7 +14158,7 @@ fn overlay_last_user_time() -> u32 {
 
 /// Take the keyboard so a just-opened notes palette can type immediately.
 ///
-/// `grab_focus` only names the GTK widget. Ctrl+Alt+N never went through this
+/// `grab_focus` only names the GTK widget. Super+Shift+L never went through this
 /// GDK display — it is a GNOME custom shortcut or an X grab on another
 /// connection — so `user_time` is stale and mutter ignores `_NET_ACTIVE_WINDOW`.
 /// Ask the X server for a fresh timestamp and focus the overlay ourselves.

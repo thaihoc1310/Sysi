@@ -87,9 +87,9 @@ fn main() {
     }
     // Wayland never delivers the X11 grab to a focused Wayland client. A
     // GNOME custom shortcut runs the same IPC the panel button uses, so
-    // Ctrl+Alt+N works from any app. Left alone if the user already bound it.
+    // Super+Shift+L works from any app. Left alone if the user already bound it.
     if let Err(error) = install_notes_hotkey() {
-        eprintln!("Could not register Ctrl+Alt+N as a GNOME shortcut: {error}");
+        eprintln!("Could not register Super+Shift+L as a GNOME shortcut: {error}");
     }
     if let Err(error) = install_ocr_hotkey() {
         eprintln!("Could not register Super+Shift+A as a GNOME shortcut: {error}");
@@ -300,18 +300,27 @@ const NOTES_HOTKEY_PATH: &str =
     "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sysi-notes/";
 const NOTES_HOTKEY_NAME: &str = "Sysi Notes";
 const NOTES_HOTKEY_COMMAND: &str = "sysi --panel-action toggle-notes";
-const NOTES_HOTKEY_BINDING: &str = "<Control><Alt>n";
+const NOTES_HOTKEY_BINDING: &str = "<Super><Shift>l";
 const MEDIA_KEYS_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
 const CUSTOM_KEYBINDING_SCHEMA: &str =
     "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding";
 
 fn install_notes_hotkey() -> io::Result<()> {
+    // Notes answered to Ctrl+Alt+N until 0.1.77. A shortcut still on that
+    // default moves to the new one; a key the user picked is left alone.
+    if gsettings_reloc_get(NOTES_HOTKEY_PATH, "command")
+        .is_some_and(|value| unquote_gsettings(&value) == NOTES_HOTKEY_COMMAND)
+        && gsettings_reloc_get(NOTES_HOTKEY_PATH, "binding")
+            .is_some_and(|value| binding_is_ctrl_alt_n(&unquote_gsettings(&value)))
+    {
+        gsettings_reloc_set(NOTES_HOTKEY_PATH, "binding", NOTES_HOTKEY_BINDING)?;
+    }
     install_custom_hotkey(
         NOTES_HOTKEY_PATH,
         NOTES_HOTKEY_NAME,
         NOTES_HOTKEY_COMMAND,
         NOTES_HOTKEY_BINDING,
-        binding_is_ctrl_alt_n,
+        |binding| binding_is_super_shift(binding, "l"),
     )
 }
 
@@ -327,7 +336,7 @@ fn install_ocr_hotkey() -> io::Result<()> {
         OCR_HOTKEY_NAME,
         OCR_HOTKEY_COMMAND,
         OCR_HOTKEY_BINDING,
-        binding_is_super_shift_a,
+        |binding| binding_is_super_shift(binding, "a"),
     )
 }
 
@@ -395,10 +404,11 @@ fn binding_is_ctrl_alt_n(binding: &str) -> bool {
         && !binding_has(&parts, &["shift", "super"])
 }
 
-// Super+Shift+A, not Super+A (Show Apps) and not Super+Shift+S (screenshot).
-fn binding_is_super_shift_a(binding: &str) -> bool {
+/// Super+Shift+`letter` and nothing else: Super+Shift+A is not Super+A (Show
+/// Apps), and Super+Shift+L is not Super+L (lock screen).
+fn binding_is_super_shift(binding: &str, letter: &str) -> bool {
     let (parts, key) = binding_modifiers(binding);
-    key == "a"
+    key == letter
         && binding_has(&parts, &["super"])
         && binding_has(&parts, &["shift"])
         && !binding_has(&parts, &["control", "ctrl", "primary", "alt"])
@@ -518,13 +528,15 @@ mod tests {
     }
 
     #[test]
-    fn binding_is_super_shift_a_accepts_common_spellings() {
-        assert!(binding_is_super_shift_a("<Super><Shift>a"));
-        assert!(binding_is_super_shift_a("<Shift><Super>A"));
-        assert!(!binding_is_super_shift_a("<Super>a"));
-        assert!(!binding_is_super_shift_a("<Super><Shift>s"));
-        assert!(!binding_is_super_shift_a("<Super><Shift>d"));
-        assert!(!binding_is_super_shift_a("<Control><Super><Shift>a"));
+    fn binding_is_super_shift_accepts_common_spellings() {
+        assert!(binding_is_super_shift("<Super><Shift>a", "a"));
+        assert!(binding_is_super_shift("<Shift><Super>A", "a"));
+        assert!(!binding_is_super_shift("<Super>a", "a"));
+        assert!(!binding_is_super_shift("<Super><Shift>s", "a"));
+        assert!(!binding_is_super_shift("<Super><Shift>d", "a"));
+        assert!(!binding_is_super_shift("<Control><Super><Shift>a", "a"));
+        assert!(binding_is_super_shift("<Super><Shift>l", "l"));
+        assert!(!binding_is_super_shift("<Super>l", "l"));
     }
 
     #[test]
