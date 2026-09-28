@@ -121,13 +121,10 @@
    does not nudge the readings after it. */
 #panel .sysi-system-readout {
   margin-left: 10px;
-  spacing: 14px;
 }
 
-#panel .sysi-system-item {
-  spacing: 5px;
-}
-
+/* The same face and size as the strip's words beside it, rather than the
+   clock's heavier one. */
 #panel .sysi-system-caption {
   color: rgba(242, 242, 242, 0.55);
   font-family: "Noto Sans", sans-serif;
@@ -166,4 +163,11 @@
 
 .sysi-system-menu .sysi-system-row.sysi-system-full {
   color: rgba(244, 244, 244, 0.18);
+}
+
+/* The hairline between two groups of SYSTEM readings. */
+#panel .sysi-system-hairline {
+  width: 1px;
+  height: 12px;
+  background-color: rgba(242, 242, 242, 0.22);
 }

@@ -1,13 +1,17 @@
 //! SYSTEM in the GNOME top bar. Sysi samples the machine (see `system.rs`)
 //! and writes what the bar shows to a small file the shell extension watches;
 //! the extension lays it out beside its gear, and its SYSTEM menu turns each
-//! reading on and off by sending `system-metric:<key>` back.
+//! reading on and off by sending `system-metric:<key>:on|off` back.
+//!
+//! The bar reads in groups, one per kind of thing, and a caption per device:
+//! `CPU 13% 56°C | RAM 48%  SWAP 1% | NVI 12% 45°C  AMD 1% 38°C | SAM 13% 42°C
+//! UMI 45% 38°C | NET ↓9K ↑28K`.
 //!
 //! The file lives in the runtime directory, which is memory: it is rewritten
 //! every couple of seconds and has no business on a disk.
 
 use crate::state::{AppState, SystemDetails};
-use crate::system::{SystemReadOptions, SystemReader, SystemSnapshot};
+use crate::system::{SystemReadOptions, SystemReader, SystemSnapshot, Usage};
 use gtk::glib;
 use serde::Serialize;
 use std::{cell::RefCell, fs, io, path::PathBuf, rc::Rc, time::Duration};
@@ -22,7 +26,10 @@ pub struct PanelSystem {
     /// What the file holds, so a sample that changed nothing is not written
     /// and wakes nobody in the shell.
     written: RefCell<String>,
-    available: RefCell<Option<Vec<(&'static str, usize)>>>,
+    /// The first sample, taken with every reader on: which devices this
+    /// machine has and what each can report. The bar's groups are laid out
+    /// from it, and the readings it cannot give are not offered.
+    machine: RefCell<Option<SystemSnapshot>>,
     request: async_channel::Sender<SystemReadOptions>,
 }
 
@@ -46,7 +53,7 @@ impl PanelSystem {
             state,
             last: RefCell::new(None),
             written: RefCell::new(String::new()),
-            available: RefCell::new(None),
+            machine: RefCell::new(None),
             request,
         });
         glib::MainContext::default().spawn_local({
@@ -56,9 +63,9 @@ impl PanelSystem {
                     let Some(this) = this.upgrade() else {
                         break;
                     };
-                    this.available
+                    this.machine
                         .borrow_mut()
-                        .get_or_insert_with(|| available(&snapshot));
+                        .get_or_insert_with(|| snapshot.clone());
                     *this.last.borrow_mut() = Some(snapshot);
                     this.publish();
                 }
@@ -90,12 +97,11 @@ impl PanelSystem {
 
     fn publish(&self) {
         let data = self.state.borrow();
-        let available = self.available.borrow();
         let contents = render(
             data.settings.system,
             &data.settings.system_details,
+            self.machine.borrow().as_ref(),
             self.last.borrow().as_ref(),
-            available.as_deref(),
         );
         if *self.written.borrow() == contents {
             return;
@@ -136,6 +142,19 @@ impl PanelSystem {
     }
 }
 
+impl PanelSystem {
+    /// RAM, swap and drives as used/total, or as a percentage; `None` flips.
+    pub fn set_amounts(&self, on: Option<bool>) {
+        {
+            let mut data = self.state.borrow_mut();
+            let details = &mut data.settings.system_details;
+            details.amounts = on.unwrap_or(!details.amounts);
+            let _ = data.save();
+        }
+        self.publish();
+    }
+}
+
 /// What a `system…` panel action asks for: `system:on`, `system-metric:ram:off`,
 /// and the flips older extensions send (`toggle-system`, `system-metric:ram`).
 pub fn apply_action(system: &PanelSystem, action: &str) -> bool {
@@ -148,6 +167,8 @@ pub fn apply_action(system: &PanelSystem, action: &str) -> bool {
         system.set_on(None);
     } else if let Some(rest) = action.strip_prefix("system:") {
         system.set_on(wanted(rest));
+    } else if let Some(rest) = action.strip_prefix("system-amounts:") {
+        system.set_amounts(wanted(rest));
     } else if let Some(rest) = action.strip_prefix("system-metric:") {
         match rest.rsplit_once(':') {
             Some((key, state)) if wanted(state).is_some() => system.set_metric(key, wanted(state)),
@@ -159,131 +180,76 @@ pub fn apply_action(system: &PanelSystem, action: &str) -> bool {
     true
 }
 
-/// One reading the bar can show, in the order it shows them.
+/// One reading the SYSTEM menu turns on and off, in the order the bar
+/// shows them.
 struct Metric {
     key: &'static str,
-    /// What the SYSTEM menu calls it.
+    /// What the menu calls it.
     name: &'static str,
-    /// The caption in front of the value in the bar.
-    label: &'static str,
-    /// The widest one value can be, so the extension can give the reading a
-    /// fixed width and the bar does not shuffle every time a digit changes.
-    widest: &'static str,
     enabled: fn(&SystemDetails) -> bool,
     set: fn(&mut SystemDetails, bool),
-    /// One value per device: two GPUs read `30% 12%`. Empty when this
-    /// machine has none to read.
-    values: fn(&SystemSnapshot) -> Vec<String>,
 }
 
-const METRICS: [Metric; 10] = [
+const METRICS: [Metric; 9] = [
     Metric {
         key: "cpu",
         name: "cpu",
-        label: "CPU",
-        widest: "100%",
         enabled: |d| d.cpu,
         set: |d, on| d.cpu = on,
-        values: |s| vec![percent(s.cpu_percent)],
     },
     Metric {
         key: "cpu_temp",
         name: "cpu temp",
-        label: "CPU",
-        widest: "100°C",
         enabled: |d| d.cpu_temp,
         set: |d, on| d.cpu_temp = on,
-        values: |s| s.cpu_temperature.map(celsius).into_iter().collect(),
     },
     Metric {
         key: "ram",
         name: "ram",
-        label: "RAM",
-        widest: "100%",
         enabled: |d| d.ram,
         set: |d, on| d.ram = on,
-        values: |s| vec![percent(s.memory_percent)],
     },
     Metric {
         key: "swap",
         name: "swap",
-        label: "SWAP",
-        widest: "100%",
         enabled: |d| d.swap,
         set: |d, on| d.swap = on,
-        values: |s| s.swap.map(|swap| percent(swap.percent())).into_iter().collect(),
     },
     Metric {
         key: "gpus",
         name: "gpu",
-        label: "GPU",
-        widest: "100%",
         enabled: |d| d.gpus,
         set: |d, on| d.gpus = on,
-        values: |s| s.gpus.iter().filter_map(|gpu| gpu.percent).map(percent).collect(),
     },
     Metric {
         key: "gpu_temp",
         name: "gpu temp",
-        label: "GPU",
-        widest: "100°C",
         enabled: |d| d.gpu_temp,
         set: |d, on| d.gpu_temp = on,
-        values: |s| s.gpus.iter().filter_map(|gpu| gpu.temperature).map(celsius).collect(),
+    },
+    Metric {
+        key: "ssd_usage",
+        name: "ssd",
+        enabled: |d| d.ssd_usage,
+        set: |d, on| d.ssd_usage = on,
     },
     Metric {
         key: "ssd_temp",
         name: "ssd temp",
-        label: "SSD",
-        widest: "100°C",
         enabled: |d| d.ssd_temp,
         set: |d, on| d.ssd_temp = on,
-        values: |s| {
-            s.storage_temperatures
-                .iter()
-                .map(|(_, value)| celsius(*value))
-                .collect()
-        },
-    },
-    Metric {
-        key: "root_disk",
-        name: "disk /",
-        label: "DISK",
-        widest: "100%",
-        enabled: |d| d.root_disk,
-        set: |d, on| d.root_disk = on,
-        values: |s| s.root_disk.map(|disk| percent(disk.percent())).into_iter().collect(),
-    },
-    Metric {
-        key: "home_disk",
-        name: "disk /home",
-        label: "HOME",
-        widest: "100%",
-        enabled: |d| d.home_disk,
-        set: |d, on| d.home_disk = on,
-        values: |s| s.home_disk.map(|disk| percent(disk.percent())).into_iter().collect(),
     },
     Metric {
         key: "network",
         name: "network",
-        label: "NET",
-        widest: "↓888.8M ↑888.8M",
         enabled: |d| d.network,
         set: |d, on| d.network = on,
-        values: |s| {
-            s.network
-                .map(|rates| {
-                    format!(
-                        "↓{} ↑{}",
-                        rate(rates.down_bytes_per_sec),
-                        rate(rates.up_bytes_per_sec)
-                    )
-                })
-                .into_iter()
-                .collect()
-        },
     },
 ];
+
+const PERCENT_WIDEST: &str = "100%";
+const CELSIUS_WIDEST: &str = "100°C";
+const NETWORK_WIDEST: &str = "↓888.8M ↑888.8M";
 
 fn percent(value: f64) -> String {
     format!("{:.0}%", value.clamp(0.0, 100.0))
@@ -303,6 +269,277 @@ fn rate(bytes_per_sec: f64) -> String {
     }
 }
 
+/// Memory is counted in powers of two (16 GiB of RAM is "16G"), drives in the
+/// powers of ten they are sold in (a 1024 GB drive is "1T", not "954G").
+#[derive(Clone, Copy)]
+enum Units {
+    Binary,
+    Decimal,
+}
+
+/// A size in as few characters as the bar can spare: `9.5G`, `16G`, `512G`,
+/// `1T`, `1.5T`.
+fn size(kib: u64, units: Units) -> String {
+    let bytes = kib as f64 * 1024.0;
+    let (giga, step) = match units {
+        Units::Binary => (1_073_741_824.0, 1024.0),
+        Units::Decimal => (1e9, 1000.0),
+    };
+    let gigabytes = bytes / giga;
+    if gigabytes >= 999.5 {
+        let terabytes = gigabytes / step;
+        let text = format!("{terabytes:.1}");
+        format!("{}T", text.trim_end_matches(".0"))
+    } else if gigabytes < 9.95 {
+        let text = format!("{gigabytes:.1}");
+        format!("{}G", text.trim_end_matches(".0"))
+    } else {
+        format!("{gigabytes:.0}G")
+    }
+}
+
+/// How full something is, the way the menu asked: `48%` or `12G/16G`.
+fn fullness(usage: Usage, units: Units, amounts: bool) -> String {
+    if amounts {
+        format!(
+            "{}/{}",
+            size(usage.used_kib, units),
+            size(usage.total_kib, units)
+        )
+    } else {
+        percent(usage.percent())
+    }
+}
+
+/// The widest `fullness` can be for something of this size. Used can take
+/// four characters whatever the total (`9.5G`, `123G`, `1.5T`), and the total
+/// never changes.
+fn fullness_widest(total_kib: u64, units: Units, amounts: bool) -> String {
+    if amounts {
+        format!(
+            "888G/{}",
+            size(total_kib, units).replace(|c: char| c.is_ascii_digit(), "8")
+        )
+    } else {
+        PERCENT_WIDEST.to_owned()
+    }
+}
+
+/// A widest value cut to two digits wherever it has three or more: `100%` to
+/// `88%`, `888G/88.8T` to `88G/88.8T`, `↓888.8M` to `↓88.8M`.
+fn usual(widest: &str) -> String {
+    let mut out = String::new();
+    let mut run = 0;
+    for c in widest.chars() {
+        if c.is_ascii_digit() {
+            run += 1;
+            if run > 2 {
+                continue;
+            }
+            out.push('8');
+        } else {
+            run = 0;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A device's caption: the first three letters of its maker (`NVI`, `AMD`,
+/// `SAM`), with the number a repeated one was given; a drive known only by
+/// its size keeps it.
+fn caption(label: &str) -> String {
+    let (name, number) = label
+        .rsplit_once(' ')
+        .filter(|(_, number)| number.bytes().all(|byte| byte.is_ascii_digit()))
+        .unwrap_or((label, ""));
+    if !name.starts_with(|c: char| c.is_alphabetic()) {
+        return label.replace(' ', "");
+    }
+    let short: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(3)
+        .collect();
+    format!("{}{number}", short.to_uppercase())
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct Group {
+    key: &'static str,
+    devices: Vec<Device>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct Device {
+    label: String,
+    cells: Vec<Cell>,
+}
+
+/// One value a device can show, and the reading that turns it on.
+#[derive(Serialize, Debug, PartialEq)]
+struct Cell {
+    metric: &'static str,
+    /// The widest this value can be: the extension counts on it when it
+    /// decides whether the next reading fits before the clock.
+    widest: String,
+    /// What it usually is at its widest, two digits: the width it is given at
+    /// least, so the row only moves when a value grows a third digit.
+    usual: String,
+    /// `None` while its reading is off, or before a sample has it.
+    value: Option<String>,
+}
+
+/// The bar's groups, laid out from what the machine has, with a value for
+/// every cell whose reading is on and has been sampled.
+fn groups(
+    details: &SystemDetails,
+    machine: &SystemSnapshot,
+    last: Option<&SystemSnapshot>,
+) -> Vec<Group> {
+    let on = |key: &str| {
+        METRICS
+            .iter()
+            .find(|metric| metric.key == key)
+            .is_some_and(|metric| (metric.enabled)(details))
+    };
+    let cell = |metric: &'static str, widest: String, value: Option<String>| Cell {
+        metric,
+        usual: usual(&widest),
+        widest,
+        value: value.filter(|_| on(metric)),
+    };
+    let amounts = details.amounts;
+    let mut cpu = vec![cell(
+        "cpu",
+        PERCENT_WIDEST.into(),
+        last.map(|s| percent(s.cpu_percent)),
+    )];
+    if machine.cpu_temperature.is_some() {
+        cpu.push(cell(
+            "cpu_temp",
+            CELSIUS_WIDEST.into(),
+            last.and_then(|s| s.cpu_temperature).map(celsius),
+        ));
+    }
+    let mut memory = vec![Device {
+        label: "RAM".into(),
+        cells: vec![cell(
+            "ram",
+            fullness_widest(machine.memory.total_kib, Units::Binary, amounts),
+            last.map(|s| fullness(s.memory, Units::Binary, amounts)),
+        )],
+    }];
+    if let Some(swap) = machine.swap {
+        memory.push(Device {
+            label: "SWAP".into(),
+            cells: vec![cell(
+                "swap",
+                fullness_widest(swap.total_kib, Units::Binary, amounts),
+                last.and_then(|s| s.swap)
+                    .map(|swap| fullness(swap, Units::Binary, amounts)),
+            )],
+        });
+    }
+    let gpus = machine
+        .gpus
+        .iter()
+        .map(|gpu| {
+            let now = last.and_then(|s| s.gpus.iter().find(|now| now.label == gpu.label));
+            let mut cells = Vec::new();
+            if gpu.percent.is_some() {
+                cells.push(cell(
+                    "gpus",
+                    PERCENT_WIDEST.into(),
+                    now.and_then(|g| g.percent).map(percent),
+                ));
+            }
+            if gpu.temperature.is_some() {
+                cells.push(cell(
+                    "gpu_temp",
+                    CELSIUS_WIDEST.into(),
+                    now.and_then(|g| g.temperature).map(celsius),
+                ));
+            }
+            Device {
+                label: caption(&gpu.label),
+                cells,
+            }
+        })
+        .collect();
+    let drives = machine
+        .drives
+        .iter()
+        .map(|drive| {
+            let now = last.and_then(|s| s.drives.iter().find(|now| now.label == drive.label));
+            let mut cells = Vec::new();
+            if let Some(usage) = drive.usage {
+                cells.push(cell(
+                    "ssd_usage",
+                    fullness_widest(usage.total_kib, Units::Decimal, amounts),
+                    now.and_then(|d| d.usage)
+                        .map(|usage| fullness(usage, Units::Decimal, amounts)),
+                ));
+            }
+            if drive.temperature.is_some() {
+                cells.push(cell(
+                    "ssd_temp",
+                    CELSIUS_WIDEST.into(),
+                    now.and_then(|d| d.temperature).map(celsius),
+                ));
+            }
+            Device {
+                label: caption(&drive.label),
+                cells,
+            }
+        })
+        .collect();
+    let network = Cell {
+        // Kilobytes most of the time. Being last, the rate moves nothing when
+        // it grows past that.
+        usual: "↓88K ↑88K".into(),
+        ..cell(
+            "network",
+            NETWORK_WIDEST.into(),
+            last.and_then(|s| s.network).map(|rates| {
+                format!(
+                    "↓{} ↑{}",
+                    rate(rates.down_bytes_per_sec),
+                    rate(rates.up_bytes_per_sec)
+                )
+            }),
+        )
+    };
+    vec![
+        Group {
+            key: "cpu",
+            devices: vec![Device {
+                label: "CPU".into(),
+                cells: cpu,
+            }],
+        },
+        Group {
+            key: "memory",
+            devices: memory,
+        },
+        Group {
+            key: "gpu",
+            devices: gpus,
+        },
+        Group {
+            key: "ssd",
+            devices: drives,
+        },
+        Group {
+            key: "network",
+            devices: vec![Device {
+                label: "NET".into(),
+                cells: vec![network],
+            }],
+        },
+    ]
+}
+
 /// What the readers need to run for the readings that are on.
 pub fn read_options(details: &SystemDetails) -> SystemReadOptions {
     SystemReadOptions {
@@ -310,8 +547,7 @@ pub fn read_options(details: &SystemDetails) -> SystemReadOptions {
         cpu_temp: details.cpu_temp,
         gpu_temp: details.gpu_temp,
         ssd_temp: details.ssd_temp,
-        root_disk: details.root_disk,
-        home_disk: details.home_disk,
+        ssd_usage: details.ssd_usage,
         network: details.network,
     }
 }
@@ -323,24 +559,9 @@ pub fn read_everything() -> SystemReadOptions {
         cpu_temp: true,
         gpu_temp: true,
         ssd_temp: true,
-        root_disk: true,
-        home_disk: true,
+        ssd_usage: true,
         network: true,
     }
-}
-
-/// Which readings this machine can give at all, and how many devices each
-/// has, from a sample taken with every reader on. A rate needs two samples,
-/// so the network always can.
-pub fn available(snapshot: &SystemSnapshot) -> Vec<(&'static str, usize)> {
-    METRICS
-        .iter()
-        .filter_map(|metric| {
-            let count = (metric.values)(snapshot).len();
-            let count = if metric.key == "network" { 1 } else { count };
-            (count > 0).then_some((metric.key, count))
-        })
-        .collect()
 }
 
 /// Turn one reading on or off by its key; `None` flips it. False for a key
@@ -358,51 +579,54 @@ pub fn set(details: &mut SystemDetails, key: &str, on: Option<bool>) -> bool {
 struct Published<'a> {
     /// Whether SYSTEM is in the bar at all.
     on: bool,
+    /// Used/total rather than percentages.
+    amounts: bool,
     metrics: Vec<PublishedMetric<'a>>,
+    groups: Vec<Group>,
 }
 
 #[derive(Serialize)]
 struct PublishedMetric<'a> {
     key: &'a str,
     name: &'a str,
-    label: &'a str,
-    /// The widest the whole reading can be: one `widest` per device.
-    widest: String,
     on: bool,
+    /// Whether any device can show it.
     available: bool,
-    /// `None` until a sample has it, or while it is off.
-    value: Option<String>,
 }
 
 fn render(
     on: bool,
     details: &SystemDetails,
-    snapshot: Option<&SystemSnapshot>,
-    available: Option<&[(&str, usize)]>,
+    machine: Option<&SystemSnapshot>,
+    last: Option<&SystemSnapshot>,
 ) -> String {
+    // Until the first sample says what the machine has, there is nothing to
+    // lay out, and every reading is offered.
+    let groups = machine
+        .map(|machine| groups(details, machine, last))
+        .unwrap_or_default();
     let metrics = METRICS
         .iter()
-        .map(|metric| {
-            let enabled = (metric.enabled)(details);
-            let devices = available
-                .and_then(|keys| keys.iter().find(|(key, _)| *key == metric.key))
-                .map(|(_, count)| *count);
-            PublishedMetric {
-                key: metric.key,
-                name: metric.name,
-                label: metric.label,
-                widest: vec![metric.widest; devices.unwrap_or(1).max(1)].join(" "),
-                on: enabled,
-                // Unknown until the first sample: offer it rather than hide it.
-                available: available.is_none() || devices.is_some(),
-                value: snapshot
-                    .filter(|_| enabled)
-                    .map(|snapshot| (metric.values)(snapshot).join(" "))
-                    .filter(|value| !value.is_empty()),
-            }
+        .map(|metric| PublishedMetric {
+            key: metric.key,
+            name: metric.name,
+            on: (metric.enabled)(details),
+            available: machine.is_none()
+                || groups.iter().any(|group| {
+                    group
+                        .devices
+                        .iter()
+                        .any(|device| device.cells.iter().any(|cell| cell.metric == metric.key))
+                }),
         })
         .collect();
-    serde_json::to_string(&Published { on, metrics }).unwrap_or_default()
+    serde_json::to_string(&Published {
+        on,
+        amounts: details.amounts,
+        metrics,
+        groups,
+    })
+    .unwrap_or_default()
 }
 
 fn path() -> PathBuf {
@@ -425,97 +649,180 @@ fn write(contents: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system::{GpuSnapshot, NetworkRates, Usage};
+    use crate::system::{DriveSnapshot, GpuSnapshot, NetworkRates};
 
-    fn sample() -> SystemSnapshot {
+    const GIB: u64 = 1024 * 1024;
+
+    fn machine() -> SystemSnapshot {
         SystemSnapshot {
-            cpu_percent: 12.4,
-            memory_percent: 48.6,
-            swap: None,
+            cpu_percent: 12.6,
+            memory: Usage {
+                used_kib: 12 * GIB,
+                total_kib: 16 * GIB,
+            },
+            swap: Some(Usage {
+                used_kib: GIB / 10,
+                total_kib: 2 * GIB,
+            }),
             gpus: vec![
                 GpuSnapshot {
                     label: "NVIDIA".into(),
-                    percent: Some(30.0),
-                    temperature: Some(54.4),
+                    percent: Some(12.0),
+                    temperature: Some(45.0),
                 },
                 GpuSnapshot {
                     label: "AMD".into(),
-                    percent: Some(12.0),
-                    temperature: Some(61.0),
+                    percent: None,
+                    temperature: Some(38.0),
                 },
             ],
-            cpu_temperature: Some(61.0),
-            storage_temperatures: vec![("SSD 1".into(), 38.0), ("SSD 2".into(), 44.0)],
-            root_disk: Some(Usage {
-                used_kib: 62,
-                total_kib: 100,
-            }),
+            cpu_temperature: Some(56.0),
+            drives: vec![
+                DriveSnapshot {
+                    label: "SAMSUNG".into(),
+                    // 90 GB used of a 1024 GB drive, in KiB.
+                    usage: Some(Usage {
+                        used_kib: 87_890_625,
+                        total_kib: 1_000_000_000,
+                    }),
+                    temperature: Some(42.0),
+                },
+                DriveSnapshot {
+                    label: "UMIS".into(),
+                    usage: None,
+                    temperature: Some(38.0),
+                },
+            ],
             network: Some(NetworkRates {
-                down_bytes_per_sec: 1.25 * 1_048_576.0,
-                up_bytes_per_sec: 40.0 * 1024.0,
+                down_bytes_per_sec: 9.0 * 1024.0,
+                up_bytes_per_sec: 28.0 * 1024.0,
             }),
             ..SystemSnapshot::default()
         }
     }
 
-    fn published(json: &serde_json::Value, key: &str, field: &str) -> serde_json::Value {
-        json["metrics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|metric| metric["key"] == key)
-            .unwrap()[field]
-            .clone()
-    }
-
-    #[test]
-    fn the_bar_gets_short_values_for_the_readings_that_are_on() {
-        let details = SystemDetails {
+    fn everything() -> SystemDetails {
+        SystemDetails {
             cpu: true,
+            cpu_temp: true,
             ram: true,
-            network: true,
-            ..SystemDetails::default()
-        };
-        let json: serde_json::Value =
-            serde_json::from_str(&render(true, &details, Some(&sample()), None)).unwrap();
-        assert_eq!(json["on"], true);
-        assert_eq!(published(&json, "cpu", "value"), "12%");
-        assert_eq!(published(&json, "ram", "value"), "49%");
-        assert_eq!(published(&json, "network", "value"), "↓1.2M ↑40K");
-        // Off, so nothing is sampled or shown for it.
-        assert_eq!(published(&json, "gpus", "value"), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn every_gpu_and_every_drive_is_shown_and_given_room() {
-        let details = SystemDetails {
+            swap: true,
             gpus: true,
             gpu_temp: true,
+            ssd_usage: true,
             ssd_temp: true,
+            network: true,
+            amounts: false,
+        }
+    }
+
+    fn nothing() -> SystemDetails {
+        SystemDetails {
+            cpu: false,
+            ram: false,
             ..SystemDetails::default()
-        };
-        let snapshot = sample();
-        let keys = available(&snapshot);
-        let json: serde_json::Value = serde_json::from_str(&render(
-            true,
-            &details,
-            Some(&snapshot),
-            Some(&keys),
-        ))
-        .unwrap();
-        assert_eq!(published(&json, "gpus", "value"), "30% 12%");
-        assert_eq!(published(&json, "gpu_temp", "value"), "54°C 61°C");
-        assert_eq!(published(&json, "ssd_temp", "value"), "38°C 44°C");
-        assert_eq!(published(&json, "gpu_temp", "widest"), "100°C 100°C");
-        assert_eq!(published(&json, "cpu", "widest"), "100%");
+        }
+    }
+
+    /// The bar as text, the way the extension lays it out.
+    fn bar(groups: &[Group]) -> String {
+        groups
+            .iter()
+            .map(|group| {
+                group
+                    .devices
+                    .iter()
+                    .filter(|device| device.cells.iter().any(|cell| cell.value.is_some()))
+                    .map(|device| {
+                        let values: Vec<&str> = device
+                            .cells
+                            .iter()
+                            .filter_map(|cell| cell.value.as_deref())
+                            .collect();
+                        format!("{} {}", device.label, values.join(" "))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            })
+            .filter(|group| !group.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     #[test]
-    fn a_machine_without_swap_or_home_does_not_offer_them() {
-        let keys: Vec<&str> = available(&sample()).into_iter().map(|(key, _)| key).collect();
-        assert!(keys.contains(&"cpu") && keys.contains(&"gpus") && keys.contains(&"network"));
-        assert!(!keys.contains(&"swap"));
-        assert!(!keys.contains(&"home_disk"));
+    fn the_bar_reads_in_groups_with_a_caption_per_device() {
+        let machine = machine();
+        assert_eq!(
+            bar(&groups(&everything(), &machine, Some(&machine))),
+            "CPU 13% 56°C | RAM 75%  SWAP 5% | NVI 12% 45°C  AMD 38°C | SAM 9% 42°C  UMI 38°C | NET ↓9K ↑28K"
+        );
+    }
+
+    #[test]
+    fn a_reading_that_is_off_leaves_its_device_or_its_whole_group() {
+        let machine = machine();
+        let details = SystemDetails {
+            cpu: true,
+            gpu_temp: true,
+            ..nothing()
+        };
+        assert_eq!(
+            bar(&groups(&details, &machine, Some(&machine))),
+            "CPU 13% | NVI 45°C  AMD 38°C"
+        );
+    }
+
+    #[test]
+    fn amounts_read_as_used_over_total_in_the_units_each_is_sold_in() {
+        let machine = machine();
+        let details = SystemDetails {
+            ram: true,
+            swap: true,
+            ssd_usage: true,
+            amounts: true,
+            ..nothing()
+        };
+        assert_eq!(
+            bar(&groups(&details, &machine, Some(&machine))),
+            "RAM 12G/16G  SWAP 0.1G/2G | SAM 90G/1T"
+        );
+    }
+
+    #[test]
+    fn a_value_is_usually_given_room_for_two_digits() {
+        assert_eq!(usual("100%"), "88%");
+        assert_eq!(usual("100°C"), "88°C");
+        assert_eq!(usual("888G/88.8T"), "88G/88.8T");
+        assert_eq!(usual("↓888.8M ↑888.8M"), "↓88.8M ↑88.8M");
+    }
+
+    #[test]
+    fn makers_are_cut_to_three_letters_and_repeats_keep_their_number() {
+        assert_eq!(caption("NVIDIA"), "NVI");
+        assert_eq!(caption("SAMSUNG"), "SAM");
+        assert_eq!(caption("AMD 2"), "AMD2");
+        assert_eq!(caption("512G"), "512G");
+        assert_eq!(caption("1TB 1"), "1TB1");
+    }
+
+    #[test]
+    fn what_the_machine_lacks_is_not_offered() {
+        let mut machine = machine();
+        machine.swap = None;
+        machine.drives.clear();
+        let json: serde_json::Value =
+            serde_json::from_str(&render(true, &everything(), Some(&machine), None)).unwrap();
+        let offered = |key: &str| {
+            json["metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|metric| metric["key"] == key)
+                .unwrap()["available"]
+                == true
+        };
+        assert!(offered("cpu") && offered("gpus") && offered("network"));
+        assert!(!offered("swap") && !offered("ssd_usage") && !offered("ssd_temp"));
     }
 
     #[test]
@@ -535,26 +842,44 @@ mod tests {
     }
 
     #[test]
-    fn every_value_fits_the_width_its_metric_is_given() {
+    fn every_value_fits_the_width_its_cell_is_given() {
         // Wider than the template, the bar would jump as the digits changed.
-        let widest = SystemSnapshot {
-            cpu_percent: 100.0,
-            memory_percent: 100.0,
-            cpu_temperature: Some(100.0),
-            network: Some(NetworkRates {
-                down_bytes_per_sec: 888.8 * 1_048_576.0,
-                up_bytes_per_sec: 888.8 * 1_048_576.0,
-            }),
-            ..sample()
+        let mut worst = machine();
+        worst.cpu_percent = 100.0;
+        worst.cpu_temperature = Some(100.0);
+        worst.memory = Usage {
+            used_kib: 15 * GIB + GIB / 2,
+            total_kib: 16 * GIB,
         };
-        for metric in &METRICS {
-            for value in (metric.values)(&widest) {
-                assert!(
-                    value.chars().count() <= metric.widest.chars().count(),
-                    "{}: {value} is wider than {}",
-                    metric.key,
-                    metric.widest
-                );
+        worst.swap = Some(Usage {
+            used_kib: 9 * GIB / 10,
+            total_kib: 2 * GIB,
+        });
+        worst.drives[0].usage = Some(Usage {
+            used_kib: 999_000_000,
+            total_kib: 1_000_000_000,
+        });
+        worst.network = Some(NetworkRates {
+            down_bytes_per_sec: 888.8 * 1_048_576.0,
+            up_bytes_per_sec: 888.8 * 1_048_576.0,
+        });
+        for amounts in [false, true] {
+            let details = SystemDetails {
+                amounts,
+                ..everything()
+            };
+            for group in groups(&details, &machine(), Some(&worst)) {
+                for device in group.devices {
+                    for cell in device.cells {
+                        let value = cell.value.unwrap_or_default();
+                        assert!(
+                            value.chars().count() <= cell.widest.chars().count(),
+                            "{}: {value} is wider than {}",
+                            cell.metric,
+                            cell.widest
+                        );
+                    }
+                }
             }
         }
     }

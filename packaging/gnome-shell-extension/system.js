@@ -1,15 +1,21 @@
 // SYSTEM in the top bar.
 //
 // Sysi samples the machine and writes what the bar should show to
-// $XDG_RUNTIME_DIR/sysi/system.json (see src/panel_system.rs). This lays
-// those readings out beside the gear, and gives the strip's SYSTEM button a
-// menu in the style of settings: enable or disable the row, then one line per
+// $XDG_RUNTIME_DIR/sysi/system.json (see src/panel_system.rs). This lays it
+// out beside the gear, in groups split by a hairline, with a caption per
+// device:
+//
+//   CPU 13% 56°C | RAM 48%  SWAP 1% | NVI 12% 45°C  AMD 38°C | SAM 13% 42°C
+//
+// and gives the strip's SYSTEM button a menu in the style of settings:
+// enable or disable the row, percentages or used/total, then one line per
 // reading, bright while it is on and faint while it is off.
 //
-// The row never runs into the clock. Each reading has a fixed width, taken
-// from the widest value it can show, so the row does not shuffle as digits
-// change, and a reading that would not fit before the clock cannot be turned
-// on: another has to be turned off first.
+// Everything sits at its natural width with even gaps, like a flex row. A
+// value is never narrower than two digits of itself, so the row only moves
+// when one grows a third. The row never runs into the clock: whether the next
+// reading fits is judged with every value at its widest, and one that would
+// not fit cannot be turned on; another has to be turned off first.
 
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
@@ -20,6 +26,14 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 // Clear space between the last reading and the clock.
 const CLOCK_GAP = 24;
+// Between a group and the hairline on either side of it.
+const GROUP_GAP = 10;
+// Between two devices of one group.
+const DEVICE_GAP = 12;
+// Between a caption and its first value, and between two values.
+const CAPTION_GAP = 5;
+const VALUE_GAP = 7;
+const HAIRLINE = 1;
 // How long a click's choice is trusted over what the file says. Sysi writes
 // the file every couple of seconds, and one written just before the click
 // arrived would otherwise put a reading back the way it was for a moment.
@@ -28,9 +42,9 @@ const PENDING_MS = 3000;
 // A value as the bar shows it. The arrows of a network rate are drawn small
 // and faint, like the captions, so the two numbers carry the reading.
 function setValue(label, text) {
-    const escaped = GLib.markup_escape_text(text, -1);
+    const escaped = GLib.markup_escape_text(String(text ?? ''), -1);
     const markup = escaped
-        .replace(/([↓↑])/g, '<span alpha="55%" size="85%">$1</span>\u2009')
+        .replace(/([↓↑])/g, '<span alpha="55%" size="85%">$1</span> ')
         .replace(/ (?=<span)/g, '  ');
     if (label._sysiMarkup === markup)
         return;
@@ -47,22 +61,24 @@ export class SystemPanel {
         this._button = button;
         this._data = null;
         this._widths = new Map();
-        this._items = new Map();
+        this._groups = new Map();
+        this._devices = new Map();
         this._rows = new Map();
         this._pending = new Map();
         this._stripOpen = false;
 
         this._readout = new St.BoxLayout({
             style_class: 'sysi-system-readout',
+            style: `spacing: ${GROUP_GAP}px;`,
             y_align: Clutter.ActorAlign.CENTER,
             visible: false,
         });
         row.add_child(this._readout);
-        // Where every reading is measured. A hidden actor has no style, and
-        // the readings that are off, or all of them while the strip covers
-        // the row, are hidden exactly when the menu asks whether one fits.
-        // This one is always on the panel, and never seen.
-        this._probe = this._reading('', '');
+        // Where every device is measured. A hidden actor has no style, and the
+        // devices that are off, or all of them while the strip covers the row,
+        // are hidden exactly when the menu asks whether one fits. This one is
+        // always on the panel, and never seen.
+        this._probe = this._reading('');
         this._probeBox = new St.Bin({
             child: this._probe.box,
             opacity: 0,
@@ -145,13 +161,17 @@ export class SystemPanel {
             this._choose('system', !this._isOn('system'));
         });
         this._menu.addMenuItem(this._enable);
+        this._amounts = this._menuItem('used/total', () => {
+            this._choose('amounts', !this._isOn('amounts'));
+        });
+        this._menu.addMenuItem(this._amounts);
         this._menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._list = new PopupMenu.PopupMenuSection();
         this._menu.addMenuItem(this._list);
     }
 
     // A centred line like the settings menu's. Its activate is replaced: the
-    // stock one closes the menu, and a reading is picked several at a time.
+    // stock one closes the menu, and readings are picked several at a time.
     _menuItem(text, action) {
         const item = new PopupMenu.PopupMenuItem(text);
         item.label.x_align = Clutter.ActorAlign.CENTER;
@@ -177,23 +197,30 @@ export class SystemPanel {
         }
     }
 
-    // Say which way a reading should go, rather than asking for a flip, and
+    // Say which way something should go, rather than asking for a flip, and
     // show it that way at once.
     _choose(key, on) {
         this._pending.set(key, {on, until: GLib.get_monotonic_time() / 1000 + PENDING_MS});
         this._render();
-        const action = key === 'system'
-            ? `system:${on ? 'on' : 'off'}`
-            : `system-metric:${key}:${on ? 'on' : 'off'}`;
+        const state = on ? 'on' : 'off';
+        const action = key === 'system' ? `system:${state}`
+            : key === 'amounts' ? `system-amounts:${state}`
+                : `system-metric:${key}:${state}`;
         this._runAction(action, this._button);
     }
 
-    // What a reading is, as far as the user knows: their last click while
+    _published(key) {
+        if (key === 'system')
+            return Boolean(this._data?.on);
+        if (key === 'amounts')
+            return Boolean(this._data?.amounts);
+        return Boolean(this._data?.metrics.find(metric => metric.key === key)?.on);
+    }
+
+    // What something is, as far as the user knows: their last click while
     // Sysi catches up, and what Sysi published after that.
     _isOn(key) {
-        const published = key === 'system'
-            ? Boolean(this._data?.on)
-            : Boolean(this._data?.metrics.find(metric => metric.key === key)?.on);
+        const published = this._published(key);
         const pending = this._pending.get(key);
         if (!pending)
             return published;
@@ -210,12 +237,11 @@ export class SystemPanel {
             if (!ok)
                 return;
             const data = JSON.parse(new TextDecoder().decode(contents));
-            if (!Array.isArray(data?.metrics))
+            if (!Array.isArray(data?.metrics) || !Array.isArray(data?.groups))
                 return;
             this._data = data;
         } catch (_) {
-            // Missing, or read halfway through a write: the next write
-            // brings a whole one.
+            // Missing, or not written by this version of Sysi yet.
             return;
         }
         this._render();
@@ -231,49 +257,120 @@ export class SystemPanel {
         return Math.max(0, clockX - start - CLOCK_GAP);
     }
 
-    _item(metric) {
-        let item = this._items.get(metric.key);
-        if (item)
-            return item;
-        item = this._reading(metric.label, metric.widest);
-        this._readout.add_child(item.box);
-        this._items.set(metric.key, item);
-        return item;
-    }
-
-    _reading(label, text) {
-        const box = new St.BoxLayout({style_class: 'sysi-system-item', y_align: Clutter.ActorAlign.CENTER});
-        const caption = new St.Label({
-            text: label,
+    _reading(caption) {
+        const box = new St.BoxLayout({
+            style: `spacing: ${CAPTION_GAP}px;`,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        const label = new St.Label({
+            text: caption,
             style_class: 'sysi-system-caption',
             y_align: Clutter.ActorAlign.CENTER,
         });
-        const value = new St.Label({
-            text,
-            style_class: 'sysi-system-value',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        box.add_child(caption);
-        box.add_child(value);
-        return {box, caption, value};
+        const values = new St.BoxLayout({style: `spacing: ${VALUE_GAP}px;`, y_align: Clutter.ActorAlign.CENTER});
+        box.add_child(label);
+        box.add_child(values);
+        return {box, caption: label, values, cells: []};
     }
 
-    // A reading's width, set from the widest value it can take. Measured once
-    // it has a style to measure with, which it only has on the stage.
-    _width(metric) {
-        // By what is measured, not by key: a reading gains width with every
-        // GPU or drive it covers.
-        const measured = `${metric.label}\t${metric.widest}`;
-        const known = this._widths.get(measured);
+    _value() {
+        return new St.Label({style_class: 'sysi-system-value', y_align: Clutter.ActorAlign.CENTER});
+    }
+
+    // How wide a caption or a value is, measured on the probe.
+    _text(kind, text) {
+        const key = `${kind}\t${text}`;
+        const known = this._widths.get(key);
         if (known)
             return known;
-        this._probe.caption.text = metric.label;
-        setValue(this._probe.value, metric.widest);
-        const width = Math.ceil(this._probe.box.get_preferred_width(-1)[1]);
+        let label = this._probe.caption;
+        if (kind === 'caption') {
+            label.text = text;
+        } else {
+            label = this._probe.cells[0] ??= this._value();
+            if (!label.get_parent())
+                this._probe.values.add_child(label);
+            setValue(label, text);
+        }
+        const width = Math.ceil(label.get_preferred_width(-1)[1]);
         // Nothing to measure with while the panel row is off the stage.
         if (width > 0 && this._probe.box.mapped)
-            this._widths.set(measured, width);
+            this._widths.set(key, width);
         return width;
+    }
+
+    // A device's width with these values in it.
+    _measure(caption, values) {
+        return this._text('caption', caption) + CAPTION_GAP +
+            values.reduce((sum, value) => sum + this._text('value', value), 0) +
+            VALUE_GAP * (values.length - 1);
+    }
+
+    // The groups the row would show with these readings on, fitted into the
+    // room before the clock in order. A group that does not fit is left out
+    // whole, rather than drawn into the clock.
+    _layout(isOn) {
+        const room = this._room();
+        const shown = [];
+        let used = 0;
+        for (const group of this._data.groups) {
+            const devices = group.devices
+                .map(device => ({device, cells: device.cells.filter(cell => isOn(cell.metric))}))
+                .filter(({cells}) => cells.length > 0)
+                .map(entry => ({
+                    ...entry,
+                    width: this._measure(entry.device.label, entry.cells.map(cell => cell.widest)),
+                }));
+            if (!devices.length)
+                continue;
+            const width = devices.reduce((sum, {width}) => sum + width, 0) +
+                DEVICE_GAP * (devices.length - 1);
+            const cost = width + (shown.length ? 2 * GROUP_GAP + HAIRLINE : 0);
+            if (used + cost > room)
+                continue;
+            shown.push({group, devices, width});
+            used += cost;
+        }
+        return shown;
+    }
+
+    // Where the row shows a reading: in any group that made it in.
+    static _shows(layout, metric) {
+        return layout.some(({devices}) => devices.some(({cells}) =>
+            cells.some(cell => cell.metric === metric)));
+    }
+
+    // Whether turning a reading on would keep everything already shown and
+    // show it too.
+    _fits(layout, metric) {
+        const next = this._layout(key => key === metric || this._isOn(key));
+        const before = layout.map(({group}) => group.key);
+        const after = next.map(({group}) => group.key);
+        return before.every(key => after.includes(key)) && SystemPanel._shows(next, metric);
+    }
+
+    _group(key) {
+        let group = this._groups.get(key);
+        if (!group) {
+            const hairline = new St.Widget({style_class: 'sysi-system-hairline', y_align: Clutter.ActorAlign.CENTER});
+            const box = new St.BoxLayout({style: `spacing: ${DEVICE_GAP}px;`, y_align: Clutter.ActorAlign.CENTER});
+            this._readout.add_child(hairline);
+            this._readout.add_child(box);
+            group = {hairline, box};
+            this._groups.set(key, group);
+        }
+        return group;
+    }
+
+    _device(groupKey, label) {
+        const key = `${groupKey}\t${label}`;
+        let device = this._devices.get(key);
+        if (!device) {
+            device = this._reading(label);
+            this._group(groupKey).box.add_child(device.box);
+            this._devices.set(key, device);
+        }
+        return device;
     }
 
     _renderLater() {
@@ -286,53 +383,60 @@ export class SystemPanel {
         });
     }
 
-    _spacing() {
-        return this._readout.get_theme_node().get_length('spacing');
-    }
-
-    // The readings that fit, in order, and whether each off one could join.
-    _layout() {
-        const room = this._room();
-        const spacing = this._spacing();
-        const shown = [];
-        let used = 0;
-        for (const metric of this._data.metrics) {
-            if (!this._isOn(metric.key) || !metric.available)
-                continue;
-            const width = this._width(metric);
-            const next = used + (shown.length ? spacing : 0) + width;
-            // Kept out rather than drawn into the clock, should the room
-            // shrink under readings chosen on a wider screen.
-            if (next > room)
-                continue;
-            shown.push(metric.key);
-            used = next;
-        }
-        const fits = metric =>
-            used + (shown.length ? spacing : 0) + this._width(metric) <= room;
-        return {shown, fits};
-    }
-
     _render() {
         if (!this._readout || !this._data)
             return;
-        const {shown, fits} = this._layout();
-        for (const metric of this._data.metrics) {
-            const item = this._item(metric);
-            item.box.visible = shown.includes(metric.key);
-            if (item.box.visible && item.box.width !== this._width(metric))
-                item.box.width = this._width(metric);
-            setValue(item.value, metric.value ?? '–');
-        }
-        this._readout.visible = this._isOn('system') && !this._stripOpen && shown.length > 0;
+        const layout = this._layout(key => this._isOn(key));
+        const visible = this._isOn('system') && !this._stripOpen && layout.length > 0;
+        this._readout.visible = visible;
         if (this._menu.isOpen)
-            this._renderMenu(shown, fits);
+            this._renderMenu(layout);
+        // A row out of sight is left as it is: it is laid out afresh the
+        // moment it comes back (see setStripOpen).
+        if (!visible)
+            return;
+        const shown = new Map(layout.map(entry => [entry.group.key, entry]));
+        let first = true;
+        for (const group of this._data.groups) {
+            const entry = shown.get(group.key);
+            const actors = this._group(group.key);
+            actors.box.visible = Boolean(entry);
+            actors.hairline.visible = Boolean(entry) && !first;
+            if (entry)
+                first = false;
+            for (const device of group.devices) {
+                const actors = this._device(group.key, device.label);
+                const placed = entry?.devices.find(shown => shown.device.label === device.label);
+                actors.box.visible = Boolean(placed);
+                if (!placed)
+                    continue;
+                placed.cells.forEach((cell, index) => {
+                    let label = actors.cells[index];
+                    if (!label) {
+                        label = actors.cells[index] = this._value();
+                        actors.values.add_child(label);
+                    }
+                    label.visible = true;
+                    // A file from an older Sysi has no `usual`.
+                    const least = this._text('value', cell.usual ?? cell.widest);
+                    if (label._sysiLeast !== least) {
+                        label._sysiLeast = least;
+                        label.style = `min-width: ${least}px;`;
+                    }
+                    setValue(label, cell.value ?? '–');
+                });
+                for (const label of actors.cells.slice(placed.cells.length))
+                    label.visible = false;
+            }
+        }
     }
 
-    _renderMenu(shown, fits) {
+    _renderMenu(layout) {
         this._buildRows();
         const enabled = this._isOn('system');
         this._enable.label.text = enabled ? 'disable' : 'enable';
+        // Says what a click switches to, the way lock / unlock does.
+        this._amounts.label.text = this._isOn('amounts') ? 'percent' : 'used/total';
         for (const metric of this._data.metrics) {
             const row = this._rows.get(metric.key);
             if (!row)
@@ -340,17 +444,21 @@ export class SystemPanel {
             const on = this._isOn(metric.key);
             // On, but squeezed out by the clock: say so, so it is not
             // mistaken for off.
-            const squeezed = on && !shown.includes(metric.key);
-            const full = !on && !fits(metric);
+            const squeezed = on && !SystemPanel._shows(layout, metric.key);
+            const full = !on && !this._fits(layout, metric.key);
             const text = squeezed ? `${metric.name} · no room` : metric.name;
             if (row.label.text !== text)
                 row.label.text = text;
-            if (row.getSensitive() === full)
+            if (row.getSensitive() === full) {
+                // A line that greys out under the pointer or the keyboard
+                // would stay lit, looking picked, while another is hovered.
+                if (full && (row.active || row.has_key_focus())) {
+                    row.active = false;
+                    this._menu.actor.grab_key_focus();
+                }
                 row.setSensitive(!full);
-            for (const [name, active] of [
-                ['sysi-system-on', on],
-                ['sysi-system-full', full],
-            ]) {
+            }
+            for (const [name, active] of [['sysi-system-on', on], ['sysi-system-full', full]]) {
                 if (active)
                     row.add_style_class_name(name);
                 else

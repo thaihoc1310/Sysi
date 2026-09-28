@@ -12,8 +12,8 @@ pub struct SystemReadOptions {
     pub cpu_temp: bool,
     pub gpu_temp: bool,
     pub ssd_temp: bool,
-    pub root_disk: bool,
-    pub home_disk: bool,
+    /// How full each drive is, over the filesystems mounted from it.
+    pub ssd_usage: bool,
     pub network: bool,
 }
 
@@ -50,19 +50,28 @@ pub struct GpuSnapshot {
     pub temperature: Option<f64>,
 }
 
+/// One physical drive: what to call it, how full the filesystems mounted from
+/// it are between them, and how hot it runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DriveSnapshot {
+    /// Its maker ("SAMSUNG", "UMIS"), or its size, numbered when repeated.
+    pub label: String,
+    /// Space used over the filesystems mounted from it. `None` when nothing
+    /// on it is mounted, or it was not asked.
+    pub usage: Option<Usage>,
+    pub temperature: Option<f64>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SystemSnapshot {
     pub cpu_percent: f64,
-    pub memory_percent: f64,
+    pub memory: Usage,
     /// `None` on a machine with no swap configured at all.
     pub swap: Option<Usage>,
     pub gpus: Vec<GpuSnapshot>,
     pub cpu_temperature: Option<f64>,
-    /// Drive temperatures, labelled the way they are captioned: "SSD", or
-    /// "SSD 1" and "SSD 2" once the machine has more than one.
-    pub storage_temperatures: Vec<(String, f64)>,
-    pub root_disk: Option<Usage>,
-    pub home_disk: Option<Usage>,
+    /// Every internal drive that was asked about, in a stable order.
+    pub drives: Vec<DriveSnapshot>,
     /// `None` until a second sample exists, since a rate needs two counters.
     pub network: Option<NetworkRates>,
 }
@@ -82,20 +91,21 @@ pub struct SystemReader {
     /// The outer `None` means the search has not run yet; the inner one means
     /// it ran and this machine exposes no such sensor.
     cpu_temp_path: Option<Option<PathBuf>>,
-    /// The drive sensors and the caption each one earned, resolved on first
-    /// use. Kept for the same reason as `cpu_temp_path`, and for one more: a
-    /// caption worked out afresh every two seconds would renumber a pair of
-    /// same-vendor drives the moment one of their sensors missed a read.
-    /// `None` means the search has not run, and an empty list means it ran and
-    /// found nothing worth watching.
-    drive_sensors: Option<Vec<DriveSensor>>,
+    /// The drives and the caption each one earned, found on first use. Kept
+    /// for the same reason as `cpu_temp_path`, and for one more: a caption
+    /// worked out afresh every two seconds would renumber a pair of
+    /// same-vendor drives the moment one of them missed a read.
+    drives: Option<Vec<Drive>>,
 }
 
-/// One drive's temperature sensor: where to read it, and what to call it.
+/// One drive as found: its caption, its block device, and its temperature
+/// sensor if it has one.
 #[derive(Clone, Debug)]
-struct DriveSensor {
+struct Drive {
     label: String,
-    path: PathBuf,
+    /// The whole-disk name under /sys/block: `nvme0n1`, `sda`.
+    block: String,
+    temperature: Option<PathBuf>,
 }
 
 impl SystemReader {
@@ -113,7 +123,6 @@ impl SystemReader {
         self.previous_idle = idle;
 
         let memory_info = read_memory().unwrap_or_default();
-        let memory_percent = memory_info.memory.percent();
         // The temperature of a card is read from the same place its load is,
         // so the GPU readers run for either meter.
         let gpus = if options.gpus || options.gpu_temp {
@@ -126,8 +135,8 @@ impl SystemReader {
         } else {
             None
         };
-        let storage_temperatures = if options.ssd_temp {
-            self.read_storage_temperatures()
+        let drives = if options.ssd_temp || options.ssd_usage {
+            self.read_drives(options.ssd_usage, options.ssd_temp)
         } else {
             Vec::new()
         };
@@ -142,13 +151,11 @@ impl SystemReader {
 
         SystemSnapshot {
             cpu_percent,
-            memory_percent,
+            memory: memory_info.memory,
             swap: memory_info.swap,
             gpus,
             cpu_temperature,
-            storage_temperatures,
-            root_disk: options.root_disk.then(|| read_disk_usage("/")).flatten(),
-            home_disk: options.home_disk.then(read_home_disk).flatten(),
+            drives,
             network,
         }
     }
@@ -164,19 +171,25 @@ impl SystemReader {
         read_millidegrees(&path)
     }
 
-    fn read_storage_temperatures(&mut self) -> Vec<(String, f64)> {
-        // Cheap enough to retry while nothing has turned up: a machine with no
-        // drive sensor at all is also a machine where this walk finds nothing
-        // to open. Once a sensor exists it is remembered, so each sample after
-        // that is one file read per drive.
-        let sensors = match &self.drive_sensors {
-            Some(sensors) if !sensors.is_empty() => sensors,
-            _ => self.drive_sensors.insert(find_drive_sensors()),
+    fn read_drives(&mut self, usage: bool, temperature: bool) -> Vec<DriveSnapshot> {
+        let drives = self.drives.get_or_insert_with(find_drives);
+        // One pass over the mount table for all the drives: which disk each
+        // mounted filesystem lives on, found once rather than once per drive.
+        let mounted = if usage {
+            fs::read_to_string("/proc/mounts")
+                .map(|raw| mounted_disks(&parse_mounts(&raw)))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
-        sensors
+        drives
             .iter()
-            .filter_map(|sensor| {
-                read_millidegrees(&sensor.path).map(|value| (sensor.label.clone(), value))
+            .map(|drive| DriveSnapshot {
+                label: drive.label.clone(),
+                usage: usage.then(|| drive_usage(&drive.block, &mounted)).flatten(),
+                temperature: temperature
+                    .then(|| drive.temperature.as_deref().and_then(read_millidegrees))
+                    .flatten(),
             })
             .collect()
     }
@@ -359,22 +372,93 @@ fn read_disk_usage(path: impl AsRef<Path>) -> Option<Usage> {
     })
 }
 
-fn read_home_disk() -> Option<Usage> {
-    home_disk_row(read_disk_usage("/"), read_disk_usage("/home")?)
+/// Every mounted block device and where it is mounted, from /proc/mounts,
+/// with the octal escapes the kernel writes for spaces undone.
+fn parse_mounts(raw: &str) -> Vec<(String, String)> {
+    let unescape = |field: &str| {
+        let mut out = String::new();
+        let mut chars = field.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                let code: String = chars.by_ref().take(3).collect();
+                if let Ok(byte) = u8::from_str_radix(&code, 8) {
+                    out.push(char::from(byte));
+                    continue;
+                }
+                out.push(c);
+                out.push_str(&code);
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    raw.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let source = fields.next()?;
+            let target = fields.next()?;
+            source
+                .starts_with("/dev/")
+                .then(|| (unescape(source), unescape(target)))
+        })
+        .collect()
 }
 
-/// Whether /home has earned a row of its own.
-///
-/// A single-partition install keeps /home inside /, where a second row would
-/// repeat the first one byte for byte. The device number cannot answer this:
-/// btrfs hands every subvolume its own, so the root and home subvolumes of a
-/// stock Fedora or openSUSE install look like two filesystems while reporting
-/// one pool of space. What they cannot disguise is being the same pool, so
-/// that is what gets compared. Two genuinely separate mounts agreeing on both
-/// their total and their free space down to the kibibyte is not a case worth
-/// planning around.
-fn home_disk_row(root: Option<Usage>, home: Usage) -> Option<Usage> {
-    (root != Some(home)).then_some(home)
+/// The whole disk a block device lives on: a partition's parent, or, for a
+/// device-mapper or RAID volume (LUKS, LVM), the disk under it.
+fn disk_of(name: &str, depth: usize) -> Option<String> {
+    let class = Path::new("/sys/class/block").join(name);
+    if class.join("partition").is_file() {
+        let parent = fs::canonicalize(&class).ok()?;
+        return parent.parent()?.file_name()?.to_str().map(str::to_owned);
+    }
+    // Device-mapper and md volumes sit on "slaves"; follow the first.
+    let slave = sorted_dirs(&class.join("slaves")).into_iter().next();
+    match slave {
+        Some(slave) if depth < 8 => disk_of(slave.file_name()?.to_str()?, depth + 1),
+        _ => Some(name.to_owned()),
+    }
+}
+
+/// Each filesystem mounted from a block device, once however many places it
+/// is mounted (a bind mount, a subvolume), with the disk it lives on and one
+/// place to ask it how full it is. Snap packages mount dozens of loop devices,
+/// which live on no disk and are dropped before anything is looked up.
+fn mounted_disks(mounts: &[(String, String)]) -> Vec<(String, String)> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for (source, target) in mounts {
+        if source.starts_with("/dev/loop") {
+            continue;
+        }
+        let Ok(device) = fs::canonicalize(source) else {
+            continue;
+        };
+        let Some(name) = device.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if seen.iter().any(|known| known == name) {
+            continue;
+        }
+        seen.push(name.to_owned());
+        if let Some(disk) = disk_of(name, 0) {
+            out.push((disk, target.clone()));
+        }
+    }
+    out
+}
+
+/// How full a drive is, over every filesystem mounted from it.
+fn drive_usage(block: &str, mounted: &[(String, String)]) -> Option<Usage> {
+    let mut total = Usage::default();
+    for (_, target) in mounted.iter().filter(|(disk, _)| disk == block) {
+        if let Some(usage) = read_disk_usage(target) {
+            total.used_kib += usage.used_kib;
+            total.total_kib += usage.total_kib;
+        }
+    }
+    (total.total_kib > 0).then_some(total)
 }
 
 fn read_cpu_lines() -> Option<Vec<(u64, u64)>> {
@@ -471,29 +555,59 @@ fn find_cpu_temperature_path() -> Option<PathBuf> {
     thermal_zone_path(&["x86_pkg_temp", "acpitz"])
 }
 
-fn find_drive_sensors() -> Vec<DriveSensor> {
-    let mut sensors = Vec::new();
-    for chip in sorted_dirs(Path::new("/sys/class/hwmon")) {
+/// The machine's own drives, from /sys/block: no loop, RAM, optical, device
+/// mapper or removable devices. Each is captioned by its maker, and finds its
+/// temperature sensor by the device both hang off.
+fn find_drives() -> Vec<Drive> {
+    let sensors: Vec<(PathBuf, PathBuf)> = sorted_dirs(Path::new("/sys/class/hwmon"))
+        .into_iter()
         // `nvme` is the drive's own sensor; `drivetemp` is SATA SMART.
-        if !matches!(hwmon_name(&chip).as_deref(), Some("nvme" | "drivetemp")) {
-            continue;
-        }
-        let Some(path) = hwmon_temperature_path(&chip, &["Composite"]) else {
+        .filter(|chip| matches!(hwmon_name(chip).as_deref(), Some("nvme" | "drivetemp")))
+        .filter_map(|chip| {
+            let device = fs::canonicalize(chip.join("device")).ok()?;
+            Some((device, hwmon_temperature_path(&chip, &["Composite"])?))
+        })
+        .collect();
+    let mut drives = Vec::new();
+    for disk in sorted_dirs(Path::new("/sys/block")) {
+        let Some(block) = disk.file_name().and_then(|name| name.to_str()).map(str::to_owned) else {
             continue;
         };
+        if ["loop", "ram", "zram", "dm-", "md", "sr", "fd", "nbd"]
+            .iter()
+            .any(|prefix| block.starts_with(prefix))
+            || fs::read_to_string(disk.join("removable")).is_ok_and(|value| value.trim() == "1")
+        {
+            continue;
+        }
+        let sectors: u64 = fs::read_to_string(disk.join("size"))
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(0);
+        if sectors == 0 {
+            continue;
+        }
+        let device = fs::canonicalize(disk.join("device")).ok();
+        let temperature = device.as_ref().and_then(|device| {
+            sensors
+                .iter()
+                .find(|(owner, _)| owner == device)
+                .map(|(_, path)| path.clone())
+        });
         // "SSD 1" and "SSD 2" say nothing about which drive is which. The
-        // vendor is what the owner of the machine knows them by, and it fits
-        // in a caption where a full model name never would. A drive whose
-        // maker cannot be named still gets its size, which at least tells two
-        // drives apart.
-        let model = fs::read_to_string(chip.join("device/model")).unwrap_or_default();
+        // vendor is what the owner of the machine knows them by; a drive
+        // whose maker cannot be named still gets its size.
+        let model = fs::read_to_string(disk.join("device/model")).unwrap_or_default();
         let label = drive_vendor(&model)
-            .or_else(|| drive_capacity_bytes(&chip).map(format_drive_capacity))
-            .unwrap_or_else(|| "SSD".to_owned());
-        sensors.push(DriveSensor { label, path });
+            .unwrap_or_else(|| format_drive_capacity(sectors.saturating_mul(512)));
+        drives.push(Drive {
+            label,
+            block,
+            temperature,
+        });
     }
-    number_repeated_labels(&mut sensors, |sensor| &mut sensor.label);
-    sensors
+    number_repeated_labels(&mut drives, |drive| &mut drive.label);
+    drives
 }
 
 /// The maker of a drive, out of the free-form model string its firmware
@@ -564,22 +678,6 @@ fn drive_vendor(model: &str) -> Option<String> {
 /// How big the drive behind a temperature sensor is. SATA hangs its block
 /// device off a `block` directory, while an NVMe namespace sits directly
 /// inside the controller, so both places are searched.
-fn drive_capacity_bytes(chip: &Path) -> Option<u64> {
-    let device = chip.join("device");
-    let namespace = sorted_dirs(&device.join("block"))
-        .into_iter()
-        .chain(sorted_dirs(&device))
-        .find(|dir| dir.join("size").is_file())?;
-    // `size` counts 512-byte sectors whatever block size the drive itself
-    // reports, which is the one part of this that never varies.
-    let sectors: u64 = fs::read_to_string(namespace.join("size"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    (sectors > 0).then(|| sectors.saturating_mul(512))
-}
-
 /// A drive's size the way it was sold, in as few characters as a ring caption
 /// can hold. Decimal units on purpose: the 1024GB NVMe on the desk this was
 /// written for holds 1.02e12 bytes, which is "1TB" to its owner and a
@@ -731,7 +829,7 @@ fn network_rates(previous: (u64, u64), current: (u64, u64), elapsed_seconds: f64
 #[cfg(test)]
 mod tests {
     use super::{
-        drive_vendor, format_drive_capacity, home_disk_row, network_rates, number_repeated_labels,
+        drive_vendor, format_drive_capacity, network_rates, number_repeated_labels, parse_mounts,
         parse_memory, parse_network_counters, parse_nvidia_gpus, GpuSnapshot, Usage,
     };
 
@@ -765,21 +863,20 @@ mod tests {
     }
 
     #[test]
-    fn home_earns_a_row_only_when_it_is_not_the_same_pool_of_space_as_root() {
-        let root = Usage {
-            used_kib: 40_000_000,
-            total_kib: 192_000_000,
-        };
-        // The stock Fedora layout: two btrfs subvolumes, two device numbers,
-        // one pool. It reports itself twice and must be shown once.
-        assert_eq!(home_disk_row(Some(root), root), None);
-        let home = Usage {
-            used_kib: 97_000_000,
-            total_kib: 915_000_000,
-        };
-        assert_eq!(home_disk_row(Some(root), home), Some(home));
-        // Nothing to compare against is no reason to drop the row.
-        assert_eq!(home_disk_row(None, home), Some(home));
+    fn the_mount_table_gives_devices_and_where_they_are_mounted() {
+        let raw = "/dev/nvme0n1p5 / ext4 rw,relatime 0 0\n\
+                   proc /proc proc rw 0 0\n\
+                   /dev/nvme1n1p1 /home ext4 rw 0 0\n\
+                   /dev/sda1 /media/me/My\\040Disk vfat rw 0 0\n\
+                   tmpfs /run tmpfs rw 0 0\n";
+        assert_eq!(
+            parse_mounts(raw),
+            vec![
+                ("/dev/nvme0n1p5".to_owned(), "/".to_owned()),
+                ("/dev/nvme1n1p1".to_owned(), "/home".to_owned()),
+                ("/dev/sda1".to_owned(), "/media/me/My Disk".to_owned()),
+            ]
+        );
     }
 
     #[test]

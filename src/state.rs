@@ -163,12 +163,15 @@ pub struct SystemDetails {
     pub gpu_temp: bool,
     #[serde(default)]
     pub ssd_temp: bool,
+    /// How full each drive is.
     #[serde(default)]
-    pub root_disk: bool,
-    #[serde(default)]
-    pub home_disk: bool,
+    pub ssd_usage: bool,
     #[serde(default)]
     pub network: bool,
+    /// RAM, swap and drives as used over total (`12G/16G`) rather than a
+    /// percentage.
+    #[serde(default)]
+    pub amounts: bool,
 }
 
 impl Default for SystemDetails {
@@ -181,8 +184,8 @@ impl Default for SystemDetails {
             cpu_temp: false,
             gpu_temp: false,
             ssd_temp: false,
-            root_disk: false,
-            home_disk: false,
+            ssd_usage: false,
+            amounts: false,
             network: false,
         }
     }
@@ -653,14 +656,14 @@ mod tests {
         // What a card with the disk meters on used to save. The sections it
         // never knew about have to come back off rather than switch themselves
         // on for someone who never asked, and the ones SYSTEM no longer has
-        // (processes, cores) are simply dropped.
+        // (processes, cores, the / and /home disks) are simply dropped.
         let state: AppState = serde_json::from_str(
             r#"{"settings":{"system_details":{"cpu":true,"ram":true,"gpus":true,"root_disk":true,"home_disk":true,"processes":false,"cores":false}}}"#,
         )
         .expect("settings saved before the new sensors should remain readable");
         let details = state.settings.system_details;
         assert!(details.cpu && details.ram && details.gpus);
-        assert!(details.root_disk && details.home_disk);
+        assert!(!details.ssd_usage && !details.amounts);
         assert!(!details.swap);
         assert!(!details.cpu_temp && !details.gpu_temp && !details.ssd_temp);
         assert!(!details.network);
