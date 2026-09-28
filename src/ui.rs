@@ -1539,6 +1539,30 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let preview_scroll = preview_scroll.clone();
         move |_, _| notes_preview_apply_pin(&preview, &scroller, &preview_scroll)
     });
+    // The preview is first filled before it has a width, so an image wider
+    // than it would stay clipped. Fill it again once it has one, and when a
+    // dragged pane leaves an image wider than the preview.
+    // ponytail: the refill starts the preview at the top again; keep the
+    // scroll if refitting mid-read ever gets annoying.
+    notes.preview.connect_size_allocate({
+        let fitted = Rc::new(Cell::new(0));
+        let last_preview = last_preview.clone();
+        let fill_preview = fill_preview.clone();
+        let selected = notes_view.selected.clone();
+        move |preview, _| {
+            let width = preview_text_width(preview);
+            if fitted.replace(width) == width || !preview_images_misfit(preview, width) {
+                return;
+            }
+            let last_preview = last_preview.clone();
+            let fill_preview = fill_preview.clone();
+            let selected = selected.clone();
+            glib::idle_add_local_once(move || {
+                *last_preview.borrow_mut() = (None, String::new(), 0);
+                fill_preview(selected.get());
+            });
+        }
+    });
 
     let refresh_closure: Rc<dyn Fn()> = {
         let root = root.clone();
@@ -6559,9 +6583,10 @@ fn note_row(
 // text, the bytes live in their own file, and the rendered size is stored per
 // placeholder — that is all it takes to rebuild the note exactly on restart.
 
-// Pasted screenshots are usually far wider than a note, so scale to fit on
-// paste. Small images keep their natural size instead of being blown up.
-const NOTE_IMAGE_DEFAULT_MAX: i32 = 240;
+// A pasted image comes in at its natural size and is never blown up. One
+// wider than the note widens the note up to this, so a screenshot of text is
+// still readable; wider still, it is scaled down to it.
+const NOTE_IMAGE_PASTE_MAX: i32 = 600;
 const NOTE_IMAGE_MIN: i32 = 40;
 const NOTE_IMAGE_MAX: i32 = 1400;
 // A hover-only corner handle, matching the note card resize affordance.
@@ -6616,11 +6641,47 @@ type ImageResizeState = Rc<RefCell<Option<ImageResize>>>;
 type ImageOriginals = Rc<RefCell<HashMap<String, Pixbuf>>>;
 type NoteUndoState = Rc<RefCell<NoteUndo>>;
 
-// How wide a pasted image may be drawn: it has to fit the note it lands in —
-// an image wider than the note is clipped, taking its resize edge out of reach
-// with it — but a big note should not get a wall-sized paste either.
-fn note_image_cap(available_width: i32) -> i32 {
-    available_width.clamp(NOTE_IMAGE_MIN, NOTE_IMAGE_DEFAULT_MAX)
+/// The size a pasted image goes into a note at, in logical pixels.
+///
+/// Its natural size is its pixels over the display scale: a screenshot taken
+/// on a 2x display holds two pixels per point, and showing each as a point
+/// doubled it. It fills at most the note's text `column`, or
+/// `NOTE_IMAGE_PASTE_MAX` if that is wider (the note grows to fit), and never
+/// more than the note could grow to on its monitor (`room`), so the whole
+/// image and its resize edges can always be brought into view. How far down
+/// the note it lands does not matter: the note scrolls.
+fn pasted_image_size(pixels: Size, scale: i32, column: i32, room: Size) -> Size {
+    let scale = scale.max(1);
+    let natural_width = (pixels.width.max(1) + scale - 1) / scale;
+    let natural_height = (pixels.height.max(1) + scale - 1) / scale;
+    let (width, height) = fit_within_bounds(
+        natural_width,
+        natural_height,
+        column.max(NOTE_IMAGE_PASTE_MAX).min(room.width),
+        room.height.min(NOTE_IMAGE_MAX),
+    );
+    Size { width, height }
+}
+
+/// A stored image size whose shape disagrees with its picture came from the
+/// old paste, which squeezed an image pasted far down a note to a 40x1
+/// sliver. Such an image comes back as if pasted afresh into a wide note.
+fn repaired_image_size(stored: Size, pixels: Size, scale: i32) -> Option<Size> {
+    let expected = i64::from(stored.width) * i64::from(pixels.height.max(1))
+        / i64::from(pixels.width.max(1));
+    let slack = (expected / 20).max(2);
+    if stored.width > 0 && (i64::from(stored.height) - expected).abs() <= slack {
+        return None;
+    }
+    Some(pasted_image_size(
+        pixels,
+        scale,
+        NOTE_IMAGE_PASTE_MAX,
+        Size {
+            width: NOTE_IMAGE_PASTE_MAX,
+            height: NOTE_IMAGE_MAX,
+        },
+    ))
 }
 
 // What the note spends on everything that is not text: its header, the card
@@ -6787,10 +6848,13 @@ fn grow_note_for_image(
     state: &Rc<RefCell<AppState>>,
     image: Size,
 ) {
+    // Before its first allocation a card reports 1x1; its size request is
+    // the size it is about to get. Growing from 1x1 would shrink the note.
     let allocation = target.card.allocation();
+    let (request_width, request_height) = target.card.size_request();
     let current = Size {
-        width: allocation.width(),
-        height: allocation.height(),
+        width: allocation.width().max(request_width),
+        height: allocation.height().max(request_height),
     };
     let chrome = note_image_chrome(editor, &target.card);
     let limit = note_growth_limit(&target.card);
@@ -6830,13 +6894,6 @@ fn image_room(limit: Size, chrome: Size) -> Size {
     Size {
         width: (limit.width - chrome.width).max(1),
         height: (limit.height - chrome.height - NOTE_IMAGE_ROOM).max(1),
-    }
-}
-
-fn image_room_after_y(room: Size, layout_y: i32) -> Size {
-    Size {
-        width: room.width,
-        height: (room.height - layout_y.max(0)).max(1),
     }
 }
 
@@ -6951,8 +7008,9 @@ fn rescaled_image(
 }
 
 fn scaled_image(file: &str, width: i32, height: i32, originals: &ImageOriginals) -> Option<Pixbuf> {
-    let width = width.clamp(NOTE_IMAGE_MIN, NOTE_IMAGE_MAX);
-    let height = height.clamp(1, NOTE_IMAGE_MAX);
+    // Bounded as a whole, never one side alone: forcing a minimum width onto
+    // a 1px-tall size is what drew a pasted screenshot as a 40x1 line.
+    let (width, height) = fit_within_bounds(width, height, NOTE_IMAGE_MAX, NOTE_IMAGE_MAX);
     let pixbuf = rescaled_image(file, width, height, originals)?;
     // The corners are rounded on the copy that goes into the note, not on the
     // stored original: a square corner would poke out past the focus outline,
@@ -7369,30 +7427,83 @@ fn record_note_undo(history: &NoteUndoState, before: NoteSnapshot, after: &NoteS
     history.redo.clear();
 }
 
+/// Fill a note's buffer from its saved form. True when a saved image size was
+/// broken and has been repaired (see `repaired_image_size`). Images wider
+/// than `max_width` are shown scaled down to it, for a read-only view
+/// narrower than the note (the Notes preview); a note passes `i32::MAX`.
 fn fill_note_content(
     buffer: &gtk::TextBuffer,
     text: &str,
     images: &[NoteImage],
     originals: &ImageOriginals,
-) {
+    scale: i32,
+    max_width: i32,
+) -> bool {
     buffer.set_text("");
+    let mut repaired = false;
     let mut images = images.iter();
     for (index, chunk) in text.split(IMAGE_PLACEHOLDER).enumerate() {
         if index > 0 {
             // Every chunk after the first is preceded by one placeholder. An
             // image whose file went missing simply drops out of the note.
-            if let Some(pixbuf) = images
-                .next()
-                .and_then(|image| scaled_image(&image.file, image.width, image.height, originals))
-            {
-                let mut end = buffer.end_iter();
-                buffer.insert_pixbuf(&mut end, &pixbuf);
+            if let Some(image) = images.next() {
+                let stored = Size {
+                    width: image.width,
+                    height: image.height,
+                };
+                let size = loaded_image_size(&image.file, stored, scale);
+                repaired |= size != stored;
+                let (width, height) =
+                    fit_within_bounds(size.width, size.height, max_width, NOTE_IMAGE_MAX);
+                if let Some(pixbuf) = scaled_image(&image.file, width, height, originals) {
+                    let mut end = buffer.end_iter();
+                    buffer.insert_pixbuf(&mut end, &pixbuf);
+                }
             }
         }
         let mut end = buffer.end_iter();
         buffer.insert(&mut end, chunk);
     }
     mono_box_drawing_lines(buffer);
+    repaired
+}
+
+/// The size a saved image is shown at: the one it was saved with, unless that
+/// no longer matches the picture's shape. Only the file's header is read.
+fn loaded_image_size(file: &str, stored: Size, scale: i32) -> Size {
+    Pixbuf::file_info(crate::state::images_dir().join(file))
+        .and_then(|(_, width, height)| repaired_image_size(stored, Size { width, height }, scale))
+        .unwrap_or(stored)
+}
+
+/// After a note's images were repaired on load: widen it for the widest the
+/// way a paste would have, and save the repaired sizes so this happens once.
+fn settle_repaired_images(
+    editor: &gtk::TextView,
+    target: &NoteImageTarget,
+    state: &Rc<RefCell<AppState>>,
+) {
+    let Some(buffer) = editor.buffer() else {
+        return;
+    };
+    let text = note_buffer_text(&buffer);
+    let images = note_buffer_images(&buffer, &text, state);
+    if let Some(widest) = images.iter().max_by_key(|image| image.width) {
+        let size = Size {
+            width: widest.width,
+            height: widest.height,
+        };
+        grow_note_for_image(editor, target, state, size);
+    }
+    if let Some(note) = state
+        .borrow_mut()
+        .notes
+        .iter_mut()
+        .find(|note| note.id == target.id)
+    {
+        note.images = images;
+    }
+    let _ = state.borrow().save();
 }
 
 /// A table pasted from a terminal is drawn with box characters and padded
@@ -7437,9 +7548,19 @@ fn fill_note_buffer(
     note: &Note,
     originals: &ImageOriginals,
     highlights: &HighlightTags,
-) {
-    fill_note_content(buffer, &note.text, &note.images, originals);
+    scale: i32,
+    max_width: i32,
+) -> bool {
+    let repaired = fill_note_content(
+        buffer,
+        &note.text,
+        &note.images,
+        originals,
+        scale,
+        max_width,
+    );
     highlights.fill(buffer, &note.highlights);
+    repaired
 }
 
 // Where the image at `offset` is drawn, in widget coordinates — the same space
@@ -7682,28 +7803,19 @@ fn paste_note_image(
     let Some(buffer) = editor.buffer() else {
         return false;
     };
-    let Some(insert) = buffer.get_insert() else {
-        return false;
-    };
-    // Text and earlier images above the insertion point already consume some
-    // of the note's vertical growth budget.
-    let insertion_y = editor.iter_location(&buffer.iter_at_mark(&insert)).y();
     let Some(file) = store_note_image(&pixbuf, state) else {
         return false;
     };
     originals.borrow_mut().insert(file.clone(), pixbuf.clone());
-    let room = image_room_after_y(
-        image_room(
-            note_growth_limit(&target.card),
-            note_image_chrome(editor, &target.card),
-        ),
-        insertion_y,
-    );
-    let (width, height) = fit_within_bounds(
-        pixbuf.width(),
-        pixbuf.height(),
-        note_image_cap(room.width),
-        NOTE_IMAGE_DEFAULT_MAX.min(room.height),
+    let chrome = note_image_chrome(editor, &target.card);
+    let Size { width, height } = pasted_image_size(
+        Size {
+            width: pixbuf.width(),
+            height: pixbuf.height(),
+        },
+        editor.scale_factor(),
+        target.card.allocation().width() - chrome.width,
+        image_room(note_growth_limit(&target.card), chrome),
     );
     let Some(scaled) = scaled_image(&file, width, height, originals) else {
         originals.borrow_mut().remove(&file);
@@ -7721,8 +7833,7 @@ fn paste_note_image(
     let offset = at.offset();
     buffer.insert_pixbuf(&mut at, &scaled);
     buffer.place_cursor(&buffer.iter_at_offset(offset + 1));
-    // Include any text/images already above this one. Growing for the pixbuf's
-    // height alone clips a paste made after a few lines of text.
+    // Wider than the note: widen it, so none of the image is clipped.
     grow_note_for_image(editor, target, state, Size { width, height });
     note_reveal_offset(editor, offset);
     let editor = editor.clone();
@@ -7773,7 +7884,14 @@ fn apply_note_snapshot(
     // user was reading somewhere already.
     let scroll = note_scroll_value(editor);
     let freeze = NotePaintFreeze::new(editor);
-    fill_note_content(&buffer, &snapshot.text, &snapshot.images, originals);
+    fill_note_content(
+        &buffer,
+        &snapshot.text,
+        &snapshot.images,
+        originals,
+        editor.scale_factor(),
+        i32::MAX,
+    );
     target.highlights.fill(&buffer, &snapshot.highlights);
     store_note_highlights(&buffer, target, state);
     let cursor = snapshot.cursor.clamp(0, buffer.char_count());
@@ -8289,7 +8407,7 @@ fn attach_note_images(
     editor: &gtk::TextView,
     target: NoteImageTarget,
     state: &Rc<RefCell<AppState>>,
-) -> (ImageOriginals, HighlightMenu) {
+) -> (ImageOriginals, HighlightMenu, Rc<NoteImageTarget>) {
     let target = Rc::new(target);
     let originals: ImageOriginals = Rc::new(RefCell::new(HashMap::new()));
     let focus: ImageFocus = Rc::new(RefCell::new(None));
@@ -8512,21 +8630,14 @@ fn attach_note_images(
                 return glib::Propagation::Proceed;
             };
             // Never wider than the grown note can show: an image dragged past
-            // the note edge takes its own resize edge out of reach.
-            let layout_y = editor
-                .buffer()
-                .map(|buffer| {
-                    editor
-                        .iter_location(&buffer.iter_at_offset(drag.offset))
-                        .y()
-                })
-                .unwrap_or(0);
-            let room = image_room_after_y(
-                image_room(
-                    note_growth_limit(&target.card),
-                    note_image_chrome(editor, &target.card),
-                ),
-                layout_y,
+            // the note edge takes its own resize edge out of reach. Nor taller
+            // than the note can grow to, so all of it can be seen at once; how
+            // far down the note it sits does not count, since the note
+            // scrolls, and counting it pinned an image low in a long note at
+            // its smallest.
+            let room = image_room(
+                note_growth_limit(&target.card),
+                note_image_chrome(editor, &target.card),
             );
             set_editor_cursor(editor, gdk::CursorType::BottomRightCorner);
             let max_width = resize_width_limit(room, drag.aspect);
@@ -8684,7 +8795,7 @@ fn attach_note_images(
 
     let highlight_menu = build_highlight_menu_actions(editor, &target, state, &undo);
 
-    (originals, highlight_menu)
+    (originals, highlight_menu, target)
 }
 
 /// Drop the selection once its words have been painted: leaving them selected
@@ -9066,7 +9177,7 @@ fn rebuild_pinned_notes(
         // Attached after the card is registered and sized, so a paste can grow
         // the note and refresh the input shape for it. Filling the buffer here,
         // before the change handler below, keeps the load out of the save path.
-        let (image_originals, highlight_menu) = attach_note_images(
+        let (image_originals, highlight_menu, image_target) = attach_note_images(
             &editor,
             NoteImageTarget {
                 card: card.clone(),
@@ -9080,12 +9191,21 @@ fn rebuild_pinned_notes(
             },
             &state,
         );
-        fill_note_buffer(
+        let repaired = fill_note_buffer(
             &editor.buffer().expect("note buffer"),
             &note,
             &image_originals,
             &highlight_tags,
+            editor.scale_factor(),
+            i32::MAX,
         );
+        if repaired {
+            let editor = editor.clone();
+            let state = state.clone();
+            glib::idle_add_local_once(move || {
+                settle_repaired_images(&editor, &image_target, &state)
+            });
+        }
         attach_highlight_button(&pen_toggle, &pen_on, &state);
         attach_color_mode_menu(
             &card,
@@ -9230,6 +9350,37 @@ fn track_widget_hover(
     });
 }
 
+/// How wide an image the Notes preview can show whole. Before it has been
+/// allocated it can show anything; it is filled again when a note is picked.
+fn preview_text_width(preview: &gtk::TextView) -> i32 {
+    let width = preview.allocated_width();
+    if width <= 1 {
+        return i32::MAX;
+    }
+    let padding = preview.style_context().padding(gtk::StateFlags::NORMAL);
+    (width
+        - preview.left_margin()
+        - preview.right_margin()
+        - i32::from(padding.left)
+        - i32::from(padding.right))
+    .max(NOTE_IMAGE_MIN)
+}
+
+fn preview_images_misfit(preview: &gtk::TextView, width: i32) -> bool {
+    let Some(buffer) = preview.buffer() else {
+        return false;
+    };
+    let mut at = buffer.start_iter();
+    loop {
+        if at.pixbuf().is_some_and(|pixbuf| pixbuf.width() > width) {
+            return true;
+        }
+        if !at.forward_char() {
+            return false;
+        }
+    }
+}
+
 fn fill_notes_preview(
     preview: &gtk::TextView,
     state: &Rc<RefCell<AppState>>,
@@ -9256,7 +9407,14 @@ fn fill_notes_preview(
         buffer.set_text("");
         return;
     };
-    fill_note_buffer(&buffer, note, originals, highlights);
+    fill_note_buffer(
+        &buffer,
+        note,
+        originals,
+        highlights,
+        preview.scale_factor(),
+        preview_text_width(preview),
+    );
     // Inserts leave the caret at the end. Put it back so GTK's
     // keep-the-insert-visible pass cannot dive down the note.
     buffer.place_cursor(&buffer.start_iter());
@@ -15335,8 +15493,8 @@ mod timer_input_tests {
         click_became_drag, dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area,
         fit_within_bounds, held_slide_point, top_child_at, top_raised_child_at,
         foreground_for_mode, format_rate, highlight_at,
-        image_room, image_room_after_y, monitor_coordinate_divisor,
-        monitor_root_bounds, normalize_monitor_rect, note_headline, note_image_cap,
+        image_room, monitor_coordinate_divisor, pasted_image_size, repaired_image_size,
+        monitor_root_bounds, normalize_monitor_rect, note_headline,
         note_search_matches, note_size_for_image, padded_visual_rect,
         age_label, centre_on_screen, clamp_scroll_value, note_snippets, note_sort_key, notes_delete_eats_key,
         notes_pointer_global, notes_pointer_live, notes_place_point, palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
@@ -15350,7 +15508,7 @@ mod timer_input_tests {
         temperature_meter, timer_style_size, Foreground, NoteSearchMatch,
         NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, WidgetPalette,
         DRAG_REDRAW_INTERVAL, NOTE_HEIGHT,
-        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
+        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_IMAGE_PASTE_MAX,
         NOTE_WIDTH, SYSTEM_HEIGHT, SYSTEM_METER_CELL, SYSTEM_METER_GAP, SYSTEM_METER_GAP_MIN,
         SYSTEM_METER_RING, SYSTEM_METER_RING_RADIUS, SYSTEM_METER_RING_STROKE,
     };
@@ -15722,10 +15880,9 @@ mod timer_input_tests {
 
     #[test]
     fn a_pasted_screenshot_is_scaled_down_but_a_small_icon_is_left_alone() {
-        // A 1920x1080 screenshot fits the note without distorting its shape.
-        let (width, height) =
-            fit_within_bounds(1920, 1080, NOTE_IMAGE_DEFAULT_MAX, NOTE_IMAGE_DEFAULT_MAX);
-        assert_eq!(width, NOTE_IMAGE_DEFAULT_MAX);
+        // A 1920x1080 screenshot fits without distorting its shape.
+        let (width, height) = fit_within_bounds(1920, 1080, 240, 240);
+        assert_eq!(width, 240);
         assert_eq!(height, 135);
         // A tall image is bounded by its height, not its width.
         assert_eq!(fit_within_bounds(200, 1000, 240, 240), (48, 240));
@@ -15740,10 +15897,9 @@ mod timer_input_tests {
         // larger than the CSS cap `scaled_image` would have stopped at.
         let original = Pixbuf::new(Colorspace::Rgb, true, 8, 960, 540).expect("test pixbuf");
         original.fill(0xff_00_00_ff);
-        let sharp = rescaled_from(&original, NOTE_IMAGE_DEFAULT_MAX * 2, 270)
-            .expect("device-resolution scale");
+        let sharp = rescaled_from(&original, 240 * 2, 270).expect("device-resolution scale");
         assert_eq!((sharp.width(), sharp.height()), (480, 270));
-        assert!(sharp.width() > NOTE_IMAGE_DEFAULT_MAX);
+        assert!(sharp.width() > 240);
         assert!(sharp.width() < NOTE_IMAGE_MAX);
     }
 
@@ -15779,13 +15935,6 @@ mod timer_input_tests {
         assert_eq!(resize_width_limit(room, 1.0 / 3.0), 127);
         // A wide image remains width-limited.
         assert_eq!(resize_width_limit(room, 16.0 / 9.0), 516);
-        assert_eq!(
-            image_room_after_y(room, 42),
-            Size {
-                width: 516,
-                height: 340
-            }
-        );
     }
 
     #[test]
@@ -15832,15 +15981,89 @@ mod timer_input_tests {
 
     #[test]
     fn a_pasted_image_fits_the_note_it_lands_in() {
-        // A default-width note: the image must stay inside it, or its resize
-        // resize edge is clipped away with the image edge.
-        let cap = note_image_cap(NOTE_WIDTH - 10);
-        assert!(cap <= NOTE_WIDTH - 10);
-        assert_eq!(fit_within_bounds(640, 360, cap, cap).0, cap);
-        // A note dragged wide still pastes at the default size, not wall-sized.
-        assert_eq!(note_image_cap(900), NOTE_IMAGE_DEFAULT_MAX);
-        // A note dragged to its narrowest still shows something.
-        assert_eq!(note_image_cap(4), NOTE_IMAGE_MIN);
+        let screen = Size {
+            width: 1900,
+            height: 1100,
+        };
+        // A 2x screenshot of a table (the paste that came out a 40x1 line):
+        // 688x390 on screen, a little over the cap, so the note widens to the
+        // cap and the table is read at 87% of the size it was taken at.
+        let table = Size {
+            width: 1376,
+            height: 780,
+        };
+        assert_eq!(
+            pasted_image_size(table, 2, 262, screen),
+            Size {
+                width: NOTE_IMAGE_PASTE_MAX,
+                height: 340
+            }
+        );
+        // A 2x screenshot that fits under the cap goes in at its on-screen size.
+        let dialog = Size {
+            width: 900,
+            height: 500,
+        };
+        assert_eq!(
+            pasted_image_size(dialog, 2, 262, screen),
+            Size {
+                width: 450,
+                height: 250
+            }
+        );
+        // A small image is never blown up, and keeps its shape.
+        let icon = Size {
+            width: 152,
+            height: 106,
+        };
+        assert_eq!(
+            pasted_image_size(icon, 2, 262, screen),
+            Size {
+                width: 76,
+                height: 53
+            }
+        );
+        // A note already wider than the cap is filled, not left at the cap.
+        let wide = Size {
+            width: 3000,
+            height: 1000,
+        };
+        assert_eq!(pasted_image_size(wide, 1, 900, screen).width, 900);
+        // Near the monitor edge the room wins, and the shape still holds.
+        assert_eq!(
+            pasted_image_size(table, 1, 262, Size { width: 300, height: 1100 }),
+            Size {
+                width: 300,
+                height: 170
+            }
+        );
+        // A tall capture is bounded by the monitor's height, not squeezed to
+        // whatever is left below the caret.
+        let tall = Size {
+            width: 800,
+            height: 4000,
+        };
+        assert_eq!(pasted_image_size(tall, 1, 262, screen).height, 1100);
+    }
+
+    #[test]
+    fn a_saved_sliver_is_repaired_and_a_resized_image_is_left_alone() {
+        let table = Size {
+            width: 1376,
+            height: 780,
+        };
+        let sliver = Size {
+            width: 40,
+            height: 1,
+        };
+        let repaired = repaired_image_size(sliver, table, 2).expect("a broken size");
+        assert_eq!(repaired.width * 780 / 1376, repaired.height);
+        assert!(repaired.width > 400);
+        // Sizes a resize drag left behind round the height to the pixel.
+        for width in [40, 97, 262, 600] {
+            let height = (f64::from(width) * 780.0 / 1376.0).round() as i32;
+            assert_eq!(repaired_image_size(Size { width, height }, table, 2), None);
+        }
     }
 
     #[test]
