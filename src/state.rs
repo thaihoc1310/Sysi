@@ -258,6 +258,26 @@ pub struct Note {
     pub images: Vec<NoteImage>,
     #[serde(default)]
     pub highlights: Vec<NoteHighlight>,
+    /// The tags it was given in Notes, in the order they were added.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// The longest a tag may be: it has to sit on a row's meta line beside the
+/// age and still leave room for another.
+pub const TAG_MAX_CHARS: usize = 24;
+
+/// A tag as typed, made one: no `#` in front, no space around it, runs of
+/// space as one, at most `TAG_MAX_CHARS`. `None` if nothing is left.
+pub fn clean_tag(raw: &str) -> Option<String> {
+    let words: Vec<&str> = raw
+        .trim()
+        .trim_start_matches('#')
+        .split_whitespace()
+        .collect();
+    let tag: String = words.join(" ").chars().take(TAG_MAX_CHARS).collect();
+    let tag = tag.trim_end().to_owned();
+    (!tag.is_empty()).then_some(tag)
 }
 
 /// One dictionary window. The queries it has shown are kept with it so that
@@ -462,6 +482,52 @@ impl AppState {
         }
     }
 
+    /// Every tag some note has, with how many notes have it: the most used
+    /// first, then by name. Counted from the notes themselves, so a tag no
+    /// note has any more is gone rather than left at zero.
+    pub fn tag_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for tag in self.notes.iter().flat_map(|note| note.tags.iter()) {
+            match counts.iter_mut().find(|(name, _)| name == tag) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((tag.clone(), 1)),
+            }
+        }
+        counts.sort_by(|(a, a_count), (b, b_count)| {
+            b_count
+                .cmp(a_count)
+                .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+        });
+        counts
+    }
+
+    /// Give a note a tag, or take it off if it has it. A new name that
+    /// matches a tag already in use, but for case, joins that tag. Returns
+    /// whether the note has the tag now. Tagging is not an edit: the note's
+    /// age and place in the list stay as they were.
+    pub fn toggle_note_tag(&mut self, id: u64, raw: &str) -> bool {
+        let Some(tag) = clean_tag(raw) else {
+            return false;
+        };
+        let tag = self
+            .notes
+            .iter()
+            .flat_map(|note| note.tags.iter())
+            .find(|known| known.to_lowercase() == tag.to_lowercase())
+            .cloned()
+            .unwrap_or(tag);
+        let Some(note) = self.notes.iter_mut().find(|note| note.id == id) else {
+            return false;
+        };
+        if let Some(index) = note.tags.iter().position(|known| *known == tag) {
+            note.tags.remove(index);
+            false
+        } else {
+            note.tags.push(tag);
+            true
+        }
+    }
+
     pub fn referenced_image_files(&self) -> std::collections::HashSet<String> {
         self.notes
             .iter()
@@ -473,7 +539,30 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, ColorMode, HighlightColor};
+    use super::{clean_tag, AppState, ColorMode, HighlightColor};
+
+    #[test]
+    fn tags_are_counted_from_the_notes_and_toggle_on_and_off() {
+        let mut state: AppState = serde_json::from_str(
+            r#"{"notes":[{"id":1,"text":"a"},{"id":2,"text":"b"},{"id":3,"text":"c"}]}"#,
+        )
+        .unwrap();
+        assert!(state.toggle_note_tag(1, "  #speaking   part 2 "));
+        assert!(state.toggle_note_tag(2, "vocab"));
+        assert!(state.toggle_note_tag(3, "Vocab"));
+        // Case aside, a name in use joins its tag rather than making a second.
+        assert_eq!(state.notes[2].tags, ["vocab"]);
+        assert_eq!(
+            state.tag_counts(),
+            [("vocab".to_owned(), 2), ("speaking part 2".to_owned(), 1)]
+        );
+        // Given again, it comes off; the last note off it takes the tag away.
+        assert!(!state.toggle_note_tag(1, "speaking part 2"));
+        assert_eq!(state.tag_counts(), [("vocab".to_owned(), 2)]);
+        assert!(!state.toggle_note_tag(9, "vocab"));
+        assert!(!state.toggle_note_tag(1, " # "));
+        assert_eq!(clean_tag(&"x".repeat(40)).map(|tag| tag.len()), Some(24));
+    }
 
     #[test]
     fn a_pink_highlight_saved_before_red_loads_as_red() {

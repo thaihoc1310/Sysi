@@ -481,11 +481,16 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // here, with the menu, because the menu is attached while the window is.
     let hovered_notes_row: HoveredRow = Rc::new(Cell::new(None));
     let notes_star_slot: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>> = Rc::new(RefCell::new(None));
+    let rebuild_list_slot: CallbackSlot = Rc::new(RefCell::new(None));
+    // Opens the field a new tag is typed into, beside a note's row.
+    let new_tag_slot: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>> = Rc::new(RefCell::new(None));
     let notes_row_menu = build_notes_row_menu(
         state.clone(),
         note_refresh.clone(),
         hovered_notes_row.clone(),
         notes_star_slot.clone(),
+        rebuild_list_slot.clone(),
+        new_tag_slot.clone(),
     );
     window.set_accept_focus(true);
     window.style_context().add_class("editing");
@@ -1020,7 +1025,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         pin: Rc::new(Cell::new(0)),
         setting: Rc::new(Cell::new(false)),
     };
-    let rebuild_list_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let close_notes_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
     let fill_preview: Rc<dyn Fn(Option<u64>)> = {
@@ -1135,9 +1139,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         })
     };
 
+    // The tags the Notes list is narrowed to, picked in the filter beside
+    // the count.
+    let tag_filter: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let rebuild_list: Rc<dyn Fn()> = {
         let list = notes.list.clone();
         let count = notes.count.clone();
+        let tags_button = notes.tags.clone();
+        let tag_filter = tag_filter.clone();
         let search = notes.search.clone();
         let root = root.clone();
         let state = state.clone();
@@ -1152,6 +1161,16 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         Rc::new(move || {
             let keep = view.selected.get();
             view.confirm_id.set(None);
+            // A tag no note has any more cannot narrow anything.
+            let in_use: Vec<String> = state
+                .borrow()
+                .tag_counts()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            tag_filter.borrow_mut().retain(|tag| in_use.contains(tag));
+            let filter = tag_filter.borrow().clone();
+            set_tag_filter_button(&tags_button, &filter, !in_use.is_empty());
             rebuild_notes_list(
                 &list,
                 &root,
@@ -1164,6 +1183,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 &on_open,
                 &on_star,
                 &count,
+                &filter,
             );
             let next = {
                 let ids = view.visible_ids.borrow();
@@ -1176,6 +1196,17 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         })
     };
     *rebuild_list_slot.borrow_mut() = Some(rebuild_list.clone());
+    attach_tag_filter(&notes.tags, &state, &tag_filter, &rebuild_list);
+    *new_tag_slot.borrow_mut() = Some({
+        let rows = notes_view.rows.clone();
+        let state = state.clone();
+        let rebuild_list = rebuild_list.clone();
+        Rc::new(move |id| {
+            if let Some(row) = rows.borrow().get(&id) {
+                open_new_tag_field(row, id, &state, &rebuild_list);
+            }
+        })
+    });
     notes.preview_scroller.vadjustment().connect_value_changed({
         let preview_scroll = preview_scroll.clone();
         move |adj| {
@@ -1643,6 +1674,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         position,
                         images: Vec::new(),
                         highlights: Vec::new(),
+                        tags: Vec::new(),
                     });
                     let _ = data.save();
                     id
@@ -3846,9 +3878,60 @@ fn build_notes_row_menu(
     refresh: CallbackSlot,
     hovered: HoveredRow,
     star: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
+    rebuild_list: CallbackSlot,
+    new_tag: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
 ) -> Rc<dyn Fn() -> bool> {
     let menu = context_menu();
     let target: HoveredRow = Rc::new(Cell::new(None));
+
+    // TAG: the tags in use, the note's own on top and lit; a click puts the
+    // note in a tag or takes it out, and the menu stays for the next one.
+    let tag = gtk::MenuItem::with_label("TAG");
+    let tag_menu = context_menu();
+    let tags = TagList::new(&tag_menu, {
+        let state = state.clone();
+        let target = target.clone();
+        Rc::new(move |name| {
+            let Some(id) = target.get() else {
+                return (false, None);
+            };
+            let on = state.borrow_mut().toggle_note_tag(id, name);
+            let _ = state.borrow().save();
+            // The rows behind the menu show a note's tags.
+            if let Some(rebuild) = rebuild_list.borrow().clone() {
+                rebuild();
+            }
+            let count = state
+                .borrow()
+                .notes
+                .iter()
+                .filter(|note| note.tags.iter().any(|tag| tag == name))
+                .count();
+            (on, Some(count))
+        })
+    });
+    let tags_rule = gtk::SeparatorMenuItem::new();
+    tag_menu.append(&tags_rule);
+    let new_tag_item = gtk::MenuItem::with_label("NEW TAG\u{2026}");
+    new_tag_item.connect_activate({
+        let target = target.clone();
+        move |_| {
+            let Some(id) = target.get() else {
+                return;
+            };
+            // Once the menu has let go of the pointer and the keyboard.
+            let new_tag = new_tag.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(open) = new_tag.borrow().clone() {
+                    open(id);
+                }
+            });
+        }
+    });
+    tag_menu.append(&new_tag_item);
+    tag_menu.show_all();
+    tag.set_submenu(Some(&tag_menu));
+
     let pin = gtk::MenuItem::with_label("PIN");
     pin.connect_activate({
         let star = star.clone();
@@ -3879,6 +3962,7 @@ fn build_notes_row_menu(
             }
         }
     });
+    menu.append(&tag);
     menu.append(&pin);
     menu.append(&delete);
     menu.show_all();
@@ -3897,6 +3981,18 @@ fn build_notes_row_menu(
             .find(|note| note.id == id)
             .is_some_and(|note| note.starred);
         pin.set_label(if starred { "UNPIN" } else { "PIN" });
+        let choices = {
+            let data = state.borrow();
+            let own = data
+                .notes
+                .iter()
+                .find(|note| note.id == id)
+                .map(|note| note.tags.clone())
+                .unwrap_or_default();
+            tag_choices(data.tag_counts(), &own)
+        };
+        tags.fill(&choices);
+        tags_rule.set_visible(!choices.is_empty());
         target.set(Some(id));
         menu.popup_easy(3, gtk::current_event_time());
         true
@@ -4001,6 +4097,8 @@ fn rebuild_notes_list(
     on_open: &Rc<dyn Fn(u64)>,
     on_star: &Rc<dyn Fn(u64)>,
     count: &gtk::Label,
+    // Only notes with every one of these tags.
+    tags: &[String],
 ) {
     for child in list.children() {
         list.remove(&child);
@@ -4023,6 +4121,9 @@ fn rebuild_notes_list(
     let mut shown = 0_usize;
     for index in order {
         let note = &data.notes[index];
+        if !tags.iter().all(|tag| note.tags.contains(tag)) {
+            continue;
+        }
         let matches = compiled
             .as_ref()
             .map(|expression| {
@@ -4061,7 +4162,7 @@ fn rebuild_notes_list(
         format!("{shown} notes")
     });
     if shown == 0 {
-        let empty = gtk::Label::new(Some(if query.is_empty() {
+        let empty = gtk::Label::new(Some(if query.is_empty() && tags.is_empty() {
             "No notes yet"
         } else {
             "No matches"
@@ -4072,6 +4173,147 @@ fn rebuild_notes_list(
         list.pack_start(&empty, false, false, 0);
     }
     list.show_all();
+}
+
+/// The filter's button, saying what Notes is narrowed to: `tags` while
+/// nothing, `#speaking`, `#speaking +2`. Shown once any note has a tag.
+fn set_tag_filter_button(button: &gtk::Button, filter: &[String], any_tags: bool) {
+    let label = match filter {
+        [] => "tags".to_owned(),
+        [only] => format!("#{}", truncate_chars(only, 14)),
+        [first, rest @ ..] => format!("#{} +{}", truncate_chars(first, 14), rest.len()),
+    };
+    if button.label().as_deref() != Some(label.as_str()) {
+        button.set_label(&label);
+    }
+    let style = button.style_context();
+    if filter.is_empty() {
+        style.remove_class("notes-tags-on");
+    } else {
+        style.add_class("notes-tags-on");
+    }
+    button.set_visible(any_tags || !filter.is_empty());
+}
+
+/// The tag filter under the search: every tag, the most used first, the ones
+/// Notes is narrowed to lit and on top. A note shows while it has all of
+/// them, so each tag picked narrows further, as more words in the search do.
+fn attach_tag_filter(
+    button: &gtk::Button,
+    state: &Rc<RefCell<AppState>>,
+    filter: &Rc<RefCell<Vec<String>>>,
+    rebuild_list: &Rc<dyn Fn()>,
+) {
+    let menu = context_menu();
+    let list = TagList::new(&menu, {
+        let filter = filter.clone();
+        let rebuild_list = rebuild_list.clone();
+        Rc::new(move |name| {
+            let on = {
+                let mut filter = filter.borrow_mut();
+                match filter.iter().position(|tag| tag == name) {
+                    Some(index) => {
+                        filter.remove(index);
+                        false
+                    }
+                    None => {
+                        filter.push(name.to_owned());
+                        true
+                    }
+                }
+            };
+            rebuild_list();
+            (on, None)
+        })
+    });
+    let rule = gtk::SeparatorMenuItem::new();
+    let clear = gtk::MenuItem::with_label("SHOW ALL");
+    clear.connect_activate({
+        let filter = filter.clone();
+        let rebuild_list = rebuild_list.clone();
+        move |_| {
+            filter.borrow_mut().clear();
+            rebuild_list();
+        }
+    });
+    menu.append(&rule);
+    menu.append(&clear);
+    menu.show_all();
+    button.connect_clicked({
+        let state = state.clone();
+        let filter = filter.clone();
+        move |button| {
+            let choices = tag_choices(state.borrow().tag_counts(), &filter.borrow());
+            list.fill(&choices);
+            let narrowed = !filter.borrow().is_empty();
+            rule.set_visible(narrowed && !choices.is_empty());
+            clear.set_visible(narrowed);
+            menu.popup_at_widget(
+                button,
+                gdk::Gravity::SouthEast,
+                gdk::Gravity::NorthEast,
+                None,
+            );
+        }
+    });
+}
+
+/// A field under a note's row to type a new tag into; Enter gives the note
+/// that tag (or the tag in use it matches), Escape or a click away drops it.
+fn open_new_tag_field(
+    row: &gtk::EventBox,
+    id: u64,
+    state: &Rc<RefCell<AppState>>,
+    rebuild_list: &Rc<dyn Fn()>,
+) {
+    let popover = gtk::Popover::new(Some(row));
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.style_context().add_class("sysi-menu");
+    popover.style_context().add_class("tag-popover");
+    crate::glass::glass_popover(&popover);
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("New tag"));
+    entry.set_max_length(crate::state::TAG_MAX_CHARS as i32);
+    entry.set_width_chars(16);
+    entry.set_has_frame(false);
+    entry.style_context().add_class("tag-entry");
+    popover.add(&entry);
+    entry.connect_activate({
+        let popover = popover.clone();
+        let state = state.clone();
+        let rebuild_list = rebuild_list.clone();
+        move |entry| {
+            let Some(tag) = crate::state::clean_tag(&entry.text()) else {
+                return;
+            };
+            let has = {
+                let data = state.borrow();
+                data.notes.iter().any(|note| {
+                    note.id == id
+                        && note
+                            .tags
+                            .iter()
+                            .any(|known| known.to_lowercase() == tag.to_lowercase())
+                })
+            };
+            // Typed again, a tag the note has stays on rather than coming off.
+            if !has {
+                state.borrow_mut().toggle_note_tag(id, &tag);
+                let _ = state.borrow().save();
+            }
+            popover.popdown();
+            // The row this hangs off is rebuilt along with the list.
+            let rebuild_list = rebuild_list.clone();
+            glib::idle_add_local_once(move || rebuild_list());
+        }
+    });
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || unsafe { popover.destroy() });
+    });
+    popover.show_all();
+    popover.popup();
+    entry.grab_focus();
 }
 
 fn notes_row_confirm(row: &gtk::EventBox) -> Option<gtk::Label> {
@@ -4115,6 +4357,10 @@ fn note_meta_label(note: &Note, now: i64) -> String {
     let age = age_label(note.updated_at, now);
     if !age.is_empty() {
         parts.push(age);
+    }
+    if !note.tags.is_empty() {
+        let tags: Vec<String> = note.tags.iter().map(|tag| format!("#{tag}")).collect();
+        parts.push(tags.join("  "));
     }
     parts.join("  ·  ")
 }
@@ -4443,7 +4689,7 @@ fn note_row(
     row.set_visible_window(true);
     row.style_context().add_class("notes-row");
     row.set_tooltip_text(Some(
-        "Click to preview  ·  drag or Enter to open on the desk  ·  right-click to pin or delete",
+        "Click to preview  ·  drag or Enter to open on the desk  ·  right-click to tag, pin or delete",
     ));
     row.add_events(
         gdk::EventMask::BUTTON_PRESS_MASK
@@ -7573,6 +7819,8 @@ struct NotesPalette {
     card: gtk::EventBox,
     search: gtk::Entry,
     count: gtk::Label,
+    /// Opens the tag filter, and says which tags it holds.
+    tags: gtk::Button,
     hide: gtk::Button,
     list: gtk::Box,
     list_scroller: gtk::ScrolledWindow,
@@ -7618,12 +7866,20 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     search.style_context().add_class("notes-search");
     let count = gtk::Label::new(Some("0 notes"));
     count.style_context().add_class("notes-count");
+    let tags = gtk::Button::with_label("tags");
+    tags.set_relief(gtk::ReliefStyle::None);
+    tags.set_can_focus(false);
+    // No tooltip: armed by the click, it floats over the top of the menu.
+    tags.style_context().add_class("notes-tags");
+    // Left out until some note has a tag.
+    tags.set_no_show_all(true);
     let hide = small_button("\u{00d7}");
     hide.style_context().add_class("note-window-button");
     hide.style_context().add_class("note-close");
     hide.set_tooltip_text(Some("Close Notes"));
     bar.pack_start(&find, false, false, 0);
     bar.pack_start(&search, true, true, 0);
+    bar.pack_start(&tags, false, false, 0);
     bar.pack_start(&count, false, false, 0);
     bar.pack_end(&hide, false, false, 0);
     header.add(&bar);
@@ -7736,6 +7992,7 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
         card,
         search,
         count,
+        tags,
         hide,
         list,
         list_scroller,
@@ -13260,6 +13517,273 @@ impl HighlightPalette {
     }
 }
 
+/// One line of a tag list: a tag, how many notes have it, and whether it is
+/// ticked (on the note the menu is for, or in the list's filter).
+struct TagChoice {
+    name: String,
+    count: usize,
+    on: bool,
+}
+
+/// The tags in `counts` (most used first) as choices, the ticked ones on top.
+fn tag_choices(counts: Vec<(String, usize)>, on: &[String]) -> Vec<TagChoice> {
+    let (mut ticked, rest): (Vec<_>, Vec<_>) = counts
+        .into_iter()
+        .map(|(name, count)| TagChoice {
+            on: on.contains(&name),
+            name,
+            count,
+        })
+        .partition(|choice| choice.on);
+    ticked.extend(rest);
+    ticked
+}
+
+/// How many tag lines a list shows before it scrolls.
+const TAG_LIST_ROWS: usize = 8;
+/// How far one notch of the wheel scrolls a tag list.
+const TAG_WHEEL_STEP: f64 = 44.0;
+
+/// Tags to tick inside a menu, in a list that stops growing at
+/// `TAG_LIST_ROWS` and scrolls from there. A menu item lays an input window
+/// over whatever it holds, so nothing in the list hears the pointer itself:
+/// the menu's own events are hit-tested against it instead, the way the font
+/// buttons are, clicks, hover, the wheel and a drag of the scrollbar alike.
+/// A click ticks or unticks a line and leaves the menu open for the next.
+struct TagList {
+    item: gtk::MenuItem,
+    scroller: gtk::ScrolledWindow,
+    rows: gtk::Box,
+    lines: Rc<RefCell<Vec<(String, gtk::Box)>>>,
+}
+
+impl TagList {
+    /// `pick` ticks or unticks a tag, and says whether it is ticked now and,
+    /// if ticking it changed how many notes have it, how many do.
+    fn new(menu: &gtk::Menu, pick: Rc<dyn Fn(&str) -> (bool, Option<usize>)>) -> Self {
+        let item = gtk::MenuItem::new();
+        item.style_context().add_class("tag-list");
+        let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        // An overlay indicator only shows for a pointer the scroller hears.
+        scroller.set_overlay_scrolling(false);
+        scroller.set_shadow_type(gtk::ShadowType::None);
+        let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        scroller.add(&rows);
+        item.add(&scroller);
+        menu.append(&item);
+        let list = Self {
+            item,
+            scroller,
+            rows,
+            lines: Rc::new(RefCell::new(Vec::new())),
+        };
+        list.listen(menu, pick);
+        list
+    }
+
+    /// Show these choices, scrolled back to the top.
+    fn fill(&self, choices: &[TagChoice]) {
+        for child in self.rows.children() {
+            self.rows.remove(&child);
+        }
+        let mut lines = self.lines.borrow_mut();
+        lines.clear();
+        for choice in choices {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            line.style_context().add_class("tag-row");
+            if choice.on {
+                line.style_context().add_class("tag-on");
+            }
+            let name = gtk::Label::new(Some(&choice.name));
+            name.set_xalign(0.0);
+            name.set_hexpand(true);
+            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            // An ellipsizing label asks for next to no width; ask for a tag's
+            // worth, as the colour rows do.
+            name.set_width_chars(choice.name.chars().count().clamp(8, 18) as i32);
+            let count = gtk::Label::new(Some(&choice.count.to_string()));
+            count.style_context().add_class("tag-count");
+            line.pack_start(&name, true, true, 0);
+            line.pack_end(&count, false, false, 0);
+            self.rows.pack_start(&line, false, false, 0);
+            lines.push((choice.name.clone(), line));
+        }
+        // A menu lays its items out at their least height, so the list is
+        // held at the height of the lines it shows, up to TAG_LIST_ROWS.
+        let height: i32 = lines
+            .iter()
+            .take(TAG_LIST_ROWS)
+            .map(|(_, line)| {
+                line.show_all();
+                line.preferred_height().1
+            })
+            .sum();
+        self.scroller.set_min_content_height(-1);
+        self.scroller.set_max_content_height(height.max(1));
+        self.scroller.set_min_content_height(height.max(1));
+        self.rows.show_all();
+        self.item.set_visible(!choices.is_empty());
+        self.scroller.vadjustment().set_value(0.0);
+    }
+
+    fn listen(&self, menu: &gtk::Menu, pick: Rc<dyn Fn(&str) -> (bool, Option<usize>)>) {
+        // Where the pointer is, in the menu's own coordinates.
+        let at = |menu: &gtk::Menu, root: (f64, f64)| {
+            let (_, ox, oy) = menu.window()?.origin();
+            Some((root.0 - f64::from(ox), root.1 - f64::from(oy)))
+        };
+        let over = |menu: &gtk::Menu, widget: &gtk::Widget, (x, y): (f64, f64)| {
+            widget.is_visible()
+                && widget
+                    .translate_coordinates(menu, 0, 0)
+                    .is_some_and(|(left, top)| {
+                        x >= f64::from(left)
+                            && y >= f64::from(top)
+                            && x < f64::from(left + widget.allocated_width())
+                            && y < f64::from(top + widget.allocated_height())
+                    })
+        };
+        // The line under the pointer, if it is in the part of the list shown.
+        let line_at = {
+            let scroller = self.scroller.clone();
+            let lines = self.lines.clone();
+            move |menu: &gtk::Menu, point: (f64, f64)| -> Option<(String, gtk::Box)> {
+                if !over(menu, scroller.upcast_ref(), point) {
+                    return None;
+                }
+                lines
+                    .borrow()
+                    .iter()
+                    .find(|(_, line)| over(menu, line.upcast_ref(), point))
+                    .cloned()
+            }
+        };
+        let bar = self.scroller.vscrollbar();
+        // The scrollbar held since this y, at this value.
+        let dragging: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+        let hover = {
+            let lines = self.lines.clone();
+            let line_at = line_at.clone();
+            move |menu: &gtk::Menu, point: Option<(f64, f64)>| {
+                let under = point.and_then(|point| line_at(menu, point));
+                for (_, line) in lines.borrow().iter() {
+                    let lit = under.as_ref().is_some_and(|(_, hit)| hit == line);
+                    let style = line.style_context();
+                    if lit {
+                        style.add_class("tag-row-hover");
+                    } else {
+                        style.remove_class("tag-row-hover");
+                    }
+                }
+            }
+        };
+        menu.connect_button_press_event({
+            let item = self.item.clone();
+            let scroller = self.scroller.clone();
+            let bar = bar.clone();
+            let dragging = dragging.clone();
+            move |menu, event| {
+                let Some(point) = at(menu, event.root()) else {
+                    return glib::Propagation::Proceed;
+                };
+                if bar.as_ref().is_some_and(|bar| over(menu, bar, point)) {
+                    dragging.set(Some((point.1, scroller.vadjustment().value())));
+                    return glib::Propagation::Stop;
+                }
+                if over(menu, item.upcast_ref(), point) {
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
+        });
+        menu.connect_button_release_event({
+            let item = self.item.clone();
+            let dragging = dragging.clone();
+            let line_at = line_at.clone();
+            move |menu, event| {
+                if dragging.take().is_some() {
+                    return glib::Propagation::Stop;
+                }
+                let Some(point) = at(menu, event.root()) else {
+                    return glib::Propagation::Proceed;
+                };
+                if event.button() == 1 {
+                    if let Some((name, line)) = line_at(menu, point) {
+                        let (on, count) = pick(&name);
+                        let style = line.style_context();
+                        if on {
+                            style.add_class("tag-on");
+                        } else {
+                            style.remove_class("tag-on");
+                        }
+                        let count_label = line
+                            .children()
+                            .into_iter()
+                            .filter_map(|child| child.downcast::<gtk::Label>().ok())
+                            .find(|label| label.style_context().has_class("tag-count"));
+                        if let (Some(count), Some(label)) = (count, count_label) {
+                            label.set_text(&count.to_string());
+                        }
+                        return glib::Propagation::Stop;
+                    }
+                }
+                if over(menu, item.upcast_ref(), point) {
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
+        });
+        menu.connect_motion_notify_event({
+            let scroller = self.scroller.clone();
+            let bar = bar.clone();
+            let hover = hover.clone();
+            move |menu, event| {
+                let point = at(menu, event.root());
+                if let (Some((from, value)), Some(bar), Some((_, y))) =
+                    (dragging.get(), bar.as_ref(), point)
+                {
+                    // The slider moves with the pointer: the bar's length
+                    // stands for the whole list.
+                    let adjustment = scroller.vadjustment();
+                    let length = f64::from(bar.allocated_height().max(1));
+                    adjustment.set_value(value + (y - from) * adjustment.upper() / length);
+                    return glib::Propagation::Stop;
+                }
+                hover(menu, point);
+                glib::Propagation::Proceed
+            }
+        });
+        menu.connect_scroll_event({
+            let scroller = self.scroller.clone();
+            let hover = hover.clone();
+            move |menu, event| {
+                let Some(point) = at(menu, event.root()) else {
+                    return glib::Propagation::Proceed;
+                };
+                if !over(menu, scroller.upcast_ref(), point) {
+                    return glib::Propagation::Proceed;
+                }
+                let step = TAG_WHEEL_STEP;
+                let delta = match event.direction() {
+                    gdk::ScrollDirection::Up => -step,
+                    gdk::ScrollDirection::Down => step,
+                    gdk::ScrollDirection::Smooth => event.delta().1 * step,
+                    _ => 0.0,
+                };
+                let adjustment = scroller.vadjustment();
+                adjustment.set_value(adjustment.value() + delta);
+                hover(menu, Some(point));
+                glib::Propagation::Stop
+            }
+        });
+        menu.connect_leave_notify_event(move |menu, _| {
+            hover(menu, None);
+            glib::Propagation::Proceed
+        });
+    }
+}
+
 /// The highlighter's own menu, hung off the pen in a note's header: whether the
 /// pen is down, and what it is loaded with.
 fn attach_highlight_button(
@@ -13375,18 +13899,19 @@ mod tests {
         dictate_capture_answer, dictate_rect_from_drag, drag_frame_due, ellipsize,
         fit_point_to_screens, fit_to_work_area, fit_within_bounds, foreground_for_mode,
         held_slide_point, highlight_at, image_room, monitor_coordinate_divisor,
-        monitor_root_bounds, normalize_monitor_rect, note_headline, note_search_matches,
-        note_size_for_image, note_snippets, note_sort_key, notes_delete_eats_key,
-        notes_place_point, notes_pointer_global, notes_pointer_live, padded_visual_rect,
-        palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
-        pasted_image_size, pinned_note_sync, push_recent_search, read_compositor_pointer,
-        receives_input_when_locked, record_note_undo, reopen_point, repaired_image_size,
-        rescaled_from, resize_ceiling, resize_rect, resize_width_limit, resized_image_size,
-        room_on_screen, round_pixbuf_corners, sanitize_highlights, screen_in_overlay, top_child_at,
-        top_raised_child_at, Foreground, NoteSearchMatch, NoteSearchOptions, NoteSnapshot,
-        NoteUndo, NoteUndoState, ResizeBounds, ResizeEdges, ScreenRect, WidgetPalette,
-        DRAG_REDRAW_INTERVAL, NOTES_POINTER, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_MAX,
-        NOTE_IMAGE_MIN, NOTE_IMAGE_PASTE_MAX, NOTE_WIDTH, PANEL_ANCHOR,
+        monitor_root_bounds, normalize_monitor_rect, note_headline, note_meta_label,
+        note_search_matches, note_size_for_image, note_snippets, note_sort_key,
+        notes_delete_eats_key, notes_place_point, notes_pointer_global, notes_pointer_live,
+        padded_visual_rect, palette_for_mode, palette_size, parse_note_widget_id,
+        parse_panel_anchor, pasted_image_size, pinned_note_sync, push_recent_search,
+        read_compositor_pointer, receives_input_when_locked, record_note_undo, reopen_point,
+        repaired_image_size, rescaled_from, resize_ceiling, resize_rect, resize_width_limit,
+        resized_image_size, room_on_screen, round_pixbuf_corners, sanitize_highlights,
+        screen_in_overlay, tag_choices, top_child_at, top_raised_child_at, Foreground,
+        NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ResizeBounds,
+        ResizeEdges, ScreenRect, WidgetPalette, DRAG_REDRAW_INTERVAL, NOTES_POINTER, NOTE_HEIGHT,
+        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_IMAGE_PASTE_MAX, NOTE_WIDTH,
+        PANEL_ANCHOR,
     };
     use crate::state::{
         ColorMode, HighlightColor, Note, NoteHighlight, NoteImage, Point, Size, IMAGE_PLACEHOLDER,
@@ -14166,6 +14691,7 @@ mod tests {
             position: Point { x: 0, y: 0 },
             images: Vec::new(),
             highlights: Vec::new(),
+            tags: Vec::new(),
         }
     }
 
@@ -14414,6 +14940,43 @@ mod tests {
             "with no snapshot, a live --at still chooses the monitor"
         );
         PANEL_ANCHOR.with(|cell| cell.set(None));
+    }
+
+    #[test]
+    fn a_notes_tags_come_first_and_sit_on_its_meta_line() {
+        let counts = vec![
+            ("vocab".to_owned(), 9),
+            ("speaking".to_owned(), 4),
+            ("ielts".to_owned(), 2),
+        ];
+        let choices = tag_choices(counts, &["ielts".to_owned()]);
+        let order: Vec<(&str, bool)> = choices
+            .iter()
+            .map(|choice| (choice.name.as_str(), choice.on))
+            .collect();
+        assert_eq!(
+            order,
+            [("ielts", true), ("vocab", false), ("speaking", false)]
+        );
+
+        let now = 1_700_000_000_000;
+        let mut note = Note {
+            id: 1,
+            text: String::new(),
+            pinned: true,
+            starred: false,
+            updated_at: now - 2 * 86_400_000,
+            position: Point { x: 0, y: 0 },
+            images: Vec::new(),
+            highlights: Vec::new(),
+            tags: vec!["speaking".to_owned(), "part 2".to_owned()],
+        };
+        assert_eq!(
+            note_meta_label(&note, now),
+            "ON DESK  ·  2d  ·  #speaking  #part 2"
+        );
+        note.tags.clear();
+        assert_eq!(note_meta_label(&note, now), "ON DESK  ·  2d");
     }
 
     #[test]

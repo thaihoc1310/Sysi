@@ -1201,7 +1201,7 @@ scrolledwindow overshoot.right:backdrop {
 
 /* A menu opened on a LIGHT card is white like the card, with its ink. */
 .sysi-menu.menu-light {
-  background-color: rgba(242, 242, 244, 0.96);
+  background-color: rgba(242, 242, 244, 0.98);
 }
 
 .sysi-menu.menu-light menuitem {
@@ -1247,6 +1247,140 @@ scrolledwindow overshoot.right:backdrop {
 .sysi-menu.menu-light button.font-step:hover,
 .sysi-menu.menu-light button.font-step:focus {
   background-color: rgba(0, 0, 0, 0.10);
+}
+
+/* Tags. In a menu, the list is one item that never lights up itself; its
+   lines do, from the menu's pointer (see TagList). A tag the note has, or the
+   filter holds, is lit the way the selected note's row is. */
+.sysi-menu menuitem.tag-list,
+.sysi-menu menuitem.tag-list:hover {
+  background-color: transparent;
+  padding: 0;
+}
+
+.tag-row {
+  border-radius: 5px;
+  color: alpha(#f4f4f4, 0.88);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  min-height: 16px;
+  padding: 3px 9px;
+  transition: 110ms ease-out;
+}
+
+.tag-row.tag-row-hover {
+  background-color: rgba(255, 255, 255, 0.10);
+  color: #ffffff;
+}
+
+.tag-row.tag-on {
+  background-color: rgba(255, 255, 255, 0.17);
+  color: #ffffff;
+}
+
+.tag-row.tag-on.tag-row-hover {
+  background-color: rgba(255, 255, 255, 0.24);
+}
+
+.tag-count {
+  font-size: 9px;
+  font-weight: 600;
+  opacity: 0.55;
+}
+
+.tag-list scrollbar {
+  background-color: transparent;
+  border: none;
+  margin-left: 2px;
+}
+
+.tag-list scrollbar slider {
+  background-color: alpha(currentColor, 0.34);
+  border: none;
+  border-radius: 3px;
+  min-height: 20px;
+  min-width: 4px;
+}
+
+.menu-light .tag-row {
+  color: alpha(#1c1c1e, 0.86);
+}
+
+.menu-light .tag-row.tag-row-hover {
+  background-color: rgba(0, 0, 0, 0.07);
+  color: #111113;
+}
+
+.menu-light .tag-row.tag-on {
+  background-color: rgba(0, 0, 0, 0.12);
+  color: #111113;
+}
+
+.menu-light .tag-row.tag-on.tag-row-hover {
+  background-color: rgba(0, 0, 0, 0.17);
+}
+
+/* The field a new tag is typed into, on a popover dressed like the menus. */
+popover.tag-popover {
+  border: none;
+  border-radius: 8px;
+  box-shadow: none;
+  padding: 4px;
+}
+
+popover.tag-popover.glass-popup {
+  background-color: transparent;
+}
+
+.tag-entry {
+  background-color: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 5px;
+  box-shadow: none;
+  caret-color: #f4f4f4;
+  color: #f4f4f4;
+  font-size: 10px;
+  font-weight: 600;
+  min-height: 20px;
+  padding: 0 7px;
+}
+
+.menu-light .tag-entry {
+  background-color: rgba(0, 0, 0, 0.06);
+  caret-color: #1c1c1e;
+  color: #1c1c1e;
+}
+
+/* The filter's button beside the note count: faint while it narrows
+   nothing, lit while it does. */
+.notes-tags {
+  background: none;
+  border: none;
+  border-radius: 4px;
+  box-shadow: none;
+  color: #222222;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 1.1px;
+  min-height: 0;
+  opacity: 0.6;
+  padding: 1px 6px;
+  text-shadow: none;
+}
+
+.mode-dark .notes-tags {
+  color: #f2f2f2;
+}
+
+.notes-tags:hover {
+  background-color: alpha(currentColor, 0.12);
+  opacity: 1;
+}
+
+.notes-tags.notes-tags-on {
+  background-color: alpha(currentColor, 0.16);
+  opacity: 1;
 }
 
 /* GLASS. The shell extension draws liquid glass under every card and Sysi
