@@ -1,9 +1,10 @@
 // The timer, in the top bar. The strip's `timer` button opens a menu of
 // presets and a field that takes `25m`, `1h30`, `10:00` or `@17:30`; while it
 // runs, a small pill after SYSTEM's readings shows a disk of what is left, in
-// the manner of Time Timer, and the time. At zero it rings: a notification
-// that stays until it is answered, the theme's alarm sound until then (for a
-// minute at most), and the pill turns amber. A click on the pill answers it.
+// the manner of Time Timer, and the time; the disk turns amber for the last
+// stretch. At zero it rings: a notification that stays until it is answered,
+// the theme's alarm sound until then (for a minute at most), and the pill
+// turns red. A click on the pill answers it.
 
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
@@ -27,6 +28,18 @@ const RING_SOUND = 'alarm-clock-elapsed';
 const PILL_WIDTH = 60;
 const PILL_WIDTH_LONG = 74;
 const PILL_GAP = 8;
+// The disk turns amber for the last stretch: five minutes, or the last
+// quarter of a shorter run. It is the one change of colour worth making: a
+// colour that stays put says nothing, and the end itself has its own red,
+// sound and notification.
+const LAST_STRETCH = 300;
+const LAST_STRETCH_SHARE = 0.25;
+const AMBER = [0.949, 0.710, 0.227];
+
+// Whether a run of `total` seconds with `left` to go is in its last stretch.
+export function inLastStretch(left, total) {
+    return left <= Math.min(LAST_STRETCH, total * LAST_STRETCH_SHARE);
+}
 
 const now = () => GLib.get_real_time() / 1000;
 
@@ -422,7 +435,10 @@ export class TimerPanel {
         cr.arc(cx, cy, r - scale / 2, 0, 2 * Math.PI);
         cr.stroke();
         if (fraction > 0) {
-            const [red, green, blue] = countdown.running ? [0.949, 0.710, 0.227] : [color.red / 255, color.green / 255, color.blue / 255];
+            const [red, green, blue] = countdown.running &&
+                inLastStretch(countdown.remaining(), countdown.total)
+                ? AMBER
+                : [color.red / 255, color.green / 255, color.blue / 255];
             cr.setSourceRGBA(red, green, blue, 1);
             const start = -Math.PI / 2;
             cr.moveTo(cx, cy);

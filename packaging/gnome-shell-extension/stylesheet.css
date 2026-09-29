@@ -192,8 +192,8 @@
 }
 
 /* The timer's pill, after SYSTEM's readings: a disk of what is left and the
-   time, in the readings' face. Amber while it runs (Braun's second hand),
-   faint while paused, filled amber while it rings. */
+   time, in the readings' face. White while it runs, amber for the last
+   stretch (see timer.js), faint while paused, filled red while it rings. */
 #panel .sysi-timer-pill {
   margin-left: 8px;
   height: 20px;
@@ -233,12 +233,13 @@
 }
 
 #panel .sysi-timer-pill.sysi-timer-ringing {
-  background-color: #f2b53a;
+  background-color: #e0443e;
 }
 
 #panel .sysi-timer-ringing .sysi-timer-time,
 #panel .sysi-timer-ringing .sysi-timer-disk {
-  color: #1b1306;
+  color: #ffffff;
+  font-weight: 700;
 }
 
 /* The timer's menu: presets, a field for anything else, and the controls

@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "sysi-overlay"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "async-channel",
  "cairo-rs",
