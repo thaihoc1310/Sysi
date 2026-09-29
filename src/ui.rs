@@ -10614,6 +10614,32 @@ fn raise_widget_windows(widget: &impl IsA<gtk::Widget>) {
             }
         }
     }
+    // A scrolled window's overlay scrollbars take the pointer through input
+    // windows of the scrolled window's own, siblings of its content's window
+    // that belong to no child, so the loop above buried them under the
+    // content: the notes list took every press meant for its scrollbar.
+    if let Some(scrolled) = container.downcast_ref::<gtk::ScrolledWindow>() {
+        raise_owned_windows(scrolled);
+    }
+}
+
+/// Raise the windows `widget` registered on its parent's window for itself
+/// rather than for a child (a scrolled window's scrollbar indicators).
+fn raise_owned_windows(widget: &impl IsA<gtk::Widget>) {
+    use glib::translate::ToGlibPtr;
+    let Some(parent) = widget.window() else {
+        return;
+    };
+    let owner = widget.as_ptr() as glib::ffi::gpointer;
+    for window in parent.children() {
+        let mut data: glib::ffi::gpointer = std::ptr::null_mut();
+        // SAFETY: `window` is a live GdkWindow and `data` a valid out pointer;
+        // the user data is only compared, never dereferenced.
+        unsafe { gdk::ffi::gdk_window_get_user_data(window.to_glib_none().0, &mut data) };
+        if data == owner {
+            window.raise();
+        }
+    }
 }
 
 fn raise_card_windows(card: &gtk::EventBox) {
