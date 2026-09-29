@@ -295,7 +295,7 @@ export default class SysiPanelExtension extends Extension {
     _setStripOpen(open) {
         this._strip.visible = open;
         if (!open)
-            this._settingsMenu.close();
+            this._settingsMenu?.close();
         this._systemPanel?.setStripOpen(open);
         this._timerPanel?.setStripOpen(open);
     }
@@ -780,10 +780,7 @@ export default class SysiPanelExtension extends Extension {
         const running = this._readPid() > 0;
         this._indicator.visible = running;
         if (!running) {
-            this._strip.visible = false;
-            this._settingsMenu?.close();
-            this._systemPanel?.setStripOpen(false);
-            this._timerPanel?.setStripOpen(false);
+            this._setStripOpen(false);
             this._unbindOcrEscape();
         } else {
             this._syncOcrEscape();

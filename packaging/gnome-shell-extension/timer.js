@@ -24,6 +24,11 @@ const MAX_SECONDS = 24 * 3600;
 const RING_EVERY_MS = 7000;
 const RING_FOR_MS = 60000;
 const RING_SOUND = 'alarm-clock-elapsed';
+// GLib's timeouts run on a clock that stops while the machine sleeps, so the
+// end is looked for at least this often against the wall clock: woken behind
+// the lock screen, where no pill ticks, it rings within a minute rather than
+// as late as the sleep was long.
+const CHECK_EVERY_MS = 60000;
 // The pill keeps one width per run, so SYSTEM's readings do not shuffle as
 // the time counts down: one for minutes, one for hours.
 const PILL_WIDTH = 60;
@@ -136,7 +141,7 @@ const countdown = {
 
     _schedule() {
         this._unschedule();
-        const ms = Math.max(0, Math.ceil(this.endsAt - now()));
+        const ms = Math.min(CHECK_EVERY_MS, Math.max(0, Math.ceil(this.endsAt - now())));
         this._endId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
             this._endId = 0;
             this.check();
@@ -157,7 +162,13 @@ const countdown = {
         this.running = false;
         this.left = 0;
         this.ringing = true;
-        this._notify();
+        // The sound is what cannot be missed; a notification that fails must
+        // not take it down too.
+        try {
+            this._notify();
+        } catch (error) {
+            logError(error, 'Sysi timer notification failed');
+        }
         const player = global.display.get_sound_player();
         const started = now();
         const cancel = this._ringCancel = new Gio.Cancellable();
@@ -376,7 +387,8 @@ export class TimerPanel {
         const shown = active && !this._stripOpen;
         const long = countdown.total >= 3600 || countdown.remaining() >= 3600;
         const width = long ? PILL_WIDTH_LONG : PILL_WIDTH;
-        this._pill.width = width;
+        if (this._pill.width !== width)
+            this._pill.width = width;
         this._pill.visible = shown;
         this._systemPanel?.setReserve(active ? width + PILL_GAP : 0);
         for (const [name, on] of [
