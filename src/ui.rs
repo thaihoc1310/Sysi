@@ -13498,6 +13498,8 @@ fn tag_choices(counts: Vec<(String, usize)>, on: &[String]) -> Vec<TagChoice> {
 
 /// How many tag lines a list shows before it scrolls.
 const TAG_LIST_ROWS: usize = 8;
+/// The air between two tag lines, so two lit ones do not run together.
+const TAG_ROW_GAP: i32 = 2;
 /// How far one notch of the wheel scrolls a tag list.
 const TAG_WHEEL_STEP: f64 = 44.0;
 
@@ -13557,7 +13559,7 @@ impl TagList {
         // An overlay indicator only shows for a pointer the scroller hears.
         scroller.set_overlay_scrolling(false);
         scroller.set_shadow_type(gtk::ShadowType::None);
-        let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let rows = gtk::Box::new(gtk::Orientation::Vertical, TAG_ROW_GAP);
         scroller.add(&rows);
         item.add(&scroller);
         menu.append(&item);
@@ -13641,9 +13643,10 @@ impl TagList {
         // held at the height of the lines it shows, up to TAG_LIST_ROWS. It is
         // measured only as the menu opens: an open GTK menu does not grow or
         // shrink, and scrolls whatever overflows behind arrows instead, so a
-        // tag added or deleted while it is open changes what the list holds,
-        // not how tall it is. (A new tag is the note's, and shows at the top.)
+        // tag deleted or renamed while it is open changes what the list holds,
+        // not how tall it is. (A tag typed into the TAG menu reopens it.)
         if !self.menu.is_mapped() {
+            let shown = lines.len().clamp(1, TAG_LIST_ROWS) as i32;
             let mut height: i32 = lines
                 .iter()
                 .take(TAG_LIST_ROWS)
@@ -13651,7 +13654,8 @@ impl TagList {
                     line.row.show_all();
                     line.row.preferred_height().1
                 })
-                .sum();
+                .sum::<i32>()
+                + TAG_ROW_GAP * (shown - 1);
             if let Some(empty) = &empty {
                 empty.show();
                 height += empty.preferred_height().1;
@@ -14075,10 +14079,13 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
     });
     // Enter gives the note the tag typed, or the tag in use it matches but
     // for case, and shows it lit at the top; the menu stays for the next.
+    let refocus = Rc::new(Cell::new(false));
     entry.connect_activate({
         let state = state.clone();
         let note = note.clone();
         let refill = refill.clone();
+        let item = item.clone();
+        let refocus = refocus.clone();
         move |entry| {
             let (Some(id), Some(tag)) = (note.get(), crate::state::clean_tag(&entry.text())) else {
                 return;
@@ -14096,7 +14103,20 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
                 changed();
             }
             entry.set_text("");
+            // An open GTK menu does not grow, so the list is shown at its new
+            // height by closing the submenu and opening it again, the field
+            // taking the keyboard back once it is up.
+            let Some(shell) = item
+                .parent()
+                .and_then(|parent| parent.downcast::<gtk::MenuShell>().ok())
+            else {
+                refill();
+                return;
+            };
+            refocus.set(true);
+            shell.deselect();
             refill();
+            shell.select_item(&item);
         }
     });
     // A menu item lays its input window over the field, so a click there is
@@ -14111,6 +14131,14 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
             send_focus(&entry, true);
         }
     };
+    menu.connect_map({
+        let focus_field = focus_field.clone();
+        move |_| {
+            if refocus.take() {
+                focus_field();
+            }
+        }
+    });
     menu.connect_button_press_event({
         let field = field.clone();
         move |menu, event| match menu_point(menu, event.root()) {
