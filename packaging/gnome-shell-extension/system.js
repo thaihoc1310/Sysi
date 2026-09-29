@@ -25,10 +25,11 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 // Clear space between the last reading and the clock.
-const CLOCK_GAP = 6;
+const CLOCK_GAP = 2;
 // The least clear space the row may ever leave the clock, however far a value
-// has outgrown the two digits it was reckoned at.
-const CLOCK_CLEAR = 2;
+// has outgrown the two digits it was reckoned at. The clock's own padding
+// keeps its words clear of the row even at none.
+const CLOCK_CLEAR = 0;
 // Between a group and the hairline on either side of it.
 const GROUP_GAP = 8;
 // Between two devices of one group.
@@ -312,6 +313,35 @@ export class SystemPanel {
         });
     }
 
+    // How wide a value is now. Not cached: values change every sample, and a
+    // cache of them would grow for as long as the shell runs.
+    _textNow(text) {
+        const label = this._probe.cells[0];
+        if (!label)
+            return this._text('value', text);
+        setValue(label, text);
+        return Math.ceil(label.get_preferred_width(-1)[1]);
+    }
+
+    // The row's width with the values it has now, each at least as wide as
+    // the two digits it is given room for, worked out on the probe. Asking the
+    // row itself returned text laid out before its last change, and read the
+    // row wide enough to drop the network rate while it had room to spare.
+    _widthNow(layout) {
+        let width = 0;
+        for (const [index, {devices}] of layout.entries()) {
+            width += index ? 2 * GROUP_GAP + HAIRLINE : 0;
+            for (const [n, {device, cells}] of devices.entries()) {
+                width += (n ? DEVICE_GAP : 0) + this._text('caption', device.label) + CAPTION_GAP;
+                for (const [i, cell] of cells.entries()) {
+                    const least = this._text('value', cell.usual ?? cell.widest);
+                    width += (i ? VALUE_GAP : 0) + Math.max(least, this._textNow(cell.value ?? '–'));
+                }
+            }
+        }
+        return width;
+    }
+
     // A device's width with these values in it.
     _measure(caption, values) {
         return this._text('caption', caption) + CAPTION_GAP +
@@ -449,13 +479,8 @@ export class SystemPanel {
         // A value can outgrow its reckoning (a download past 100M both ways).
         // Rather than let the row run into the clock, the last group steps
         // out until it shrinks back.
-        // The preferred width counts the row's margin, which _room has
-        // already taken off.
-        const node = this._readout.get_theme_node();
-        const width = this._readout.get_preferred_width(-1)[1] -
-            node.get_margin(St.Side.LEFT) - node.get_margin(St.Side.RIGHT);
         const last = this._groups.get(layout[layout.length - 1].group.key);
-        if (layout.length > 1 && width > this._room() + CLOCK_GAP - CLOCK_CLEAR) {
+        if (layout.length > 1 && this._widthNow(layout) > this._room() + CLOCK_GAP - CLOCK_CLEAR) {
             last.box.visible = false;
             last.hairline.visible = false;
         }

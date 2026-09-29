@@ -254,15 +254,17 @@ const METRICS: [Metric; 10] = [
 ];
 
 const PERCENT_WIDEST: &str = "100%";
-const CELSIUS_WIDEST: &str = "100°C";
+const CELSIUS_WIDEST: &str = "99°C";
 const NETWORK_WIDEST: &str = "↓888M ↑888M";
 
 fn percent(value: f64) -> String {
     format!("{:.0}%", value.clamp(0.0, 100.0))
 }
 
+/// A temperature, held at 99°C: a part that hot is throttling or failing,
+/// and a third digit is room the bar would keep free all day for nothing.
 fn celsius(value: f64) -> String {
-    format!("{value:.0}°C")
+    format!("{:.0}°C", value.clamp(0.0, 99.0))
 }
 
 /// A throughput in three digits at most, the way the bar has room for:
@@ -849,7 +851,7 @@ mod tests {
     #[test]
     fn a_value_is_usually_given_room_for_two_digits() {
         assert_eq!(usual("100%"), "88%");
-        assert_eq!(usual("100°C"), "88°C");
+        assert_eq!(usual("99°C"), "88°C");
         assert_eq!(usual("888G/88.8T"), "888G/88.8T");
         assert_eq!(usual("↓888M ↑888M"), "↓88M ↑88M");
     }
