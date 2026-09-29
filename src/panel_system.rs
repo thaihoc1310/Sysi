@@ -253,7 +253,7 @@ const METRICS: [Metric; 12] = [
     },
     Metric {
         key: "battery_time",
-        name: "battery time",
+        name: "power time",
         enabled: |d| d.battery_time,
         set: |d, on| d.battery_time = on,
     },
@@ -609,46 +609,40 @@ fn groups(
         Group {
             key: "power",
             // On the battery the reading is the whole machine's; on mains it
-            // is the processor package and the GPUs. The caption says which.
-            // After it, how long the battery lasts (LEFT) or takes to fill
-            // (FULL), while it is doing either.
-            devices: machine
-                .power
-                .map(|_| {
+            // is the processor package and the GPUs. The caption says which,
+            // and so which way the time after it runs: how long the battery
+            // lasts (`BAT 22W 2h30`), or takes to fill (`PWR 8.0W 16m`).
+            // Plugged in and full, there is no time to tell.
+            devices: (machine.power.is_some() || machine.battery.is_some())
+                .then(|| {
                     let power = last.and_then(|s| s.power);
-                    Device {
-                        label: if power.is_some_and(|p| p.on_battery) {
-                            "BAT".into()
-                        } else {
-                            "PWR".into()
-                        },
-                        cells: vec![cell(
+                    let battery = last
+                        .and_then(|s| s.battery)
+                        .filter(|battery| battery.state != BatteryState::Idle);
+                    let on_battery = power.is_some_and(|p| p.on_battery)
+                        || battery.is_some_and(|b| b.state == BatteryState::Discharging);
+                    let mut cells = Vec::new();
+                    if machine.power.is_some() {
+                        cells.push(cell(
                             "power",
                             WATTS_WIDEST.into(),
                             power.map(|p| watts(p.watts)),
-                        )],
+                        ));
+                    }
+                    if machine.battery.is_some() && battery.is_some() {
+                        cells.push(cell(
+                            "battery_time",
+                            TIME_LEFT_WIDEST.into(),
+                            battery.and_then(|b| b.hours).map(time_left),
+                        ));
+                    }
+                    Device {
+                        label: if on_battery { "BAT" } else { "PWR" }.into(),
+                        cells,
                     }
                 })
+                .filter(|device| !device.cells.is_empty())
                 .into_iter()
-                .chain(
-                    last.and_then(|s| s.battery)
-                        .filter(|_| machine.battery.is_some())
-                        .and_then(|battery| {
-                            let label = match battery.state {
-                                BatteryState::Discharging => "LEFT",
-                                BatteryState::Charging => "FULL",
-                                BatteryState::Idle => return None,
-                            };
-                            Some(Device {
-                                label: label.into(),
-                                cells: vec![cell(
-                                    "battery_time",
-                                    TIME_LEFT_WIDEST.into(),
-                                    battery.hours.map(time_left),
-                                )],
-                            })
-                        }),
-                )
                 .collect(),
         },
         Group {
@@ -903,7 +897,7 @@ mod tests {
         let machine = machine();
         assert_eq!(
             bar(&groups(&everything(), &machine, Some(&machine))),
-            "CPU 13% 56°C | RAM 75%  SWAP 5% | NVI 12% 45°C 20M/8G  AMD 38°C 481M/512M | SAM 9% 42°C  UMI 38°C | PWR 7.9W  FULL 1h20 | NET ↓9K ↑28K"
+            "CPU 13% 56°C | RAM 75%  SWAP 5% | NVI 12% 45°C 20M/8G  AMD 38°C 481M/512M | SAM 9% 42°C  UMI 38°C | PWR 7.9W 1h20 | NET ↓9K ↑28K"
         );
     }
 
@@ -958,6 +952,7 @@ mod tests {
         );
         // A machine that can report neither is not offered the reading.
         machine.power = None;
+        machine.battery = None;
         assert!(groups(&details, &machine, None)
             .iter()
             .find(|group| group.key == "power")
@@ -983,12 +978,9 @@ mod tests {
         let read = |last: &SystemSnapshot| bar(&groups(&details, &machine, Some(last)));
         assert_eq!(
             read(&at(BatteryState::Discharging, Some(2.49))),
-            "BAT 16W  LEFT 2h30"
+            "BAT 16W 2h30"
         );
-        assert_eq!(
-            read(&at(BatteryState::Charging, Some(0.75))),
-            "PWR 16W  FULL 45m"
-        );
+        assert_eq!(read(&at(BatteryState::Charging, Some(0.75))), "PWR 16W 45m");
         // Plugged in and full, there is no time to tell...
         let full = at(BatteryState::Idle, None);
         assert_eq!(read(&full), "PWR 16W");
@@ -1008,6 +1000,19 @@ mod tests {
             battery: None,
             ..machine.clone()
         }));
+        // The time alone, the watts off: the caption still says which way.
+        let time_only = SystemDetails {
+            power: false,
+            ..details
+        };
+        let unplugged = SystemSnapshot {
+            power: None,
+            ..at(BatteryState::Discharging, Some(2.49))
+        };
+        assert_eq!(
+            bar(&groups(&time_only, &machine, Some(&unplugged))),
+            "BAT 2h30"
+        );
         // Off, it is not on the bar, whichever way the battery goes.
         let off = SystemDetails {
             battery_time: false,
