@@ -631,17 +631,26 @@ const GlassCard = GObject.registerClass({
     place(x, y, width, height, radius, pressed) {
         this.set_position(x - MARGIN, y - MARGIN);
         this.set_size(width + 2 * MARGIN, height + 2 * MARGIN);
-        const changed = this._rect[2] !== width || this._rect[3] !== height ||
+        let changed = this._rect[2] !== width || this._rect[3] !== height ||
             this._radius !== radius;
         this._rect = [MARGIN, MARGIN, width, height];
         this._radius = radius;
+        // The light stays under the pointer while the card is held. Dragged,
+        // the card carries the pointer's spot along anyway; resized, the
+        // edge runs away from where it was pressed and left the light behind.
+        if (pressed) {
+            const [pointerX, pointerY] = global.get_pointer();
+            // Through the parent, and from the place just set: the card's own
+            // transform is not laid out anew until the next frame.
+            const [ok, parentX, parentY] = this.get_parent()?.transform_stage_point(pointerX, pointerY) ?? [false];
+            const at = ok
+                ? [parentX - (x - MARGIN), parentY - (y - MARGIN)]
+                : [MARGIN + width / 2, MARGIN + height / 2];
+            changed ||= at[0] !== this._pressAt[0] || at[1] !== this._pressAt[1];
+            this._pressAt = at;
+        }
         if (pressed !== this._pressed) {
             this._pressed = pressed;
-            if (pressed) {
-                const [pointerX, pointerY] = global.get_pointer();
-                const [ok, localX, localY] = this.transform_stage_point(pointerX, pointerY);
-                this._pressAt = ok ? [localX, localY] : [this.width / 2, this.height / 2];
-            }
             this.remove_transition('press');
             this.ease_property('press', pressed ? 1 : 0, {
                 duration: pressed ? PRESS_IN_MS : PRESS_OUT_MS,
