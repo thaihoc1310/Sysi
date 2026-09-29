@@ -14,9 +14,8 @@
 // Everything sits at its natural width with even gaps, like a flex row. A
 // value is never narrower than two digits of itself, so the row only moves
 // when one grows a third. The row stops short of the clock: whether the next
-// reading fits is judged with every value at two digits (the network rate at
-// its widest), and one that would not fit cannot be turned on; another has to
-// be turned off first.
+// reading fits is judged with every value at two digits, and one that would
+// not fit cannot be turned on; another has to be turned off first.
 
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
@@ -88,10 +87,10 @@ export class SystemPanel {
             reactive: false,
         });
         row.add_child(this._probeBox);
-        this._probe.box.connect('style-changed', () => {
-            this._widths.clear();
-            this._renderLater();
-        });
+        // The box and each label take their style in their own time; a width
+        // measured before the last of them arrived is in the wrong font.
+        this._forgetWidthsOnStyle(this._probe.box);
+        this._forgetWidthsOnStyle(this._probe.caption);
 
         this._menu = new PopupMenu.PopupMenu(button, 0.5, St.Side.TOP);
         this._menu.actor.add_style_class_name('sysi-settings-menu');
@@ -288,9 +287,12 @@ export class SystemPanel {
         if (kind === 'caption') {
             label.text = text;
         } else {
-            label = this._probe.cells[0] ??= this._value();
-            if (!label.get_parent())
+            label = this._probe.cells[0];
+            if (!label) {
+                label = this._probe.cells[0] = this._value();
                 this._probe.values.add_child(label);
+                this._forgetWidthsOnStyle(label);
+            }
             setValue(label, text);
         }
         const width = Math.ceil(label.get_preferred_width(-1)[1]);
@@ -298,6 +300,13 @@ export class SystemPanel {
         if (width > 0 && this._probe.box.mapped)
             this._widths.set(key, width);
         return width;
+    }
+
+    _forgetWidthsOnStyle(actor) {
+        actor.connect('style-changed', () => {
+            this._widths.clear();
+            this._renderLater();
+        });
     }
 
     // A device's width with these values in it.
@@ -312,13 +321,9 @@ export class SystemPanel {
     // whole, rather than drawn into the clock.
     _layout(isOn) {
         // What each value is given in the reckoning: two digits of itself,
-        // which is what the row shows but for a rare 100% or 100°C, and the
-        // clock gap takes that digit. The network rate is the exception: it
-        // runs from kilobytes to megabytes all day, and reckoned at its usual
-        // width it would drop out of the row whenever a download started.
-        const reckoned = cell => cell.metric === 'network'
-            ? cell.widest
-            : cell.usual ?? cell.widest;
+        // which is what the row shows but for a rare 100%, 100°C or a
+        // download past 100M, and the clock gap takes that digit.
+        const reckoned = cell => cell.usual ?? cell.widest;
         const room = this._room();
         const shown = [];
         let used = 0;

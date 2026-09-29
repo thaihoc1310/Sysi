@@ -249,7 +249,7 @@ const METRICS: [Metric; 9] = [
 
 const PERCENT_WIDEST: &str = "100%";
 const CELSIUS_WIDEST: &str = "100°C";
-const NETWORK_WIDEST: &str = "↓888.8M ↑888.8M";
+const NETWORK_WIDEST: &str = "↓888M ↑888M";
 
 fn percent(value: f64) -> String {
     format!("{:.0}%", value.clamp(0.0, 100.0))
@@ -259,13 +259,20 @@ fn celsius(value: f64) -> String {
     format!("{value:.0}°C")
 }
 
-/// A throughput short enough for the bar: `1.2M`, `340K`, `0K`.
+/// A throughput in three digits at most, the way the bar has room for:
+/// `0K`, `340K`, `1.2M`, `88M`, `120M`. A tenth of a megabyte is only worth
+/// its character below ten.
 fn rate(bytes_per_sec: f64) -> String {
-    let rate = bytes_per_sec.max(0.0);
-    if rate >= 1_048_576.0 {
-        format!("{:.1}M", rate / 1_048_576.0)
+    let kilobytes = bytes_per_sec.max(0.0) / 1024.0;
+    let megabytes = kilobytes / 1024.0;
+    if kilobytes < 999.5 {
+        format!("{kilobytes:.0}K")
+    } else if megabytes < 9.95 {
+        format!("{megabytes:.1}M")
+    } else if megabytes < 999.5 {
+        format!("{megabytes:.0}M")
     } else {
-        format!("{:.0}K", rate / 1024.0)
+        format!("{:.1}G", megabytes / 1024.0)
     }
 }
 
@@ -326,7 +333,7 @@ fn fullness_widest(total_kib: u64, units: Units, amounts: bool) -> String {
 }
 
 /// A widest value cut to two digits wherever it has three or more: `100%` to
-/// `88%`, `888G/88.8T` to `88G/88.8T`, `↓888.8M` to `↓88.8M`.
+/// `88%`, `888G/88.8T` to `88G/88.8T`, `↓888M` to `↓88M`.
 fn usual(widest: &str) -> String {
     let mut out = String::new();
     let mut run = 0;
@@ -789,11 +796,27 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_never_takes_more_than_three_digits() {
+        let kib = 1024.0;
+        let mib = 1024.0 * kib;
+        assert_eq!(rate(500.0), "0K");
+        assert_eq!(rate(340.0 * kib), "340K");
+        assert_eq!(rate(999.4 * kib), "999K");
+        assert_eq!(rate(1.25 * mib), "1.2M");
+        assert_eq!(rate(9.94 * mib), "9.9M");
+        assert_eq!(rate(88.0 * mib), "88M");
+        assert_eq!(rate(120.0 * mib), "120M");
+        for bytes in [0.0, 999.6 * kib, 9.96 * mib, 999.4 * mib] {
+            assert!(rate(bytes).chars().count() <= "888M".chars().count(), "{}", rate(bytes));
+        }
+    }
+
+    #[test]
     fn a_value_is_usually_given_room_for_two_digits() {
         assert_eq!(usual("100%"), "88%");
         assert_eq!(usual("100°C"), "88°C");
         assert_eq!(usual("888G/88.8T"), "88G/88.8T");
-        assert_eq!(usual("↓888.8M ↑888.8M"), "↓88.8M ↑88.8M");
+        assert_eq!(usual("↓888M ↑888M"), "↓88M ↑88M");
     }
 
     #[test]
@@ -860,8 +883,8 @@ mod tests {
             total_kib: 1_000_000_000,
         });
         worst.network = Some(NetworkRates {
-            down_bytes_per_sec: 888.8 * 1_048_576.0,
-            up_bytes_per_sec: 888.8 * 1_048_576.0,
+            down_bytes_per_sec: 999.4 * 1_048_576.0,
+            up_bytes_per_sec: 999.4 * 1024.0,
         });
         for amounts in [false, true] {
             let details = SystemDetails {
