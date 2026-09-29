@@ -1,6 +1,6 @@
 [package]
 name = "sysi-overlay"
-version = "2.2.6"
+version = "2.2.7"
 edition = "2021"
 description = "A tiny transparent desktop overlay for Ubuntu"
 license = "MIT"

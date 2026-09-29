@@ -13500,18 +13500,18 @@ struct TagChoice {
     on: bool,
 }
 
-/// The tags in `counts` (most used first) as choices, the ticked ones on top.
+/// The tags in `counts` as choices, in its order (the most used first), the
+/// ones in `on` ticked. The order stays put whatever is ticked, so a line
+/// does not move as it is clicked and every menu reads the same.
 fn tag_choices(counts: Vec<(String, usize)>, on: &[String]) -> Vec<TagChoice> {
-    let (mut ticked, rest): (Vec<_>, Vec<_>) = counts
+    counts
         .into_iter()
         .map(|(name, count)| TagChoice {
             on: on.contains(&name),
             name,
             count,
         })
-        .partition(|choice| choice.on);
-    ticked.extend(rest);
-    ticked
+        .collect()
 }
 
 /// How many tag lines a list shows before it scrolls.
@@ -15397,7 +15397,7 @@ mod tests {
     }
 
     #[test]
-    fn a_notes_tags_come_first_and_sit_on_its_meta_line() {
+    fn tags_keep_their_order_and_sit_on_a_notes_meta_line() {
         let counts = vec![
             ("vocab".to_owned(), 9),
             ("speaking".to_owned(), 4),
@@ -15410,7 +15410,7 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            [("ielts", true), ("vocab", false), ("speaking", false)]
+            [("vocab", false), ("speaking", false), ("ielts", true)]
         );
 
         let now = 1_700_000_000_000;
