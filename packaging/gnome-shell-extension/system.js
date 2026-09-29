@@ -25,11 +25,14 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 // Clear space between the last reading and the clock.
-const CLOCK_GAP = 24;
+const CLOCK_GAP = 12;
+// The least clear space the row may ever leave the clock, however far a value
+// has outgrown the two digits it was reckoned at.
+const CLOCK_CLEAR = 4;
 // Between a group and the hairline on either side of it.
-const GROUP_GAP = 10;
+const GROUP_GAP = 8;
 // Between two devices of one group.
-const DEVICE_GAP = 12;
+const DEVICE_GAP = 10;
 // Between a caption and its first value, and between two values.
 const CAPTION_GAP = 5;
 const VALUE_GAP = 7;
@@ -442,6 +445,15 @@ export class SystemPanel {
                 for (const label of actors.cells.slice(placed.cells.length))
                     label.visible = false;
             }
+        }
+        // A value can outgrow its reckoning (a download past 100M both ways).
+        // Rather than let the row run into the clock, the last group steps
+        // out until it shrinks back.
+        const last = this._groups.get(layout[layout.length - 1].group.key);
+        if (layout.length > 1 &&
+            this._readout.get_preferred_width(-1)[1] > this._room() + CLOCK_GAP - CLOCK_CLEAR) {
+            last.box.visible = false;
+            last.hairline.visible = false;
         }
     }
 
