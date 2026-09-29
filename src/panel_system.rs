@@ -253,12 +253,14 @@ const METRICS: [Metric; 10] = [
     },
 ];
 
-const PERCENT_WIDEST: &str = "100%";
+const PERCENT_WIDEST: &str = "99%";
 const CELSIUS_WIDEST: &str = "99°C";
 const NETWORK_WIDEST: &str = "↓888M ↑888M";
 
+/// A percentage, held at 99%: a full 100 says nothing 99 does not, and a
+/// third digit is room the bar would keep free all day for it.
 fn percent(value: f64) -> String {
-    format!("{:.0}%", value.clamp(0.0, 100.0))
+    format!("{:.0}%", value.clamp(0.0, 99.0))
 }
 
 /// A temperature, held at 99°C: a part that hot is throttling or failing,
@@ -344,7 +346,7 @@ fn fullness_widest(total_kib: u64, units: Units, amounts: bool) -> String {
     }
 }
 
-/// A widest value cut to two digits wherever it has three or more: `100%` to
+/// A widest value cut to two digits wherever it has three or more: `999%` to
 /// `88%`, `↓888M` to `↓88M`. Used/total is left whole.
 fn usual(widest: &str) -> String {
     // Used over total: the total never changes, and the used part runs to
@@ -850,7 +852,7 @@ mod tests {
 
     #[test]
     fn a_value_is_usually_given_room_for_two_digits() {
-        assert_eq!(usual("100%"), "88%");
+        assert_eq!(usual("99%"), "88%");
         assert_eq!(usual("99°C"), "88°C");
         assert_eq!(usual("888G/88.8T"), "888G/88.8T");
         assert_eq!(usual("↓888M ↑888M"), "↓88M ↑88M");
