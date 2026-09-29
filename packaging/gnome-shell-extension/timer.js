@@ -75,6 +75,22 @@ const countdown = {
         return this.running ? Math.max(0, this.endsAt - now()) / 1000 : this.left;
     },
 
+    // Set from the menu: held at its full length until started, so it can be
+    // picked ahead of the thing it times.
+    set(seconds) {
+        this._silence();
+        this._unschedule();
+        this.total = this.left = seconds;
+        this.endsAt = 0;
+        this.running = false;
+        this._changed();
+    },
+
+    // Whether it has been set and not yet started.
+    get unstarted() {
+        return !this.running && !this.ringing && this.left > 0 && this.left === this.total;
+    },
+
     start(seconds) {
         this._silence();
         this.total = seconds;
@@ -233,10 +249,10 @@ const countdown = {
 export class TimerPanel {
     // `row` is the panel row the pill joins, after SYSTEM's readings;
     // `button` is the strip's `timer`; `systemPanel` is told how much of the
-    // row the pill takes; `onStart` runs once a timer is set from the menu.
-    constructor({row, button, systemPanel, onStart}) {
+    // row the pill takes; `onSet` runs once a timer is set from the menu.
+    constructor({row, button, systemPanel, onSet}) {
         this._button = button;
-        this._onStart = onStart;
+        this._onSet = onSet;
         this._systemPanel = systemPanel;
         this._stripOpen = false;
         this._tickId = 0;
@@ -314,7 +330,7 @@ export class TimerPanel {
                     label: minutes < 60 ? String(minutes) : '1h',
                     can_focus: true,
                 });
-                chip.connect('clicked', () => this._start(minutes * 60));
+                chip.connect('clicked', () => this._set(minutes * 60));
                 chips.add_child(chip);
             }
             body.add_child(chips);
@@ -331,7 +347,7 @@ export class TimerPanel {
                 this._entry.add_style_class_name('sysi-timer-wrong');
                 return;
             }
-            this._start(seconds);
+            this._set(seconds);
         });
         this._entry.clutter_text.connect('text-changed', () => {
             this._entry.remove_style_class_name('sysi-timer-wrong');
@@ -374,10 +390,10 @@ export class TimerPanel {
         this._menu.open();
     }
 
-    _start(seconds) {
-        countdown.start(seconds);
+    _set(seconds) {
+        countdown.set(seconds);
         this._menu.close();
-        this._onStart?.();
+        this._onSet?.();
     }
 
     _render() {
@@ -413,9 +429,11 @@ export class TimerPanel {
     }
 
     _renderMenu() {
-        // Pause, +1 min and cancel only mean something while a timer runs.
+        // Start or pause, +1 min and cancel only mean something once a timer
+        // is set.
         this._controls.visible = countdown.active && !countdown.ringing;
-        this._pause.label = countdown.running ? 'pause' : 'resume';
+        this._pause.label = countdown.running ? 'pause'
+            : countdown.unstarted ? 'start' : 'resume';
     }
 
     // Wake as the displayed second changes, not on a fixed beat that would

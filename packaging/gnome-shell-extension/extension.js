@@ -101,7 +101,7 @@ export default class SysiPanelExtension extends Extension {
             button: this._timer,
             systemPanel: this._systemPanel,
             // A timer just set is what the row should show next.
-            onStart: () => this._setStripOpen(false),
+            onSet: () => this._setStripOpen(false),
         });
         this._pidFile = Gio.File.new_for_path(
             GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi', 'pid']),
