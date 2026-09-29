@@ -31,7 +31,7 @@ const CLOCK_GAP = 2;
 // keeps its words clear of the row even at none.
 const CLOCK_CLEAR = 0;
 // Between a group and the hairline on either side of it.
-const GROUP_GAP = 8;
+const GROUP_GAP = 10;
 // Between two devices of one group.
 const DEVICE_GAP = 10;
 // Between a caption and its first value, and between two values.
