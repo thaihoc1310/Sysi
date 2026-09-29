@@ -88,6 +88,9 @@ pub struct SystemReader {
     /// machine with no NVIDIA driver pays for spawning a missing process every
     /// two seconds for as long as the GPU meters are on.
     nvidia_missing: bool,
+    /// The NVIDIA cards' PCI devices, found on first use, whose power state
+    /// says whether asking `nvidia-smi` would wake one.
+    nvidia_devices: Option<Vec<PathBuf>>,
     /// The last interface counters and when they were read, which is what a
     /// throughput rate is measured against.
     previous_network: Option<(Instant, u64, u64)>,
@@ -229,6 +232,31 @@ impl SystemReader {
         if self.nvidia_missing {
             return Vec::new();
         }
+        // A laptop's discrete card sleeps while nothing uses it, and
+        // nvidia-smi wakes it to answer: polled every two seconds, it would
+        // never sleep again, and cost the battery watts for a reading of 0%.
+        // A sleeping card reads as idle, and is left asleep.
+        // The first reading is the one the bar is laid out from, so it asks
+        // even a sleeping card what it can report.
+        let first = self.nvidia_devices.is_none();
+        let devices = self.nvidia_devices.get_or_insert_with(find_nvidia_devices);
+        if !first
+            && !devices.is_empty()
+            && devices.iter().all(|device| {
+                fs::read_to_string(device.join("power/runtime_status"))
+                    .is_ok_and(|status| status.trim() == "suspended")
+            })
+        {
+            return devices
+                .iter()
+                .map(|_| GpuSnapshot {
+                    label: "NVIDIA".into(),
+                    percent: Some(0.0),
+                    temperature: None,
+                    memory: None,
+                })
+                .collect();
+        }
         let output = Command::new("nvidia-smi")
             .args([
                 "--query-gpu=index,name,utilization.gpu,temperature.gpu,memory.used,memory.total",
@@ -318,6 +346,17 @@ fn clamp_percent(value: f64) -> f64 {
     value.clamp(0.0, 100.0)
 }
 
+/// Every NVIDIA display controller on the PCI bus.
+fn find_nvidia_devices() -> Vec<PathBuf> {
+    sorted_dirs(Path::new("/sys/bus/pci/devices"))
+        .into_iter()
+        .filter(|device| {
+            let read = |name: &str| fs::read_to_string(device.join(name)).unwrap_or_default();
+            read("vendor").trim() == "0x10de" && read("class").trim().starts_with("0x03")
+        })
+        .collect()
+}
+
 fn read_amd_gpus() -> Vec<GpuSnapshot> {
     let Ok(entries) = fs::read_dir("/sys/class/drm") else {
         return Vec::new();
@@ -385,16 +424,23 @@ fn amd_gpu_temperature(device: &Path) -> Option<f64> {
         .and_then(read_millidegrees)
 }
 
+/// How full a filesystem is, the way `df` has it: the blocks in use over
+/// those in use plus those an ordinary user may still fill. The ones ext4
+/// keeps back for root (five percent by default) are counted as neither;
+/// counting them as used read an ext4 root 30% full as 33%.
 fn read_disk_usage(path: impl AsRef<Path>) -> Option<Usage> {
-    let path = path.as_ref();
-    let total = fs2::total_space(path).ok()?;
-    let available = fs2::available_space(path).ok()?;
-    if total == 0 {
+    let path = std::ffi::CString::new(path.as_ref().as_os_str().as_encoded_bytes()).ok()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is NUL-terminated and `stats` is a valid out pointer.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
         return None;
     }
-    Some(Usage {
-        used_kib: total.saturating_sub(available) / 1024,
-        total_kib: total / 1024,
+    let block = stats.f_frsize as u64;
+    let used = (stats.f_blocks as u64).saturating_sub(stats.f_bfree as u64) * block / 1024;
+    let available = stats.f_bavail as u64 * block / 1024;
+    (used + available > 0).then_some(Usage {
+        used_kib: used,
+        total_kib: used + available,
     })
 }
 
@@ -488,7 +534,11 @@ fn drive_usage(block: &str, mounted: &[(String, String)]) -> Option<Usage> {
 }
 
 fn read_cpu_lines() -> Option<Vec<(u64, u64)>> {
-    let raw = fs::read_to_string("/proc/stat").ok()?;
+    parse_cpu_lines(&fs::read_to_string("/proc/stat").ok()?)
+}
+
+/// Each CPU line of /proc/stat as its busy-or-idle total and its idle part.
+fn parse_cpu_lines(raw: &str) -> Option<Vec<(u64, u64)>> {
     let mut result = Vec::new();
     for line in raw.lines().take_while(|line| line.starts_with("cpu")) {
         let mut values = line.split_whitespace();
@@ -500,8 +550,12 @@ fn read_cpu_lines() -> Option<Vec<(u64, u64)>> {
         if nums.len() < 5 {
             continue;
         }
+        // user nice system idle iowait irq softirq steal. The two after
+        // them, guest and guest_nice, are already counted in user and nice:
+        // summing them too counted a virtual machine's time twice and read
+        // the CPU as idler than it was, the way top and htop do not.
         result.push((
-            nums.iter().sum(),
+            nums.iter().take(8).sum(),
             nums[3] + nums.get(4).copied().unwrap_or(0),
         ));
     }
@@ -855,7 +909,8 @@ fn network_rates(previous: (u64, u64), current: (u64, u64), elapsed_seconds: f64
 #[cfg(test)]
 mod tests {
     use super::{
-        drive_vendor, format_drive_capacity, network_rates, number_repeated_labels, parse_mounts,
+        drive_vendor, format_drive_capacity, network_rates, number_repeated_labels, parse_cpu_lines,
+        parse_mounts,
         parse_memory, parse_network_counters, parse_nvidia_gpus, GpuSnapshot, Usage,
     };
 
@@ -894,6 +949,13 @@ mod tests {
         // shown as zero.
         assert!(parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], [N/A], [N/A], [N/A]\n").is_empty());
         assert!(parse_nvidia_gpus("nvidia-smi: command failed\n").is_empty());
+    }
+
+    #[test]
+    fn a_virtual_machines_time_is_counted_once() {
+        // guest (400) and guest_nice (0) are already inside user (1000).
+        let raw = "cpu  1000 0 500 8000 100 0 0 0 400 0\nintr 1\n";
+        assert_eq!(parse_cpu_lines(raw), Some(vec![(9600, 8100)]));
     }
 
     #[test]
