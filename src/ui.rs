@@ -10180,6 +10180,7 @@ fn attach_color_mode_menu(
         let state = state.clone();
         let registry = registry.clone();
         let key = key.clone();
+        let card = widget.clone();
         move |item| {
             let next = saved_color_mode(&state.borrow(), &key).next();
             state
@@ -10189,6 +10190,12 @@ fn attach_color_mode_menu(
             let _ = state.borrow().save();
             apply_widget_color_mode(&registry, &key, next);
             item.set_label(next.next().label());
+            if let Some(menu) = item
+                .parent()
+                .and_then(|menu| menu.downcast::<gtk::Menu>().ok())
+            {
+                crate::glass::restyle_menu(&menu, &card);
+            }
         }
     });
     menu.append(&color_item);

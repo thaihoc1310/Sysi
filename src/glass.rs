@@ -437,9 +437,21 @@ pub fn glass_menu(menu: &gtk::Menu) {
         set_class(menu, GLASS_POPUP, glass);
         if glass {
             let menu = menu.clone();
-            glib::idle_add_local_once(move || send_menu(&menu, 6));
+            glib::idle_add_local_once(move || send_menu(&menu, true, 6));
         }
     });
+}
+
+/// Put an open menu on glass or take it off it when the card it was opened
+/// on changes mode under it: the colour item keeps the menu open, and it
+/// would otherwise stay the way it opened until it closed.
+pub fn restyle_menu(menu: &gtk::Menu, card: &impl IsA<gtk::Widget>) {
+    let glass = glass_is_live() && has_glass(card);
+    if !menu.is_mapped() || glass == menu.style_context().has_class(GLASS_POPUP) {
+        return;
+    }
+    set_class(menu, GLASS_POPUP, glass);
+    send_menu(menu, glass, 6);
 }
 
 fn menu_opened_on_glass(menu: &gtk::Menu) -> bool {
@@ -479,10 +491,11 @@ fn menu_opened_on_glass(menu: &gtk::Menu) -> bool {
         .is_some_and(|card| has_glass(&card))
 }
 
-/// Ask for glass under a menu's window. The extension only finds the window
-/// once the compositor has mapped it, a moment after GTK has, so a miss is
-/// asked again a few times before the menu falls back to its own plate.
-fn send_menu(menu: &gtk::Menu, tries: u32) {
+/// Ask for glass under a menu's window, or (`on` false) for it to go. The
+/// extension only finds the window once the compositor has mapped it, a
+/// moment after GTK has, so a miss is asked again a few times before the menu
+/// falls back to its own plate.
+fn send_menu(menu: &gtk::Menu, on: bool, tries: u32) {
     let Some(connection) = LINK.with(|link| {
         link.borrow()
             .as_ref()
@@ -512,15 +525,19 @@ fn send_menu(menu: &gtk::Menu, tries: u32) {
         xid,
         f64::from(top.allocated_width()) * scale,
         f64::from(top.allocated_height()) * scale,
-        vec![(
-            "menu".into(),
-            f64::from(x) * scale,
-            f64::from(y) * scale,
-            f64::from(body.width()) * scale,
-            f64::from(body.height()) * scale,
-            MENU_RADIUS * scale,
-            false,
-        )],
+        on.then(|| {
+            (
+                "menu".into(),
+                f64::from(x) * scale,
+                f64::from(y) * scale,
+                f64::from(body.width()) * scale,
+                f64::from(body.height()) * scale,
+                MENU_RADIUS * scale,
+                false,
+            )
+        })
+        .into_iter()
+        .collect(),
     );
     let menu = menu.clone();
     connection.call(
@@ -538,7 +555,9 @@ fn send_menu(menu: &gtk::Menu, tries: u32) {
                 .ok()
                 .and_then(|reply| reply.get::<(bool,)>())
                 .is_some_and(|(attached,)| attached);
-            if attached || !menu.is_mapped() {
+            // Taken off glass, or put on it since: nothing to ask again.
+            if attached || !on || !menu.is_mapped() || !menu.style_context().has_class(GLASS_POPUP)
+            {
                 return;
             }
             if tries == 0 {
@@ -546,7 +565,7 @@ fn send_menu(menu: &gtk::Menu, tries: u32) {
                 return;
             }
             glib::timeout_add_local_once(Duration::from_millis(30), move || {
-                send_menu(&menu, tries - 1)
+                send_menu(&menu, true, tries - 1)
             });
         },
     );
