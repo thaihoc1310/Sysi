@@ -446,10 +446,12 @@ pub fn glass_menu(menu: &gtk::Menu) {
         let glass = glass && glass_is_live();
         set_class(menu, GLASS_POPUP, glass);
         set_class(menu, LIGHT_MENU, light);
-        if glass {
-            let menu = menu.clone();
-            glib::idle_add_local_once(move || send_menu(&menu, true, 6));
-        }
+        // A menu keeps its window between openings, and the extension puts
+        // the glass it last had back each time that window maps: one that
+        // opens without glass says so, or a menu once opened on a glass card
+        // would wear it again on a LIGHT one.
+        let menu = menu.clone();
+        glib::idle_add_local_once(move || send_menu(&menu, glass, if glass { 6 } else { 0 }));
     });
 }
 
@@ -506,6 +508,10 @@ fn card_under_pointer() -> Option<gtk::Widget> {
 /// moment after GTK has, so a miss is asked again a few times before the menu
 /// falls back to its own plate.
 fn send_menu(menu: &gtk::Menu, on: bool, tries: u32) {
+    // Taken off glass since this was asked for (its card changed mode).
+    if on && !menu.style_context().has_class(GLASS_POPUP) {
+        return;
+    }
     let Some(connection) = LINK.with(|link| {
         link.borrow()
             .as_ref()

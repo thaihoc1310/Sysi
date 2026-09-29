@@ -1195,7 +1195,18 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             fill_preview(next);
         })
     };
-    *rebuild_list_slot.borrow_mut() = Some(rebuild_list.clone());
+    // For changes made elsewhere (a tag ticked on a desk note, a star): the
+    // rows are only rebuilt while Notes shows them, as opening Notes always
+    // rebuilds them.
+    *rebuild_list_slot.borrow_mut() = Some({
+        let rebuild_list = rebuild_list.clone();
+        let card = notes.card.clone();
+        Rc::new(move || {
+            if card.is_visible() {
+                rebuild_list();
+            }
+        })
+    });
     attach_tag_filter(&notes.tags, &state, &tag_filter, &rebuild_list);
     notes.preview_scroller.vadjustment().connect_value_changed({
         let preview_scroll = preview_scroll.clone();
@@ -4242,6 +4253,7 @@ fn attach_tag_filter(
     // open GTK menu does not shrink, so it is opened again at its new size.
     list.set_reopen(Rc::new({
         let open = open.clone();
+        let button = button.clone();
         move || {
             menu.popdown();
             // Once the click that did it is over: a menu opened again from
@@ -4249,7 +4261,14 @@ fn attach_tag_filter(
             // is still what it opens for.
             let open = open.clone();
             let trigger = gtk::current_event();
-            glib::idle_add_local_once(move || open(trigger));
+            let button = button.clone();
+            glib::idle_add_local_once(move || {
+                // The last tag gone takes the button with it: nothing to
+                // open under, nor anything to show.
+                if button.is_visible() {
+                    open(trigger);
+                }
+            });
         }
     }));
     button.connect_clicked(move |_| open(None));
@@ -10287,6 +10306,13 @@ fn attach_color_mode_menu(
     tags: Option<(u64, CallbackSlot)>,
 ) {
     let menu = context_menu();
+    // A menu is a window of its own that no one else holds: it goes with the
+    // card, or every note unpinned from the desk would leave its menu (and
+    // TAG's submenu) behind.
+    widget.connect_destroy({
+        let menu = menu.clone();
+        move |_| unsafe { menu.destroy() }
+    });
 
     // Highlighting sits above everything, LOOK UP included: it acts on the
     // words the click landed on rather than on the widget, and it is usually
@@ -13930,6 +13956,7 @@ impl TagList {
         menu.connect_motion_notify_event({
             let list = self.clone();
             let bar = bar.clone();
+            let dragging = dragging.clone();
             let line_at = line_at.clone();
             move |menu, event| {
                 let point = at(menu, event.root());
@@ -14011,6 +14038,9 @@ impl TagList {
             move |_| {
                 list.disarm();
                 list.cancel_rename();
+                // A scrollbar let go of outside the menu (or held through
+                // Escape) must not drag the list the next time it opens.
+                dragging.set(None);
             }
         });
     }
@@ -14113,7 +14143,7 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
         }
     });
     // Enter gives the note the tag typed, or the tag in use it matches but
-    // for case, and shows it lit at the top; the menu stays for the next.
+    // for case, and shows it lit in its place; the menu stays for the next.
     let refocus = Rc::new(Cell::new(false));
     entry.connect_activate({
         let state = state.clone();

@@ -1200,8 +1200,10 @@ scrolledwindow overshoot.right:backdrop {
 }
 
 /* A menu opened on a LIGHT card is white like the card, with its ink. */
+/* A shade whiter than the LIGHT card it opens on, which it would otherwise
+   melt into with no edge (menus have none) to tell them apart. */
 .sysi-menu.menu-light {
-  background-color: rgba(242, 242, 244, 0.98);
+  background-color: rgba(251, 251, 252, 0.98);
 }
 
 .sysi-menu.menu-light menuitem {

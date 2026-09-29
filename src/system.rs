@@ -565,8 +565,10 @@ fn supply_watt_hours(supply: &Path, which: &str) -> Option<f64> {
     if let Some(microwatt_hours) = supply_number(supply, &format!("energy_{which}")) {
         return Some(microwatt_hours / 1e6);
     }
+    // A design voltage of 0 is firmware that does not know it.
     let volts = supply_number(supply, "voltage_min_design")
-        .or_else(|| supply_number(supply, "voltage_now"))?;
+        .filter(|volts| *volts > 0.0)
+        .or_else(|| supply_number(supply, "voltage_now").filter(|volts| *volts > 0.0))?;
     Some(supply_number(supply, &format!("charge_{which}"))? * volts / 1e12)
 }
 
@@ -615,12 +617,14 @@ fn read_batteries(supplies: &Path) -> Option<BatteryReading> {
             watts,
             watt_hours: held,
         },
-        (None, Some(watts)) => BatteryReading {
+        // Some firmware says Charging at full, or at its charge limit, with a
+        // trickle going in: nothing is left to fill, so nothing to time.
+        (None, Some(watts)) if missing >= 0.05 => BatteryReading {
             state: BatteryState::Charging,
             watts,
             watt_hours: missing,
         },
-        (None, None) => BatteryReading {
+        _ => BatteryReading {
             state: BatteryState::Idle,
             watts: 0.0,
             watt_hours: 0.0,
@@ -630,9 +634,10 @@ fn read_batteries(supplies: &Path) -> Option<BatteryReading> {
 
 /// A rate averaged over the last `BATTERY_AVERAGE` seconds, taking in one
 /// more reading `seconds` after the last, `going` seconds after the
-/// battery started the way it is going. Until that long has gone by, every reading counts the same,
-/// so a spike in the first seconds off (or on) the mains does not hang on
-/// for minutes; after it, older readings fade. (A suspend is no gap: Instant
+/// battery started the way it is going. Until that long has gone by, the
+/// readings since the first count the same (the first only starts the
+/// clock: off the mains it is often a spike), so none hangs on for minutes;
+/// after it, older readings fade. (A suspend is no gap: Instant
 /// stands still through it, and the rate before it is as good a guess as any
 /// for after.)
 fn settle(average: f64, watts: f64, seconds: f64, going: f64) -> f64 {
@@ -1259,6 +1264,47 @@ mod tests {
             read_batteries(&full).map(|reading| reading.state),
             Some(BatteryState::Idle)
         );
+        // Charging with nothing left to fill (a trickle at full, or at a
+        // charge limit) is idle, not `0m` to go.
+        let trickle = supplies(
+            "trickle",
+            &[(
+                "BAT0",
+                &[
+                    ("type", "Battery"),
+                    ("status", "Charging"),
+                    ("energy_now", "50000000"),
+                    ("energy_full", "50000000"),
+                    ("power_now", "900000"),
+                ],
+            )],
+        );
+        assert_eq!(
+            read_batteries(&trickle).map(|reading| reading.state),
+            Some(BatteryState::Idle)
+        );
+        // A design voltage of 0 is not believed: the voltage now stands in.
+        let unrated = supplies(
+            "unrated",
+            &[(
+                "BAT0",
+                &[
+                    ("type", "Battery"),
+                    ("status", "Discharging"),
+                    ("charge_now", "2000000"),
+                    ("voltage_min_design", "0"),
+                    ("voltage_now", "15000000"),
+                    ("current_now", "1000000"),
+                ],
+            )],
+        );
+        assert_eq!(
+            read_batteries(&unrated).map(|reading| reading.watt_hours),
+            Some(30.0)
+        );
+        for dir in [&trickle, &unrated] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         // A battery that does not say what it holds is no battery to time.
         let mute = supplies(
             "mute",
