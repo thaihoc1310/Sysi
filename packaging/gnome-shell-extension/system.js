@@ -283,31 +283,40 @@ export class SystemPanel {
         return new St.Label({style_class: 'sysi-system-value', y_align: Clutter.ActorAlign.CENTER});
     }
 
-    // How wide a caption or a value is, measured on the probe.
+    // How wide a caption or a value is, measured on a label made for the
+    // purpose. A label that is kept and given new text could answer with a
+    // width laid out in the panel's default font rather than its own (33px
+    // for a 25px "88°C"), which left a reading its own slack before the next
+    // hairline. A new one, styled before it is asked, always answers true.
+    _measureNow(kind, text) {
+        const label = kind === 'caption'
+            ? new St.Label({style_class: 'sysi-system-caption', text})
+            : this._value();
+        this._probe.values.add_child(label);
+        label.ensure_style();
+        if (kind !== 'caption')
+            setValue(label, text);
+        const width = Math.ceil(label.get_preferred_width(-1)[1]);
+        label.destroy();
+        return width;
+    }
+
+    // The same, remembered: for captions and the two-digit widths values are
+    // given at least, which are few and never change.
     _text(kind, text) {
         const key = `${kind}\t${text}`;
         const known = this._widths.get(key);
         if (known)
             return known;
-        let label = this._probe.caption;
-        if (kind === 'caption') {
-            label.text = text;
-        } else {
-            label = this._probe.cells[0];
-            if (!label) {
-                label = this._probe.cells[0] = this._value();
-                this._probe.values.add_child(label);
-                this._forgetWidthsOnStyle(label);
-            }
-            setValue(label, text);
-        }
-        const width = Math.ceil(label.get_preferred_width(-1)[1]);
+        const width = this._measureNow(kind, text);
         // Nothing to measure with while the panel row is off the stage.
         if (width > 0 && this._probe.box.mapped)
             this._widths.set(key, width);
         return width;
     }
 
+    // A theme or text-scale change restyles the probe: every width is
+    // measured again.
     _forgetWidthsOnStyle(actor) {
         actor.connect('style-changed', () => {
             this._widths.clear();
@@ -315,14 +324,10 @@ export class SystemPanel {
         });
     }
 
-    // How wide a value is now. Not cached: values change every sample, and a
-    // cache of them would grow for as long as the shell runs.
+    // How wide a value is now. Not remembered: values change every sample,
+    // and a cache of them would grow for as long as the shell runs.
     _textNow(text) {
-        const label = this._probe.cells[0];
-        if (!label)
-            return this._text('value', text);
-        setValue(label, text);
-        return Math.ceil(label.get_preferred_width(-1)[1]);
+        return this._measureNow('value', text);
     }
 
     // The row's width with the values it has now, each at least as wide as
@@ -336,7 +341,9 @@ export class SystemPanel {
             for (const [n, {device, cells}] of devices.entries()) {
                 width += (n ? DEVICE_GAP : 0) + this._text('caption', device.label) + CAPTION_GAP;
                 for (const [i, cell] of cells.entries()) {
-                    const least = this._text('value', cell.usual ?? cell.widest);
+                    const least = cell.usual && cell.usual !== cell.widest
+                        ? this._text('value', cell.usual)
+                        : 0;
                     width += (i ? VALUE_GAP : 0) + Math.max(least, this._textNow(cell.value ?? '–'));
                 }
             }
@@ -466,8 +473,13 @@ export class SystemPanel {
                         actors.values.add_child(label);
                     }
                     label.visible = true;
-                    // A file from an older Sysi has no `usual`.
-                    const least = this._text('value', cell.usual ?? cell.widest);
+                    // Room for two digits keeps a load or a temperature still
+                    // as it goes from 9 to 10. A used/total value has no such
+                    // floor (its usual is its widest): its length barely
+                    // changes, and a floor sized for 888G left 6.6G/14G a gap.
+                    const least = cell.usual && cell.usual !== cell.widest
+                        ? this._text('value', cell.usual)
+                        : 0;
                     if (label._sysiLeast !== least) {
                         label._sysiLeast = least;
                         label.style = `min-width: ${least}px;`;
