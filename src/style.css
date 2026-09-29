@@ -1321,16 +1321,12 @@ scrolledwindow overshoot.right:backdrop {
   background-color: rgba(0, 0, 0, 0.17);
 }
 
-/* The field a new tag is typed into, on a popover dressed like the menus. */
-popover.tag-popover {
-  border: none;
-  border-radius: 8px;
-  box-shadow: none;
-  padding: 4px;
-}
-
-popover.tag-popover.glass-popup {
+/* The field under the list a new tag is typed into: a faint `new tag` until
+   it is clicked, set in the tag's own face rather than the menu's capitals. */
+.sysi-menu menuitem.tag-field,
+.sysi-menu menuitem.tag-field:hover {
   background-color: transparent;
+  padding: 2px 4px;
 }
 
 .tag-entry {
@@ -1342,8 +1338,9 @@ popover.tag-popover.glass-popup {
   color: #f4f4f4;
   font-size: 10px;
   font-weight: 600;
+  letter-spacing: 0.3px;
   min-height: 20px;
-  padding: 0 7px;
+  padding: 0 5px;
 }
 
 .menu-light .tag-entry {

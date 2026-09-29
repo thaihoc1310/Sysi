@@ -482,15 +482,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     let hovered_notes_row: HoveredRow = Rc::new(Cell::new(None));
     let notes_star_slot: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>> = Rc::new(RefCell::new(None));
     let rebuild_list_slot: CallbackSlot = Rc::new(RefCell::new(None));
-    // Opens the field a new tag is typed into, beside a note's row.
-    let new_tag_slot: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>> = Rc::new(RefCell::new(None));
     let notes_row_menu = build_notes_row_menu(
         state.clone(),
         note_refresh.clone(),
         hovered_notes_row.clone(),
         notes_star_slot.clone(),
         rebuild_list_slot.clone(),
-        new_tag_slot.clone(),
     );
     window.set_accept_focus(true);
     window.style_context().add_class("editing");
@@ -515,6 +512,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
+        None,
         None,
         None,
         None,
@@ -547,6 +545,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         interactive.clone(),
         Some(lookup_actions.clone()),
         Some(notes_row_menu),
+        None,
         None,
     );
 
@@ -592,6 +591,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
+        None,
         None,
         None,
         None,
@@ -1197,16 +1197,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     };
     *rebuild_list_slot.borrow_mut() = Some(rebuild_list.clone());
     attach_tag_filter(&notes.tags, &state, &tag_filter, &rebuild_list);
-    *new_tag_slot.borrow_mut() = Some({
-        let rows = notes_view.rows.clone();
-        let state = state.clone();
-        let rebuild_list = rebuild_list.clone();
-        Rc::new(move |id| {
-            if let Some(row) = rows.borrow().get(&id) {
-                open_new_tag_field(row, id, &state, &rebuild_list);
-            }
-        })
-    });
     notes.preview_scroller.vadjustment().connect_value_changed({
         let preview_scroll = preview_scroll.clone();
         move |adj| {
@@ -1269,6 +1259,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let window = window.clone();
         let card = notes.card.clone();
         let rebuild_list = rebuild_list.clone();
+        let rebuild_list_slot = rebuild_list_slot.clone();
         Rc::new(move || {
             rebuild_pinned_notes(
                 &root,
@@ -1278,6 +1269,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 interactive.clone(),
                 window.clone(),
                 lookup_actions.clone(),
+                rebuild_list_slot.clone(),
             );
             // Desktop typing never reaches here. Opening, starring, deleting,
             // or dragging a note out of the palette does. Desk cards that
@@ -3879,58 +3871,11 @@ fn build_notes_row_menu(
     hovered: HoveredRow,
     star: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
     rebuild_list: CallbackSlot,
-    new_tag: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
 ) -> Rc<dyn Fn() -> bool> {
     let menu = context_menu();
     let target: HoveredRow = Rc::new(Cell::new(None));
 
-    // TAG: the tags in use, the note's own on top and lit; a click puts the
-    // note in a tag or takes it out, and the menu stays for the next one.
-    let tag = gtk::MenuItem::with_label("TAG");
-    let tag_menu = context_menu();
-    let tags = TagList::new(&tag_menu, {
-        let state = state.clone();
-        let target = target.clone();
-        Rc::new(move |name| {
-            let Some(id) = target.get() else {
-                return (false, None);
-            };
-            let on = state.borrow_mut().toggle_note_tag(id, name);
-            let _ = state.borrow().save();
-            // The rows behind the menu show a note's tags.
-            if let Some(rebuild) = rebuild_list.borrow().clone() {
-                rebuild();
-            }
-            let count = state
-                .borrow()
-                .notes
-                .iter()
-                .filter(|note| note.tags.iter().any(|tag| tag == name))
-                .count();
-            (on, Some(count))
-        })
-    });
-    let tags_rule = gtk::SeparatorMenuItem::new();
-    tag_menu.append(&tags_rule);
-    let new_tag_item = gtk::MenuItem::with_label("NEW TAG\u{2026}");
-    new_tag_item.connect_activate({
-        let target = target.clone();
-        move |_| {
-            let Some(id) = target.get() else {
-                return;
-            };
-            // Once the menu has let go of the pointer and the keyboard.
-            let new_tag = new_tag.clone();
-            glib::idle_add_local_once(move || {
-                if let Some(open) = new_tag.borrow().clone() {
-                    open(id);
-                }
-            });
-        }
-    });
-    tag_menu.append(&new_tag_item);
-    tag_menu.show_all();
-    tag.set_submenu(Some(&tag_menu));
+    let tag = note_tag_menu(&state, rebuild_list);
 
     let pin = gtk::MenuItem::with_label("PIN");
     pin.connect_activate({
@@ -3962,7 +3907,7 @@ fn build_notes_row_menu(
             }
         }
     });
-    menu.append(&tag);
+    menu.append(&tag.item);
     menu.append(&pin);
     menu.append(&delete);
     menu.show_all();
@@ -3981,18 +3926,8 @@ fn build_notes_row_menu(
             .find(|note| note.id == id)
             .is_some_and(|note| note.starred);
         pin.set_label(if starred { "UNPIN" } else { "PIN" });
-        let choices = {
-            let data = state.borrow();
-            let own = data
-                .notes
-                .iter()
-                .find(|note| note.id == id)
-                .map(|note| note.tags.clone())
-                .unwrap_or_default();
-            tag_choices(data.tag_counts(), &own)
-        };
-        tags.fill(&choices);
-        tags_rule.set_visible(!choices.is_empty());
+        tag.note.set(Some(id));
+        (tag.refill)();
         target.set(Some(id));
         menu.popup_easy(3, gtk::current_event_time());
         true
@@ -4256,64 +4191,6 @@ fn attach_tag_filter(
             );
         }
     });
-}
-
-/// A field under a note's row to type a new tag into; Enter gives the note
-/// that tag (or the tag in use it matches), Escape or a click away drops it.
-fn open_new_tag_field(
-    row: &gtk::EventBox,
-    id: u64,
-    state: &Rc<RefCell<AppState>>,
-    rebuild_list: &Rc<dyn Fn()>,
-) {
-    let popover = gtk::Popover::new(Some(row));
-    popover.set_position(gtk::PositionType::Bottom);
-    popover.style_context().add_class("sysi-menu");
-    popover.style_context().add_class("tag-popover");
-    crate::glass::glass_popover(&popover);
-    let entry = gtk::Entry::new();
-    entry.set_placeholder_text(Some("New tag"));
-    entry.set_max_length(crate::state::TAG_MAX_CHARS as i32);
-    entry.set_width_chars(16);
-    entry.set_has_frame(false);
-    entry.style_context().add_class("tag-entry");
-    popover.add(&entry);
-    entry.connect_activate({
-        let popover = popover.clone();
-        let state = state.clone();
-        let rebuild_list = rebuild_list.clone();
-        move |entry| {
-            let Some(tag) = crate::state::clean_tag(&entry.text()) else {
-                return;
-            };
-            let has = {
-                let data = state.borrow();
-                data.notes.iter().any(|note| {
-                    note.id == id
-                        && note
-                            .tags
-                            .iter()
-                            .any(|known| known.to_lowercase() == tag.to_lowercase())
-                })
-            };
-            // Typed again, a tag the note has stays on rather than coming off.
-            if !has {
-                state.borrow_mut().toggle_note_tag(id, &tag);
-                let _ = state.borrow().save();
-            }
-            popover.popdown();
-            // The row this hangs off is rebuilt along with the list.
-            let rebuild_list = rebuild_list.clone();
-            glib::idle_add_local_once(move || rebuild_list());
-        }
-    });
-    popover.connect_closed(|popover| {
-        let popover = popover.clone();
-        glib::idle_add_local_once(move || unsafe { popover.destroy() });
-    });
-    popover.show_all();
-    popover.popup();
-    entry.grab_focus();
 }
 
 fn notes_row_confirm(row: &gtk::EventBox) -> Option<gtk::Label> {
@@ -7308,6 +7185,8 @@ fn rebuild_pinned_notes(
     interactive: Rc<Cell<bool>>,
     window: gtk::ApplicationWindow,
     lookup: LookupActions,
+    // Rebuilds the Notes rows, which show a note's tags.
+    rebuild_list: CallbackSlot,
 ) {
     let pinned: Vec<Note> = state
         .borrow()
@@ -7580,6 +7459,7 @@ fn rebuild_pinned_notes(
             Some(lookup.clone()),
             None,
             Some(highlight_menu.clone()),
+            Some((note.id, rebuild_list.clone())),
         );
 
         let pending_save: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
@@ -8767,6 +8647,7 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
                 header: translate.header.clone(),
             }),
         }),
+        None,
         None,
         None,
     );
@@ -10339,6 +10220,9 @@ fn attach_color_mode_menu(
     row_menu: Option<Rc<dyn Fn() -> bool>>,
     // The highlighter, which only a note is given.
     highlight: Option<HighlightMenu>,
+    // A note on the desk is tagged from its menu too: its id, and what
+    // rebuilds the Notes rows that show its tags.
+    tags: Option<(u64, CallbackSlot)>,
 ) {
     let menu = context_menu();
 
@@ -10433,6 +10317,13 @@ fn attach_color_mode_menu(
         (item, new_item, open_item, separator)
     });
     apply_widget_font(widget, state.borrow().font_size(&key));
+    // Above the colour: tagging is about the note, the rest about its card.
+    let tag_menu = tags.map(|(id, rebuild_list)| {
+        let tag = note_tag_menu(&state, rebuild_list);
+        tag.note.set(Some(id));
+        menu.append(&tag.item);
+        tag
+    });
     let color_item = gtk::MenuItem::with_label("LIGHT");
     color_item.connect_activate({
         let state = state.clone();
@@ -10571,6 +10462,9 @@ fn attach_color_mode_menu(
             *selected.borrow_mut() = query;
         }
         gesture.set_state(gtk::EventSequenceState::Claimed);
+        if let Some(tag) = &tag_menu {
+            (tag.refill)();
+        }
         menu.popup_easy(3, gtk::current_event_time());
     });
 
@@ -13517,6 +13411,25 @@ impl HighlightPalette {
     }
 }
 
+/// Where a pointer event at `root` falls in a menu's own coordinates.
+fn menu_point(menu: &gtk::Menu, root: (f64, f64)) -> Option<(f64, f64)> {
+    let (_, ox, oy) = menu.window()?.origin();
+    Some((root.0 - f64::from(ox), root.1 - f64::from(oy)))
+}
+
+/// Whether a point in a menu's coordinates lands on this widget of it.
+fn menu_over(menu: &gtk::Menu, widget: &gtk::Widget, (x, y): (f64, f64)) -> bool {
+    widget.is_visible()
+        && widget
+            .translate_coordinates(menu, 0, 0)
+            .is_some_and(|(left, top)| {
+                x >= f64::from(left)
+                    && y >= f64::from(top)
+                    && x < f64::from(left + widget.allocated_width())
+                    && y < f64::from(top + widget.allocated_height())
+            })
+}
+
 /// One line of a tag list: a tag, how many notes have it, and whether it is
 /// ticked (on the note the menu is for, or in the list's filter).
 struct TagChoice {
@@ -13628,22 +13541,8 @@ impl TagList {
     }
 
     fn listen(&self, menu: &gtk::Menu, pick: Rc<dyn Fn(&str) -> (bool, Option<usize>)>) {
-        // Where the pointer is, in the menu's own coordinates.
-        let at = |menu: &gtk::Menu, root: (f64, f64)| {
-            let (_, ox, oy) = menu.window()?.origin();
-            Some((root.0 - f64::from(ox), root.1 - f64::from(oy)))
-        };
-        let over = |menu: &gtk::Menu, widget: &gtk::Widget, (x, y): (f64, f64)| {
-            widget.is_visible()
-                && widget
-                    .translate_coordinates(menu, 0, 0)
-                    .is_some_and(|(left, top)| {
-                        x >= f64::from(left)
-                            && y >= f64::from(top)
-                            && x < f64::from(left + widget.allocated_width())
-                            && y < f64::from(top + widget.allocated_height())
-                    })
-        };
+        let at = menu_point;
+        let over = menu_over;
         // The line under the pointer, if it is in the part of the list shown.
         let line_at = {
             let scroller = self.scroller.clone();
@@ -13782,6 +13681,177 @@ impl TagList {
             glib::Propagation::Proceed
         });
     }
+}
+
+/// `TAG` and the submenu it opens, for the note in `note`: the tags in use to
+/// tick, and under them a field to type a new one into. Shared by a note's
+/// row in Notes and the note itself on the desk.
+struct NoteTagMenu {
+    item: gtk::MenuItem,
+    /// The note the menu acts on, set before it pops up.
+    note: HoveredRow,
+    /// Fills the list for that note; run before the menu pops up.
+    refill: Rc<dyn Fn()>,
+}
+
+fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> NoteTagMenu {
+    let note: HoveredRow = Rc::new(Cell::new(None));
+    let item = gtk::MenuItem::with_label("TAG");
+    let menu = context_menu();
+    // A change shows at once on the Notes rows, which carry a note's tags.
+    let changed = move || {
+        let rebuild = rebuild_list.borrow().clone();
+        if let Some(rebuild) = rebuild {
+            rebuild();
+        }
+    };
+    let list = Rc::new(TagList::new(&menu, {
+        let state = state.clone();
+        let note = note.clone();
+        let changed = changed.clone();
+        Rc::new(move |name| {
+            let Some(id) = note.get() else {
+                return (false, None);
+            };
+            let on = state.borrow_mut().toggle_note_tag(id, name);
+            let _ = state.borrow().save();
+            changed();
+            let count = state
+                .borrow()
+                .notes
+                .iter()
+                .filter(|note| note.tags.iter().any(|tag| tag == name))
+                .count();
+            (on, Some(count))
+        })
+    }));
+    let rule = gtk::SeparatorMenuItem::new();
+    menu.append(&rule);
+    let field = gtk::MenuItem::new();
+    field.style_context().add_class("tag-field");
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("new tag"));
+    entry.set_max_length(crate::state::TAG_MAX_CHARS as i32);
+    entry.set_width_chars(12);
+    entry.set_has_frame(false);
+    entry.style_context().add_class("tag-entry");
+    field.add(&entry);
+    menu.append(&field);
+
+    let refill: Rc<dyn Fn()> = Rc::new({
+        let state = state.clone();
+        let note = note.clone();
+        let list = list.clone();
+        let rule = rule.clone();
+        move || {
+            let choices = {
+                let data = state.borrow();
+                let own = note
+                    .get()
+                    .and_then(|id| data.notes.iter().find(|note| note.id == id))
+                    .map(|note| note.tags.clone())
+                    .unwrap_or_default();
+                tag_choices(data.tag_counts(), &own)
+            };
+            list.fill(&choices);
+            rule.set_visible(!choices.is_empty());
+        }
+    });
+    // Enter gives the note the tag typed, or the tag in use it matches but
+    // for case, and shows it lit at the top; the menu stays for the next.
+    entry.connect_activate({
+        let state = state.clone();
+        let note = note.clone();
+        let refill = refill.clone();
+        move |entry| {
+            let (Some(id), Some(tag)) = (note.get(), crate::state::clean_tag(&entry.text())) else {
+                return;
+            };
+            let has = state.borrow().notes.iter().any(|note| {
+                note.id == id
+                    && note
+                        .tags
+                        .iter()
+                        .any(|known| known.to_lowercase() == tag.to_lowercase())
+            });
+            if !has {
+                state.borrow_mut().toggle_note_tag(id, &tag);
+                let _ = state.borrow().save();
+                changed();
+            }
+            entry.set_text("");
+            refill();
+        }
+    });
+    // A menu item lays its input window over the field, so a click there is
+    // the menu's: it gives the field the keyboard. The menu holds the
+    // keyboard grab and hands keys to its focus widget, but its window is
+    // never the focused one, so the field is told it has focus itself:
+    // without that the input method (Vietnamese through IBus) never wakes.
+    let focus_field = {
+        let entry = entry.clone();
+        move || {
+            entry.grab_focus();
+            if let Some(window) = entry.window() {
+                let mut event = gdk::Event::new(gdk::EventType::FocusChange);
+                // SAFETY: a FocusChange event is a GdkEventFocus; the window
+                // reference is handed to the event, which frees it.
+                unsafe {
+                    use glib::translate::{ToGlibPtr, ToGlibPtrMut};
+                    let raw: *mut gdk::ffi::GdkEvent = event.to_glib_none_mut().0;
+                    let focus = raw as *mut gdk::ffi::GdkEventFocus;
+                    (*focus).in_ = 1;
+                    (*focus).window = window.to_glib_full();
+                }
+                entry.send_focus_change(&event);
+            }
+        }
+    };
+    menu.connect_button_press_event({
+        let field = field.clone();
+        move |menu, event| match menu_point(menu, event.root()) {
+            Some(point) if menu_over(menu, field.upcast_ref(), point) => glib::Propagation::Stop,
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    menu.connect_button_release_event({
+        let field = field.clone();
+        move |menu, event| match menu_point(menu, event.root()) {
+            Some(point) if menu_over(menu, field.upcast_ref(), point) => {
+                focus_field();
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    // The menu reads keys before its focus widget does, and takes Space and
+    // Enter to mean the item under the pointer. While the field is being
+    // typed in, they are its; Escape, Up, Down and Tab still move the menu.
+    let typing = {
+        let entry = entry.clone();
+        move |event: &gdk::EventKey| {
+            use gdk::keys::constants as key;
+            let moves = [key::Escape, key::Up, key::Down, key::Tab, key::ISO_Left_Tab];
+            if entry.has_focus() && !moves.contains(&event.keyval()) && entry.event(event) {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    };
+    menu.connect_key_press_event({
+        let typing = typing.clone();
+        move |_, event| typing(event)
+    });
+    // An input method reads the releases as well.
+    menu.connect_key_release_event(move |_, event| typing(event));
+    menu.connect_hide({
+        let entry = entry.clone();
+        move |_| entry.set_text("")
+    });
+    menu.show_all();
+    item.set_submenu(Some(&menu));
+    NoteTagMenu { item, note, refill }
 }
 
 /// The highlighter's own menu, hung off the pen in a note's header: whether the

@@ -365,8 +365,7 @@ fn set_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool) {
     }
 }
 
-/// Give a popover glass of its own while the card it belongs to is glass,
-/// and dress it white on a LIGHT one.
+/// Give a popover glass of its own while the card it belongs to is glass.
 /// A popover lives inside the overlay window, so its glass travels with the
 /// cards' as one more card, painted last.
 pub fn glass_popover(popover: &gtk::Popover) {
@@ -376,13 +375,12 @@ pub fn glass_popover(popover: &gtk::Popover) {
         list.push((format!("popover:{serial}"), popover.downgrade()));
     });
     popover.connect_map(|popover| {
-        let (glass, light) = root()
-            .zip(popover.relative_to())
-            .and_then(|(root, anchor)| card_of(&anchor, &root))
-            .map_or((false, false), |card| menu_look(&card));
-        set_class(popover, GLASS_POPUP, glass && glass_is_live());
-        // White on a LIGHT card, the way a menu opened there is.
-        set_class(popover, LIGHT_MENU, light);
+        let glass = glass_is_live()
+            && root()
+                .zip(popover.relative_to())
+                .and_then(|(root, anchor)| card_of(&anchor, &root))
+                .is_some_and(|card| has_glass(&card));
+        set_class(popover, GLASS_POPUP, glass);
     });
     popover.connect_draw(|popover, cr| {
         if let Some(outline) = popover_outline(popover) {
