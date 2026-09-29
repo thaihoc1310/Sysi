@@ -15,6 +15,9 @@ pub struct SystemReadOptions {
     /// How full each drive is, over the filesystems mounted from it.
     pub ssd_usage: bool,
     pub network: bool,
+    /// What the machine draws: the battery's discharge, or on mains the
+    /// processor package and the GPUs.
+    pub power: bool,
 }
 
 /// How much of something is in use, in KiB. Both halves are kept rather than
@@ -52,6 +55,9 @@ pub struct GpuSnapshot {
     /// is only the slice of RAM set aside for it, which it overflows into
     /// shared memory, so it often reads close to full.
     pub memory: Option<Usage>,
+    /// Watts drawn. For a GPU built into the processor this is the whole
+    /// package, CPU cores included: the driver reports it for the chip.
+    pub power: Option<f64>,
 }
 
 /// One physical drive: what to call it, how full the filesystems mounted from
@@ -78,6 +84,17 @@ pub struct SystemSnapshot {
     pub drives: Vec<DriveSnapshot>,
     /// `None` until a second sample exists, since a rate needs two counters.
     pub network: Option<NetworkRates>,
+    pub power: Option<PowerDraw>,
+}
+
+/// What the machine is drawing, and from where.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PowerDraw {
+    pub watts: f64,
+    /// Running on its battery: `watts` is then the whole machine's draw. On
+    /// mains, no laptop reports that, so it is the processor package and the
+    /// GPUs, the parts that draw the most and vary the most.
+    pub on_battery: bool,
 }
 
 #[derive(Default)]
@@ -132,7 +149,7 @@ impl SystemReader {
         let memory_info = read_memory().unwrap_or_default();
         // The temperature of a card is read from the same place its load is,
         // so the GPU readers run for either meter.
-        let gpus = if options.gpus || options.gpu_temp {
+        let gpus = if options.gpus || options.gpu_temp || options.power {
             self.read_gpus()
         } else {
             Vec::new()
@@ -156,12 +173,14 @@ impl SystemReader {
             None
         };
 
+        let power = options.power.then(|| read_power(&gpus)).flatten();
         SystemSnapshot {
             cpu_percent,
             memory: memory_info.memory,
             swap: memory_info.swap,
             gpus,
             cpu_temperature,
+            power,
             drives,
             network,
         }
@@ -254,12 +273,14 @@ impl SystemReader {
                     percent: Some(0.0),
                     temperature: None,
                     memory: None,
+                    // Asleep, it draws next to nothing.
+                    power: Some(0.0),
                 })
                 .collect();
         }
         let output = Command::new("nvidia-smi")
             .args([
-                "--query-gpu=index,name,utilization.gpu,temperature.gpu,memory.used,memory.total",
+                "--query-gpu=index,name,utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw",
                 "--format=csv,noheader,nounits",
             ])
             .stdin(Stdio::null())
@@ -284,15 +305,17 @@ impl SystemReader {
 fn parse_nvidia_gpus(raw: &str) -> Vec<GpuSnapshot> {
     raw.lines()
         .filter_map(|line| {
-            // index, name, load, temperature, memory used, memory total (MiB).
-            // Counted from the right, because a card whose name has a comma in
-            // it would otherwise shift every column along.
+            // index, name, load, temperature, memory used, memory total (MiB),
+            // power (W). Counted from the right, because a card whose name has
+            // a comma in it would otherwise shift every column along.
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
             let _index = fields.first()?.parse::<usize>().ok()?;
-            let length = fields.len();
-            if length < 6 {
+            let full = fields.len();
+            if full < 7 {
                 return None;
             }
+            let power = fields[full - 1].parse::<f64>().ok();
+            let length = full - 1;
             // A driver that answers "[N/A]" for one column still means what it
             // says in the others, so no reading is allowed to take the card's
             // whole row down with it.
@@ -311,6 +334,7 @@ fn parse_nvidia_gpus(raw: &str) -> Vec<GpuSnapshot> {
                 percent,
                 temperature,
                 memory,
+                power,
             })
         })
         .collect()
@@ -399,6 +423,7 @@ fn read_amd_gpus() -> Vec<GpuSnapshot> {
             }),
             _ => None,
         };
+        let power = amd_gpu_power(&device);
         if percent.is_none() && temperature.is_none() && memory.is_none() {
             continue;
         }
@@ -407,9 +432,64 @@ fn read_amd_gpus() -> Vec<GpuSnapshot> {
             percent,
             temperature,
             memory,
+            power,
         });
     }
     values
+}
+
+/// An AMD GPU's draw in watts, averaged by the driver: power1_average, or on
+/// chips without it the instant reading. On a processor with the GPU built in
+/// it is the whole package's (PPT), CPU cores included.
+fn amd_gpu_power(device: &Path) -> Option<f64> {
+    sorted_dirs(&device.join("hwmon")).iter().find_map(|dir| {
+        ["power1_average", "power1_input"].iter().find_map(|name| {
+            fs::read_to_string(dir.join(name))
+                .ok()
+                .and_then(|raw| raw.trim().parse::<f64>().ok())
+                .map(|microwatts| microwatts / 1e6)
+        })
+    })
+}
+
+/// A battery's discharge in watts, while it is discharging: from power_now,
+/// or current_now × voltage_now where the firmware reports those instead.
+fn battery_discharge(supply: &Path) -> Option<f64> {
+    let read = |name: &str| {
+        fs::read_to_string(supply.join(name))
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+    };
+    if fs::read_to_string(supply.join("type")).ok()?.trim() != "Battery"
+        || fs::read_to_string(supply.join("status")).ok()?.trim() != "Discharging"
+    {
+        return None;
+    }
+    let watts = match read("power_now") {
+        Some(microwatts) => microwatts / 1e6,
+        None => read("current_now")? * read("voltage_now")? / 1e12,
+    };
+    Some(watts.abs())
+}
+
+/// What the machine draws: every discharging battery's output, or on mains
+/// the processor package and the GPUs, `None` when neither can be read.
+fn read_power(gpus: &[GpuSnapshot]) -> Option<PowerDraw> {
+    let batteries: Vec<f64> = sorted_dirs(Path::new("/sys/class/power_supply"))
+        .iter()
+        .filter_map(|supply| battery_discharge(supply))
+        .collect();
+    if !batteries.is_empty() {
+        return Some(PowerDraw {
+            watts: batteries.iter().sum(),
+            on_battery: true,
+        });
+    }
+    let parts: Vec<f64> = gpus.iter().filter_map(|gpu| gpu.power).collect();
+    (!parts.is_empty()).then(|| PowerDraw {
+        watts: parts.iter().sum(),
+        on_battery: false,
+    })
 }
 
 /// The temperature of an AMD card, read from the hwmon chip the driver hangs
@@ -917,8 +997,8 @@ mod tests {
     #[test]
     fn nvidia_csv_keeps_every_gpu_and_clamps_what_the_driver_reports() {
         let values = parse_nvidia_gpus(
-            "0, NVIDIA GeForce RTX 4060 Laptop GPU, 57, 43, 20, 8188\n\
-             1, NVIDIA GTX 1080, 101, 62, 4096, 8192\n",
+            "0, NVIDIA GeForce RTX 4060 Laptop GPU, 57, 43, 20, 8188, 1.66\n\
+             1, NVIDIA GTX 1080, 101, 62, 4096, 8192, [N/A]\n",
         );
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].percent, Some(57.0));
@@ -930,24 +1010,26 @@ mod tests {
                 total_kib: 8188 * 1024
             })
         );
+        assert_eq!(values[0].power, Some(1.66));
         assert_eq!(values[1].percent, Some(100.0));
         assert_eq!(values[1].temperature, Some(62.0));
+        assert_eq!(values[1].power, None);
         // A name with a comma in it does not shift the columns along.
-        let comma = parse_nvidia_gpus("0, NVIDIA RTX, Ada, 12, 40, 100, 4096\n");
+        let comma = parse_nvidia_gpus("0, NVIDIA RTX, Ada, 12, 40, 100, 4096, 5\n");
         assert_eq!(comma[0].percent, Some(12.0));
         assert_eq!(comma[0].temperature, Some(40.0));
         // "[N/A]" in one column does not take the others down with it.
-        let hot = parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], 51, [N/A], [N/A]\n");
+        let hot = parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], 51, [N/A], [N/A], [N/A]\n");
         assert_eq!(hot[0].percent, None);
         assert_eq!(hot[0].temperature, Some(51.0));
         assert_eq!(hot[0].memory, None);
-        let busy = parse_nvidia_gpus("0, NVIDIA RTX A2000, 34, [N/A], 512, 6144\n");
+        let busy = parse_nvidia_gpus("0, NVIDIA RTX A2000, 34, [N/A], 512, 6144, 20\n");
         assert_eq!(busy[0].percent, Some(34.0));
         assert_eq!(busy[0].temperature, None);
         assert!(busy[0].memory.is_some());
         // A line with nothing usable in any column is skipped rather than
         // shown as zero.
-        assert!(parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], [N/A], [N/A], [N/A]\n").is_empty());
+        assert!(parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], [N/A], [N/A], [N/A], [N/A]\n").is_empty());
         assert!(parse_nvidia_gpus("nvidia-smi: command failed\n").is_empty());
     }
 
@@ -1070,6 +1152,7 @@ mod tests {
             percent: Some(0.0),
             temperature: None,
             memory: None,
+            power: None,
         };
         // The hybrid laptop this was written for: one of each, no numbering.
         let mut mixed = vec![gpu("NVIDIA"), gpu("AMD")];

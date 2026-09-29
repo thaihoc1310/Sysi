@@ -142,6 +142,24 @@
   text-shadow: none;
 }
 
+/* A network rate's arrows: small and faint like the captions, a hair from
+   the number they point at and clear of the one before. */
+#panel .sysi-system-value-box {
+  spacing: 2px;
+}
+
+#panel .sysi-system-arrow {
+  color: rgba(242, 242, 242, 0.55);
+  font-family: "Noto Sans", sans-serif;
+  font-size: 9.5px;
+  font-weight: 500;
+  text-shadow: none;
+}
+
+#panel .sysi-system-arrow-apart {
+  margin-left: 6px;
+}
+
 /* SYSTEM's menu, in the style of settings: centred words, the reading bright
    while it is in the bar and faint while it is not, fainter still when there
    is no room left for it before the clock. */

@@ -20,6 +20,7 @@
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Pango from 'gi://Pango';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
@@ -43,17 +44,65 @@ const HAIRLINE = 1;
 // arrived would otherwise put a reading back the way it was for a moment.
 const PENDING_MS = 3000;
 
-// A value as the bar shows it. The arrows of a network rate are drawn small
-// and faint, like the captions, so the two numbers carry the reading.
-function setValue(label, text) {
-    const escaped = GLib.markup_escape_text(String(text ?? ''), -1);
-    const markup = escaped
-        .replace(/([↓↑])/g, '<span alpha="55%" size="85%">$1</span> ')
-        .replace(/ (?=<span)/g, '  ');
-    if (label._sysiMarkup === markup)
+// A value as the bar shows it, in plain text. Not Pango markup: a kept label
+// given new markup kept the old spans' byte offsets, which split a
+// three-byte arrow and drew broken glyphs, and laid itself out a third too
+// wide. The arrows of a network rate sit in labels of their own instead,
+// small and faint like the captions, so the two numbers carry the reading.
+function valueBox() {
+    return new St.BoxLayout({style_class: 'sysi-system-value-box', y_align: Clutter.ActorAlign.CENTER});
+}
+
+function setValue(box, text) {
+    text = String(text ?? '');
+    if (box._sysiText === text)
         return;
-    label._sysiMarkup = markup;
-    label.clutter_text.set_markup(markup);
+    box._sysiText = text;
+    const tokens = text.split(/([↓↑])/)
+        .map(part => part.trim())
+        .filter(Boolean);
+    const labels = box.get_children();
+    tokens.forEach((token, index) => {
+        let label = labels[index];
+        if (!label) {
+            label = whole(new St.Label({y_align: Clutter.ActorAlign.CENTER}));
+            box.add_child(label);
+        }
+        const arrow = token === '↓' || token === '↑';
+        label.style_class = arrow
+            ? index > 0 ? 'sysi-system-arrow sysi-system-arrow-apart' : 'sysi-system-arrow'
+            : 'sysi-system-value';
+        if (label.text !== token)
+            label.text = token;
+        label.visible = true;
+    });
+    for (const label of labels.slice(tokens.length))
+        label.visible = false;
+}
+
+// A caption or value is always shown whole: never cut to an ellipsis, even
+// if a rounding pixel leaves it a hair wider than the room it was given.
+function whole(label) {
+    label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+    return label;
+}
+
+// Give a label the width worked out for it. What a kept label reports of
+// itself cannot be trusted: after its text changes it may answer in the
+// panel's default font, a third wider, which widened the row and had the
+// panel squeeze its captions. Laid out to widths measured on fresh labels,
+// the row is exactly as wide as it was reckoned.
+function setWidth(label, width) {
+    if (label._sysiWidth !== width) {
+        label._sysiWidth = width;
+        label.width = width;
+    }
+}
+
+// Put a child at a place in its parent, if it is not there already.
+function place(parent, child, index) {
+    if (parent.get_child_at_index(index) !== child)
+        parent.set_child_at_index(child, index);
 }
 
 export class SystemPanel {
@@ -274,6 +323,7 @@ export class SystemPanel {
             style_class: 'sysi-system-caption',
             y_align: Clutter.ActorAlign.CENTER,
         });
+        whole(label);
         const values = new St.BoxLayout({style: `spacing: ${VALUE_GAP}px;`, y_align: Clutter.ActorAlign.CENTER});
         box.add_child(label);
         box.add_child(values);
@@ -281,7 +331,7 @@ export class SystemPanel {
     }
 
     _value() {
-        return new St.Label({style_class: 'sysi-system-value', y_align: Clutter.ActorAlign.CENTER});
+        return valueBox();
     }
 
     // How wide a caption or a value is, measured on a label made for the
@@ -291,13 +341,21 @@ export class SystemPanel {
     // hairline. A new one, styled before it is asked, always answers true.
     _measureNow(kind, text) {
         const label = kind === 'caption'
-            ? new St.Label({style_class: 'sysi-system-caption', text})
+            ? whole(new St.Label({style_class: 'sysi-system-caption', text}))
             : this._value();
         this._probe.values.add_child(label);
-        label.ensure_style();
         if (kind !== 'caption')
             setValue(label, text);
-        const width = Math.ceil(label.get_preferred_width(-1)[1]);
+        label.ensure_style();
+        const texts = kind === 'caption' ? [label] : label.get_children();
+        for (const text of texts)
+            text.ensure_style();
+        // A label that has never been shown lays its text out at 1x; on the
+        // panel, at 2x, the same text rounds up to as much as a pixel wider.
+        // Counting that pixel for each label keeps the reckoning from ever
+        // falling short: a row reckoned a few pixels narrow was squeezed by
+        // the panel to ellipses.
+        const width = Math.ceil(label.get_preferred_width(-1)[1]) + texts.length;
         label.destroy();
         return width;
     }
@@ -331,27 +389,6 @@ export class SystemPanel {
         return this._measureNow('value', text);
     }
 
-    // The row's width with the values it has now, each at least as wide as
-    // the two digits it is given room for, worked out on the probe. Asking the
-    // row itself returned text laid out before its last change, and read the
-    // row wide enough to drop the network rate while it had room to spare.
-    _widthNow(layout) {
-        let width = 0;
-        for (const [index, {devices}] of layout.entries()) {
-            width += index ? 2 * GROUP_GAP + HAIRLINE : 0;
-            for (const [n, {device, cells}] of devices.entries()) {
-                width += (n ? DEVICE_GAP : 0) + this._text('caption', device.label) + CAPTION_GAP;
-                for (const [i, cell] of cells.entries()) {
-                    const least = cell.usual && cell.usual !== cell.widest
-                        ? this._text('value', cell.usual)
-                        : 0;
-                    width += (i ? VALUE_GAP : 0) + Math.max(least, this._textNow(cell.value ?? '–'));
-                }
-            }
-        }
-        return width;
-    }
-
     // A device's width with these values in it.
     _measure(caption, values) {
         return this._text('caption', caption) + CAPTION_GAP +
@@ -363,10 +400,10 @@ export class SystemPanel {
     // room before the clock in order. A group that does not fit is left out
     // whole, rather than drawn into the clock.
     _layout(isOn) {
-        // What each value is given in the reckoning: two digits of itself,
-        // which is what the row shows but for a rare 100%, 100°C or a
-        // download past 100M, and the clock gap takes that digit.
-        const reckoned = cell => cell.usual ?? cell.widest;
+        // Each value is reckoned at the widest it can ever be (↓888M ↑888M,
+        // 888W), so a group that is let in never has to step out again when
+        // a download or the draw climbs. The row itself hugs what it shows.
+        const reckoned = cell => cell.widest;
         const room = this._room();
         const shown = [];
         let used = 0;
@@ -454,19 +491,39 @@ export class SystemPanel {
             return;
         const shown = new Map(layout.map(entry => [entry.group.key, entry]));
         let first = true;
+        // The row's width, added up from the widths every label is given
+        // below: it is laid out to exactly these, so this is what it takes.
+        let width = 0;
+        this._data.groups.forEach((group, index) => {
+            // In the order Sysi lists them. Actors are made as groups first
+            // appear, and a group a newer Sysi added (power, after a file
+            // from an older one) would otherwise land at the end of the row.
+            const actors = this._group(group.key);
+            place(this._readout, actors.hairline, 2 * index);
+            place(this._readout, actors.box, 2 * index + 1);
+        });
         for (const group of this._data.groups) {
             const entry = shown.get(group.key);
             const actors = this._group(group.key);
             actors.box.visible = Boolean(entry);
             actors.hairline.visible = Boolean(entry) && !first;
-            if (entry)
-                first = false;
+            if (!entry)
+                continue;
+            width += first ? 0 : 2 * GROUP_GAP + HAIRLINE;
+            first = false;
+            let devices = 0;
+            group.devices.forEach((device, index) => {
+                place(actors.box, this._device(group.key, device.label).box, index);
+            });
             for (const device of group.devices) {
                 const actors = this._device(group.key, device.label);
-                const placed = entry?.devices.find(shown => shown.device.label === device.label);
+                const placed = entry.devices.find(shown => shown.device.label === device.label);
                 actors.box.visible = Boolean(placed);
                 if (!placed)
                     continue;
+                const captionWidth = this._text('caption', device.label);
+                setWidth(actors.caption, captionWidth);
+                width += (devices++ ? DEVICE_GAP : 0) + captionWidth + CAPTION_GAP;
                 placed.cells.forEach((cell, index) => {
                     let label = actors.cells[index];
                     if (!label) {
@@ -481,21 +538,21 @@ export class SystemPanel {
                     const least = cell.usual && cell.usual !== cell.widest
                         ? this._text('value', cell.usual)
                         : 0;
-                    if (label._sysiLeast !== least) {
-                        label._sysiLeast = least;
-                        label.style = `min-width: ${least}px;`;
-                    }
-                    setValue(label, cell.value ?? '–');
+                    const text = cell.value ?? '–';
+                    const valueWidth = Math.max(least, this._textNow(text));
+                    setValue(label, text);
+                    setWidth(label, valueWidth);
+                    width += (index ? VALUE_GAP : 0) + valueWidth;
                 });
                 for (const label of actors.cells.slice(placed.cells.length))
                     label.visible = false;
             }
         }
-        // A value can outgrow its reckoning (a download past 100M both ways).
-        // Rather than let the row run into the clock, the last group steps
-        // out until it shrinks back.
+        // Nothing outgrows its reckoning, but a rounding pixel or a font the
+        // probe did not see could. Rather than let the row run into the
+        // clock, the last group steps out until it shrinks back.
         const last = this._groups.get(layout[layout.length - 1].group.key);
-        if (layout.length > 1 && this._widthNow(layout) > this._room() + CLOCK_GAP - CLOCK_CLEAR) {
+        if (layout.length > 1 && width > this._room() + CLOCK_GAP - CLOCK_CLEAR) {
             last.box.visible = false;
             last.hairline.visible = false;
         }

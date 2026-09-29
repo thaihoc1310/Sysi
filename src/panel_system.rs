@@ -190,7 +190,7 @@ struct Metric {
     set: fn(&mut SystemDetails, bool),
 }
 
-const METRICS: [Metric; 10] = [
+const METRICS: [Metric; 11] = [
     Metric {
         key: "cpu",
         name: "cpu",
@@ -246,6 +246,12 @@ const METRICS: [Metric; 10] = [
         set: |d, on| d.ssd_temp = on,
     },
     Metric {
+        key: "power",
+        name: "power",
+        enabled: |d| d.power,
+        set: |d, on| d.power = on,
+    },
+    Metric {
         key: "network",
         name: "network",
         enabled: |d| d.network,
@@ -256,6 +262,7 @@ const METRICS: [Metric; 10] = [
 const PERCENT_WIDEST: &str = "99%";
 const CELSIUS_WIDEST: &str = "99°C";
 const NETWORK_WIDEST: &str = "↓888M ↑888M";
+const WATTS_WIDEST: &str = "888W";
 
 /// A percentage, held at 99%: a full 100 says nothing 99 does not, and a
 /// third digit is room the bar would keep free all day for it.
@@ -283,6 +290,16 @@ fn rate(bytes_per_sec: f64) -> String {
         format!("{megabytes:.0}M")
     } else {
         format!("{:.1}G", megabytes / 1024.0)
+    }
+}
+
+/// Watts in as few characters as the bar can spare: `6.2W`, `25W`, `150W`.
+fn watts(value: f64) -> String {
+    let value = value.clamp(0.0, 999.0);
+    if value < 9.95 {
+        format!("{value:.1}W")
+    } else {
+        format!("{value:.0}W")
     }
 }
 
@@ -333,12 +350,13 @@ fn fullness(usage: Usage, units: Units, amounts: bool) -> String {
 }
 
 /// The widest `fullness` can be for something of this size. Used can take
-/// four characters whatever the total (`9.5G`, `123G`, `1.5T`), and the total
-/// never changes.
+/// four characters whatever the total (`999M`, `9.5G`, `123G`, `1.5T`), and
+/// `888M` is the widest of them, M being the widest unit. The total never
+/// changes.
 fn fullness_widest(total_kib: u64, units: Units, amounts: bool) -> String {
     if amounts {
         format!(
-            "888G/{}",
+            "888M/{}",
             size(total_kib, units).replace(|c: char| c.is_ascii_digit(), "8")
         )
     } else {
@@ -567,6 +585,27 @@ fn groups(
             devices: drives,
         },
         Group {
+            key: "power",
+            // On the battery the reading is the whole machine's; on mains it
+            // is the processor package and the GPUs. The caption says which.
+            devices: machine
+                .power
+                .map(|_| Device {
+                    label: if last.and_then(|s| s.power).is_some_and(|p| p.on_battery) {
+                        "BAT".into()
+                    } else {
+                        "PWR".into()
+                    },
+                    cells: vec![cell(
+                        "power",
+                        WATTS_WIDEST.into(),
+                        last.and_then(|s| s.power).map(|p| watts(p.watts)),
+                    )],
+                })
+                .into_iter()
+                .collect(),
+        },
+        Group {
             key: "network",
             devices: vec![Device {
                 label: "NET".into(),
@@ -586,6 +625,7 @@ pub fn read_options(details: &SystemDetails) -> SystemReadOptions {
         ssd_temp: details.ssd_temp,
         ssd_usage: details.ssd_usage,
         network: details.network,
+        power: details.power,
     }
 }
 
@@ -598,6 +638,7 @@ pub fn read_everything() -> SystemReadOptions {
         ssd_temp: true,
         ssd_usage: true,
         network: true,
+        power: true,
     }
 }
 
@@ -686,7 +727,7 @@ fn write(contents: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system::{DriveSnapshot, GpuSnapshot, NetworkRates};
+    use crate::system::{DriveSnapshot, GpuSnapshot, NetworkRates, PowerDraw};
 
     const GIB: u64 = 1024 * 1024;
 
@@ -710,6 +751,7 @@ mod tests {
                         used_kib: 20 * 1024,
                         total_kib: 8 * GIB,
                     }),
+                    power: Some(1.66),
                 },
                 GpuSnapshot {
                     label: "AMD".into(),
@@ -719,6 +761,7 @@ mod tests {
                         used_kib: 481 * 1024,
                         total_kib: 512 * 1024,
                     }),
+                    power: Some(6.2),
                 },
             ],
             cpu_temperature: Some(56.0),
@@ -742,7 +785,10 @@ mod tests {
                 down_bytes_per_sec: 9.0 * 1024.0,
                 up_bytes_per_sec: 28.0 * 1024.0,
             }),
-            ..SystemSnapshot::default()
+            power: Some(PowerDraw {
+                watts: 7.86,
+                on_battery: false,
+            }),
         }
     }
 
@@ -755,6 +801,7 @@ mod tests {
             gpus: true,
             gpu_temp: true,
             gpu_memory: true,
+            power: true,
             ssd_usage: true,
             ssd_temp: true,
             network: true,
@@ -800,7 +847,7 @@ mod tests {
         let machine = machine();
         assert_eq!(
             bar(&groups(&everything(), &machine, Some(&machine))),
-            "CPU 13% 56°C | RAM 75%  SWAP 5% | NVI 12% 45°C 20M/8G  AMD 38°C 481M/512M | SAM 9% 42°C  UMI 38°C | NET ↓9K ↑28K"
+            "CPU 13% 56°C | RAM 75%  SWAP 5% | NVI 12% 45°C 20M/8G  AMD 38°C 481M/512M | SAM 9% 42°C  UMI 38°C | PWR 7.9W | NET ↓9K ↑28K"
         );
     }
 
@@ -835,6 +882,39 @@ mod tests {
     }
 
     #[test]
+    fn the_draw_says_whether_it_is_the_battery_or_the_chips() {
+        let details = SystemDetails {
+            power: true,
+            ..nothing()
+        };
+        let mut machine = machine();
+        assert_eq!(bar(&groups(&details, &machine, Some(&machine))), "PWR 7.9W");
+        let unplugged = SystemSnapshot {
+            power: Some(PowerDraw {
+                watts: 16.4,
+                on_battery: true,
+            }),
+            ..machine.clone()
+        };
+        assert_eq!(bar(&groups(&details, &machine, Some(&unplugged))), "BAT 16W");
+        // A machine that can report neither is not offered the reading.
+        machine.power = None;
+        assert!(groups(&details, &machine, None)
+            .iter()
+            .find(|group| group.key == "power")
+            .is_some_and(|group| group.devices.is_empty()));
+    }
+
+    #[test]
+    fn watts_take_four_characters_at_most() {
+        assert_eq!(watts(0.0), "0.0W");
+        assert_eq!(watts(6.21), "6.2W");
+        assert_eq!(watts(9.96), "10W");
+        assert_eq!(watts(150.4), "150W");
+        assert_eq!(watts(5000.0), "999W");
+    }
+
+    #[test]
     fn a_rate_never_takes_more_than_three_digits() {
         let kib = 1024.0;
         let mib = 1024.0 * kib;
@@ -854,7 +934,7 @@ mod tests {
     fn a_value_is_usually_given_room_for_two_digits() {
         assert_eq!(usual("99%"), "88%");
         assert_eq!(usual("99°C"), "88°C");
-        assert_eq!(usual("888G/88.8T"), "888G/88.8T");
+        assert_eq!(usual("888M/88.8T"), "888M/88.8T");
         assert_eq!(usual("↓888M ↑888M"), "↓88M ↑88M");
     }
 

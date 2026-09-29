@@ -171,6 +171,9 @@ pub struct SystemDetails {
     pub ssd_usage: bool,
     #[serde(default)]
     pub network: bool,
+    /// What the machine draws, in watts.
+    #[serde(default)]
+    pub power: bool,
     /// RAM, swap and drives as used over total (`12G/16G`) rather than a
     /// percentage.
     #[serde(default)]
@@ -188,6 +191,7 @@ impl Default for SystemDetails {
             gpu_temp: false,
             ssd_temp: false,
             gpu_memory: false,
+            power: false,
             ssd_usage: false,
             amounts: false,
             network: false,
