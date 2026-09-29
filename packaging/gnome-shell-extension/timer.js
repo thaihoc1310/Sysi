@@ -7,6 +7,7 @@
 // turns red. A click on the pill answers it.
 
 import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -55,6 +56,9 @@ const countdown = {
     ringing: false,
     _endId: 0,
     _ringId: 0,
+    // Stops the alarm mid-sound: answered, it should fall quiet at once
+    // rather than play its six seconds out.
+    _ringCancel: null,
     _notification: null,
     _listeners: new Set(),
 
@@ -156,13 +160,14 @@ const countdown = {
         this._notify();
         const player = global.display.get_sound_player();
         const started = now();
-        player.play_from_theme(RING_SOUND, "Time's up", null);
+        const cancel = this._ringCancel = new Gio.Cancellable();
+        player.play_from_theme(RING_SOUND, "Time's up", cancel);
         this._ringId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, RING_EVERY_MS, () => {
             if (now() - started >= RING_FOR_MS) {
                 this._ringId = 0;
                 return GLib.SOURCE_REMOVE;
             }
-            player.play_from_theme(RING_SOUND, "Time's up", null);
+            player.play_from_theme(RING_SOUND, "Time's up", cancel);
             return GLib.SOURCE_CONTINUE;
         });
         this._changed();
@@ -205,6 +210,8 @@ const countdown = {
         if (this._ringId)
             GLib.source_remove(this._ringId);
         this._ringId = 0;
+        this._ringCancel?.cancel();
+        this._ringCancel = null;
         this.ringing = false;
         const notification = this._notification;
         this._notification = null;
