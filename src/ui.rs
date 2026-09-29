@@ -13493,6 +13493,7 @@ struct TagLine {
 
 #[derive(Clone)]
 struct TagList {
+    menu: gtk::Menu,
     item: gtk::MenuItem,
     scroller: gtk::ScrolledWindow,
     rows: gtk::Box,
@@ -13524,6 +13525,7 @@ impl TagList {
         item.add(&scroller);
         menu.append(&item);
         let list = Self {
+            menu: menu.clone(),
             item,
             scroller,
             rows,
@@ -13561,6 +13563,14 @@ impl TagList {
             let cross = gtk::Label::new(Some("\u{00d7}"));
             cross.style_context().add_class("tag-cross");
             cross.set_no_show_all(true);
+            if self.delete.is_some() {
+                // The menu is sized when it opens, from lines showing their
+                // counts: room is kept at the end of each for `delete?`.
+                for end in [&count, &cross] {
+                    end.set_width_chars(7);
+                    end.set_xalign(1.0);
+                }
+            }
             row.pack_start(&name, true, true, 0);
             row.pack_end(&cross, false, false, 0);
             row.pack_end(&count, false, false, 0);
@@ -13572,21 +13582,40 @@ impl TagList {
                 cross,
             });
         }
+        // With no tags yet the list still holds a line, faint, so the first
+        // one typed takes its place rather than the list growing from nothing.
+        let empty = choices.is_empty().then(|| {
+            let line = gtk::Label::new(Some("no tags yet"));
+            line.set_xalign(0.0);
+            line.style_context().add_class("tag-row");
+            line.style_context().add_class("tag-empty");
+            self.rows.pack_start(&line, false, false, 0);
+            line
+        });
         // A menu lays its items out at their least height, so the list is
-        // held at the height of the lines it shows, up to TAG_LIST_ROWS.
-        let height: i32 = lines
-            .iter()
-            .take(TAG_LIST_ROWS)
-            .map(|line| {
-                line.row.show_all();
-                line.row.preferred_height().1
-            })
-            .sum();
-        self.scroller.set_min_content_height(-1);
-        self.scroller.set_max_content_height(height.max(1));
-        self.scroller.set_min_content_height(height.max(1));
+        // held at the height of the lines it shows, up to TAG_LIST_ROWS. It is
+        // measured only as the menu opens: an open GTK menu does not grow or
+        // shrink, and scrolls whatever overflows behind arrows instead, so a
+        // tag added or deleted while it is open changes what the list holds,
+        // not how tall it is. (A new tag is the note's, and shows at the top.)
+        if !self.menu.is_mapped() {
+            let mut height: i32 = lines
+                .iter()
+                .take(TAG_LIST_ROWS)
+                .map(|line| {
+                    line.row.show_all();
+                    line.row.preferred_height().1
+                })
+                .sum();
+            if let Some(empty) = &empty {
+                empty.show();
+                height += empty.preferred_height().1;
+            }
+            self.scroller.set_min_content_height(-1);
+            self.scroller.set_max_content_height(height.max(1));
+            self.scroller.set_min_content_height(height.max(1));
+        }
         self.rows.show_all();
-        self.item.set_visible(!choices.is_empty());
         self.scroller.vadjustment().set_value(0.0);
     }
 
@@ -13783,6 +13812,25 @@ impl TagList {
     }
 }
 
+/// Tell a widget it has gained or lost the keyboard, for a widget in a window
+/// that is never the focused one (a menu's), where GTK would not.
+fn send_focus(widget: &impl IsA<gtk::Widget>, gained: bool) {
+    let Some(window) = widget.window() else {
+        return;
+    };
+    let mut event = gdk::Event::new(gdk::EventType::FocusChange);
+    // SAFETY: a FocusChange event is a GdkEventFocus; the window reference is
+    // handed to the event, which frees it.
+    unsafe {
+        use glib::translate::{ToGlibPtr, ToGlibPtrMut};
+        let raw: *mut gdk::ffi::GdkEvent = event.to_glib_none_mut().0;
+        let focus = raw as *mut gdk::ffi::GdkEventFocus;
+        (*focus).in_ = i16::from(gained);
+        (*focus).window = window.to_glib_full();
+    }
+    widget.send_focus_change(&event);
+}
+
 /// `TAG` and the submenu it opens, for the note in `note`: the tags in use to
 /// tick, and under them a field to type a new one into. Shared by a note's
 /// row in Notes and the note itself on the desk.
@@ -13846,7 +13894,6 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
         let state = state.clone();
         let note = note.clone();
         let list = list.clone();
-        let rule = rule.clone();
         move || {
             let choices = {
                 let data = state.borrow();
@@ -13858,7 +13905,6 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
                 tag_choices(data.tag_counts(), &own)
             };
             list.fill(&choices);
-            rule.set_visible(!choices.is_empty());
         }
     });
     // Enter gives the note the tag typed, or the tag in use it matches but
@@ -13896,19 +13942,7 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
         let entry = entry.clone();
         move || {
             entry.grab_focus();
-            if let Some(window) = entry.window() {
-                let mut event = gdk::Event::new(gdk::EventType::FocusChange);
-                // SAFETY: a FocusChange event is a GdkEventFocus; the window
-                // reference is handed to the event, which frees it.
-                unsafe {
-                    use glib::translate::{ToGlibPtr, ToGlibPtrMut};
-                    let raw: *mut gdk::ffi::GdkEvent = event.to_glib_none_mut().0;
-                    let focus = raw as *mut gdk::ffi::GdkEventFocus;
-                    (*focus).in_ = 1;
-                    (*focus).window = window.to_glib_full();
-                }
-                entry.send_focus_change(&event);
-            }
+            send_focus(&entry, true);
         }
     };
     menu.connect_button_press_event({
@@ -13949,9 +13983,22 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
     });
     // An input method reads the releases as well.
     menu.connect_key_release_event(move |_, event| typing(event));
+    // Closed, the field lets go of the keyboard: a focused field hides its
+    // `new tag`, and would open next time with a caret in it.
     menu.connect_hide({
         let entry = entry.clone();
-        move |_| entry.set_text("")
+        move |_| {
+            entry.set_text("");
+            if entry.has_focus() {
+                send_focus(&entry, false);
+            }
+            if let Some(window) = entry
+                .toplevel()
+                .and_then(|top| top.downcast::<gtk::Window>().ok())
+            {
+                window.set_focus(None::<&gtk::Widget>);
+            }
+        }
     });
     menu.show_all();
     item.set_submenu(Some(&menu));

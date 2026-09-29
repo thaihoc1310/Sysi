@@ -1283,6 +1283,11 @@ scrolledwindow overshoot.right:backdrop {
   background-color: rgba(255, 255, 255, 0.24);
 }
 
+.tag-empty {
+  font-weight: 600;
+  opacity: 0.45;
+}
+
 .tag-count {
   font-size: 9px;
   font-weight: 600;
