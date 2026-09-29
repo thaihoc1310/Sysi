@@ -1381,6 +1381,21 @@ scrolledwindow overshoot.right:backdrop {
   color: #1c1c1e;
 }
 
+/* A tag's name typed over in place: no taller than the line it replaces,
+   which an open menu could not make room for, and selected in the ink's
+   own tint rather than the theme's accent. */
+.tag-row .tag-entry {
+  border-radius: 4px;
+  margin: 0 -5px;
+  min-height: 16px;
+  padding: 0 5px;
+}
+
+.tag-entry selection {
+  background-color: alpha(currentColor, 0.28);
+  color: inherit;
+}
+
 /* The filter's button beside the note count: faint while it narrows
    nothing, lit while it does. */
 .notes-tags {

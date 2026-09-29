@@ -4218,23 +4218,41 @@ fn attach_tag_filter(
     menu.append(&rule);
     menu.append(&clear);
     menu.show_all();
-    button.connect_clicked({
+    let open: Rc<dyn Fn(Option<gdk::Event>)> = Rc::new({
         let state = state.clone();
         let filter = filter.clone();
-        move |button| {
+        let list = list.clone();
+        let menu = menu.clone();
+        let button = button.clone();
+        move |trigger: Option<gdk::Event>| {
             let choices = tag_choices(state.borrow().tag_counts(), &filter.borrow());
             list.fill(&choices);
             let narrowed = !filter.borrow().is_empty();
             rule.set_visible(narrowed && !choices.is_empty());
             clear.set_visible(narrowed);
             menu.popup_at_widget(
-                button,
+                &button,
                 gdk::Gravity::SouthEast,
                 gdk::Gravity::NorthEast,
-                None,
+                trigger.or_else(gtk::current_event).as_ref(),
             );
         }
     });
+    // A tag deleted or renamed away leaves the open list a line short; an
+    // open GTK menu does not shrink, so it is opened again at its new size.
+    list.set_reopen(Rc::new({
+        let open = open.clone();
+        move || {
+            menu.popdown();
+            // Once the click that did it is over: a menu opened again from
+            // inside its own release is let go of by that release. That click
+            // is still what it opens for.
+            let open = open.clone();
+            let trigger = gtk::current_event();
+            glib::idle_add_local_once(move || open(trigger));
+        }
+    }));
+    button.connect_clicked(move |_| open(None));
 }
 
 fn notes_row_confirm(row: &gtk::EventBox) -> Option<gtk::Label> {
@@ -13541,6 +13559,9 @@ struct TagList {
     armed: Rc<RefCell<Option<String>>>,
     /// The line whose name is being typed over, and the field it is typed in.
     editing: Rc<RefCell<Option<(TagLine, gtk::Entry)>>>,
+    /// Opens the menu again, measured afresh, after a delete or a rename
+    /// changed how many lines it holds.
+    reopen: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 }
 
 impl TagList {
@@ -13573,9 +13594,28 @@ impl TagList {
             rename,
             armed: Rc::new(RefCell::new(None)),
             editing: Rc::new(RefCell::new(None)),
+            reopen: Rc::new(RefCell::new(None)),
         };
         list.listen(menu, pick);
         list
+    }
+
+    fn set_reopen(&self, reopen: Rc<dyn Fn()>) {
+        *self.reopen.borrow_mut() = Some(reopen);
+    }
+
+    /// After a delete or a rename, show the list as it is now: opened again
+    /// at its new height where the owner can, else in place.
+    fn refresh(&self, choices: &[TagChoice]) {
+        let reopen = self.reopen.borrow().clone();
+        match reopen {
+            Some(reopen) if self.menu.is_mapped() => reopen(),
+            _ => {
+                let at = self.scroller.vadjustment().value();
+                self.fill(choices);
+                self.scroller.vadjustment().set_value(at);
+            }
+        }
     }
 
     /// Show these choices, scrolled back to the top.
@@ -13738,10 +13778,8 @@ impl TagList {
                     list.cancel_rename();
                     return;
                 }
-                let at = list.scroller.vadjustment().value();
                 let choices = rename(&old, &new);
-                list.fill(&choices);
-                list.scroller.vadjustment().set_value(at);
+                list.refresh(&choices);
             }
         });
         *self.editing.borrow_mut() = Some((line.clone(), entry));
@@ -13786,11 +13824,8 @@ impl TagList {
             line.cross.set_text("delete?");
             return;
         }
-        let at = self.scroller.vadjustment().value();
         let choices = delete(&line.name);
-        self.fill(&choices);
-        // Where it was, less the line that went.
-        self.scroller.vadjustment().set_value(at);
+        self.refresh(&choices);
     }
 
     fn listen(&self, menu: &gtk::Menu, pick: Rc<dyn Fn(&str) -> (bool, Option<usize>)>) {
@@ -14117,6 +14152,10 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
             shell.deselect();
             refill();
             shell.select_item(&item);
+            // Up at once, as Enter on a submenu's row opens it, rather than
+            // after the pointer's popup delay: the menu is gone a frame, not
+            // a quarter of a second.
+            shell.emit_by_name::<()>("activate-current", &[&false]);
         }
     });
     // A menu item lays its input window over the field, so a click there is
