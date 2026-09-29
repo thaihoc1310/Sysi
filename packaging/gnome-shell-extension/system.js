@@ -25,12 +25,12 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 // Clear space between the last reading and the clock.
-const CLOCK_GAP = 10;
+const CLOCK_GAP = 6;
 // The least clear space the row may ever leave the clock, however far a value
 // has outgrown the two digits it was reckoned at.
 const CLOCK_CLEAR = 2;
 // Between a group and the hairline on either side of it.
-const GROUP_GAP = 6;
+const GROUP_GAP = 8;
 // Between two devices of one group.
 const DEVICE_GAP = 10;
 // Between a caption and its first value, and between two values.
