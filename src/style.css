@@ -982,6 +982,14 @@ scrolledwindow overshoot.right:backdrop {
  * the same soft-tinted hover the note scrollbars use, and no theme accent
  * anywhere. Kept deliberately tight — the desktop theme's menu metrics made a
  * three-word menu the size of a dialog. */
+/* The window a menu pops up in. Yaru rings it with a 1px line at 65% black
+   (`0 0 0 1px` in its box-shadow), and that ring, not the menu's own border,
+   was the dark edge left around every menu. A glass menu gets its shadow
+   from the extension. */
+.csd.popup decoration {
+  box-shadow: none;
+}
+
 .sysi-menu {
   background-color: rgba(22, 22, 24, 0.90);
   border: none;
