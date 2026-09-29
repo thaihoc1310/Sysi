@@ -43,6 +43,8 @@ const HAIRLINE = 1;
 // the file every couple of seconds, and one written just before the click
 // arrived would otherwise put a reading back the way it was for a moment.
 const PENDING_MS = 3000;
+// How many measured widths are kept before they are all forgotten.
+const WIDTHS_KEPT = 512;
 
 // A value as the bar shows it, in plain text. Not Pango markup: a kept label
 // given new markup kept the old spans' byte offsets, which split a
@@ -360,8 +362,9 @@ export class SystemPanel {
         return width;
     }
 
-    // The same, remembered: for captions and the two-digit widths values are
-    // given at least, which are few and never change.
+    // The same, remembered. Values come round again and again (45°C, 12%),
+    // so a sample mostly costs no new actors; the few hundred a day of
+    // readings brings are forgotten together and measured again as seen.
     _text(kind, text) {
         const key = `${kind}\t${text}`;
         const known = this._widths.get(key);
@@ -369,8 +372,11 @@ export class SystemPanel {
             return known;
         const width = this._measureNow(kind, text);
         // Nothing to measure with while the panel row is off the stage.
-        if (width > 0 && this._probe.box.mapped)
+        if (width > 0 && this._probe.box.mapped) {
+            if (this._widths.size >= WIDTHS_KEPT)
+                this._widths.clear();
             this._widths.set(key, width);
+        }
         return width;
     }
 
@@ -381,12 +387,6 @@ export class SystemPanel {
             this._widths.clear();
             this._renderLater();
         });
-    }
-
-    // How wide a value is now. Not remembered: values change every sample,
-    // and a cache of them would grow for as long as the shell runs.
-    _textNow(text) {
-        return this._measureNow('value', text);
     }
 
     // A device's width with these values in it.
@@ -549,7 +549,7 @@ export class SystemPanel {
                         ? this._text('value', cell.usual)
                         : 0;
                     const text = cell.value ?? '–';
-                    const valueWidth = Math.max(least, this._textNow(text));
+                    const valueWidth = Math.max(least, this._text('value', text));
                     setValue(label, text);
                     setWidth(label, valueWidth);
                     width += (index ? VALUE_GAP : 0) + valueWidth;
