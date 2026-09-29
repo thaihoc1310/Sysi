@@ -25,12 +25,12 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 // Clear space between the last reading and the clock.
-const CLOCK_GAP = 12;
+const CLOCK_GAP = 10;
 // The least clear space the row may ever leave the clock, however far a value
 // has outgrown the two digits it was reckoned at.
-const CLOCK_CLEAR = 4;
+const CLOCK_CLEAR = 2;
 // Between a group and the hairline on either side of it.
-const GROUP_GAP = 8;
+const GROUP_GAP = 6;
 // Between two devices of one group.
 const DEVICE_GAP = 10;
 // Between a caption and its first value, and between two values.
@@ -449,9 +449,13 @@ export class SystemPanel {
         // A value can outgrow its reckoning (a download past 100M both ways).
         // Rather than let the row run into the clock, the last group steps
         // out until it shrinks back.
+        // The preferred width counts the row's margin, which _room has
+        // already taken off.
+        const node = this._readout.get_theme_node();
+        const width = this._readout.get_preferred_width(-1)[1] -
+            node.get_margin(St.Side.LEFT) - node.get_margin(St.Side.RIGHT);
         const last = this._groups.get(layout[layout.length - 1].group.key);
-        if (layout.length > 1 &&
-            this._readout.get_preferred_width(-1)[1] > this._room() + CLOCK_GAP - CLOCK_CLEAR) {
+        if (layout.length > 1 && width > this._room() + CLOCK_GAP - CLOCK_CLEAR) {
             last.box.visible = false;
             last.hairline.visible = false;
         }

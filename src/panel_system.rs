@@ -343,8 +343,13 @@ fn fullness_widest(total_kib: u64, units: Units, amounts: bool) -> String {
 }
 
 /// A widest value cut to two digits wherever it has three or more: `100%` to
-/// `88%`, `888G/88.8T` to `88G/88.8T`, `↓888M` to `↓88M`.
+/// `88%`, `↓888M` to `↓88M`. Used/total is left whole.
 fn usual(widest: &str) -> String {
+    // Used over total: the total never changes, and the used part runs to
+    // four characters (7.3G, 123G) as a matter of course.
+    if widest.contains('/') {
+        return widest.to_owned();
+    }
     let mut out = String::new();
     let mut run = 0;
     for c in widest.chars() {
@@ -845,7 +850,7 @@ mod tests {
     fn a_value_is_usually_given_room_for_two_digits() {
         assert_eq!(usual("100%"), "88%");
         assert_eq!(usual("100°C"), "88°C");
-        assert_eq!(usual("888G/88.8T"), "88G/88.8T");
+        assert_eq!(usual("888G/88.8T"), "888G/88.8T");
         assert_eq!(usual("↓888M ↑888M"), "↓88M ↑88M");
     }
 
