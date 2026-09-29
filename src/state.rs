@@ -528,6 +528,18 @@ impl AppState {
         }
     }
 
+    /// Take a tag off every note that has it, and say how many had it. Like
+    /// tagging, it is not an edit of the notes.
+    pub fn delete_tag(&mut self, tag: &str) -> usize {
+        let mut had = 0;
+        for note in &mut self.notes {
+            let before = note.tags.len();
+            note.tags.retain(|known| known != tag);
+            had += before - note.tags.len();
+        }
+        had
+    }
+
     pub fn referenced_image_files(&self) -> std::collections::HashSet<String> {
         self.notes
             .iter()
@@ -560,6 +572,11 @@ mod tests {
         assert!(!state.toggle_note_tag(1, "speaking part 2"));
         assert_eq!(state.tag_counts(), [("vocab".to_owned(), 2)]);
         assert!(!state.toggle_note_tag(9, "vocab"));
+        // Deleted, a tag leaves every note it was on, and only that tag.
+        assert!(state.toggle_note_tag(3, "ielts"));
+        assert_eq!(state.delete_tag("vocab"), 2);
+        assert_eq!(state.tag_counts(), [("ielts".to_owned(), 1)]);
+        assert_eq!(state.delete_tag("vocab"), 0);
         assert!(!state.toggle_note_tag(1, " # "));
         assert_eq!(clean_tag(&"x".repeat(40)).map(|tag| tag.len()), Some(24));
     }

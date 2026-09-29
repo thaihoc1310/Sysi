@@ -4140,27 +4140,44 @@ fn attach_tag_filter(
     rebuild_list: &Rc<dyn Fn()>,
 ) {
     let menu = context_menu();
-    let list = TagList::new(&menu, {
-        let filter = filter.clone();
-        let rebuild_list = rebuild_list.clone();
-        Rc::new(move |name| {
-            let on = {
-                let mut filter = filter.borrow_mut();
-                match filter.iter().position(|tag| tag == name) {
-                    Some(index) => {
-                        filter.remove(index);
-                        false
+    let list = TagList::new(
+        &menu,
+        {
+            let filter = filter.clone();
+            let rebuild_list = rebuild_list.clone();
+            Rc::new(move |name| {
+                let on = {
+                    let mut filter = filter.borrow_mut();
+                    match filter.iter().position(|tag| tag == name) {
+                        Some(index) => {
+                            filter.remove(index);
+                            false
+                        }
+                        None => {
+                            filter.push(name.to_owned());
+                            true
+                        }
                     }
-                    None => {
-                        filter.push(name.to_owned());
-                        true
-                    }
-                }
-            };
-            rebuild_list();
-            (on, None)
-        })
-    });
+                };
+                rebuild_list();
+                (on, None)
+            })
+        },
+        Some({
+            // Two clicks on a tag's × take it off every note (see TagList).
+            let state = state.clone();
+            let filter = filter.clone();
+            let rebuild_list = rebuild_list.clone();
+            Rc::new(move |name| {
+                state.borrow_mut().delete_tag(name);
+                let _ = state.borrow().save();
+                // Also drops the tag from the filter, and hides the button if
+                // it was the last tag.
+                rebuild_list();
+                tag_choices(state.borrow().tag_counts(), &filter.borrow())
+            })
+        }),
+    );
     let rule = gtk::SeparatorMenuItem::new();
     let clear = gtk::MenuItem::with_label("SHOW ALL");
     clear.connect_activate({
@@ -13463,17 +13480,38 @@ const TAG_WHEEL_STEP: f64 = 44.0;
 /// the menu's own events are hit-tested against it instead, the way the font
 /// buttons are, clicks, hover, the wheel and a drag of the scrollbar alike.
 /// A click ticks or unticks a line and leaves the menu open for the next.
+/// One line of a tag list as drawn.
+#[derive(Clone)]
+struct TagLine {
+    name: String,
+    row: gtk::Box,
+    count: gtk::Label,
+    /// In a list that deletes tags: the `×` shown for the line under the
+    /// pointer, and `delete?` once it has been clicked.
+    cross: gtk::Label,
+}
+
+#[derive(Clone)]
 struct TagList {
     item: gtk::MenuItem,
     scroller: gtk::ScrolledWindow,
     rows: gtk::Box,
-    lines: Rc<RefCell<Vec<(String, gtk::Box)>>>,
+    lines: Rc<RefCell<Vec<TagLine>>>,
+    /// Takes a tag off every note and says what the list holds after; only
+    /// the filter's list has it.
+    delete: Option<Rc<dyn Fn(&str) -> Vec<TagChoice>>>,
+    /// The tag whose `×` was clicked once and asks to be clicked again.
+    armed: Rc<RefCell<Option<String>>>,
 }
 
 impl TagList {
     /// `pick` ticks or unticks a tag, and says whether it is ticked now and,
     /// if ticking it changed how many notes have it, how many do.
-    fn new(menu: &gtk::Menu, pick: Rc<dyn Fn(&str) -> (bool, Option<usize>)>) -> Self {
+    fn new(
+        menu: &gtk::Menu,
+        pick: Rc<dyn Fn(&str) -> (bool, Option<usize>)>,
+        delete: Option<Rc<dyn Fn(&str) -> Vec<TagChoice>>>,
+    ) -> Self {
         let item = gtk::MenuItem::new();
         item.style_context().add_class("tag-list");
         let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
@@ -13490,6 +13528,8 @@ impl TagList {
             scroller,
             rows,
             lines: Rc::new(RefCell::new(Vec::new())),
+            delete,
+            armed: Rc::new(RefCell::new(None)),
         };
         list.listen(menu, pick);
         list
@@ -13497,16 +13537,17 @@ impl TagList {
 
     /// Show these choices, scrolled back to the top.
     fn fill(&self, choices: &[TagChoice]) {
+        self.armed.borrow_mut().take();
         for child in self.rows.children() {
             self.rows.remove(&child);
         }
         let mut lines = self.lines.borrow_mut();
         lines.clear();
         for choice in choices {
-            let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-            line.style_context().add_class("tag-row");
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            row.style_context().add_class("tag-row");
             if choice.on {
-                line.style_context().add_class("tag-on");
+                row.style_context().add_class("tag-on");
             }
             let name = gtk::Label::new(Some(&choice.name));
             name.set_xalign(0.0);
@@ -13517,19 +13558,28 @@ impl TagList {
             name.set_width_chars(choice.name.chars().count().clamp(8, 18) as i32);
             let count = gtk::Label::new(Some(&choice.count.to_string()));
             count.style_context().add_class("tag-count");
-            line.pack_start(&name, true, true, 0);
-            line.pack_end(&count, false, false, 0);
-            self.rows.pack_start(&line, false, false, 0);
-            lines.push((choice.name.clone(), line));
+            let cross = gtk::Label::new(Some("\u{00d7}"));
+            cross.style_context().add_class("tag-cross");
+            cross.set_no_show_all(true);
+            row.pack_start(&name, true, true, 0);
+            row.pack_end(&cross, false, false, 0);
+            row.pack_end(&count, false, false, 0);
+            self.rows.pack_start(&row, false, false, 0);
+            lines.push(TagLine {
+                name: choice.name.clone(),
+                row,
+                count,
+                cross,
+            });
         }
         // A menu lays its items out at their least height, so the list is
         // held at the height of the lines it shows, up to TAG_LIST_ROWS.
         let height: i32 = lines
             .iter()
             .take(TAG_LIST_ROWS)
-            .map(|(_, line)| {
-                line.show_all();
-                line.preferred_height().1
+            .map(|line| {
+                line.row.show_all();
+                line.row.preferred_height().1
             })
             .sum();
         self.scroller.set_min_content_height(-1);
@@ -13540,6 +13590,58 @@ impl TagList {
         self.scroller.vadjustment().set_value(0.0);
     }
 
+    /// Light the line under the pointer, and in a list that deletes, give it
+    /// the `×` in place of its count. A line asking to be deleted stops asking
+    /// once the pointer leaves it.
+    fn hover(&self, under: Option<&TagLine>) {
+        let armed = self.armed.borrow().clone();
+        if armed.is_some() && armed.as_deref() != under.map(|line| line.name.as_str()) {
+            self.disarm();
+        }
+        for line in self.lines.borrow().iter() {
+            let lit = under.is_some_and(|under| under.row == line.row);
+            let style = line.row.style_context();
+            if lit {
+                style.add_class("tag-row-hover");
+            } else {
+                style.remove_class("tag-row-hover");
+            }
+            if self.delete.is_some() {
+                line.cross.set_visible(lit);
+                line.count.set_visible(!lit);
+            }
+        }
+    }
+
+    fn disarm(&self) {
+        let Some(name) = self.armed.borrow_mut().take() else {
+            return;
+        };
+        if let Some(line) = self.lines.borrow().iter().find(|line| line.name == name) {
+            line.row.style_context().remove_class("tag-arming");
+            line.cross.set_text("\u{00d7}");
+        }
+    }
+
+    /// A click on a line's `×`: the first asks, the second deletes the tag.
+    fn cross_clicked(&self, line: &TagLine) {
+        let Some(delete) = &self.delete else {
+            return;
+        };
+        if self.armed.borrow().as_deref() != Some(line.name.as_str()) {
+            self.disarm();
+            *self.armed.borrow_mut() = Some(line.name.clone());
+            line.row.style_context().add_class("tag-arming");
+            line.cross.set_text("delete?");
+            return;
+        }
+        let at = self.scroller.vadjustment().value();
+        let choices = delete(&line.name);
+        self.fill(&choices);
+        // Where it was, less the line that went.
+        self.scroller.vadjustment().set_value(at);
+    }
+
     fn listen(&self, menu: &gtk::Menu, pick: Rc<dyn Fn(&str) -> (bool, Option<usize>)>) {
         let at = menu_point;
         let over = menu_over;
@@ -13547,36 +13649,20 @@ impl TagList {
         let line_at = {
             let scroller = self.scroller.clone();
             let lines = self.lines.clone();
-            move |menu: &gtk::Menu, point: (f64, f64)| -> Option<(String, gtk::Box)> {
+            move |menu: &gtk::Menu, point: (f64, f64)| -> Option<TagLine> {
                 if !over(menu, scroller.upcast_ref(), point) {
                     return None;
                 }
                 lines
                     .borrow()
                     .iter()
-                    .find(|(_, line)| over(menu, line.upcast_ref(), point))
+                    .find(|line| over(menu, line.row.upcast_ref(), point))
                     .cloned()
             }
         };
         let bar = self.scroller.vscrollbar();
         // The scrollbar held since this y, at this value.
         let dragging: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
-        let hover = {
-            let lines = self.lines.clone();
-            let line_at = line_at.clone();
-            move |menu: &gtk::Menu, point: Option<(f64, f64)>| {
-                let under = point.and_then(|point| line_at(menu, point));
-                for (_, line) in lines.borrow().iter() {
-                    let lit = under.as_ref().is_some_and(|(_, hit)| hit == line);
-                    let style = line.style_context();
-                    if lit {
-                        style.add_class("tag-row-hover");
-                    } else {
-                        style.remove_class("tag-row-hover");
-                    }
-                }
-            }
-        };
         menu.connect_button_press_event({
             let item = self.item.clone();
             let scroller = self.scroller.clone();
@@ -13597,7 +13683,7 @@ impl TagList {
             }
         });
         menu.connect_button_release_event({
-            let item = self.item.clone();
+            let list = self.clone();
             let dragging = dragging.clone();
             let line_at = line_at.clone();
             move |menu, event| {
@@ -13608,35 +13694,42 @@ impl TagList {
                     return glib::Propagation::Proceed;
                 };
                 if event.button() == 1 {
-                    if let Some((name, line)) = line_at(menu, point) {
-                        let (on, count) = pick(&name);
-                        let style = line.style_context();
+                    if let Some(line) = line_at(menu, point) {
+                        // The × is small: the whole end of the line from a
+                        // little before it counts.
+                        let on_cross = line.cross.is_visible()
+                            && line
+                                .cross
+                                .translate_coordinates(menu, 0, 0)
+                                .is_some_and(|(left, _)| point.0 >= f64::from(left - 6));
+                        if on_cross {
+                            list.cross_clicked(&line);
+                            return glib::Propagation::Stop;
+                        }
+                        list.disarm();
+                        let (on, count) = pick(&line.name);
+                        let style = line.row.style_context();
                         if on {
                             style.add_class("tag-on");
                         } else {
                             style.remove_class("tag-on");
                         }
-                        let count_label = line
-                            .children()
-                            .into_iter()
-                            .filter_map(|child| child.downcast::<gtk::Label>().ok())
-                            .find(|label| label.style_context().has_class("tag-count"));
-                        if let (Some(count), Some(label)) = (count, count_label) {
-                            label.set_text(&count.to_string());
+                        if let Some(count) = count {
+                            line.count.set_text(&count.to_string());
                         }
                         return glib::Propagation::Stop;
                     }
                 }
-                if over(menu, item.upcast_ref(), point) {
+                if over(menu, list.item.upcast_ref(), point) {
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
             }
         });
         menu.connect_motion_notify_event({
-            let scroller = self.scroller.clone();
+            let list = self.clone();
             let bar = bar.clone();
-            let hover = hover.clone();
+            let line_at = line_at.clone();
             move |menu, event| {
                 let point = at(menu, event.root());
                 if let (Some((from, value)), Some(bar), Some((_, y))) =
@@ -13644,23 +13737,23 @@ impl TagList {
                 {
                     // The slider moves with the pointer: the bar's length
                     // stands for the whole list.
-                    let adjustment = scroller.vadjustment();
+                    let adjustment = list.scroller.vadjustment();
                     let length = f64::from(bar.allocated_height().max(1));
                     adjustment.set_value(value + (y - from) * adjustment.upper() / length);
                     return glib::Propagation::Stop;
                 }
-                hover(menu, point);
+                list.hover(point.and_then(|point| line_at(menu, point)).as_ref());
                 glib::Propagation::Proceed
             }
         });
         menu.connect_scroll_event({
-            let scroller = self.scroller.clone();
-            let hover = hover.clone();
+            let list = self.clone();
+            let line_at = line_at.clone();
             move |menu, event| {
                 let Some(point) = at(menu, event.root()) else {
                     return glib::Propagation::Proceed;
                 };
-                if !over(menu, scroller.upcast_ref(), point) {
+                if !over(menu, list.scroller.upcast_ref(), point) {
                     return glib::Propagation::Proceed;
                 }
                 let step = TAG_WHEEL_STEP;
@@ -13670,15 +13763,22 @@ impl TagList {
                     gdk::ScrollDirection::Smooth => event.delta().1 * step,
                     _ => 0.0,
                 };
-                let adjustment = scroller.vadjustment();
+                let adjustment = list.scroller.vadjustment();
                 adjustment.set_value(adjustment.value() + delta);
-                hover(menu, Some(point));
+                list.hover(line_at(menu, point).as_ref());
                 glib::Propagation::Stop
             }
         });
-        menu.connect_leave_notify_event(move |menu, _| {
-            hover(menu, None);
-            glib::Propagation::Proceed
+        menu.connect_leave_notify_event({
+            let list = self.clone();
+            move |_, _| {
+                list.hover(None);
+                glib::Propagation::Proceed
+            }
+        });
+        menu.connect_hide({
+            let list = self.clone();
+            move |_| list.disarm()
         });
     }
 }
@@ -13705,26 +13805,30 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
             rebuild();
         }
     };
-    let list = Rc::new(TagList::new(&menu, {
-        let state = state.clone();
-        let note = note.clone();
-        let changed = changed.clone();
-        Rc::new(move |name| {
-            let Some(id) = note.get() else {
-                return (false, None);
-            };
-            let on = state.borrow_mut().toggle_note_tag(id, name);
-            let _ = state.borrow().save();
-            changed();
-            let count = state
-                .borrow()
-                .notes
-                .iter()
-                .filter(|note| note.tags.iter().any(|tag| tag == name))
-                .count();
-            (on, Some(count))
-        })
-    }));
+    let list = Rc::new(TagList::new(
+        &menu,
+        {
+            let state = state.clone();
+            let note = note.clone();
+            let changed = changed.clone();
+            Rc::new(move |name| {
+                let Some(id) = note.get() else {
+                    return (false, None);
+                };
+                let on = state.borrow_mut().toggle_note_tag(id, name);
+                let _ = state.borrow().save();
+                changed();
+                let count = state
+                    .borrow()
+                    .notes
+                    .iter()
+                    .filter(|note| note.tags.iter().any(|tag| tag == name))
+                    .count();
+                (on, Some(count))
+            })
+        },
+        None,
+    ));
     let rule = gtk::SeparatorMenuItem::new();
     menu.append(&rule);
     let field = gtk::MenuItem::new();
