@@ -489,6 +489,16 @@ export class SystemPanel {
         // moment it comes back (see setStripOpen).
         if (!visible)
             return;
+        // A device Sysi no longer lists (PWR once unplugged turns BAT, a
+        // drive unmounted) would otherwise stay on the row as it last was.
+        const listed = new Set(this._data.groups.flatMap(group =>
+            group.devices.map(device => `${group.key}\t${device.label}`)));
+        for (const [key, device] of this._devices) {
+            if (!listed.has(key)) {
+                device.box.destroy();
+                this._devices.delete(key);
+            }
+        }
         const shown = new Map(layout.map(entry => [entry.group.key, entry]));
         let first = true;
         // The row's width, added up from the widths every label is given
