@@ -952,7 +952,10 @@ mod tests {
             }),
             ..machine.clone()
         };
-        assert_eq!(bar(&groups(&details, &machine, Some(&unplugged))), "BAT 16W");
+        assert_eq!(
+            bar(&groups(&details, &machine, Some(&unplugged))),
+            "BAT 16W"
+        );
         // A machine that can report neither is not offered the reading.
         machine.power = None;
         assert!(groups(&details, &machine, None)
@@ -978,8 +981,14 @@ mod tests {
             ..machine.clone()
         };
         let read = |last: &SystemSnapshot| bar(&groups(&details, &machine, Some(last)));
-        assert_eq!(read(&at(BatteryState::Discharging, Some(2.49))), "BAT 16W  LEFT 2h30");
-        assert_eq!(read(&at(BatteryState::Charging, Some(0.75))), "PWR 16W  FULL 45m");
+        assert_eq!(
+            read(&at(BatteryState::Discharging, Some(2.49))),
+            "BAT 16W  LEFT 2h30"
+        );
+        assert_eq!(
+            read(&at(BatteryState::Charging, Some(0.75))),
+            "PWR 16W  FULL 45m"
+        );
         // Plugged in and full, there is no time to tell...
         let full = at(BatteryState::Idle, None);
         assert_eq!(read(&full), "PWR 16W");
@@ -1005,7 +1014,11 @@ mod tests {
             ..details
         };
         assert_eq!(
-            bar(&groups(&off, &machine, Some(&at(BatteryState::Discharging, Some(2.49))))),
+            bar(&groups(
+                &off,
+                &machine,
+                Some(&at(BatteryState::Discharging, Some(2.49)))
+            )),
             "BAT 16W"
         );
     }
@@ -1045,7 +1058,11 @@ mod tests {
         assert_eq!(rate(88.0 * mib), "88M");
         assert_eq!(rate(120.0 * mib), "120M");
         for bytes in [0.0, 999.6 * kib, 9.96 * mib, 999.4 * mib] {
-            assert!(rate(bytes).chars().count() <= "888M".chars().count(), "{}", rate(bytes));
+            assert!(
+                rate(bytes).chars().count() <= "888M".chars().count(),
+                "{}",
+                rate(bytes)
+            );
         }
     }
 

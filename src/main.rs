@@ -56,9 +56,8 @@ fn main() {
     if let Some(action) = option_value("--panel-action") {
         // Where the panel button that asked for this sits. The overlay cannot
         // find that out for itself; see the extension's _runAction.
-        let anchor = option_value("--at").or_else(|| {
-            platform::query_focus_or_pointer().map(|(x, y)| format!("{x},{y}"))
-        });
+        let anchor = option_value("--at")
+            .or_else(|| platform::query_focus_or_pointer().map(|(x, y)| format!("{x},{y}")));
         if let Err(error) = write_panel_action(&action, anchor.as_deref()) {
             eprintln!("Could not send the Sysi panel action: {error}");
             process::exit(1);
@@ -190,7 +189,10 @@ fn install_panel_extension() -> io::Result<()> {
     write_if_changed(&extension_dir.join("glass.js"), PANEL_EXTENSION_GLASS_JS)?;
     write_if_changed(&extension_dir.join("system.js"), PANEL_EXTENSION_SYSTEM_JS)?;
     write_if_changed(&extension_dir.join("timer.js"), PANEL_EXTENSION_TIMER_JS)?;
-    write_if_changed(&extension_dir.join("duration.js"), PANEL_EXTENSION_DURATION_JS)?;
+    write_if_changed(
+        &extension_dir.join("duration.js"),
+        PANEL_EXTENSION_DURATION_JS,
+    )?;
     // GNOME loads stylesheet.css from the extension directory on its own; the
     // strip's whole look lives there rather than in inline styles.
     write_if_changed(&extension_dir.join("stylesheet.css"), PANEL_EXTENSION_CSS)
@@ -402,7 +404,9 @@ fn binding_modifiers(binding: &str) -> (Vec<String>, String) {
 }
 
 fn binding_has(parts: &[String], names: &[&str]) -> bool {
-    parts.iter().any(|part| names.iter().any(|name| part == name))
+    parts
+        .iter()
+        .any(|part| names.iter().any(|name| part == name))
 }
 
 fn binding_is_ctrl_alt_n(binding: &str) -> bool {
@@ -515,10 +519,7 @@ mod tests {
 
     #[test]
     fn format_gsettings_path_list_round_trips() {
-        let paths = vec![
-            "/a/".to_owned(),
-            "/b/".to_owned(),
-        ];
+        let paths = vec!["/a/".to_owned(), "/b/".to_owned()];
         assert_eq!(
             parse_gsettings_path_list(&format_gsettings_path_list(&paths)),
             paths
@@ -551,7 +552,9 @@ mod tests {
     #[test]
     fn unquote_gsettings_strips_surrounding_quotes() {
         assert_eq!(unquote_gsettings("'Sysi Notes'"), "Sysi Notes");
-        assert_eq!(unquote_gsettings("sysi --panel-action toggle-notes"), "sysi --panel-action toggle-notes");
+        assert_eq!(
+            unquote_gsettings("sysi --panel-action toggle-notes"),
+            "sysi --panel-action toggle-notes"
+        );
     }
-
 }

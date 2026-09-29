@@ -84,7 +84,10 @@ fn looks_like_markdown(text: &str) -> bool {
     let tex = |line: &str| {
         dollar.is_match(line)
             || delimited.captures_iter(line).any(|caps| {
-                caps.get(1).or(caps.get(2)).or(caps.get(3)).is_some_and(|m| is_tex(m.as_str()))
+                caps.get(1)
+                    .or(caps.get(2))
+                    .or(caps.get(3))
+                    .is_some_and(|m| is_tex(m.as_str()))
             })
     };
     // `<br>` is not on the list: on its own it is as likely an HTML file.
@@ -100,7 +103,8 @@ fn looks_like_markdown(text: &str) -> bool {
         {
             return true;
         }
-        if bold.is_match(line) || bold_underscore.is_match(line) || tex(line) || link.is_match(line) {
+        if bold.is_match(line) || bold_underscore.is_match(line) || tex(line) || link.is_match(line)
+        {
             return true;
         }
     }
@@ -216,9 +220,10 @@ fn strip_indent(line: &str, indent: usize) -> &str {
 /// back the trailing newline the paste had.
 fn finish(lines: Vec<String>, trailing_newline: bool) -> String {
     let mut out: Vec<String> = Vec::new();
-    for line in lines.into_iter().flat_map(|line| {
-        line.split('\n').map(str::to_owned).collect::<Vec<_>>()
-    }) {
+    for line in lines
+        .into_iter()
+        .flat_map(|line| line.split('\n').map(str::to_owned).collect::<Vec<_>>())
+    {
         if let Some(code) = line.strip_prefix(VERBATIM) {
             out.push(code.to_owned());
             continue;
@@ -249,7 +254,14 @@ fn clean_line_kind(line: &str) -> (String, bool) {
     let task = regex!(r"^\[([ xX])\]\s+(.*)$");
     let Some(caps) = item.captures(line) else {
         let indent = &line[..line.len() - line.trim_start().len()];
-        return (format!("{}{}", indent.replace('\t', "    "), clean_inline(line.trim())), false);
+        return (
+            format!(
+                "{}{}",
+                indent.replace('\t', "    "),
+                clean_inline(line.trim())
+            ),
+            false,
+        );
     };
     let indent = caps[1].replace('\t', "    ");
     let marker = &caps[2];
@@ -323,13 +335,66 @@ pub fn diagram_lines(text: &str) -> Vec<usize> {
 
 /// Strokes that go on into the line below, and ones that come from above.
 fn reaches_down(c: char) -> bool {
-    matches!(c, '┌' | '┐' | '┬' | '├' | '┤' | '┼' | '│' | '╭' | '╮' | '╔' | '╗' | '╦' | '╠'
-        | '╣' | '╬' | '║' | '┏' | '┓' | '┳' | '┣' | '┫' | '╋' | '┃' | '+' | '|')
+    matches!(
+        c,
+        '┌' | '┐'
+            | '┬'
+            | '├'
+            | '┤'
+            | '┼'
+            | '│'
+            | '╭'
+            | '╮'
+            | '╔'
+            | '╗'
+            | '╦'
+            | '╠'
+            | '╣'
+            | '╬'
+            | '║'
+            | '┏'
+            | '┓'
+            | '┳'
+            | '┣'
+            | '┫'
+            | '╋'
+            | '┃'
+            | '+'
+            | '|'
+    )
 }
 
 fn reaches_up(c: char) -> bool {
-    matches!(c, '│' | '├' | '┤' | '┼' | '┴' | '└' | '┘' | '╰' | '╯' | '║' | '╚' | '╝' | '╩'
-        | '╠' | '╣' | '╬' | '┃' | '┗' | '┛' | '┻' | '┣' | '┫' | '╋' | '▼' | '▲' | '↓' | '+' | '|')
+    matches!(
+        c,
+        '│' | '├'
+            | '┤'
+            | '┼'
+            | '┴'
+            | '└'
+            | '┘'
+            | '╰'
+            | '╯'
+            | '║'
+            | '╚'
+            | '╝'
+            | '╩'
+            | '╠'
+            | '╣'
+            | '╬'
+            | '┃'
+            | '┗'
+            | '┛'
+            | '┻'
+            | '┣'
+            | '┫'
+            | '╋'
+            | '▼'
+            | '▲'
+            | '↓'
+            | '+'
+            | '|'
+    )
 }
 
 /// The character in each fixed-width cell of a line (`None` for the second
@@ -368,9 +433,13 @@ pub fn restore_drawing_indent(text: &str) -> Option<String> {
         return None;
     }
     let meets = |shift: usize| {
-        strokes
-            .iter()
-            .all(|x| below.get(x + shift).copied().flatten().is_some_and(reaches_up))
+        strokes.iter().all(|x| {
+            below
+                .get(x + shift)
+                .copied()
+                .flatten()
+                .is_some_and(reaches_up)
+        })
     };
     if meets(0) {
         return None;
@@ -460,7 +529,9 @@ fn render_table(lines: &[&str], start: usize, width: usize) -> (Vec<String>, usi
             let mut k = j;
             while k < lines.len() && k < j + 40 {
                 let next = lines[k];
-                if next.trim_start().starts_with('|') || separator_re().is_match(next) && next.contains('|') {
+                if next.trim_start().starts_with('|')
+                    || separator_re().is_match(next) && next.contains('|')
+                {
                     break;
                 }
                 if ends_with_unescaped_pipe(next) {
@@ -476,7 +547,12 @@ fn render_table(lines: &[&str], start: usize, width: usize) -> (Vec<String>, usi
         }
         rows.push(split_row(&row));
     }
-    let columns = rows.iter().map(Vec::len).chain([header.len()]).max().unwrap_or(1);
+    let columns = rows
+        .iter()
+        .map(Vec::len)
+        .chain([header.len()])
+        .max()
+        .unwrap_or(1);
     let cell_lines = |cells: &[String]| -> Vec<Vec<String>> {
         (0..columns)
             .map(|c| {
@@ -495,7 +571,9 @@ fn render_table(lines: &[&str], start: usize, width: usize) -> (Vec<String>, usi
     };
     let header = cell_lines(&header);
     let body: Vec<Vec<Vec<String>>> = rows.iter().map(|row| cell_lines(row)).collect();
-    let aligns: Vec<Align> = (0..columns).map(|c| aligns.get(c).copied().unwrap_or(Align::Left)).collect();
+    let aligns: Vec<Align> = (0..columns)
+        .map(|c| aligns.get(c).copied().unwrap_or(Align::Left))
+        .collect();
     let drawn = draw_box_table(&header, &body, &aligns, width)
         .unwrap_or_else(|| draw_records(&header, &body));
     (drawn, j)
@@ -606,7 +684,11 @@ fn join_sentences(lines: &[String]) -> String {
     let mut out = String::new();
     for line in lines {
         if !out.is_empty() {
-            out.push_str(if out.ends_with(['.', '!', '?', ';', ':']) { " " } else { "; " });
+            out.push_str(if out.ends_with(['.', '!', '?', ';', ':']) {
+                " "
+            } else {
+                "; "
+            });
         }
         out.push_str(line);
     }
@@ -725,7 +807,12 @@ impl Held {
             }
             text = token
                 .replace_all(&text, |caps: &Captures| {
-                    caps[1].parse::<usize>().ok().and_then(|i| self.0.get(i)).cloned().unwrap_or_default()
+                    caps[1]
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| self.0.get(i))
+                        .cloned()
+                        .unwrap_or_default()
                 })
                 .into_owned();
         }
@@ -740,7 +827,9 @@ fn clean_inline(text: &str) -> String {
     let text = hold_code_spans(text, &mut held);
     let text = hold_maths(&text, &mut held);
     let escape = regex!(r"\\([!-/:-@\[-`{-~])");
-    let text = escape.replace_all(&text, |caps: &Captures| held.hold(caps[1].to_owned())).into_owned();
+    let text = escape
+        .replace_all(&text, |caps: &Captures| held.hold(caps[1].to_owned()))
+        .into_owned();
 
     // One level of brackets inside a URL, for Wikipedia's Foo_(bar).
     let image = regex!(r#"!\[([^\]]*)\]\(\s*((?:[^()\s]|\([^()\s]*\))+)(?:\s+"[^"]*")?\s*\)"#);
@@ -765,14 +854,20 @@ fn clean_inline(text: &str) -> String {
         })
         .into_owned();
     let autolink = regex!(r"<((?:https?|mailto):[^>\s]+)>");
-    let text = autolink.replace_all(&text, |caps: &Captures| held.hold(caps[1].to_owned())).into_owned();
+    let text = autolink
+        .replace_all(&text, |caps: &Captures| held.hold(caps[1].to_owned()))
+        .into_owned();
 
     let br = regex!(r"(?i)<br\s*/?>");
     let text = br.replace_all(&text, "\n").into_owned();
     let sup = regex!(r"(?i)<sup>([^<]*)</sup>");
-    let text = sup.replace_all(&text, |caps: &Captures| scripted(&caps[1], true)).into_owned();
+    let text = sup
+        .replace_all(&text, |caps: &Captures| scripted(&caps[1], true))
+        .into_owned();
     let sub = regex!(r"(?i)<sub>([^<]*)</sub>");
-    let text = sub.replace_all(&text, |caps: &Captures| scripted(&caps[1], false)).into_owned();
+    let text = sub
+        .replace_all(&text, |caps: &Captures| scripted(&caps[1], false))
+        .into_owned();
     let tag = regex!(
         r"(?i)</?(?:b|strong|i|em|u|s|del|ins|strike|mark|span|small|big|font|code|kbd|samp|var|abbr|cite|q|p|div|center|details|summary|tt)(?:\s[^<>]*)?/?>"
     );
@@ -792,8 +887,14 @@ fn clean_inline(text: &str) -> String {
                 "$1$2",
             ),
             (regex!(BOLD_UNDERSCORE), "$1$2$3"),
-            (regex!(r"(^|[^\w*])\*([^\s*](?:[^*\n]*[^\s*])?)\*($|[^\w*])"), "$1$2$3"),
-            (regex!(r"(^|[^\w])_([^\s_](?:[^_\n]*[^\s_])?)_($|[^\w])"), "$1$2$3"),
+            (
+                regex!(r"(^|[^\w*])\*([^\s*](?:[^*\n]*[^\s*])?)\*($|[^\w*])"),
+                "$1$2$3",
+            ),
+            (
+                regex!(r"(^|[^\w])_([^\s_](?:[^_\n]*[^\s_])?)_($|[^\w])"),
+                "$1$2$3",
+            ),
             (regex!(r"~~([^\n~]+?)~~"), "$1"),
         ] {
             text = pattern.replace_all(&text, replacement).into_owned();
@@ -852,7 +953,11 @@ fn hold_maths(text: &str, held: &mut Held) -> String {
     let display = regex!(r"\$\$(.+?)\$\$|\\\((.+?)\\\)|\\\[(.+?)\\\]");
     let text = display
         .replace_all(text, |caps: &Captures| {
-            let body = caps.get(1).or(caps.get(2)).or(caps.get(3)).map_or("", |m| m.as_str());
+            let body = caps
+                .get(1)
+                .or(caps.get(2))
+                .or(caps.get(3))
+                .map_or("", |m| m.as_str());
             // A regex group, \(foo\), is left for the escape pass, and a span
             // around held code is not maths at all: converting it would tear
             // the hold apart.
@@ -872,7 +977,9 @@ fn hold_maths(text: &str, held: &mut Held) -> String {
     while i < chars.len() {
         let opens = chars[i] == '$'
             && (i == 0 || chars[i - 1] != '\\')
-            && chars.get(i + 1).is_some_and(|c| !c.is_whitespace() && *c != '$');
+            && chars
+                .get(i + 1)
+                .is_some_and(|c| !c.is_whitespace() && *c != '$');
         if opens {
             let close = (i + 2..chars.len())
                 .take_while(|&j| chars[j] != '\n')
@@ -904,7 +1011,10 @@ fn decode_entities(text: &str) -> String {
         .replace_all(text, |caps: &Captures| {
             let name = &caps[1];
             let decoded = if let Some(hex) = name.strip_prefix("#x").or(name.strip_prefix("#X")) {
-                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32).map(String::from)
+                u32::from_str_radix(hex, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(String::from)
             } else if let Some(dec) = name.strip_prefix('#') {
                 dec.parse().ok().and_then(char::from_u32).map(String::from)
             } else {
@@ -1397,8 +1507,11 @@ Mẹo so sánh:
 ";
         assert_eq!(cleaned, expected);
         // Every table line is the same number of cells wide, so it lines up.
-        let widths: Vec<usize> =
-            cleaned.lines().filter(|l| l.starts_with(['┌', '│', '├', '└'])).map(display_width).collect();
+        let widths: Vec<usize> = cleaned
+            .lines()
+            .filter(|l| l.starts_with(['┌', '│', '├', '└']))
+            .map(display_width)
+            .collect();
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
     }
 
@@ -1416,7 +1529,10 @@ Mẹo so sánh:
     fn a_table_too_wide_for_the_note_becomes_records() {
         let table = "| A | B | C | D | E |\n|---|---|---|---|---|\n| một | hai | ba | bốn<br>x | Năm.<br>Sáu |\n";
         let cleaned = clean_pasted_markdown(table, 20).unwrap();
-        assert_eq!(cleaned, "• một\n  B: hai\n  C: ba\n  D: bốn; x\n  E: Năm. Sáu\n");
+        assert_eq!(
+            cleaned,
+            "• một\n  B: hai\n  C: ba\n  D: bốn; x\n  E: Năm. Sáu\n"
+        );
     }
 
     #[test]
@@ -1445,9 +1561,15 @@ Mẹo so sánh:
     #[test]
     fn code_fences_keep_their_contents_verbatim() {
         let text = "Run **this**:\n\n```bash\nls **/*.rs | wc -l\n```\n";
-        assert_eq!(clean_pasted_markdown(text, 40).unwrap(), "Run this:\n\nls **/*.rs | wc -l\n");
+        assert_eq!(
+            clean_pasted_markdown(text, 40).unwrap(),
+            "Run this:\n\nls **/*.rs | wc -l\n"
+        );
         let inline = "Use `**raw**` and **bold**";
-        assert_eq!(clean_pasted_markdown(inline, 40).unwrap(), "Use **raw** and bold");
+        assert_eq!(
+            clean_pasted_markdown(inline, 40).unwrap(),
+            "Use **raw** and bold"
+        );
     }
 
     #[test]
@@ -1462,13 +1584,22 @@ Mẹo so sánh:
     #[test]
     fn maths_becomes_unicode() {
         assert_eq!(latex_to_text(r"\rightarrow"), "→");
-        assert_eq!(latex_to_text(r"x^2 + y_{1} \le \frac{a+b}{c}"), "x² + y₁ ≤ (a+b)/c");
+        assert_eq!(
+            latex_to_text(r"x^2 + y_{1} \le \frac{a+b}{c}"),
+            "x² + y₁ ≤ (a+b)/c"
+        );
         assert_eq!(latex_to_text(r"\sqrt{x^2+1} \times \pi"), "√(x²+1) × π");
         assert_eq!(latex_to_text(r"90^\circ, \alpha \to \beta"), "90°, α → β");
-        assert_eq!(latex_to_text(r"\mathbb{R}^n, \text{ nếu } x \neq 0"), "ℝⁿ, nếu x ≠ 0");
+        assert_eq!(
+            latex_to_text(r"\mathbb{R}^n, \text{ nếu } x \neq 0"),
+            "ℝⁿ, nếu x ≠ 0"
+        );
         assert_eq!(latex_to_text(r"\unknown{x}"), r"\unknownx");
         let text = "Bold **a** so \\(E = mc^2\\) and $$\\sum_{i=1}^{n} i$$";
-        assert_eq!(clean_pasted_markdown(text, 40).unwrap(), "Bold a so E = mc² and ∑ᵢ₌₁ⁿ i");
+        assert_eq!(
+            clean_pasted_markdown(text, 40).unwrap(),
+            "Bold a so E = mc² and ∑ᵢ₌₁ⁿ i"
+        );
     }
 
     #[test]
@@ -1488,7 +1619,8 @@ Mẹo so sánh:
             clean_pasted_markdown(table, 0).unwrap(),
             "┌───┬───┬───┐\n│ a │ b │   │\n├───┼───┼───┤\n│ 1 │ 2 │ 3 │\n└───┴───┴───┘\n"
         );
-        let text = "Title\n===\n***both*** and **bold**, costs $5 and $10, 5 * 3, a**b, **open\nx&nbsp;y";
+        let text =
+            "Title\n===\n***both*** and **bold**, costs $5 and $10, 5 * 3, a**b, **open\nx&nbsp;y";
         assert_eq!(
             clean_pasted_markdown(text, 40).unwrap(),
             "Title\nboth and bold, costs $5 and $10, 5 * 3, a**b, **open\nx y"
@@ -1546,8 +1678,14 @@ Mẹo so sánh:
     #[test]
     fn a_chatbot_answer_still_triggers_on_bold_maths_and_underscored_phrases() {
         assert_eq!(clean_pasted_markdown("**Note:** x", 40).unwrap(), "Note: x");
-        assert_eq!(clean_pasted_markdown("Try \\(x^2\\) now **ok**", 40).unwrap(), "Try x² now ok");
-        assert_eq!(clean_pasted_markdown("**A** and __bold words__ and __init__", 40).unwrap(), "A and bold words and __init__");
+        assert_eq!(
+            clean_pasted_markdown("Try \\(x^2\\) now **ok**", 40).unwrap(),
+            "Try x² now ok"
+        );
+        assert_eq!(
+            clean_pasted_markdown("**A** and __bold words__ and __init__", 40).unwrap(),
+            "A and bold words and __init__"
+        );
     }
 
     /// The diagram a chatbot answer carried, as it reached a note: the copy
@@ -1603,7 +1741,8 @@ Mẹo so sánh:
         // the sentence above it or the one after the blank line.
         assert_eq!(diagram_lines(&note), (1..=lines.len()).collect::<Vec<_>>());
         // A table's rows and rules, but not a pipe table or plain notes.
-        let table = "Lệnh:\n│ go vet ./... │ Bắt lỗi │\n├──────┼──────┤\n| markdown | pipes |\nghi chú";
+        let table =
+            "Lệnh:\n│ go vet ./... │ Bắt lỗi │\n├──────┼──────┤\n| markdown | pipes |\nghi chú";
         assert_eq!(diagram_lines(table), vec![1, 2]);
         assert!(diagram_lines("").is_empty());
         // An ASCII box counts as a drawing as well.

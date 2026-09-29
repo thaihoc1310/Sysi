@@ -33,3 +33,10 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# GTK wiring passes the widgets a card is built from, and keeps its shared
+# state in Rc<RefCell<...>> of callbacks: long argument lists and nested
+# types are how that reads, and splitting them would only hide the wiring.
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"

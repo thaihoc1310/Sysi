@@ -1104,7 +1104,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let state = state.clone();
         let rebuild_list_slot = rebuild_list_slot.clone();
         Rc::new(move |id| {
-            if let Some(note) = state.borrow_mut().notes.iter_mut().find(|note| note.id == id)
+            if let Some(note) = state
+                .borrow_mut()
+                .notes
+                .iter_mut()
+                .find(|note| note.id == id)
             {
                 note.starred ^= true;
             }
@@ -1393,7 +1397,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 return;
             }
             last.set(now);
-            let opening = card.is_visible() == false;
+            let opening = !card.is_visible();
             if opening {
                 // Snapshot once. Later idle/follow queries see the overlay
                 // focused and the mouse on another monitor — those must not
@@ -1612,7 +1616,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             });
             let id = match (blank, mounted) {
                 (Some(id), Some(card)) => {
-                    if let Some(note) = state.borrow_mut().notes.iter_mut().find(|note| note.id == id)
+                    if let Some(note) = state
+                        .borrow_mut()
+                        .notes
+                        .iter_mut()
+                        .find(|note| note.id == id)
                     {
                         note.position = position;
                     }
@@ -1710,17 +1718,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         move |_| toggle_action()
     });
 
-    let dictate = install_dictate(
-        &window,
-        &root,
-        &registry,
-        &interactive,
-        {
-            let notes = notes.card.clone();
-            let interactive = interactive.clone();
-            Rc::new(move || notes.is_visible() || interactive.get())
-        },
-    );
+    let dictate = install_dictate(&window, &root, &registry, &interactive, {
+        let notes = notes.card.clone();
+        let interactive = interactive.clone();
+        Rc::new(move || notes.is_visible() || interactive.get())
+    });
 
     let dispatch_panel_action: Rc<dyn Fn()> = {
         let panel_system = panel_system.clone();
@@ -1783,9 +1785,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         // The X11 grab often opens first, on a stale seat
                         // position. A compositor --at that arrives in the
                         // same press should move the palette, not close it.
-                        let opened_recently = now_ms()
-                            .saturating_sub(notes_opened_at.get())
-                            < 250;
+                        let opened_recently = now_ms().saturating_sub(notes_opened_at.get()) < 250;
                         if action.anchor.is_some() && opened_recently {
                             follow_notes_pointer();
                         } else {
@@ -4024,7 +4024,9 @@ fn rebuild_notes_list(
         let note = &data.notes[index];
         let matches = compiled
             .as_ref()
-            .map(|expression| note_search_hits(&note.text, expression, NoteSearchOptions::default()))
+            .map(|expression| {
+                note_search_hits(&note.text, expression, NoteSearchOptions::default())
+            })
             .unwrap_or_default();
         if compiled.is_some() && matches.is_empty() {
             continue;
@@ -4076,9 +4078,10 @@ fn notes_row_confirm(row: &gtk::EventBox) -> Option<gtk::Label> {
         .and_then(|child| child.downcast::<gtk::Box>().ok())
         .and_then(|body| {
             body.children().into_iter().find_map(|child| {
-                child.downcast::<gtk::Label>().ok().filter(|label| {
-                    label.style_context().has_class("notes-row-confirm")
-                })
+                child
+                    .downcast::<gtk::Label>()
+                    .ok()
+                    .filter(|label| label.style_context().has_class("notes-row-confirm"))
             })
         })
 }
@@ -4276,9 +4279,7 @@ fn notes_pointer_global() -> Option<Point> {
 /// Where this open of the palette belongs. The snapshot taken at open
 /// wins so an idle place or a late --at cannot walk it to another screen.
 fn notes_place_point() -> Option<Point> {
-    NOTES_POINTER
-        .with(Cell::get)
-        .or_else(notes_pointer_global)
+    NOTES_POINTER.with(Cell::get).or_else(notes_pointer_global)
 }
 
 fn notes_pointer_local(root: &gtk::Fixed, point: Point) -> Point {
@@ -4291,11 +4292,7 @@ fn notes_pointer_local(root: &gtk::Fixed, point: Point) -> Point {
 
 /// Compositor, X11, and GDK disagree on logical vs device pixels.
 /// Keep the first candidate that actually sits on a monitor.
-fn fit_point_to_screens(
-    point: Point,
-    screens: &[ScreenRect],
-    scale: i32,
-) -> Option<(f64, f64)> {
+fn fit_point_to_screens(point: Point, screens: &[ScreenRect], scale: i32) -> Option<(f64, f64)> {
     let scale = scale.max(1);
     let candidates = [
         (f64::from(point.x), f64::from(point.y)),
@@ -4388,7 +4385,12 @@ fn notes_scroll_row(scroller: &gtk::ScrolledWindow, row: &impl IsA<gtk::Widget>)
 }
 
 fn pin_note_on_desk(state: &Rc<RefCell<AppState>>, id: u64) {
-    if let Some(note) = state.borrow_mut().notes.iter_mut().find(|note| note.id == id) {
+    if let Some(note) = state
+        .borrow_mut()
+        .notes
+        .iter_mut()
+        .find(|note| note.id == id)
+    {
         note.pinned = true;
     }
     let _ = state.borrow().save();
@@ -4419,7 +4421,6 @@ fn notes_request_delete(
         label.show();
     }
 }
-
 
 fn note_row(
     note: &Note,
@@ -4746,8 +4747,8 @@ fn pasted_image_size(pixels: Size, scale: i32, column: i32, room: Size) -> Size 
 /// old paste, which squeezed an image pasted far down a note to a 40x1
 /// sliver. Such an image comes back as if pasted afresh into a wide note.
 fn repaired_image_size(stored: Size, pixels: Size, scale: i32) -> Option<Size> {
-    let expected = i64::from(stored.width) * i64::from(pixels.height.max(1))
-        / i64::from(pixels.width.max(1));
+    let expected =
+        i64::from(stored.width) * i64::from(pixels.height.max(1)) / i64::from(pixels.width.max(1));
     let slack = (expected / 20).max(2);
     if stored.width > 0 && (i64::from(stored.height) - expected).abs() <= slack {
         return None;
@@ -4846,10 +4847,7 @@ fn note_size_for_image(current: Size, chrome: Size, image: Size, limit: Size) ->
 }
 
 fn note_scroll_value(editor: &gtk::TextView) -> f64 {
-    editor
-        .vadjustment()
-        .map(|adj| adj.value())
-        .unwrap_or(0.0)
+    editor.vadjustment().map(|adj| adj.value()).unwrap_or(0.0)
 }
 
 fn note_set_scroll_value(editor: &gtk::TextView, value: f64) {
@@ -5628,7 +5626,7 @@ fn mono_box_drawing_lines(buffer: &gtk::TextBuffer) {
     buffer.remove_tag(&tag, &start, &end);
     for line in crate::markdown::diagram_lines(&note_buffer_text(buffer)) {
         let from = buffer.iter_at_line(line as i32);
-        let mut to = from.clone();
+        let mut to = from;
         to.forward_to_line_end();
         buffer.apply_tag(&tag, &from, &to);
     }
@@ -5877,7 +5875,10 @@ fn paste_note_text(
 
 /// The width of one fixed-width cell in this note, in logical pixels.
 fn note_mono_cell(editor: &gtk::TextView) -> f64 {
-    let mut font = editor.pango_context().font_description().unwrap_or_default();
+    let mut font = editor
+        .pango_context()
+        .font_description()
+        .unwrap_or_default();
     font.set_family(NOTE_MONO_FAMILY);
     let sample = "0".repeat(20);
     let layout = editor.create_pango_layout(Some(&sample));
@@ -6102,8 +6103,8 @@ fn note_search_hits(
             }
             let before = text[..found.start()].chars().next_back();
             let after = text[found.end()..].chars().next();
-            before.is_some_and(is_note_search_word_char) == false
-                && after.is_some_and(is_note_search_word_char) == false
+            !before.is_some_and(is_note_search_word_char)
+                && !after.is_some_and(is_note_search_word_char)
         })
         .map(|found| {
             // GtkTextBuffer offsets count Unicode characters, while regex
@@ -6132,7 +6133,6 @@ fn note_search_matches(
     let expression = note_search_regex(query, options)?;
     Ok(note_search_hits(text, &expression, options))
 }
-
 
 fn clear_note_search_tags(
     buffer: &gtk::TextBuffer,
@@ -7636,7 +7636,8 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     paned.set_vexpand(true);
     paned.style_context().add_class("notes-paned");
 
-    let list_scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    let list_scroller =
+        gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     list_scroller.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
     list_scroller.set_overlay_scrolling(true);
     list_scroller.set_shadow_type(gtk::ShadowType::None);
@@ -7748,7 +7749,6 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
     }
 }
 
-
 struct WidgetPicker {
     card: gtk::EventBox,
     drag: gtk::EventBox,
@@ -7827,7 +7827,6 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
         quit,
     }
 }
-
 
 // The dictionary window is the history window's twin: the same note chrome and
 // resize grip, a plain title bar to grab it by, and a scrolling column of
@@ -9695,10 +9694,7 @@ fn raise_widget_windows(widget: &impl IsA<gtk::Widget>) {
     // SYSTEM and the timer could be dragged once and then took no press at
     // all. Setting above-child again is the public way to lift that window.
     if let Some(event_box) = container.downcast_ref::<gtk::EventBox>() {
-        if event_box.is_realized()
-            && !event_box.is_visible_window()
-            && event_box.is_above_child()
-        {
+        if event_box.is_realized() && !event_box.is_visible_window() && event_box.is_above_child() {
             event_box.set_above_child(false);
             event_box.set_above_child(true);
         }
@@ -9760,7 +9756,11 @@ fn restack_overlay_card(card: &gtk::EventBox) {
     let Ok(fixed) = parent.downcast::<gtk::Fixed>() else {
         return;
     };
-    let already_top = fixed.children().iter().rev().find(|child| child.widget_name() != "dictate")
+    let already_top = fixed
+        .children()
+        .iter()
+        .rev()
+        .find(|child| child.widget_name() != "dictate")
         .is_some_and(|child| child == card.upcast_ref::<gtk::Widget>());
     if already_top {
         raise_card_windows(card);
@@ -10610,9 +10610,8 @@ fn monitor_coordinate_divisor(
     // The overlay sits below the top bar, so logical monitors already overhang
     // it by the bar's height; halving those confined every widget to the
     // top-left quarter of a scale-2 desk. Split the difference instead.
-    let device = |span: i32, bound: i32| {
-        i64::from(span) * 2 > i64::from(bound) * i64::from(scale + 1)
-    };
+    let device =
+        |span: i32, bound: i32| i64::from(span) * 2 > i64::from(bound) * i64::from(scale + 1);
     if device(max_x.saturating_sub(min_x), root_bounds.width)
         || device(max_y.saturating_sub(min_y), root_bounds.height)
     {
@@ -11282,8 +11281,16 @@ fn resize_rect(
     let width = width.clamp(bounds.min_width, max_width);
     let height = height.clamp(bounds.min_height, max_height);
     ScreenRect {
-        x: if edges.left { start.x + start.width - width } else { start.x },
-        y: if edges.top { start.y + start.height - height } else { start.y },
+        x: if edges.left {
+            start.x + start.width - width
+        } else {
+            start.x
+        },
+        y: if edges.top {
+            start.y + start.height - height
+        } else {
+            start.y
+        },
         width,
         height,
     }
@@ -11304,7 +11311,10 @@ fn attach_edge_resize(
     window: gtk::ApplicationWindow,
     bounds: ResizeBounds,
 ) {
-    let Some(overlay) = handle.hitbox.parent().and_then(|p| p.downcast::<gtk::Overlay>().ok())
+    let Some(overlay) = handle
+        .hitbox
+        .parent()
+        .and_then(|p| p.downcast::<gtk::Overlay>().ok())
     else {
         return;
     };
@@ -11318,11 +11328,32 @@ fn attach_edge_resize(
     let area = Rc::new(Cell::new(None::<ScreenRect>));
     let mut zones = Vec::new();
     let layout = [
-        (false, false, true, false, gtk::Align::Fill, gtk::Align::Start),
+        (
+            false,
+            false,
+            true,
+            false,
+            gtk::Align::Fill,
+            gtk::Align::Start,
+        ),
         (false, false, false, true, gtk::Align::Fill, gtk::Align::End),
-        (true, false, false, false, gtk::Align::Start, gtk::Align::Fill),
+        (
+            true,
+            false,
+            false,
+            false,
+            gtk::Align::Start,
+            gtk::Align::Fill,
+        ),
         (false, true, false, false, gtk::Align::End, gtk::Align::Fill),
-        (true, false, true, false, gtk::Align::Start, gtk::Align::Start),
+        (
+            true,
+            false,
+            true,
+            false,
+            gtk::Align::Start,
+            gtk::Align::Start,
+        ),
         (false, true, true, false, gtk::Align::End, gtk::Align::Start),
         (true, false, false, true, gtk::Align::Start, gtk::Align::End),
         (false, true, false, true, gtk::Align::End, gtk::Align::End),
@@ -11342,7 +11373,11 @@ fn attach_edge_resize(
         zone.set_valign(valign);
         let corner = (left || right) && (top || bottom);
         if corner {
-            let reach = if top { RESIZE_TOP_CORNER } else { RESIZE_CORNER };
+            let reach = if top {
+                RESIZE_TOP_CORNER
+            } else {
+                RESIZE_CORNER
+            };
             zone.set_size_request(reach, reach);
         } else if left || right {
             zone.set_size_request(RESIZE_EDGE, -1);
@@ -11350,7 +11385,11 @@ fn attach_edge_resize(
             zone.set_margin_bottom(RESIZE_CORNER);
         } else {
             zone.set_size_request(-1, RESIZE_EDGE);
-            let reach = if top { RESIZE_TOP_CORNER } else { RESIZE_CORNER };
+            let reach = if top {
+                RESIZE_TOP_CORNER
+            } else {
+                RESIZE_CORNER
+            };
             zone.set_margin_start(reach);
             zone.set_margin_end(reach);
         }
@@ -11428,8 +11467,16 @@ fn attach_edge_resize(
                 // on each motion event is far too slow, and it cannot change.
                 let screens = overlay_screen_rects(&root);
                 area.set(
-                    host_screen(Point { x: rect.x, y: rect.y }, rect.width, rect.height, &screens)
-                        .or(Some(rect)),
+                    host_screen(
+                        Point {
+                            x: rect.x,
+                            y: rect.y,
+                        },
+                        rect.width,
+                        rect.height,
+                        &screens,
+                    )
+                    .or(Some(rect)),
                 );
                 start.set(Some((rect, pointer_x, pointer_y)));
                 latest.set(Some(rect));
@@ -11462,7 +11509,10 @@ fn attach_edge_resize(
                     return glib::Propagation::Proceed;
                 }
                 let (x, y) = event.root();
-                let delta = ((x - pointer_x).round() as i32, (y - pointer_y).round() as i32);
+                let delta = (
+                    (x - pointer_x).round() as i32,
+                    (y - pointer_y).round() as i32,
+                );
                 let Some(area) = area.get() else {
                     return glib::Propagation::Stop;
                 };
@@ -11808,9 +11858,7 @@ fn attach_drag(
 
     ensure_overlay_drag_release(&window);
 
-    handle.add_events(
-        gdk::EventMask::BUTTON_PRESS_MASK | gdk::EventMask::BUTTON_RELEASE_MASK,
-    );
+    handle.add_events(gdk::EventMask::BUTTON_PRESS_MASK | gdk::EventMask::BUTTON_RELEASE_MASK);
     handle.connect_button_press_event({
         let start = start.clone();
         let live = live.clone();
@@ -12001,11 +12049,7 @@ fn pointer_drag_sample() -> Option<(f64, f64, bool)> {
     let pointer = display.default_seat()?.pointer()?;
     let root = display.default_screen().root_window()?;
     let (_, x, y, mask) = root.device_position_double(&pointer);
-    Some((
-        x,
-        y,
-        mask.contains(gdk::ModifierType::BUTTON1_MASK),
-    ))
+    Some((x, y, mask.contains(gdk::ModifierType::BUTTON1_MASK)))
 }
 
 fn ungrab_pointer() {
@@ -12911,10 +12955,7 @@ fn collect_widget_input_shape(
         // their content can still be scrolled; editing is disabled separately
         // via the read-only editor, and their headers hide as edit chrome.
         let lock_note = receives_input_when_locked(&item.key);
-        if interactive
-            || settings
-            || lock_note
-        {
+        if interactive || settings || lock_note {
             if !item.widget.is_visible() || !item.widget.is_mapped() {
                 continue;
             }
@@ -13322,29 +13363,25 @@ fn install_css(screen: &gdk::Screen) {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_to_screens, clip_screen_to_overlay, dictate_capture_answer,
-        dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area,
-        fit_within_bounds, held_slide_point, top_child_at, top_raised_child_at,
-        foreground_for_mode, highlight_at,
-        image_room, monitor_coordinate_divisor, pasted_image_size, repaired_image_size,
-        monitor_root_bounds, normalize_monitor_rect, note_headline,
-        note_search_matches, note_size_for_image, padded_visual_rect,
-        age_label, centre_on_screen, clamp_scroll_value, note_snippets, note_sort_key, notes_delete_eats_key,
-        notes_pointer_global, notes_pointer_live, notes_place_point, palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
-        fit_point_to_screens, read_compositor_pointer, NOTES_POINTER, PANEL_ANCHOR,
-        pinned_note_sync, push_recent_search,
-        receives_input_when_locked, record_note_undo, reopen_point,
-        rescaled_from, resize_ceiling, resize_rect, resize_width_limit, ResizeBounds, ResizeEdges, resized_image_size, room_on_screen,
-        round_pixbuf_corners, sanitize_highlights, screen_in_overlay,
-        Foreground, NoteSearchMatch,
-        NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, WidgetPalette,
-        DRAG_REDRAW_INTERVAL, NOTE_HEIGHT,
-        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_IMAGE_PASTE_MAX,
-        NOTE_WIDTH,
+        age_label, centre_on_screen, clamp_scroll_value, clamp_to_screens, clip_screen_to_overlay,
+        dictate_capture_answer, dictate_rect_from_drag, drag_frame_due, ellipsize,
+        fit_point_to_screens, fit_to_work_area, fit_within_bounds, foreground_for_mode,
+        held_slide_point, highlight_at, image_room, monitor_coordinate_divisor,
+        monitor_root_bounds, normalize_monitor_rect, note_headline, note_search_matches,
+        note_size_for_image, note_snippets, note_sort_key, notes_delete_eats_key,
+        notes_place_point, notes_pointer_global, notes_pointer_live, padded_visual_rect,
+        palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
+        pasted_image_size, pinned_note_sync, push_recent_search, read_compositor_pointer,
+        receives_input_when_locked, record_note_undo, reopen_point, repaired_image_size,
+        rescaled_from, resize_ceiling, resize_rect, resize_width_limit, resized_image_size,
+        room_on_screen, round_pixbuf_corners, sanitize_highlights, screen_in_overlay, top_child_at,
+        top_raised_child_at, Foreground, NoteSearchMatch, NoteSearchOptions, NoteSnapshot,
+        NoteUndo, NoteUndoState, ResizeBounds, ResizeEdges, ScreenRect, WidgetPalette,
+        DRAG_REDRAW_INTERVAL, NOTES_POINTER, NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_MAX,
+        NOTE_IMAGE_MIN, NOTE_IMAGE_PASTE_MAX, NOTE_WIDTH, PANEL_ANCHOR,
     };
     use crate::state::{
-        ColorMode, HighlightColor, Note, NoteHighlight, NoteImage, Point, Size,
-        IMAGE_PLACEHOLDER,
+        ColorMode, HighlightColor, Note, NoteHighlight, NoteImage, Point, Size, IMAGE_PLACEHOLDER,
     };
     use gdk_pixbuf::{Colorspace, Pixbuf};
     use std::{cell::RefCell, path::PathBuf, rc::Rc};
@@ -13384,11 +13421,7 @@ mod tests {
 
     #[test]
     fn the_last_overlapping_child_is_the_one_on_top() {
-        let children = [
-            (0, 0, 100, 80),
-            (40, 20, 100, 80),
-            (200, 0, 50, 50),
-        ];
+        let children = [(0, 0, 100, 80), (40, 20, 100, 80), (200, 0, 50, 50)];
         assert_eq!(top_child_at(&children, 10, 10), Some(0));
         assert_eq!(top_child_at(&children, 50, 30), Some(1));
         assert_eq!(top_child_at(&children, 210, 10), Some(2));
@@ -13397,20 +13430,14 @@ mod tests {
 
     #[test]
     fn a_raised_child_sits_above_later_siblings() {
-        let children = [
-            (0, 0, 100, 80, 3, false),
-            (40, 20, 100, 80, 1, false),
-        ];
+        let children = [(0, 0, 100, 80, 3, false), (40, 20, 100, 80, 1, false)];
         assert_eq!(top_raised_child_at(&children, 50, 30), Some(0));
         assert_eq!(top_raised_child_at(&children, 10, 10), Some(0));
     }
 
     #[test]
     fn a_windowed_child_sits_above_a_windowless_overlap() {
-        let children = [
-            (0, 0, 100, 80, 0, true),
-            (40, 20, 100, 80, 9, false),
-        ];
+        let children = [(0, 0, 100, 80, 0, true), (40, 20, 100, 80, 9, false)];
         assert_eq!(top_raised_child_at(&children, 50, 30), Some(0));
         assert_eq!(top_raised_child_at(&children, 120, 30), Some(1));
     }
@@ -13850,7 +13877,15 @@ mod tests {
         assert_eq!(pasted_image_size(wide, 1, 900, screen).width, 900);
         // Near the monitor edge the room wins, and the shape still holds.
         assert_eq!(
-            pasted_image_size(table, 1, 262, Size { width: 300, height: 1100 }),
+            pasted_image_size(
+                table,
+                1,
+                262,
+                Size {
+                    width: 300,
+                    height: 1100
+                }
+            ),
             Size {
                 width: 300,
                 height: 170
@@ -14279,7 +14314,15 @@ mod tests {
         assert!(oversized.y >= left.y);
         assert_eq!(
             oversized,
-            clamp_to_screens(Point { x: left.x, y: left.y }, 2000, 900, &[left]),
+            clamp_to_screens(
+                Point {
+                    x: left.x,
+                    y: left.y
+                },
+                2000,
+                900,
+                &[left]
+            ),
         );
     }
 
@@ -14375,7 +14418,6 @@ mod tests {
         assert_eq!(age_label(now - 3 * 86_400 * 1000, now), "3d");
         assert_eq!(age_label(now - 14 * 86_400 * 1000, now), "2w");
     }
-
 
     #[test]
     fn shifted_overlay_clamps_to_real_monitor_edges() {
@@ -14642,21 +14684,60 @@ mod tests {
             preserve_current_aspect: false,
             height_for_width: None,
         };
-        let area = ScreenRect { x: 0, y: 29, width: 1280, height: 691 };
-        let note = ScreenRect { x: 300, y: 200, width: 220, height: 160 };
-        let edges = |left, right, top, bottom| ResizeEdges { left, right, top, bottom };
+        let area = ScreenRect {
+            x: 0,
+            y: 29,
+            width: 1280,
+            height: 691,
+        };
+        let note = ScreenRect {
+            x: 300,
+            y: 200,
+            width: 220,
+            height: 160,
+        };
+        let edges = |left, right, top, bottom| ResizeEdges {
+            left,
+            right,
+            top,
+            bottom,
+        };
         let drag = |e, dx, dy| resize_rect(note, e, (dx, dy), &bounds, area);
         // Left edge out by 50: wider, and the right edge stays at 520.
-        assert_eq!(drag(edges(true, false, false, false), -50, 30), ScreenRect { x: 250, y: 200, width: 270, height: 160 });
+        assert_eq!(
+            drag(edges(true, false, false, false), -50, 30),
+            ScreenRect {
+                x: 250,
+                y: 200,
+                width: 270,
+                height: 160
+            }
+        );
         // Top-left in: the bottom-right corner never moves.
         let r = drag(edges(true, false, true, false), 40, 20);
         assert_eq!((r.x + r.width, r.y + r.height), (520, 360));
         assert_eq!((r.width, r.height), (180, 140));
         // Bottom edge only changes the height.
-        assert_eq!(drag(edges(false, false, false, true), 99, 40), ScreenRect { x: 300, y: 200, width: 220, height: 200 });
+        assert_eq!(
+            drag(edges(false, false, false, true), 99, 40),
+            ScreenRect {
+                x: 300,
+                y: 200,
+                width: 220,
+                height: 200
+            }
+        );
         // Too small stops at the floor, still pinned to the far side.
         let r = drag(edges(true, false, true, false), 500, 500);
-        assert_eq!(r, ScreenRect { x: 445, y: 268, width: 75, height: 92 });
+        assert_eq!(
+            r,
+            ScreenRect {
+                x: 445,
+                y: 268,
+                width: 75,
+                height: 92
+            }
+        );
         // Never past the monitor: not over the left edge, not under the top bar.
         let r = drag(edges(true, false, true, false), -900, -900);
         assert_eq!((r.x, r.y, r.x + r.width, r.y + r.height), (0, 29, 520, 360));
@@ -14666,11 +14747,28 @@ mod tests {
 
     #[test]
     fn each_resize_zone_shows_the_cursor_for_its_direction() {
-        let edges = |left, right, top, bottom| ResizeEdges { left, right, top, bottom };
-        assert_eq!(edges(true, false, true, false).cursor(), gdk::CursorType::TopLeftCorner);
-        assert_eq!(edges(false, true, false, true).cursor(), gdk::CursorType::BottomRightCorner);
-        assert_eq!(edges(false, true, false, false).cursor(), gdk::CursorType::SbHDoubleArrow);
-        assert_eq!(edges(false, false, true, false).cursor(), gdk::CursorType::SbVDoubleArrow);
+        let edges = |left, right, top, bottom| ResizeEdges {
+            left,
+            right,
+            top,
+            bottom,
+        };
+        assert_eq!(
+            edges(true, false, true, false).cursor(),
+            gdk::CursorType::TopLeftCorner
+        );
+        assert_eq!(
+            edges(false, true, false, true).cursor(),
+            gdk::CursorType::BottomRightCorner
+        );
+        assert_eq!(
+            edges(false, true, false, false).cursor(),
+            gdk::CursorType::SbHDoubleArrow
+        );
+        assert_eq!(
+            edges(false, false, true, false).cursor(),
+            gdk::CursorType::SbVDoubleArrow
+        );
     }
 
     #[test]

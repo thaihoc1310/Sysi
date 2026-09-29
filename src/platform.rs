@@ -157,9 +157,7 @@ pub fn spawn_global_hotkey(sender: Sender<HotkeyAction>) -> bool {
 /// One connection. Used only by the short-lived `--panel-action` helper
 /// when the compositor did not pass `--at`.
 pub fn query_focus_or_pointer() -> Option<(i32, i32)> {
-    if std::env::var_os("DISPLAY").is_none() {
-        return None;
-    }
+    std::env::var_os("DISPLAY")?;
     unsafe {
         let display = xlib::XOpenDisplay(ptr::null());
         if display.is_null() {
@@ -196,7 +194,7 @@ unsafe fn root_pointer(display: *mut xlib::Display) -> Option<(i32, i32)> {
 
 unsafe fn active_window_center(display: *mut xlib::Display) -> Option<(i32, i32)> {
     let root = xlib::XDefaultRootWindow(display);
-    let net_active = xlib::XInternAtom(display, b"_NET_ACTIVE_WINDOW\0".as_ptr() as *const _, 0);
+    let net_active = xlib::XInternAtom(display, c"_NET_ACTIVE_WINDOW".as_ptr(), 0);
     if net_active == 0 {
         return None;
     }

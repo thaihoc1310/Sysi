@@ -551,7 +551,9 @@ fn supply_number(supply: &Path, name: &str) -> Option<f64> {
 fn supply_watts(supply: &Path) -> Option<f64> {
     let watts = match supply_number(supply, "power_now") {
         Some(microwatts) => microwatts / 1e6,
-        None => supply_number(supply, "current_now")? * supply_number(supply, "voltage_now")? / 1e12,
+        None => {
+            supply_number(supply, "current_now")? * supply_number(supply, "voltage_now")? / 1e12
+        }
     };
     Some(watts.abs())
 }
@@ -577,7 +579,12 @@ fn read_batteries(supplies: &Path) -> Option<BatteryReading> {
     let (mut found, mut held, mut missing) = (false, 0.0, 0.0);
     let (mut watts_out, mut watts_in) = (None::<f64>, None::<f64>);
     for supply in sorted_dirs(supplies) {
-        if fs::read_to_string(supply.join("type")).ok().as_deref().map(str::trim) != Some("Battery") {
+        if fs::read_to_string(supply.join("type"))
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            != Some("Battery")
+        {
             continue;
         }
         let Some(now) = supply_watt_hours(&supply, "now") else {
@@ -630,11 +637,7 @@ fn read_batteries(supplies: &Path) -> Option<BatteryReading> {
 /// for after.)
 fn settle(average: f64, watts: f64, seconds: f64, going: f64) -> f64 {
     let fading = 1.0 - (-seconds / BATTERY_AVERAGE).exp();
-    let even = if going > 0.0 {
-        seconds / going
-    } else {
-        1.0
-    };
+    let even = if going > 0.0 { seconds / going } else { 1.0 };
     average + (watts - average) * fading.max(even).min(1.0)
 }
 
@@ -896,7 +899,11 @@ fn find_drives() -> Vec<Drive> {
         .collect();
     let mut drives = Vec::new();
     for disk in sorted_dirs(Path::new("/sys/block")) {
-        let Some(block) = disk.file_name().and_then(|name| name.to_str()).map(str::to_owned) else {
+        let Some(block) = disk
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+        else {
             continue;
         };
         if ["loop", "ram", "zram", "dm-", "md", "sr", "fd", "nbd"]
@@ -1182,15 +1189,33 @@ mod tests {
                 mains,
                 (
                     "BAT0",
-                    &[("type", "Battery"), ("status", "Discharging"), ("energy_now", "30000000"), ("energy_full", "50000000"), ("power_now", "-12000000")],
+                    &[
+                        ("type", "Battery"),
+                        ("status", "Discharging"),
+                        ("energy_now", "30000000"),
+                        ("energy_full", "50000000"),
+                        ("power_now", "-12000000"),
+                    ],
                 ),
                 // A second battery waiting its turn still counts to the time.
-                ("BAT1", &[("type", "Battery"), ("status", "Unknown"), ("energy_now", "20000000"), ("energy_full", "20000000")]),
+                (
+                    "BAT1",
+                    &[
+                        ("type", "Battery"),
+                        ("status", "Unknown"),
+                        ("energy_now", "20000000"),
+                        ("energy_full", "20000000"),
+                    ],
+                ),
             ],
         );
         assert_eq!(
             read_batteries(&discharging),
-            Some(BatteryReading { state: BatteryState::Discharging, watts: 12.0, watt_hours: 50.0 })
+            Some(BatteryReading {
+                state: BatteryState::Discharging,
+                watts: 12.0,
+                watt_hours: 50.0
+            })
         );
         // Counted in charge, filling to a limit of 80%: 4 Ah at 15 V rated is
         // 60 Wh full, 48 Wh at the limit, and 30 Wh are in.
@@ -1212,15 +1237,36 @@ mod tests {
         );
         assert_eq!(
             read_batteries(&charging),
-            Some(BatteryReading { state: BatteryState::Charging, watts: 24.0, watt_hours: 18.0 })
+            Some(BatteryReading {
+                state: BatteryState::Charging,
+                watts: 24.0,
+                watt_hours: 18.0
+            })
         );
         let full = supplies(
             "full",
-            &[("BAT0", &[("type", "Battery"), ("status", "Full"), ("energy_now", "50000000"), ("power_now", "0")])],
+            &[(
+                "BAT0",
+                &[
+                    ("type", "Battery"),
+                    ("status", "Full"),
+                    ("energy_now", "50000000"),
+                    ("power_now", "0"),
+                ],
+            )],
         );
-        assert_eq!(read_batteries(&full).map(|reading| reading.state), Some(BatteryState::Idle));
+        assert_eq!(
+            read_batteries(&full).map(|reading| reading.state),
+            Some(BatteryState::Idle)
+        );
         // A battery that does not say what it holds is no battery to time.
-        let mute = supplies("mute", &[mains, ("BAT0", &[("type", "Battery"), ("status", "Discharging")])]);
+        let mute = supplies(
+            "mute",
+            &[
+                mains,
+                ("BAT0", &[("type", "Battery"), ("status", "Discharging")]),
+            ],
+        );
         assert_eq!(read_batteries(&mute), None);
         for dir in [discharging, charging, full, mute] {
             let _ = std::fs::remove_dir_all(dir);
