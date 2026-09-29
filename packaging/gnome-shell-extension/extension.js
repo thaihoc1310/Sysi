@@ -10,7 +10,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-import {GlassManager} from './glass.js';
+import {GlassManager, glassMenu} from './glass.js';
 import {SystemPanel} from './system.js';
 
 const UUID = 'sysi-panel@thaihoc';
@@ -235,6 +235,7 @@ export default class SysiPanelExtension extends Extension {
         const button = this._buildPanelButton('settings');
         this._settingsMenu = new PopupMenu.PopupMenu(button, 0.5, St.Side.TOP);
         this._settingsMenu.actor.add_style_class_name('sysi-settings-menu');
+        glassMenu(this._settingsMenu);
         Main.uiGroup.add_child(this._settingsMenu.actor);
         this._settingsMenu.actor.hide();
         Main.panel.menuManager.addMenu(this._settingsMenu);

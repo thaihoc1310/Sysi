@@ -76,11 +76,16 @@
 
 .sysi-settings-menu .popup-menu-content {
   background-color: rgba(22, 22, 24, 0.90);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: none;
   border-radius: 8px;
   padding: 3px 1px;
   box-shadow: none;
   min-width: 0;
+}
+
+/* On glass (see glass.js) the menu keeps only a faint tint of the slab. */
+.sysi-settings-menu.sysi-glass-menu .popup-menu-content {
+  background-color: rgba(22, 22, 24, 0.12);
 }
 
 .sysi-settings-menu .popup-menu-item {

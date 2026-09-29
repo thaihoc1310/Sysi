@@ -25,6 +25,8 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
+import {glassMenu} from './glass.js';
+
 // Clear space between the last reading and the clock.
 const CLOCK_GAP = 2;
 // The least clear space the row may ever leave the clock, however far a value
@@ -150,6 +152,7 @@ export class SystemPanel {
         this._menu = new PopupMenu.PopupMenu(button, 0.5, St.Side.TOP);
         this._menu.actor.add_style_class_name('sysi-settings-menu');
         this._menu.actor.add_style_class_name('sysi-system-menu');
+        glassMenu(this._menu);
         Main.uiGroup.add_child(this._menu.actor);
         this._menu.actor.hide();
         Main.panel.menuManager.addMenu(this._menu);

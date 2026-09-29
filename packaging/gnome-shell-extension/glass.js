@@ -113,6 +113,10 @@ uniform vec4 uRect;
 uniform float uRadius;
 uniform float uScale;
 uniform float uAppear;
+// 1 for a card's lit rim, 0 for a popup's plain edge.
+uniform float uRim;
+// The actor's paint opacity: a shell menu fades in and out with its own.
+uniform float uOpacity;
 uniform float uPress;
 uniform vec2 uPressAt;
 
@@ -172,7 +176,7 @@ if (cover < 1.0) {
     float shade = 0.14 * exp(-(ds * ds) / (2.0 * sigma * sigma));
     // A hairline of darkness right at the rim keeps the edge crisp on light
     // backdrops.
-    shade = max(shade, 0.14 * exp(-max(d, 0.0) * uScale));
+    shade = max(shade, 0.14 * uRim * exp(-max(d, 0.0) * uScale));
     result = vec4(0.0, 0.0, 0.0, shade * uAppear * (1.0 - cover));
 }
 
@@ -224,8 +228,8 @@ if (cover > 0.0) {
     float ring = exp(-depth / 1.0);
     float lit = pow(max(dot(n, light), 0.0), 1.5) + 0.7 * pow(max(dot(n, -light), 0.0), 1.5);
     vec3 tint = mix(vec3(1.0), clamp(glass_saturate(soft, 4.0), 0.0, 1.0), 0.35);
-    colour += tint * ring * lit * 0.65 * uAppear;
-    colour += 0.035 * exp(-depth / max(0.4 * band, 0.5)) * uAppear;
+    colour += tint * ring * lit * 0.65 * uAppear * uRim;
+    colour += 0.035 * exp(-depth / max(0.4 * band, 0.5)) * uAppear * uRim;
 
     // Pressing lights the glass from within, spreading from the pointer.
     vec2 m = px - uPressAt;
@@ -236,7 +240,7 @@ if (cover > 0.0) {
     colour = clamp(colour, 0.0, 1.0);
     result = vec4(colour * cover, cover) + result * (1.0 - cover);
 }
-cogl_color_out = result;
+cogl_color_out = result * uOpacity;
 `;
 
 function makePipeline(context, declarations, main, layers) {
@@ -250,6 +254,18 @@ function makePipeline(context, declarations, main, layers) {
     snippet.set_replace(main);
     pipeline.add_snippet(snippet);
     return pipeline;
+}
+
+function makePipelines(context) {
+    const pipelines = {
+        down: makePipeline(context, KAWASE_DECLARATIONS, KAWASE_DOWN, 1),
+        up: makePipeline(context, KAWASE_DECLARATIONS, KAWASE_UP, 1),
+        glass: makePipeline(context, GLASS_DECLARATIONS, GLASS_MAIN, 3),
+    };
+    // The blur passes overwrite their target outright.
+    for (const pipeline of [pipelines.down, pipelines.up])
+        pipeline.set_blend('RGBA = ADD (SRC_COLOR, 0)');
+    return pipelines;
 }
 
 // Uniform locations never change for a pipeline; asking for them every
@@ -385,15 +401,18 @@ class SysiGlassEffect extends Clutter.Effect {
         this._spareTimeout = 0;
     }
 
-    vfunc_paint_node(node, paintContext) {
+    // The glass, then whatever the actor paints itself: nothing for a card,
+    // the items for a shell menu.
+    vfunc_paint_node(node, paintContext, flags) {
         const actor = this.actor;
-        if (!actor || actor.is_in_clone_paint())
-            return;
-        try {
-            this._paint(node, paintContext, actor);
-        } catch (error) {
-            this._card.fail(error);
+        if (actor && !actor.is_in_clone_paint()) {
+            try {
+                this._paint(node, paintContext, actor);
+            } catch (error) {
+                this._card.fail(error);
+            }
         }
+        super.vfunc_paint_node(node, paintContext, flags);
     }
 
     _paint(node, paintContext, actor) {
@@ -583,6 +602,8 @@ const GlassCard = GObject.registerClass({
         super._init({reactive: false});
         this._host = host;
         this.key = key;
+        // A context menu or a popover sits on glass with no lit edge.
+        this._rim = key === 'menu' || key.startsWith('popover:') ? 0 : 1;
         this._appear = 1;
         this._press = 0;
         this._pressed = false;
@@ -728,6 +749,8 @@ const GlassCard = GObject.registerClass({
         setUniform(pipeline, 'uAppear', this._appear);
         setUniform(pipeline, 'uPress', this._press);
         setUniform(pipeline, 'uPressAt', ...this._pressAt);
+        setUniform(pipeline, 'uRim', this._rim);
+        setUniform(pipeline, 'uOpacity', 1);
     }
 
     repaintSoon() {
@@ -847,16 +870,7 @@ class GlassHost {
     }
 
     pipelines(context) {
-        if (!this._pipelines) {
-            this._pipelines = {
-                down: makePipeline(context, KAWASE_DECLARATIONS, KAWASE_DOWN, 1),
-                up: makePipeline(context, KAWASE_DECLARATIONS, KAWASE_UP, 1),
-                glass: makePipeline(context, GLASS_DECLARATIONS, GLASS_MAIN, 3),
-            };
-            // The blur passes overwrite their target outright.
-            for (const pipeline of [this._pipelines.down, this._pipelines.up])
-                pipeline.set_blend('RGBA = ADD (SRC_COLOR, 0)');
-        }
+        this._pipelines ??= makePipelines(context);
         return this._pipelines;
     }
 
@@ -896,6 +910,96 @@ class GlassHost {
         this._cards.clear();
         this._pipelines = null;
     }
+}
+
+// A shell menu (the gear's settings, SYSTEM's) on the same glass as Sysi's
+// cards, edge unlit like a popup's: beside a blurred top bar, the dark slab
+// it had looked pasted on. The glass goes under the menu's content box, the
+// part with the rounded corners, and the items paint over it.
+class MenuGlass {
+    constructor(menu) {
+        this._menu = menu;
+        this._box = menu.box;
+        this._forced = false;
+        this._repaintId = 0;
+        this._pipelines = null;
+        this._blur = null;
+        this.destroyed = false;
+        this._effect = new GlassEffect(this);
+        this._box.add_effect(this._effect);
+        menu.actor.add_style_class_name('sysi-glass-menu');
+        // The box pointer paints itself offscreen, and glass there would copy
+        // that empty buffer rather than the screen. Painted straight on,
+        // every actor takes the menu's fading opacity itself (uOpacity).
+        menu.actor.set_offscreen_redirect(0);
+        this._box.connect('destroy', () => {
+            this.destroyed = true;
+            if (this._repaintId)
+                GLib.source_remove(this._repaintId);
+            this._repaintId = 0;
+        });
+    }
+
+    pipelines(context) {
+        this._pipelines ??= makePipelines(context);
+        return this._pipelines;
+    }
+
+    blurPipelines(context, levels) {
+        if (this._blur?.down.length !== levels) {
+            const {down, up} = this.pipelines(context);
+            this._blur = {
+                down: Array.from({length: levels}, () => down.copy()),
+                up: Array.from({length: levels - 1}, () => up.copy()),
+            };
+        }
+        return this._blur;
+    }
+
+    get forced() {
+        return this._forced;
+    }
+
+    setGlassUniforms(pipeline, scale, shareX, shareY, maxX, maxY) {
+        // The copy has been taken by now: a forced one is done.
+        this._forced = false;
+        const box = this._box;
+        setUniform(pipeline, 'uSize', box.width, box.height);
+        setUniform(pipeline, 'uUvScale', shareX, shareY);
+        setUniform(pipeline, 'uUvMax', maxX, maxY);
+        setUniform(pipeline, 'uRect', 0, 0, box.width, box.height);
+        setUniform(pipeline, 'uRadius', box.get_theme_node().get_border_radius(St.Corner.TOPLEFT));
+        setUniform(pipeline, 'uScale', scale);
+        setUniform(pipeline, 'uAppear', 1);
+        setUniform(pipeline, 'uPress', 0);
+        setUniform(pipeline, 'uPressAt', 0, 0);
+        setUniform(pipeline, 'uRim', 0);
+        setUniform(pipeline, 'uOpacity', box.get_paint_opacity() / 255);
+    }
+
+    repaintSoon() {
+        if (this._repaintId)
+            return;
+        this._repaintId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, REPAINT_DELAY_MS, () => {
+            this._repaintId = 0;
+            if (!this.destroyed) {
+                this._forced = true;
+                this._box.queue_redraw();
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    // Glass that cannot be drawn gives the menu back its plain slab.
+    fail(error) {
+        logError(error, 'Sysi menu glass failed');
+        this._box.remove_effect(this._effect);
+        this._menu.actor.remove_style_class_name('sysi-glass-menu');
+    }
+}
+
+export function glassMenu(menu) {
+    return new MenuGlass(menu);
 }
 
 export class GlassManager {

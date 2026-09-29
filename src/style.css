@@ -1035,13 +1035,13 @@ scrolledwindow overshoot.right:backdrop {
  * every mode on purpose: a menu that flipped to dark-on-dark alongside the
  * DARK widget mode would be unreadable.
  *
- * The look is the app's own: a small translucent slab with a hairline edge,
+ * The look is the app's own: a small translucent slab with no edge line,
  * the same soft-tinted hover the note scrollbars use, and no theme accent
  * anywhere. Kept deliberately tight — the desktop theme's menu metrics made a
  * three-word menu the size of a dialog. */
 .sysi-menu {
   background-color: rgba(22, 22, 24, 0.90);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: none;
   border-radius: 8px;
   padding: 3px;
 }
