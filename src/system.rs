@@ -18,6 +18,8 @@ pub struct SystemReadOptions {
     /// What the machine draws: the battery's discharge, or on mains the
     /// processor package and the GPUs.
     pub power: bool,
+    /// How long the battery lasts, or takes to fill.
+    pub battery: bool,
 }
 
 /// How much of something is in use, in KiB. Both halves are kept rather than
@@ -85,6 +87,35 @@ pub struct SystemSnapshot {
     /// `None` until a second sample exists, since a rate needs two counters.
     pub network: Option<NetworkRates>,
     pub power: Option<PowerDraw>,
+    /// `None` on a machine with no battery that says how much it holds, or
+    /// when it was not asked.
+    pub battery: Option<Battery>,
+}
+
+/// Which way the battery is going, and how long until it gets there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Battery {
+    pub state: BatteryState,
+    /// Hours until empty, or until full while charging, at the rate of the
+    /// last couple of minutes. `None` while it is neither, or at no rate.
+    pub hours: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatteryState {
+    Discharging,
+    Charging,
+    /// Full, or plugged in and held where it is (a charge limit).
+    Idle,
+}
+
+/// What the batteries do between them, read once: the way they are going,
+/// at what rate, and the watt-hours until they get there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BatteryReading {
+    state: BatteryState,
+    watts: f64,
+    watt_hours: f64,
 }
 
 /// What the machine is drawing, and from where.
@@ -95,15 +126,11 @@ pub struct PowerDraw {
     /// mains, no laptop reports that, so it is the processor package and the
     /// GPUs, the parts that draw the most and vary the most.
     pub on_battery: bool,
-    /// On the battery, how long what it has left lasts at the draw of the
-    /// last couple of minutes; `None` on mains, or where the battery does not
-    /// say how much it holds.
-    pub hours_left: Option<f64>,
 }
 
-/// How far back the time left looks at the draw. `watts` is the draw of the
-/// moment, and swings from 15 W to 40 W and back as a page loads or a build
-/// runs; a time worked out from it would jump by an hour every two seconds.
+/// How far back the battery's time looks at its rate. The rate of the moment
+/// swings from 15 W to 40 W and back as a page loads or a build runs; a time
+/// worked out from it would jump by an hour every two seconds.
 const BATTERY_AVERAGE: f64 = 120.0;
 
 #[derive(Default)]
@@ -129,9 +156,9 @@ pub struct SystemReader {
     /// worked out afresh every two seconds would renumber a pair of
     /// same-vendor drives the moment one of them missed a read.
     drives: Option<Vec<Drive>>,
-    /// The battery's draw averaged so far, when it was last read, and since
-    /// when it has been discharging (see `settle`).
-    battery_draw: Option<(f64, Instant, Instant)>,
+    /// Which way the battery was going, its rate averaged so far, when it was
+    /// last read, and since when it has been going that way (see `settle`).
+    battery_rate: Option<(BatteryState, f64, Instant, Instant)>,
 }
 
 /// One drive as found: its caption, its block device, and its temperature
@@ -185,29 +212,12 @@ impl SystemReader {
             None
         };
 
-        let mut power = options.power.then(|| read_power(&gpus)).flatten();
-        self.battery_draw = match power.as_mut().filter(|power| power.on_battery) {
-            Some(power) => {
-                let now = Instant::now();
-                let average = match self.battery_draw {
-                    Some((average, then, since)) => settle(
-                        average,
-                        power.watts,
-                        now.duration_since(then).as_secs_f64(),
-                        now.duration_since(since).as_secs_f64(),
-                    ),
-                    None => power.watts,
-                };
-                power.hours_left = battery_watt_hours()
-                    .filter(|_| average >= 0.1)
-                    .map(|watt_hours| watt_hours / average);
-                let since = self.battery_draw.map_or(now, |(_, _, since)| since);
-                Some((average, now, since))
-            }
-            // Plugged in, or the reading off: the next time on the battery is
-            // a draw of its own.
-            None => None,
-        };
+        let power = options.power.then(|| read_power(&gpus)).flatten();
+        let battery = options
+            .battery
+            .then(|| read_batteries(Path::new("/sys/class/power_supply")))
+            .flatten();
+        let battery = self.time_battery(battery);
         SystemSnapshot {
             cpu_percent,
             memory: memory_info.memory,
@@ -215,9 +225,40 @@ impl SystemReader {
             gpus,
             cpu_temperature,
             power,
+            battery,
             drives,
             network,
         }
+    }
+
+    /// How long the battery takes to get where it is going, at its rate
+    /// averaged since it started that way.
+    fn time_battery(&mut self, reading: Option<BatteryReading>) -> Option<Battery> {
+        let reading = reading?;
+        let state = reading.state;
+        let now = Instant::now();
+        let (average, since) = match self.battery_rate {
+            _ if state == BatteryState::Idle => {
+                self.battery_rate = None;
+                return Some(Battery { state, hours: None });
+            }
+            Some((was, average, then, since)) if was == state => (
+                settle(
+                    average,
+                    reading.watts,
+                    now.duration_since(then).as_secs_f64(),
+                    now.duration_since(since).as_secs_f64(),
+                ),
+                since,
+            ),
+            // Plugged in or out: the rate before says nothing about this one.
+            _ => (reading.watts, now),
+        };
+        self.battery_rate = Some((state, average, now, since));
+        Some(Battery {
+            state,
+            hours: (average >= 0.1).then(|| reading.watt_hours / average),
+        })
     }
 
     fn read_cpu_temperature(&mut self) -> Option<f64> {
@@ -489,62 +530,108 @@ fn amd_gpu_power(device: &Path) -> Option<f64> {
 /// A battery's discharge in watts, while it is discharging: from power_now,
 /// or current_now × voltage_now where the firmware reports those instead.
 fn battery_discharge(supply: &Path) -> Option<f64> {
-    let read = |name: &str| {
-        fs::read_to_string(supply.join(name))
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-    };
     if fs::read_to_string(supply.join("type")).ok()?.trim() != "Battery"
         || fs::read_to_string(supply.join("status")).ok()?.trim() != "Discharging"
     {
         return None;
     }
-    let watts = match read("power_now") {
+    supply_watts(supply)
+}
+
+/// A number a power supply reports, as it reports it (µW, µWh, µV, µA...).
+fn supply_number(supply: &Path, name: &str) -> Option<f64> {
+    fs::read_to_string(supply.join(name))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+}
+
+/// The rate a battery is emptying or filling at, in watts: power_now, or
+/// current_now × voltage_now where the firmware reports those instead. Some
+/// firmware signs it by direction; the direction is in the status.
+fn supply_watts(supply: &Path) -> Option<f64> {
+    let watts = match supply_number(supply, "power_now") {
         Some(microwatts) => microwatts / 1e6,
-        None => read("current_now")? * read("voltage_now")? / 1e12,
+        None => supply_number(supply, "current_now")? * supply_number(supply, "voltage_now")? / 1e12,
     };
     Some(watts.abs())
 }
 
-/// What every battery holds now, in watt-hours: energy_now, or where the
-/// firmware counts charge instead, charge_now at the voltage the battery is
-/// rated for (at the one it is at, failing that). `None` if none says.
-fn battery_watt_hours() -> Option<f64> {
-    let held: Vec<f64> = sorted_dirs(Path::new("/sys/class/power_supply"))
-        .iter()
-        .filter_map(|supply| {
-            let read = |name: &str| {
-                fs::read_to_string(supply.join(name))
-                    .ok()
-                    .and_then(|raw| raw.trim().parse::<f64>().ok())
-            };
-            if fs::read_to_string(supply.join("type")).ok()?.trim() != "Battery" {
-                return None;
-            }
-            match read("energy_now") {
-                Some(microwatt_hours) => Some(microwatt_hours / 1e6),
-                None => Some(
-                    read("charge_now")?
-                        * read("voltage_min_design").or_else(|| read("voltage_now"))?
-                        / 1e12,
-                ),
-            }
-        })
-        .collect();
-    (!held.is_empty()).then(|| held.iter().sum())
+/// A battery's energy in watt-hours: `energy_*`, or where the firmware
+/// counts charge instead, `charge_*` at the voltage the battery is rated for
+/// (at the one it is at, failing that).
+fn supply_watt_hours(supply: &Path, which: &str) -> Option<f64> {
+    if let Some(microwatt_hours) = supply_number(supply, &format!("energy_{which}")) {
+        return Some(microwatt_hours / 1e6);
+    }
+    let volts = supply_number(supply, "voltage_min_design")
+        .or_else(|| supply_number(supply, "voltage_now"))?;
+    Some(supply_number(supply, &format!("charge_{which}"))? * volts / 1e12)
 }
 
-/// The draw averaged over the last `BATTERY_AVERAGE` seconds, taking in one
-/// more reading `seconds` after the last, `discharging` seconds into the
-/// discharge. Until that long has gone by, every reading counts the same,
-/// so a spike in the first seconds off the mains does not hang on for
-/// minutes; after it, older readings fade. (A suspend is no gap: Instant
-/// stands still through it, and the draw before it is as good a guess as
-/// any for after.)
-fn settle(average: f64, watts: f64, seconds: f64, discharging: f64) -> f64 {
+/// What the batteries under `supplies` do between them. Discharging, they
+/// last for all they hold, an idle second battery included, since it is
+/// drawn on next. Charging, they fill to where charging stops: full, or a
+/// charge limit (charge_control_end_threshold) set below it. `None` if no
+/// battery says how much it holds.
+fn read_batteries(supplies: &Path) -> Option<BatteryReading> {
+    let (mut found, mut held, mut missing) = (false, 0.0, 0.0);
+    let (mut watts_out, mut watts_in) = (None::<f64>, None::<f64>);
+    for supply in sorted_dirs(supplies) {
+        if fs::read_to_string(supply.join("type")).ok().as_deref().map(str::trim) != Some("Battery") {
+            continue;
+        }
+        let Some(now) = supply_watt_hours(&supply, "now") else {
+            continue;
+        };
+        found = true;
+        held += now;
+        let limit = supply_number(&supply, "charge_control_end_threshold")
+            .filter(|percent| (1.0..100.0).contains(percent))
+            .map_or(1.0, |percent| percent / 100.0);
+        if let Some(full) = supply_watt_hours(&supply, "full") {
+            missing += (full * limit - now).max(0.0);
+        }
+        let status = fs::read_to_string(supply.join("status")).unwrap_or_default();
+        let rate = match status.trim() {
+            "Discharging" => &mut watts_out,
+            "Charging" => &mut watts_in,
+            _ => continue,
+        };
+        *rate = Some(rate.unwrap_or(0.0) + supply_watts(&supply).unwrap_or(0.0));
+    }
+    if !found {
+        return None;
+    }
+    Some(match (watts_out, watts_in) {
+        (Some(watts), _) => BatteryReading {
+            state: BatteryState::Discharging,
+            watts,
+            watt_hours: held,
+        },
+        (None, Some(watts)) => BatteryReading {
+            state: BatteryState::Charging,
+            watts,
+            watt_hours: missing,
+        },
+        (None, None) => BatteryReading {
+            state: BatteryState::Idle,
+            watts: 0.0,
+            watt_hours: 0.0,
+        },
+    })
+}
+
+/// A rate averaged over the last `BATTERY_AVERAGE` seconds, taking in one
+/// more reading `seconds` after the last, `going` seconds after the
+/// battery started the way it is going. Until that long has gone by, every reading counts the same,
+/// so a spike in the first seconds off (or on) the mains does not hang on
+/// for minutes; after it, older readings fade. (A suspend is no gap: Instant
+/// stands still through it, and the rate before it is as good a guess as any
+/// for after.)
+fn settle(average: f64, watts: f64, seconds: f64, going: f64) -> f64 {
     let fading = 1.0 - (-seconds / BATTERY_AVERAGE).exp();
-    let even = if discharging > 0.0 {
-        seconds / discharging
+    let even = if going > 0.0 {
+        seconds / going
     } else {
         1.0
     };
@@ -562,14 +649,12 @@ fn read_power(gpus: &[GpuSnapshot]) -> Option<PowerDraw> {
         return Some(PowerDraw {
             watts: batteries.iter().sum(),
             on_battery: true,
-            hours_left: None,
         });
     }
     let parts: Vec<f64> = gpus.iter().filter_map(|gpu| gpu.power).collect();
     (!parts.is_empty()).then(|| PowerDraw {
         watts: parts.iter().sum(),
         on_battery: false,
-        hours_left: None,
     })
 }
 
@@ -1072,8 +1157,75 @@ mod tests {
     use super::{
         drive_vendor, format_drive_capacity, network_rates, number_repeated_labels,
         parse_cpu_lines, parse_memory, parse_mounts, parse_network_counters, parse_nvidia_gpus,
-        settle, GpuSnapshot, Usage,
+        read_batteries, settle, BatteryReading, BatteryState, GpuSnapshot, Usage,
     };
+
+    /// A power_supply directory with these supplies, each a list of files.
+    fn supplies(name: &str, list: &[(&str, &[(&str, &str)])]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sysi-supplies-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (supply, files) in list {
+            std::fs::create_dir_all(dir.join(supply)).unwrap();
+            for (file, contents) in *files {
+                std::fs::write(dir.join(supply).join(file), format!("{contents}\n")).unwrap();
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn the_batteries_say_which_way_they_go_and_how_far() {
+        let mains = ("AC", &[("type", "Mains"), ("online", "0")][..]);
+        let discharging = supplies(
+            "out",
+            &[
+                mains,
+                (
+                    "BAT0",
+                    &[("type", "Battery"), ("status", "Discharging"), ("energy_now", "30000000"), ("energy_full", "50000000"), ("power_now", "-12000000")],
+                ),
+                // A second battery waiting its turn still counts to the time.
+                ("BAT1", &[("type", "Battery"), ("status", "Unknown"), ("energy_now", "20000000"), ("energy_full", "20000000")]),
+            ],
+        );
+        assert_eq!(
+            read_batteries(&discharging),
+            Some(BatteryReading { state: BatteryState::Discharging, watts: 12.0, watt_hours: 50.0 })
+        );
+        // Counted in charge, filling to a limit of 80%: 4 Ah at 15 V rated is
+        // 60 Wh full, 48 Wh at the limit, and 30 Wh are in.
+        let charging = supplies(
+            "in",
+            &[(
+                "BAT0",
+                &[
+                    ("type", "Battery"),
+                    ("status", "Charging"),
+                    ("charge_now", "2000000"),
+                    ("charge_full", "4000000"),
+                    ("voltage_min_design", "15000000"),
+                    ("voltage_now", "16000000"),
+                    ("current_now", "1500000"),
+                    ("charge_control_end_threshold", "80"),
+                ],
+            )],
+        );
+        assert_eq!(
+            read_batteries(&charging),
+            Some(BatteryReading { state: BatteryState::Charging, watts: 24.0, watt_hours: 18.0 })
+        );
+        let full = supplies(
+            "full",
+            &[("BAT0", &[("type", "Battery"), ("status", "Full"), ("energy_now", "50000000"), ("power_now", "0")])],
+        );
+        assert_eq!(read_batteries(&full).map(|reading| reading.state), Some(BatteryState::Idle));
+        // A battery that does not say what it holds is no battery to time.
+        let mute = supplies("mute", &[mains, ("BAT0", &[("type", "Battery"), ("status", "Discharging")])]);
+        assert_eq!(read_batteries(&mute), None);
+        for dir in [discharging, charging, full, mute] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 
     #[test]
     fn the_battery_draw_is_averaged_so_the_time_left_holds_still() {

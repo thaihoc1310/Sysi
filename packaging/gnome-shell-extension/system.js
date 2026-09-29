@@ -441,7 +441,8 @@ export class SystemPanel {
         return shown;
     }
 
-    // Where the row shows a reading: in any group that made it in.
+    // Where the row shows a reading: in any group that made it in (or, given
+    // all of Sysi's groups, whether any device has it at all).
     static _shows(layout, metric) {
         return layout.some(({devices}) => devices.some(({cells}) =>
             cells.some(cell => cell.metric === metric)));
@@ -592,10 +593,13 @@ export class SystemPanel {
             if (!row)
                 continue;
             const on = this._isOn(metric.key);
+            // A reading with nothing to show just now (the battery's time,
+            // plugged in and full) is neither squeezed out nor kept out.
+            const listed = SystemPanel._shows(this._data.groups, metric.key);
             // On, but squeezed out by the clock: say so, so it is not
             // mistaken for off.
-            const squeezed = on && !SystemPanel._shows(layout, metric.key);
-            const full = !on && !this._fits(layout, metric.key);
+            const squeezed = listed && on && !SystemPanel._shows(layout, metric.key);
+            const full = listed && !on && !this._fits(layout, metric.key);
             const text = squeezed ? `${metric.name} · no room` : metric.name;
             if (row.label.text !== text)
                 row.label.text = text;

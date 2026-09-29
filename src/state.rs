@@ -126,6 +126,9 @@ pub struct SystemDetails {
     /// What the machine draws, in watts.
     #[serde(default)]
     pub power: bool,
+    /// How long the battery lasts, or takes to fill.
+    #[serde(default)]
+    pub battery_time: bool,
     /// RAM, swap and drives as used over total (`12G/16G`) rather than a
     /// percentage.
     #[serde(default)]
@@ -144,6 +147,7 @@ impl Default for SystemDetails {
             ssd_temp: false,
             gpu_memory: false,
             power: false,
+            battery_time: false,
             ssd_usage: false,
             amounts: false,
             network: false,

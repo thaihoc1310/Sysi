@@ -11,7 +11,7 @@
 //! every couple of seconds and has no business on a disk.
 
 use crate::state::{AppState, SystemDetails};
-use crate::system::{SystemReadOptions, SystemReader, SystemSnapshot, Usage};
+use crate::system::{BatteryState, SystemReadOptions, SystemReader, SystemSnapshot, Usage};
 use gtk::glib;
 use serde::Serialize;
 use std::{cell::RefCell, fs, io, path::PathBuf, rc::Rc, time::Duration};
@@ -190,7 +190,7 @@ struct Metric {
     set: fn(&mut SystemDetails, bool),
 }
 
-const METRICS: [Metric; 11] = [
+const METRICS: [Metric; 12] = [
     Metric {
         key: "cpu",
         name: "cpu",
@@ -250,6 +250,12 @@ const METRICS: [Metric; 11] = [
         name: "power",
         enabled: |d| d.power,
         set: |d, on| d.power = on,
+    },
+    Metric {
+        key: "battery_time",
+        name: "battery time",
+        enabled: |d| d.battery_time,
+        set: |d, on| d.battery_time = on,
     },
     Metric {
         key: "network",
@@ -602,32 +608,47 @@ fn groups(
         },
         Group {
             key: "power",
-            // On the battery the reading is the whole machine's, and how long
-            // what it has left lasts; on mains it is the processor package and
-            // the GPUs. The caption says which.
+            // On the battery the reading is the whole machine's; on mains it
+            // is the processor package and the GPUs. The caption says which.
+            // After it, how long the battery lasts (LEFT) or takes to fill
+            // (FULL), while it is doing either.
             devices: machine
                 .power
                 .map(|_| {
                     let power = last.and_then(|s| s.power);
-                    let on_battery = power.is_some_and(|p| p.on_battery);
-                    let mut cells = vec![cell(
-                        "power",
-                        WATTS_WIDEST.into(),
-                        power.map(|p| watts(p.watts)),
-                    )];
-                    if on_battery {
-                        cells.push(cell(
-                            "power",
-                            TIME_LEFT_WIDEST.into(),
-                            power.and_then(|p| p.hours_left).map(time_left),
-                        ));
-                    }
                     Device {
-                        label: if on_battery { "BAT" } else { "PWR" }.into(),
-                        cells,
+                        label: if power.is_some_and(|p| p.on_battery) {
+                            "BAT".into()
+                        } else {
+                            "PWR".into()
+                        },
+                        cells: vec![cell(
+                            "power",
+                            WATTS_WIDEST.into(),
+                            power.map(|p| watts(p.watts)),
+                        )],
                     }
                 })
                 .into_iter()
+                .chain(
+                    last.and_then(|s| s.battery)
+                        .filter(|_| machine.battery.is_some())
+                        .and_then(|battery| {
+                            let label = match battery.state {
+                                BatteryState::Discharging => "LEFT",
+                                BatteryState::Charging => "FULL",
+                                BatteryState::Idle => return None,
+                            };
+                            Some(Device {
+                                label: label.into(),
+                                cells: vec![cell(
+                                    "battery_time",
+                                    TIME_LEFT_WIDEST.into(),
+                                    battery.hours.map(time_left),
+                                )],
+                            })
+                        }),
+                )
                 .collect(),
         },
         Group {
@@ -651,6 +672,7 @@ pub fn read_options(details: &SystemDetails) -> SystemReadOptions {
         ssd_usage: details.ssd_usage,
         network: details.network,
         power: details.power,
+        battery: details.battery_time,
     }
 }
 
@@ -664,6 +686,7 @@ pub fn read_everything() -> SystemReadOptions {
         ssd_usage: true,
         network: true,
         power: true,
+        battery: true,
     }
 }
 
@@ -715,6 +738,9 @@ fn render(
             name: metric.name,
             on: (metric.enabled)(details),
             available: machine.is_none()
+                // Plugged in and full, the battery has no time to show, but
+                // the reading is still there to turn on and off.
+                || (metric.key == "battery_time" && machine.is_some_and(|m| m.battery.is_some()))
                 || groups.iter().any(|group| {
                     group
                         .devices
@@ -752,7 +778,7 @@ fn write(contents: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system::{DriveSnapshot, GpuSnapshot, NetworkRates, PowerDraw};
+    use crate::system::{Battery, DriveSnapshot, GpuSnapshot, NetworkRates, PowerDraw};
 
     const GIB: u64 = 1024 * 1024;
 
@@ -813,7 +839,10 @@ mod tests {
             power: Some(PowerDraw {
                 watts: 7.86,
                 on_battery: false,
-                hours_left: None,
+            }),
+            battery: Some(Battery {
+                state: BatteryState::Charging,
+                hours: Some(1.34),
             }),
         }
     }
@@ -828,6 +857,7 @@ mod tests {
             gpu_temp: true,
             gpu_memory: true,
             power: true,
+            battery_time: true,
             ssd_usage: true,
             ssd_temp: true,
             network: true,
@@ -873,7 +903,7 @@ mod tests {
         let machine = machine();
         assert_eq!(
             bar(&groups(&everything(), &machine, Some(&machine))),
-            "CPU 13% 56°C | RAM 75%  SWAP 5% | NVI 12% 45°C 20M/8G  AMD 38°C 481M/512M | SAM 9% 42°C  UMI 38°C | PWR 7.9W | NET ↓9K ↑28K"
+            "CPU 13% 56°C | RAM 75%  SWAP 5% | NVI 12% 45°C 20M/8G  AMD 38°C 481M/512M | SAM 9% 42°C  UMI 38°C | PWR 7.9W  FULL 1h20 | NET ↓9K ↑28K"
         );
     }
 
@@ -919,20 +949,65 @@ mod tests {
             power: Some(PowerDraw {
                 watts: 16.4,
                 on_battery: true,
-                hours_left: Some(2.49),
             }),
             ..machine.clone()
         };
-        assert_eq!(
-            bar(&groups(&details, &machine, Some(&unplugged))),
-            "BAT 16W 2h30"
-        );
+        assert_eq!(bar(&groups(&details, &machine, Some(&unplugged))), "BAT 16W");
         // A machine that can report neither is not offered the reading.
         machine.power = None;
         assert!(groups(&details, &machine, None)
             .iter()
             .find(|group| group.key == "power")
             .is_some_and(|group| group.devices.is_empty()));
+    }
+
+    #[test]
+    fn the_battery_time_says_which_way_the_battery_goes() {
+        let details = SystemDetails {
+            power: true,
+            battery_time: true,
+            ..nothing()
+        };
+        let machine = machine();
+        let at = |state, hours| SystemSnapshot {
+            power: Some(PowerDraw {
+                watts: 16.4,
+                on_battery: state == BatteryState::Discharging,
+            }),
+            battery: Some(Battery { state, hours }),
+            ..machine.clone()
+        };
+        let read = |last: &SystemSnapshot| bar(&groups(&details, &machine, Some(last)));
+        assert_eq!(read(&at(BatteryState::Discharging, Some(2.49))), "BAT 16W  LEFT 2h30");
+        assert_eq!(read(&at(BatteryState::Charging, Some(0.75))), "PWR 16W  FULL 45m");
+        // Plugged in and full, there is no time to tell...
+        let full = at(BatteryState::Idle, None);
+        assert_eq!(read(&full), "PWR 16W");
+        // ...but the reading is still offered, to be on when it unplugs.
+        let offered = |machine: &SystemSnapshot| {
+            let json: serde_json::Value =
+                serde_json::from_str(&render(true, &details, Some(machine), Some(&full))).unwrap();
+            json["metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|metric| metric["key"] == "battery_time" && metric["available"] == true)
+        };
+        assert!(offered(&machine));
+        // A machine with no battery is not.
+        assert!(!offered(&SystemSnapshot {
+            battery: None,
+            ..machine.clone()
+        }));
+        // Off, it is not on the bar, whichever way the battery goes.
+        let off = SystemDetails {
+            battery_time: false,
+            ..details
+        };
+        assert_eq!(
+            bar(&groups(&off, &machine, Some(&at(BatteryState::Discharging, Some(2.49))))),
+            "BAT 16W"
+        );
     }
 
     #[test]
