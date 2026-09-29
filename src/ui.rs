@@ -4177,6 +4177,33 @@ fn attach_tag_filter(
                 tag_choices(state.borrow().tag_counts(), &filter.borrow())
             })
         }),
+        Some({
+            // ✎ gives a tag a new name on every note, or merges it into the
+            // tag that has that name already.
+            let state = state.clone();
+            let filter = filter.clone();
+            let rebuild_list = rebuild_list.clone();
+            Rc::new(move |old, new| {
+                let renamed = state.borrow_mut().rename_tag(old, new);
+                if let Some(name) = renamed {
+                    let _ = state.borrow().save();
+                    let mut filter = filter.borrow_mut();
+                    for tag in filter.iter_mut() {
+                        if tag == old {
+                            *tag = name.clone();
+                        }
+                    }
+                    let mut seen = Vec::new();
+                    filter.retain(|tag| {
+                        let first = !seen.contains(tag);
+                        seen.push(tag.clone());
+                        first
+                    });
+                }
+                rebuild_list();
+                tag_choices(state.borrow().tag_counts(), &filter.borrow())
+            })
+        }),
     );
     let rule = gtk::SeparatorMenuItem::new();
     let clear = gtk::MenuItem::with_label("SHOW ALL");
@@ -13485,7 +13512,11 @@ const TAG_WHEEL_STEP: f64 = 44.0;
 struct TagLine {
     name: String,
     row: gtk::Box,
+    label: gtk::Label,
     count: gtk::Label,
+    /// In a list that renames tags: the `✎` shown for the line under the
+    /// pointer, which turns the name into a field.
+    pencil: gtk::Label,
     /// In a list that deletes tags: the `×` shown for the line under the
     /// pointer, and `delete?` once it has been clicked.
     cross: gtk::Label,
@@ -13501,8 +13532,13 @@ struct TagList {
     /// Takes a tag off every note and says what the list holds after; only
     /// the filter's list has it.
     delete: Option<Rc<dyn Fn(&str) -> Vec<TagChoice>>>,
+    /// Gives a tag a new name on every note and says what the list holds
+    /// after; only the filter's list has it.
+    rename: Option<Rc<dyn Fn(&str, &str) -> Vec<TagChoice>>>,
     /// The tag whose `×` was clicked once and asks to be clicked again.
     armed: Rc<RefCell<Option<String>>>,
+    /// The line whose name is being typed over, and the field it is typed in.
+    editing: Rc<RefCell<Option<(TagLine, gtk::Entry)>>>,
 }
 
 impl TagList {
@@ -13512,6 +13548,7 @@ impl TagList {
         menu: &gtk::Menu,
         pick: Rc<dyn Fn(&str) -> (bool, Option<usize>)>,
         delete: Option<Rc<dyn Fn(&str) -> Vec<TagChoice>>>,
+        rename: Option<Rc<dyn Fn(&str, &str) -> Vec<TagChoice>>>,
     ) -> Self {
         let item = gtk::MenuItem::new();
         item.style_context().add_class("tag-list");
@@ -13531,7 +13568,9 @@ impl TagList {
             rows,
             lines: Rc::new(RefCell::new(Vec::new())),
             delete,
+            rename,
             armed: Rc::new(RefCell::new(None)),
+            editing: Rc::new(RefCell::new(None)),
         };
         list.listen(menu, pick);
         list
@@ -13540,6 +13579,7 @@ impl TagList {
     /// Show these choices, scrolled back to the top.
     fn fill(&self, choices: &[TagChoice]) {
         self.armed.borrow_mut().take();
+        self.cancel_rename();
         for child in self.rows.children() {
             self.rows.remove(&child);
         }
@@ -13563,22 +13603,27 @@ impl TagList {
             let cross = gtk::Label::new(Some("\u{00d7}"));
             cross.style_context().add_class("tag-cross");
             cross.set_no_show_all(true);
-            if self.delete.is_some() {
+            let pencil = gtk::Label::new(Some("\u{270e}"));
+            pencil.style_context().add_class("tag-cross");
+            pencil.set_no_show_all(true);
+            if self.delete.is_some() || self.rename.is_some() {
                 // The menu is sized when it opens, from lines showing their
-                // counts: room is kept at the end of each for `delete?`.
-                for end in [&count, &cross] {
-                    end.set_width_chars(7);
-                    end.set_xalign(1.0);
-                }
+                // counts: room is kept at the end of each for what the
+                // pointer brings up there instead, `✎ ×` or `delete?`.
+                count.set_width_chars(9);
+                count.set_xalign(1.0);
             }
             row.pack_start(&name, true, true, 0);
             row.pack_end(&cross, false, false, 0);
+            row.pack_end(&pencil, false, false, 0);
             row.pack_end(&count, false, false, 0);
             self.rows.pack_start(&row, false, false, 0);
             lines.push(TagLine {
                 name: choice.name.clone(),
                 row,
+                label: name,
                 count,
+                pencil,
                 cross,
             });
         }
@@ -13635,11 +13680,84 @@ impl TagList {
             } else {
                 style.remove_class("tag-row-hover");
             }
-            if self.delete.is_some() {
-                line.cross.set_visible(lit);
+            let editing = self
+                .editing
+                .borrow()
+                .as_ref()
+                .is_some_and(|(edited, _)| edited.row == line.row);
+            let armed = armed.as_deref() == Some(line.name.as_str());
+            if editing {
+                // The field has the line to itself.
+                for end in [&line.count, &line.pencil, &line.cross] {
+                    end.hide();
+                }
+            } else if self.delete.is_some() || self.rename.is_some() {
                 line.count.set_visible(!lit);
+                line.cross.set_visible(lit && self.delete.is_some());
+                line.pencil
+                    .set_visible(lit && self.rename.is_some() && !armed);
             }
         }
+    }
+
+    /// Turn a line's name into a field holding it, all of it selected, for
+    /// the tag to be typed a new name. Enter renames; Escape puts it back.
+    fn begin_rename(&self, line: &TagLine) {
+        let Some(rename) = self.rename.clone() else {
+            return;
+        };
+        self.cancel_rename();
+        self.disarm();
+        let entry = gtk::Entry::new();
+        entry.set_text(&line.name);
+        entry.set_max_length(crate::state::TAG_MAX_CHARS as i32);
+        entry.set_width_chars(line.label.width_chars());
+        entry.set_has_frame(false);
+        entry.set_hexpand(true);
+        entry.style_context().add_class("tag-entry");
+        line.row.pack_start(&entry, true, true, 0);
+        line.row.reorder_child(&entry, 0);
+        line.label.hide();
+        for end in [&line.count, &line.pencil, &line.cross] {
+            end.hide();
+        }
+        entry.show();
+        entry.grab_focus();
+        send_focus(&entry, true);
+        entry.select_region(0, -1);
+        entry.connect_activate({
+            let list = self.clone();
+            let old = line.name.clone();
+            move |entry| {
+                let new = entry.text().to_string();
+                if crate::state::clean_tag(&new).is_none() {
+                    list.cancel_rename();
+                    return;
+                }
+                let at = list.scroller.vadjustment().value();
+                let choices = rename(&old, &new);
+                list.fill(&choices);
+                list.scroller.vadjustment().set_value(at);
+            }
+        });
+        *self.editing.borrow_mut() = Some((line.clone(), entry));
+    }
+
+    /// Put a line being renamed back as it was.
+    fn cancel_rename(&self) {
+        let Some((line, entry)) = self.editing.borrow_mut().take() else {
+            return;
+        };
+        send_focus(&entry, false);
+        if let Some(window) = entry
+            .toplevel()
+            .and_then(|top| top.downcast::<gtk::Window>().ok())
+        {
+            window.set_focus(None::<&gtk::Widget>);
+        }
+        line.row.remove(&entry);
+        line.label.show();
+        line.count.show();
     }
 
     fn disarm(&self) {
@@ -13724,15 +13842,30 @@ impl TagList {
                 };
                 if event.button() == 1 {
                     if let Some(line) = line_at(menu, point) {
-                        // The × is small: the whole end of the line from a
-                        // little before it counts.
-                        let on_cross = line.cross.is_visible()
-                            && line
-                                .cross
-                                .translate_coordinates(menu, 0, 0)
-                                .is_some_and(|(left, _)| point.0 >= f64::from(left - 6));
-                        if on_cross {
+                        // A click in the field being typed in stays there.
+                        let editing = list
+                            .editing
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|(edited, _)| edited.row == line.row);
+                        if editing {
+                            return glib::Propagation::Stop;
+                        }
+                        list.cancel_rename();
+                        // The ✎ and × are small: each counts from a little
+                        // before it, the × to the end of the line.
+                        let from = |mark: &gtk::Label, slack: i32| {
+                            mark.is_visible()
+                                && mark
+                                    .translate_coordinates(menu, 0, 0)
+                                    .is_some_and(|(left, _)| point.0 >= f64::from(left - slack))
+                        };
+                        if from(&line.cross, 4) {
                             list.cross_clicked(&line);
+                            return glib::Propagation::Stop;
+                        }
+                        if from(&line.pencil, 6) {
+                            list.begin_rename(&line);
                             return glib::Propagation::Stop;
                         }
                         list.disarm();
@@ -13805,9 +13938,41 @@ impl TagList {
                 glib::Propagation::Proceed
             }
         });
+        // While a name is being typed over, keys are the field's: the menu
+        // reads them first and would take Space and Enter for its items.
+        // Escape puts the name back rather than closing the menu.
+        let typing = {
+            let list = self.clone();
+            move |event: &gdk::EventKey| {
+                use gdk::keys::constants as key;
+                let entry = match list.editing.borrow().as_ref() {
+                    Some((_, entry)) => entry.clone(),
+                    None => return glib::Propagation::Proceed,
+                };
+                if event.keyval() == key::Escape {
+                    if event.event_type() == gdk::EventType::KeyPress {
+                        list.cancel_rename();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                if [key::Up, key::Down, key::Tab, key::ISO_Left_Tab].contains(&event.keyval()) {
+                    return glib::Propagation::Proceed;
+                }
+                entry.event(event);
+                glib::Propagation::Stop
+            }
+        };
+        menu.connect_key_press_event({
+            let typing = typing.clone();
+            move |_, event| typing(event)
+        });
+        menu.connect_key_release_event(move |_, event| typing(event));
         menu.connect_hide({
             let list = self.clone();
-            move |_| list.disarm()
+            move |_| {
+                list.disarm();
+                list.cancel_rename();
+            }
         });
     }
 }
@@ -13875,6 +14040,7 @@ fn note_tag_menu(state: &Rc<RefCell<AppState>>, rebuild_list: CallbackSlot) -> N
                 (on, Some(count))
             })
         },
+        None,
         None,
     ));
     let rule = gtk::SeparatorMenuItem::new();

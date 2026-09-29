@@ -540,6 +540,34 @@ impl AppState {
         had
     }
 
+    /// Give a tag a new name on every note, and return the name it ends up
+    /// with. A name another tag has already (but for case) merges the two:
+    /// a note that had both keeps the tag once, where the first of them was.
+    /// `None` if the new name is empty once cleaned.
+    pub fn rename_tag(&mut self, tag: &str, raw: &str) -> Option<String> {
+        let name = clean_tag(raw)?;
+        let name = self
+            .notes
+            .iter()
+            .flat_map(|note| note.tags.iter())
+            .find(|known| *known != tag && known.to_lowercase() == name.to_lowercase())
+            .cloned()
+            .unwrap_or(name);
+        for note in &mut self.notes {
+            let mut seen = false;
+            note.tags.retain_mut(|known| {
+                if *known == tag {
+                    *known = name.clone();
+                }
+                if *known != name {
+                    return true;
+                }
+                !std::mem::replace(&mut seen, true)
+            });
+        }
+        Some(name)
+    }
+
     pub fn referenced_image_files(&self) -> std::collections::HashSet<String> {
         self.notes
             .iter()
@@ -577,6 +605,23 @@ mod tests {
         assert_eq!(state.delete_tag("vocab"), 2);
         assert_eq!(state.tag_counts(), [("ielts".to_owned(), 1)]);
         assert_eq!(state.delete_tag("vocab"), 0);
+        // Renamed, a tag keeps its notes; onto a name in use, the two merge
+        // and a note with both keeps one, where the first was.
+        assert!(state.toggle_note_tag(1, "writing"));
+        assert!(state.toggle_note_tag(1, "ielts"));
+        assert_eq!(
+            state.rename_tag("ielts", " IELTS 7 "),
+            Some("IELTS 7".to_owned())
+        );
+        assert_eq!(state.notes[0].tags, ["writing", "IELTS 7"]);
+        assert_eq!(
+            state.rename_tag("IELTS 7", "Writing"),
+            Some("writing".to_owned())
+        );
+        assert_eq!(state.notes[0].tags, ["writing"]);
+        assert_eq!(state.notes[2].tags, ["writing"]);
+        assert_eq!(state.rename_tag("writing", " # "), None);
+        assert_eq!(state.tag_counts(), [("writing".to_owned(), 2)]);
         assert!(!state.toggle_note_tag(1, " # "));
         assert_eq!(clean_tag(&"x".repeat(40)).map(|tag| tag.len()), Some(24));
     }
