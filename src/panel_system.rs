@@ -263,6 +263,7 @@ const PERCENT_WIDEST: &str = "99%";
 const CELSIUS_WIDEST: &str = "99°C";
 const NETWORK_WIDEST: &str = "↓888M ↑888M";
 const WATTS_WIDEST: &str = "888W";
+const TIME_LEFT_WIDEST: &str = "8h88";
 
 /// A percentage, held at 99%: a full 100 says nothing 99 does not, and a
 /// third digit is room the bar would keep free all day for it.
@@ -300,6 +301,21 @@ fn watts(value: f64) -> String {
         format!("{value:.1}W")
     } else {
         format!("{value:.0}W")
+    }
+}
+
+/// How long the battery lasts, no finer than the guess it is: `45m`, then
+/// to five minutes (`2h30`), then to the hour (`12h`), held at 99h.
+fn time_left(hours: f64) -> String {
+    let minutes = (hours.clamp(0.0, 99.0) * 60.0).round() as u32;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let minutes = (minutes + 2) / 5 * 5;
+    if minutes < 600 {
+        format!("{}h{:02}", minutes / 60, minutes % 60)
+    } else {
+        format!("{}h", (minutes + 30) / 60)
     }
 }
 
@@ -586,21 +602,30 @@ fn groups(
         },
         Group {
             key: "power",
-            // On the battery the reading is the whole machine's; on mains it
-            // is the processor package and the GPUs. The caption says which.
+            // On the battery the reading is the whole machine's, and how long
+            // what it has left lasts; on mains it is the processor package and
+            // the GPUs. The caption says which.
             devices: machine
                 .power
-                .map(|_| Device {
-                    label: if last.and_then(|s| s.power).is_some_and(|p| p.on_battery) {
-                        "BAT".into()
-                    } else {
-                        "PWR".into()
-                    },
-                    cells: vec![cell(
+                .map(|_| {
+                    let power = last.and_then(|s| s.power);
+                    let on_battery = power.is_some_and(|p| p.on_battery);
+                    let mut cells = vec![cell(
                         "power",
                         WATTS_WIDEST.into(),
-                        last.and_then(|s| s.power).map(|p| watts(p.watts)),
-                    )],
+                        power.map(|p| watts(p.watts)),
+                    )];
+                    if on_battery {
+                        cells.push(cell(
+                            "power",
+                            TIME_LEFT_WIDEST.into(),
+                            power.and_then(|p| p.hours_left).map(time_left),
+                        ));
+                    }
+                    Device {
+                        label: if on_battery { "BAT" } else { "PWR" }.into(),
+                        cells,
+                    }
                 })
                 .into_iter()
                 .collect(),
@@ -788,6 +813,7 @@ mod tests {
             power: Some(PowerDraw {
                 watts: 7.86,
                 on_battery: false,
+                hours_left: None,
             }),
         }
     }
@@ -893,16 +919,34 @@ mod tests {
             power: Some(PowerDraw {
                 watts: 16.4,
                 on_battery: true,
+                hours_left: Some(2.49),
             }),
             ..machine.clone()
         };
-        assert_eq!(bar(&groups(&details, &machine, Some(&unplugged))), "BAT 16W");
+        assert_eq!(
+            bar(&groups(&details, &machine, Some(&unplugged))),
+            "BAT 16W 2h30"
+        );
         // A machine that can report neither is not offered the reading.
         machine.power = None;
         assert!(groups(&details, &machine, None)
             .iter()
             .find(|group| group.key == "power")
             .is_some_and(|group| group.devices.is_empty()));
+    }
+
+    #[test]
+    fn the_time_left_is_no_finer_than_the_guess() {
+        assert_eq!(time_left(0.0), "0m");
+        assert_eq!(time_left(44.6 / 60.0), "45m");
+        assert_eq!(time_left(59.4 / 60.0), "59m");
+        assert_eq!(time_left(59.6 / 60.0), "1h00");
+        assert_eq!(time_left(2.0 + 32.0 / 60.0), "2h30");
+        assert_eq!(time_left(2.0 + 33.0 / 60.0), "2h35");
+        assert_eq!(time_left(9.0 + 58.0 / 60.0), "10h");
+        assert_eq!(time_left(12.4), "12h");
+        assert_eq!(time_left(500.0), "99h");
+        assert_eq!(time_left(f64::NAN), "0m");
     }
 
     #[test]

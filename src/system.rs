@@ -95,7 +95,16 @@ pub struct PowerDraw {
     /// mains, no laptop reports that, so it is the processor package and the
     /// GPUs, the parts that draw the most and vary the most.
     pub on_battery: bool,
+    /// On the battery, how long what it has left lasts at the draw of the
+    /// last couple of minutes; `None` on mains, or where the battery does not
+    /// say how much it holds.
+    pub hours_left: Option<f64>,
 }
+
+/// How far back the time left looks at the draw. `watts` is the draw of the
+/// moment, and swings from 15 W to 40 W and back as a page loads or a build
+/// runs; a time worked out from it would jump by an hour every two seconds.
+const BATTERY_AVERAGE: f64 = 120.0;
 
 #[derive(Default)]
 pub struct SystemReader {
@@ -120,6 +129,9 @@ pub struct SystemReader {
     /// worked out afresh every two seconds would renumber a pair of
     /// same-vendor drives the moment one of them missed a read.
     drives: Option<Vec<Drive>>,
+    /// The battery's draw averaged so far, when it was last read, and since
+    /// when it has been discharging (see `settle`).
+    battery_draw: Option<(f64, Instant, Instant)>,
 }
 
 /// One drive as found: its caption, its block device, and its temperature
@@ -173,7 +185,29 @@ impl SystemReader {
             None
         };
 
-        let power = options.power.then(|| read_power(&gpus)).flatten();
+        let mut power = options.power.then(|| read_power(&gpus)).flatten();
+        self.battery_draw = match power.as_mut().filter(|power| power.on_battery) {
+            Some(power) => {
+                let now = Instant::now();
+                let average = match self.battery_draw {
+                    Some((average, then, since)) => settle(
+                        average,
+                        power.watts,
+                        now.duration_since(then).as_secs_f64(),
+                        now.duration_since(since).as_secs_f64(),
+                    ),
+                    None => power.watts,
+                };
+                power.hours_left = battery_watt_hours()
+                    .filter(|_| average >= 0.1)
+                    .map(|watt_hours| watt_hours / average);
+                let since = self.battery_draw.map_or(now, |(_, _, since)| since);
+                Some((average, now, since))
+            }
+            // Plugged in, or the reading off: the next time on the battery is
+            // a draw of its own.
+            None => None,
+        };
         SystemSnapshot {
             cpu_percent,
             memory: memory_info.memory,
@@ -472,6 +506,51 @@ fn battery_discharge(supply: &Path) -> Option<f64> {
     Some(watts.abs())
 }
 
+/// What every battery holds now, in watt-hours: energy_now, or where the
+/// firmware counts charge instead, charge_now at the voltage the battery is
+/// rated for (at the one it is at, failing that). `None` if none says.
+fn battery_watt_hours() -> Option<f64> {
+    let held: Vec<f64> = sorted_dirs(Path::new("/sys/class/power_supply"))
+        .iter()
+        .filter_map(|supply| {
+            let read = |name: &str| {
+                fs::read_to_string(supply.join(name))
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<f64>().ok())
+            };
+            if fs::read_to_string(supply.join("type")).ok()?.trim() != "Battery" {
+                return None;
+            }
+            match read("energy_now") {
+                Some(microwatt_hours) => Some(microwatt_hours / 1e6),
+                None => Some(
+                    read("charge_now")?
+                        * read("voltage_min_design").or_else(|| read("voltage_now"))?
+                        / 1e12,
+                ),
+            }
+        })
+        .collect();
+    (!held.is_empty()).then(|| held.iter().sum())
+}
+
+/// The draw averaged over the last `BATTERY_AVERAGE` seconds, taking in one
+/// more reading `seconds` after the last, `discharging` seconds into the
+/// discharge. Until that long has gone by, every reading counts the same,
+/// so a spike in the first seconds off the mains does not hang on for
+/// minutes; after it, older readings fade. (A suspend is no gap: Instant
+/// stands still through it, and the draw before it is as good a guess as
+/// any for after.)
+fn settle(average: f64, watts: f64, seconds: f64, discharging: f64) -> f64 {
+    let fading = 1.0 - (-seconds / BATTERY_AVERAGE).exp();
+    let even = if discharging > 0.0 {
+        seconds / discharging
+    } else {
+        1.0
+    };
+    average + (watts - average) * fading.max(even).min(1.0)
+}
+
 /// What the machine draws: every discharging battery's output, or on mains
 /// the processor package and the GPUs, `None` when neither can be read.
 fn read_power(gpus: &[GpuSnapshot]) -> Option<PowerDraw> {
@@ -483,12 +562,14 @@ fn read_power(gpus: &[GpuSnapshot]) -> Option<PowerDraw> {
         return Some(PowerDraw {
             watts: batteries.iter().sum(),
             on_battery: true,
+            hours_left: None,
         });
     }
     let parts: Vec<f64> = gpus.iter().filter_map(|gpu| gpu.power).collect();
     (!parts.is_empty()).then(|| PowerDraw {
         watts: parts.iter().sum(),
         on_battery: false,
+        hours_left: None,
     })
 }
 
@@ -989,10 +1070,29 @@ fn network_rates(previous: (u64, u64), current: (u64, u64), elapsed_seconds: f64
 #[cfg(test)]
 mod tests {
     use super::{
-        drive_vendor, format_drive_capacity, network_rates, number_repeated_labels, parse_cpu_lines,
-        parse_mounts,
-        parse_memory, parse_network_counters, parse_nvidia_gpus, GpuSnapshot, Usage,
+        drive_vendor, format_drive_capacity, network_rates, number_repeated_labels,
+        parse_cpu_lines, parse_memory, parse_mounts, parse_network_counters, parse_nvidia_gpus,
+        settle, GpuSnapshot, Usage,
     };
+
+    #[test]
+    fn the_battery_draw_is_averaged_so_the_time_left_holds_still() {
+        // The first minutes off the mains: every reading counts the same.
+        let mut average = 22.0;
+        for (step, watts) in [40.0, 22.0, 22.0].into_iter().enumerate() {
+            average = settle(average, watts, 2.0, 2.0 * (step + 1) as f64);
+        }
+        assert!((average - 28.0).abs() < 1e-9, "{average}");
+        // Settled at 22 W, one spike to 60 W moves it by under 2 W...
+        let spiked = settle(22.0, 60.0, 2.0, 600.0);
+        assert!(spiked > 22.0 && spiked < 23.0, "{spiked}");
+        // ...while a draw that stays up is taken in within a few minutes.
+        let mut average = 22.0;
+        for _ in 0..180 {
+            average = settle(average, 40.0, 2.0, 600.0);
+        }
+        assert!(average > 39.0, "{average}");
+    }
 
     #[test]
     fn nvidia_csv_keeps_every_gpu_and_clamps_what_the_driver_reports() {
@@ -1029,7 +1129,10 @@ mod tests {
         assert!(busy[0].memory.is_some());
         // A line with nothing usable in any column is skipped rather than
         // shown as zero.
-        assert!(parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], [N/A], [N/A], [N/A], [N/A]\n").is_empty());
+        assert!(
+            parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], [N/A], [N/A], [N/A], [N/A]\n")
+                .is_empty()
+        );
         assert!(parse_nvidia_gpus("nvidia-smi: command failed\n").is_empty());
     }
 
