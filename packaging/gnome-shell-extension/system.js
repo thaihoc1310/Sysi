@@ -31,9 +31,9 @@ const CLOCK_GAP = 2;
 // keeps its words clear of the row even at none.
 const CLOCK_CLEAR = 0;
 // Between a group and the hairline on either side of it.
-const GROUP_GAP = 10;
+const GROUP_GAP = 8;
 // Between two devices of one group.
-const DEVICE_GAP = 10;
+const DEVICE_GAP = 8;
 // Between a caption and its first value, and between two values.
 const CAPTION_GAP = 5;
 const VALUE_GAP = 7;
@@ -252,11 +252,12 @@ export class SystemPanel {
     }
 
     // How much of the bar the readings may take: from beside the gear to a
-    // little short of the clock's words. Not of its button: the button's
-    // padding is empty bar, and the row may use it.
+    // little short of the panel's centre box, the clock's. That is where the
+    // panel ends the left box it lends this row: run past it, even into the
+    // clock button's empty padding, and the panel squeezes every caption in
+    // the row to an ellipsis.
     _room() {
-        const menu = Main.panel.statusArea.dateMenu;
-        const clock = menu?._clockDisplay ?? menu ?? Main.panel._centerBox;
+        const clock = Main.panel._centerBox ?? Main.panel.statusArea.dateMenu;
         const [clockX] = clock.get_transformed_position();
         const [gearX] = this._gear.get_transformed_position();
         const start = gearX + this._gear.width + this._readout.get_theme_node().get_margin(St.Side.LEFT);
