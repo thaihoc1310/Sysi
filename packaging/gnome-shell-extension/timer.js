@@ -202,9 +202,10 @@ const countdown = {
 export class TimerPanel {
     // `row` is the panel row the pill joins, after SYSTEM's readings;
     // `button` is the strip's `timer`; `systemPanel` is told how much of the
-    // row the pill takes.
-    constructor({row, button, systemPanel}) {
+    // row the pill takes; `onStart` runs once a timer is set from the menu.
+    constructor({row, button, systemPanel, onStart}) {
         this._button = button;
+        this._onStart = onStart;
         this._systemPanel = systemPanel;
         this._stripOpen = false;
         this._tickId = 0;
@@ -345,6 +346,7 @@ export class TimerPanel {
     _start(seconds) {
         countdown.start(seconds);
         this._menu.close();
+        this._onStart?.();
     }
 
     _render() {

@@ -80,11 +80,7 @@ export default class SysiPanelExtension extends Extension {
 
         this._gear.connect('clicked', () => {
             this._syncPanelState();
-            this._strip.visible = !this._strip.visible;
-            if (!this._strip.visible)
-                this._settingsMenu.close();
-            this._systemPanel?.setStripOpen(this._strip.visible);
-            this._timerPanel?.setStripOpen(this._strip.visible);
+            this._setStripOpen(!this._strip.visible);
         });
 
         // Append after Ubuntu's left-side indicator instead of prepending it.
@@ -101,6 +97,8 @@ export default class SysiPanelExtension extends Extension {
             row: this._content,
             button: this._timer,
             systemPanel: this._systemPanel,
+            // A timer just set is what the row should show next.
+            onStart: () => this._setStripOpen(false),
         });
         this._pidFile = Gio.File.new_for_path(
             GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi', 'pid']),
@@ -291,6 +289,15 @@ export default class SysiPanelExtension extends Extension {
         quit.label.x_expand = true;
         quit.connect('activate', () => this._runAction('quit', button));
         this._settingsMenu.addMenuItem(quit);
+    }
+
+    // The strip covers the readings and the timer while it is open.
+    _setStripOpen(open) {
+        this._strip.visible = open;
+        if (!open)
+            this._settingsMenu.close();
+        this._systemPanel?.setStripOpen(open);
+        this._timerPanel?.setStripOpen(open);
     }
 
     _buildPanelButton(label) {
