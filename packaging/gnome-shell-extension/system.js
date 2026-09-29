@@ -13,9 +13,10 @@
 //
 // Everything sits at its natural width with even gaps, like a flex row. A
 // value is never narrower than two digits of itself, so the row only moves
-// when one grows a third. The row never runs into the clock: whether the next
-// reading fits is judged with every value at its widest, and one that would
-// not fit cannot be turned on; another has to be turned off first.
+// when one grows a third. The row stops short of the clock: whether the next
+// reading fits is judged with every value at two digits (the network rate at
+// its widest), and one that would not fit cannot be turned on; another has to
+// be turned off first.
 
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
@@ -310,6 +311,14 @@ export class SystemPanel {
     // room before the clock in order. A group that does not fit is left out
     // whole, rather than drawn into the clock.
     _layout(isOn) {
+        // What each value is given in the reckoning: two digits of itself,
+        // which is what the row shows but for a rare 100% or 100°C, and the
+        // clock gap takes that digit. The network rate is the exception: it
+        // runs from kilobytes to megabytes all day, and reckoned at its usual
+        // width it would drop out of the row whenever a download started.
+        const reckoned = cell => cell.metric === 'network'
+            ? cell.widest
+            : cell.usual ?? cell.widest;
         const room = this._room();
         const shown = [];
         let used = 0;
@@ -319,7 +328,7 @@ export class SystemPanel {
                 .filter(({cells}) => cells.length > 0)
                 .map(entry => ({
                     ...entry,
-                    width: this._measure(entry.device.label, entry.cells.map(cell => cell.widest)),
+                    width: this._measure(entry.device.label, entry.cells.map(reckoned)),
                 }));
             if (!devices.length)
                 continue;

@@ -145,10 +145,6 @@
 /* SYSTEM's menu, in the style of settings: centred words, the reading bright
    while it is in the bar and faint while it is not, fainter still when there
    is no room left for it before the clock. */
-.sysi-system-menu .popup-menu-content {
-  min-width: 118px;
-}
-
 .sysi-system-menu .popup-separator-menu-item {
   padding: 2px 8px;
 }
