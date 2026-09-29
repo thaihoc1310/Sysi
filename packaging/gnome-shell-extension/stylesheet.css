@@ -190,3 +190,118 @@
   height: 12px;
   background-color: rgba(242, 242, 242, 0.22);
 }
+
+/* The timer's pill, after SYSTEM's readings: a disk of what is left and the
+   time, in the readings' face. Amber while it runs (Braun's second hand),
+   faint while paused, filled amber while it rings. */
+#panel .sysi-timer-pill {
+  margin-left: 8px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  color: #f2f2f2;
+  background-color: transparent;
+}
+
+#panel .sysi-timer-pill:hover,
+#panel .sysi-timer-pill:focus {
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
+#panel .sysi-timer-pill-box {
+  spacing: 5px;
+}
+
+#panel .sysi-timer-disk {
+  width: 11px;
+  height: 11px;
+  color: #f2f2f2;
+}
+
+#panel .sysi-timer-time {
+  color: #f2f2f2;
+  font-family: "Noto Sans", sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  font-feature-settings: "tnum";
+  text-shadow: none;
+}
+
+#panel .sysi-timer-paused .sysi-timer-time,
+#panel .sysi-timer-paused .sysi-timer-disk {
+  color: rgba(242, 242, 242, 0.55);
+}
+
+#panel .sysi-timer-pill.sysi-timer-ringing {
+  background-color: #f2b53a;
+}
+
+#panel .sysi-timer-ringing .sysi-timer-time,
+#panel .sysi-timer-ringing .sysi-timer-disk {
+  color: #1b1306;
+}
+
+/* The timer's menu: presets, a field for anything else, and the controls
+   of a running timer. */
+.sysi-timer-menu .sysi-timer-body {
+  spacing: 7px;
+  padding: 6px 7px;
+}
+
+.sysi-timer-menu .sysi-timer-chips,
+.sysi-timer-menu .sysi-timer-controls {
+  spacing: 6px;
+}
+
+.sysi-timer-menu .sysi-timer-chip,
+.sysi-timer-menu .sysi-timer-control {
+  height: 26px;
+  border-radius: 7px;
+  background-color: rgba(255, 255, 255, 0.08);
+  color: #f4f4f4;
+  font-family: "Noto Sans", sans-serif;
+  font-size: 11.5px;
+  font-weight: 500;
+  font-feature-settings: "tnum";
+}
+
+/* Four presets or three controls to a row, all one width, so the grid lines
+   up whatever the labels say: 4 × 42 + 3 × 6 = 3 × 58 + 2 × 6 = 186. */
+.sysi-timer-menu .sysi-timer-chip {
+  width: 42px;
+}
+
+.sysi-timer-menu .sysi-timer-control {
+  width: 58px;
+  height: 24px;
+  font-size: 11px;
+}
+
+.sysi-timer-menu .sysi-timer-chip:hover,
+.sysi-timer-menu .sysi-timer-chip:focus,
+.sysi-timer-menu .sysi-timer-control:hover,
+.sysi-timer-menu .sysi-timer-control:focus {
+  background-color: rgba(255, 255, 255, 0.18);
+}
+
+.sysi-timer-menu .sysi-timer-entry {
+  min-height: 0;
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background-color: rgba(255, 255, 255, 0.08);
+  box-shadow: none;
+  color: #f4f4f4;
+  caret-color: #f4f4f4;
+  selection-background-color: rgba(242, 181, 58, 0.45);
+  font-family: "Noto Sans", sans-serif;
+  font-size: 11.5px;
+}
+
+.sysi-timer-menu .sysi-timer-entry StLabel.hint-text {
+  color: rgba(244, 244, 244, 0.45);
+}
+
+.sysi-timer-menu .sysi-timer-entry.sysi-timer-wrong {
+  border-color: rgba(242, 181, 58, 0.85);
+}

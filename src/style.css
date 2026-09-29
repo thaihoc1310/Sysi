@@ -106,50 +106,6 @@ separator {
   min-height: 1px;
 }
 
-.timer-value {
-  font-family: "Cantarell", "Inter", "Noto Sans", sans-serif;
-  font-size: 25px;
-  font-weight: 600;
-  letter-spacing: 1px;
-}
-
-.timer-action {
-  font-family: "Cantarell", "Noto Sans", sans-serif;
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 1.2px;
-}
-
-.timer-card.timer-style-digital .timer-value {
-  font-family: "Noto Sans Mono", "DejaVu Sans Mono", monospace;
-  font-weight: 700;
-  letter-spacing: 0.3px;
-}
-
-.timer-card.timer-style-digital .timer-action {
-  letter-spacing: 2.1px;
-}
-
-.timer-card.timer-style-ticks .timer-value {
-  font-weight: 700;
-  letter-spacing: 1.4px;
-}
-
-.timer-card.timer-style-arc .timer-value {
-  font-weight: 500;
-  letter-spacing: 1.7px;
-}
-
-.timer-editor {
-  background-color: transparent;
-  border: none;
-  color: currentColor;
-  font-family: "Noto Sans Mono", monospace;
-  font-size: 18px;
-  font-weight: 600;
-  padding: 3px 5px;
-}
-
 .tiny-button {
   background-image: none;
   background-color: alpha(currentColor, 0.09);
@@ -166,13 +122,6 @@ separator {
 .tiny-button:hover {
   background-color: alpha(currentColor, 0.18);
 }
-
-.alarm .card {
-  border: none;
-  box-shadow: none;
-}
-
-.timer-alarm-value { font-weight: 800; }
 
 .resize-handle {
   background-color: transparent;
@@ -1023,12 +972,6 @@ scrolledwindow overshoot.right:backdrop {
   color: alpha(currentColor, 0.3);
 }
 
-/* The timer renders without the overlay text halo; placed after the
-   .mode-* .card rules so it wins at equal specificity. */
-.timer-card .card {
-  text-shadow: none;
-}
-
 /* ------------------------------------------------------------------- menus
  * Right-click menus are separate toplevels, so they inherit none of the card
  * classes and none of the widget colour modes. They keep one dark chrome in
@@ -1322,13 +1265,6 @@ window:not(.editing) .mode-glass.pinned-note:not(.notes-window) .frost-body {
 /* Keep the scrollbar out of the rounded bottom corner. */
 .mode-glass.pinned-note scrollbar.vertical {
   margin-bottom: 10px;
-}
-
-/* SYSTEM and the timer are widgets on the desk, not windows, and get no
-   glass: they stay clear, with the heavier halo that keeps white ink readable
-   over whatever lies behind. */
-.no-glass.mode-glass .card {
-  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.86);
 }
 
 window.glass-live .mode-glass .frost-body,

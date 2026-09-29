@@ -123,6 +123,8 @@ export class SystemPanel {
         this._rows = new Map();
         this._pending = new Map();
         this._stripOpen = false;
+        // Room kept free after the readings (the timer's pill).
+        this._reserve = 0;
 
         this._readout = new St.BoxLayout({
             style_class: 'sysi-system-readout',
@@ -212,6 +214,14 @@ export class SystemPanel {
 
     close() {
         this._menu?.close();
+    }
+
+    // Keep this much of the row free after the readings.
+    setReserve(width) {
+        if (this._reserve === width)
+            return;
+        this._reserve = width;
+        this._render();
     }
 
     _buildMenu() {
@@ -315,7 +325,7 @@ export class SystemPanel {
         const [clockX] = clock.get_transformed_position();
         const [gearX] = this._gear.get_transformed_position();
         const start = gearX + this._gear.width + this._readout.get_theme_node().get_margin(St.Side.LEFT);
-        return Math.max(0, clockX - start - CLOCK_GAP);
+        return Math.max(0, clockX - start - CLOCK_GAP - this._reserve);
     }
 
     _reading(caption) {

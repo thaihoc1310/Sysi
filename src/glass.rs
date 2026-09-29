@@ -21,12 +21,9 @@ const OBJECT_PATH: &str = "/io/sysi/Glass";
 const INTERFACE: &str = "io.sysi.Glass1";
 const LIVE_CLASS: &str = "glass-live";
 
-/// Whether a card sits on glass. SYSTEM and the timer carry `no-glass`: they
-/// are widgets on the desk rather than windows, and a plate did not suit
-/// them, so in GLASS they stay clear the way they always were.
+/// Whether a card sits on glass.
 pub fn has_glass(widget: &impl IsA<gtk::Widget>) -> bool {
-    let context = widget.style_context();
-    context.has_class("mode-glass") && !context.has_class("no-glass")
+    widget.style_context().has_class("mode-glass")
 }
 
 /// The rounded rectangle one card's glass occupies, in the card's own

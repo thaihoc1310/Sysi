@@ -2,7 +2,7 @@ use crate::{
     platform,
     state::{
         AppState, ColorMode, DictionaryWindow, HighlightColor, Note, NoteHighlight, NoteImage,
-        Point, Size, TimerStyle, IMAGE_PLACEHOLDER,
+        Point, Size, IMAGE_PLACEHOLDER,
     },
     translate,
     usage::{self, Source as UsageSource},
@@ -16,7 +16,7 @@ use std::{
     cell::{Cell, RefCell},
     cmp::Reverse,
     collections::{HashMap, HashSet},
-    f64::consts::{FRAC_PI_2, PI, TAU},
+    f64::consts::{FRAC_PI_2, PI},
     fs,
     ops::RangeInclusive,
     rc::{Rc, Weak},
@@ -31,7 +31,6 @@ use std::{
 /// couple of thousand words, and nothing that is dropped costs more than one
 /// re-download.
 const AUDIO_CACHE_LIMIT: u64 = 64 * 1024 * 1024;
-const TIMER_SIZE: i32 = 116;
 const NOTE_WIDTH: i32 = 218;
 const NOTE_HEIGHT: i32 = 124;
 const USAGE_WIDTH: i32 = 292;
@@ -68,10 +67,6 @@ const VISUAL_SHAPE_MARGIN: i32 = 8;
 /// on this app's multi-monitor surface, so apply at most roughly 60 moves/s and
 /// always commit the exact pointer position on release.
 const DRAG_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
-/// Manhattan pixels in root coordinates. Widget-local slop is useless on
-/// the timer: the card is its own drag handle, so it follows the pointer
-/// and a drag's press and release land on the same local point.
-const CLICK_DRAG_SLOP: f64 = 5.0;
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 // The notes-palette row the pointer is on, or None. The palette's right-click
@@ -273,15 +268,6 @@ struct NoteSearchState {
     current: Option<usize>,
 }
 
-struct TimerRuntime {
-    duration_seconds: i64,
-    remaining: Duration,
-    target: Option<Instant>,
-    started: bool,
-    alarm: bool,
-    phase: f64,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScreenRect {
     x: i32,
@@ -326,13 +312,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let mut data = state.borrow_mut();
         if data.layout_version < 3 {
             data.positions.insert(
-                "timer".into(),
-                Point {
-                    x: primary_screen.x + primary_screen.width - TIMER_SIZE - 30,
-                    y: primary_screen.y + 68,
-                },
-            );
-            data.positions.insert(
                 "notes".into(),
                 Point {
                     x: primary_screen.x + 32,
@@ -355,46 +334,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             data.layout_version = 3;
             let _ = data.save();
         }
-        if data.layout_version < 4 {
-            let old_size = data.sizes.get("timer").copied();
-            let compact_size = match data.timer_style {
-                TimerStyle::Digital
-                    if old_size
-                        == Some(Size {
-                            width: 108,
-                            height: 48,
-                        }) =>
-                {
-                    Some(TimerStyle::Digital.default_size())
-                }
-                TimerStyle::Ring | TimerStyle::Ticks | TimerStyle::Arc
-                    if old_size
-                        == Some(Size {
-                            width: 132,
-                            height: 132,
-                        }) =>
-                {
-                    Some(data.timer_style.default_size())
-                }
-                _ => None,
-            };
-            if let Some(size) = compact_size {
-                data.sizes.insert("timer".into(), size);
-            }
-            data.layout_version = 4;
-            let _ = data.save();
-        }
+        // 4 and 5 resized the desk timer, which is now in the top bar.
         if data.layout_version < 5 {
-            if data.timer_style == TimerStyle::Digital
-                && data.sizes.get("timer").copied()
-                    == Some(Size {
-                        width: 96,
-                        height: 40,
-                    })
-            {
-                data.sizes
-                    .insert("timer".into(), TimerStyle::Digital.default_size());
-            }
             data.layout_version = 5;
             let _ = data.save();
         }
@@ -548,87 +489,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     );
     window.set_accept_focus(true);
     window.style_context().add_class("editing");
-    let (timer_color_mode, picker_color_mode) = {
-        let data = state.borrow();
-        (saved_color_mode(&data, "timer"), saved_color_mode(&data, "picker"))
-    };
-
-    let timer_card = build_timer_card(
-        state.clone(),
-        interactive.clone(),
-        foreground_for_mode(timer_color_mode),
-    );
-    let timer_default_size = timer_card.style.get().default_size();
-    let timer_default = Point {
-        x: (primary_screen.x + primary_screen.width - timer_default_size.width - 34)
-            .max(primary_screen.x + 8),
-        y: primary_screen.y + 34,
-    };
-    let timer_position = state
-        .borrow()
-        .positions
-        .get("timer")
-        .copied()
-        .unwrap_or(timer_default);
-    apply_widget_size(&timer_card.card, "timer", &state, timer_default_size);
-    place_card(&root, &timer_card.card, timer_position);
-    register(
-        &registry,
-        "timer",
-        &timer_card.card,
-        timer_card.color_mode.clone(),
-        timer_color_mode,
-    );
-    attach_color_mode_menu(
-        &timer_card.card,
-        "timer".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        Some(TimerStylePreview {
-            style: timer_card.style.clone(),
-            size: timer_card.style_size.clone(),
-            card: timer_card.card.clone(),
-            canvas: timer_card.canvas.clone(),
-            window: window.clone(),
-            registry: registry.clone(),
-            interactive: interactive.clone(),
-            typography: timer_card.typography.clone(),
-            open_edit: timer_card.open_edit.clone(),
-        }),
-        None,
-        None,
-        None,
-    );
-    attach_drag(
-        &timer_card.drag,
-        &timer_card.card,
-        &root,
-        "timer".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        window.clone(),
-    );
-    attach_resize(
-        &timer_card.resize,
-        &timer_card.card,
-        &root,
-        "timer".into(),
-        state.clone(),
-        registry.clone(),
-        interactive.clone(),
-        window.clone(),
-        ResizeBounds {
-            min_width: 72,
-            min_height: 36,
-            max_width: Some(320),
-            max_height: Some(320),
-            aspect_ratio: Some(1.0),
-            preserve_current_aspect: true,
-            height_for_width: None,
-        },
-    );
+    let picker_color_mode = saved_color_mode(&state.borrow(), "picker");
 
     let widget_picker = build_widget_picker(picker_color_mode);
     let picker_position = Point {
@@ -649,7 +510,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
-        None,
         None,
         None,
         None,
@@ -680,7 +540,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
-        None,
         Some(lookup_actions.clone()),
         Some(notes_row_menu),
         None,
@@ -728,7 +587,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         state.clone(),
         registry.clone(),
         interactive.clone(),
-        None,
         None,
         None,
         None,
@@ -1664,12 +1522,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         move |_, event| handle_notes_keys(event)
     });
 
-    let (system_enabled, timer_enabled, color_mode) = {
+    let (system_enabled, color_mode) = {
         let settings = &state.borrow().settings;
-        (settings.system, settings.timer, settings.color_mode)
+        (settings.system, settings.color_mode)
     };
     widget_picker.system.set_active(system_enabled);
-    widget_picker.timer.set_active(timer_enabled);
     widget_picker.mode.set_label(color_mode.label());
 
     // SYSTEM lives in the GNOME top bar now; see `panel_system`.
@@ -1681,37 +1538,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         }
     });
 
-    widget_picker.timer.connect_toggled({
-        let target = timer_card.card.clone();
-        let state = state.clone();
-        let window = window.clone();
-        let registry = registry.clone();
-        let interactive = interactive.clone();
-        let root = root.clone();
-        let picker = widget_picker.card.clone();
-        move |button| {
-            let enabled = button.is_active();
-            if enabled {
-                reopen_widget(
-                    &target,
-                    "timer",
-                    &root,
-                    &state,
-                    Size {
-                        width: TIMER_SIZE,
-                        height: TIMER_SIZE,
-                    },
-                    Some(&picker),
-                );
-                target.show_all();
-            } else {
-                target.hide();
-            }
-            state.borrow_mut().settings.timer = enabled;
-            let _ = state.borrow().save();
-            refresh_input_shape(&window, &registry, interactive.get());
-        }
-    });
     widget_picker.mode.connect_clicked({
         let state = state.clone();
         let registry = registry.clone();
@@ -1850,7 +1676,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let lock = widget_picker.lock.clone();
         let state = state.clone();
-        let commit_timer_edit = timer_card.commit_edit.clone();
         Rc::new(move || {
             let enabled = !interactive.get();
             interactive.set(enabled);
@@ -1858,7 +1683,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 window.set_accept_focus(true);
                 window.style_context().add_class("editing");
             } else {
-                commit_timer_edit();
                 let open_searches: Vec<NoteSearchControls> = registry
                     .borrow()
                     .iter()
@@ -1900,7 +1724,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
 
     let dispatch_panel_action: Rc<dyn Fn()> = {
         let panel_system = panel_system.clone();
-        let timer = widget_picker.timer.clone();
         let mode = widget_picker.mode.clone();
         let lock = widget_picker.lock.clone();
         let new_note = widget_picker.new_note.clone();
@@ -1937,7 +1760,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 }
                 match action.name.as_str() {
                     name if crate::panel_system::apply_action(&panel_system, name) => {}
-                    "toggle-timer" => timer.set_active(!timer.is_active()),
                     "next-color-mode" => mode.clicked(),
                     "font-smaller" | "font-larger" => {
                         let delta = if action.name == "font-larger" { 1 } else { -1 };
@@ -2082,9 +1904,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     // Likewise the dictionary: show_all() dropped its query panel down, but a
     // window restored from the last session was not asked for just now.
     translate_after_show();
-    if !timer_enabled {
-        timer_card.card.hide();
-    }
     window.present();
     window.move_(0, 0);
     crate::glass::start(window.upcast_ref(), root.upcast_ref(), {
@@ -2256,8 +2075,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     translate_scrollers
         .borrow_mut()
         .push(notes.preview_scroller.clone());
-    track_widget_hover(registry.clone(), translate_scrollers.clone());
-    start_timer_updates(timer_card, state, window, registry, interactive);
+    track_widget_hover(registry, translate_scrollers);
 }
 
 fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
@@ -4003,716 +3821,6 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
         refresh,
         show,
     }
-}
-
-struct TimerCard {
-    card: gtk::EventBox,
-    drag: gtk::EventBox,
-    color_mode: Rc<Cell<Foreground>>,
-    style: Rc<Cell<TimerStyle>>,
-    style_size: Rc<Cell<Size>>,
-    typography: gtk::CssProvider,
-    canvas: gtk::DrawingArea,
-    stack: gtk::Stack,
-    label: gtk::Label,
-    action: gtk::Label,
-    runtime: Rc<RefCell<TimerRuntime>>,
-    alarm: Rc<Cell<bool>>,
-    hovered: Rc<Cell<bool>>,
-    open_edit: Rc<dyn Fn()>,
-    commit_edit: Rc<dyn Fn()>,
-    resize: ResizeHandle,
-    wake_updates: CallbackSlot,
-}
-
-#[derive(Clone)]
-struct TimerStylePreview {
-    style: Rc<Cell<TimerStyle>>,
-    size: Rc<Cell<Size>>,
-    card: gtk::EventBox,
-    canvas: gtk::DrawingArea,
-    window: gtk::ApplicationWindow,
-    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
-    interactive: Rc<Cell<bool>>,
-    typography: gtk::CssProvider,
-    open_edit: Rc<dyn Fn()>,
-}
-
-fn build_timer_card(
-    state: Rc<RefCell<AppState>>,
-    _interactive: Rc<Cell<bool>>,
-    initial_color_mode: Foreground,
-) -> TimerCard {
-    let (card, body, drag, color_mode, resize) = card_shell("", "", initial_color_mode);
-    card.style_context().add_class("timer-card");
-    card.style_context().add_class("no-glass");
-    let style = Rc::new(Cell::new(state.borrow().timer_style));
-    let style_size = Rc::new(Cell::new(style.get().default_size()));
-    card.style_context().add_class(style.get().css_class());
-    let duration = state.borrow().timer_seconds.clamp(1, 24 * 3600);
-    let runtime = Rc::new(RefCell::new(TimerRuntime {
-        duration_seconds: duration,
-        remaining: Duration::from_secs(duration as u64),
-        target: None,
-        started: false,
-        alarm: false,
-        phase: 0.0,
-    }));
-    let alarm = Rc::new(Cell::new(false));
-    let hovered = Rc::new(Cell::new(false));
-    let wake_updates: CallbackSlot = Rc::new(RefCell::new(None));
-
-    let overlay = gtk::Overlay::new();
-    overlay.set_halign(gtk::Align::Fill);
-    overlay.set_valign(gtk::Align::Fill);
-    overlay.set_hexpand(true);
-    overlay.set_vexpand(true);
-    let canvas = gtk::DrawingArea::new();
-    canvas.set_size_request(1, 1);
-    canvas.set_hexpand(true);
-    canvas.set_vexpand(true);
-    overlay.add(&canvas);
-
-    let interaction = gtk::EventBox::new();
-    interaction.set_visible_window(false);
-    interaction.set_above_child(true);
-    interaction.set_halign(gtk::Align::Fill);
-    interaction.set_valign(gtk::Align::Fill);
-    interaction.add_events(
-        gdk::EventMask::ENTER_NOTIFY_MASK
-            | gdk::EventMask::LEAVE_NOTIFY_MASK
-            | gdk::EventMask::POINTER_MOTION_MASK
-            | gdk::EventMask::BUTTON_PRESS_MASK
-            | gdk::EventMask::BUTTON_RELEASE_MASK,
-    );
-    let stack = gtk::Stack::new();
-    stack.set_transition_type(gtk::StackTransitionType::None);
-    stack.set_hhomogeneous(false);
-    stack.set_vhomogeneous(false);
-    stack.set_halign(gtk::Align::Center);
-    stack.set_valign(gtk::Align::Center);
-
-    let label = gtk::Label::new(Some(&format_duration(duration)));
-    label.set_selectable(false);
-    label.style_context().add_class("timer-value");
-    let action = gtk::Label::new(Some("START"));
-    action.set_selectable(false);
-    action.style_context().add_class("timer-action");
-    action.set_halign(gtk::Align::Center);
-    action.set_valign(gtk::Align::Center);
-    action.set_opacity(1.0);
-    action.hide();
-    let editor = gtk::Entry::new();
-    editor.set_width_chars(5);
-    editor.set_can_focus(true);
-    editor.set_max_length(8);
-    editor.set_alignment(0.5);
-    editor.style_context().add_class("timer-editor");
-    stack.add_named(&label, "time");
-    stack.add_named(&editor, "editor");
-    stack.set_visible_child_name("time");
-    let text_overlay = gtk::Overlay::new();
-    text_overlay.set_halign(gtk::Align::Center);
-    text_overlay.set_valign(gtk::Align::Center);
-    text_overlay.add(&stack);
-    text_overlay.add_overlay(&action);
-    text_overlay.set_overlay_pass_through(&action, true);
-    interaction.add(&text_overlay);
-    overlay.add_overlay(&interaction);
-    body.pack_start(&overlay, true, true, 0);
-
-    let typography = gtk::CssProvider::new();
-    for widget in [
-        &label.clone().upcast::<gtk::Widget>(),
-        &action.clone().upcast(),
-        &editor.clone().upcast(),
-    ] {
-        widget
-            .style_context()
-            .add_provider(&typography, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 3);
-    }
-    apply_timer_typography(&typography, style.get(), style_size.get(), 1.0);
-    card.connect_size_allocate({
-        let style_size = style_size.clone();
-        let style = style.clone();
-        let typography = typography.clone();
-        move |card, allocation| {
-            let size = Size {
-                width: allocation.width().max(1),
-                height: allocation.height().max(1),
-            };
-            style_size.set(size);
-            apply_timer_typography(&typography, style.get(), size, widget_font_scale(card));
-        }
-    });
-
-    canvas.connect_draw({
-        let runtime = runtime.clone();
-        let color_mode = color_mode.clone();
-        let style = style.clone();
-        move |area, ctx| {
-            draw_timer_style(area, ctx, &runtime.borrow(), color_mode.get(), style.get());
-            glib::Propagation::Proceed
-        }
-    });
-
-    let editing = Rc::new(Cell::new(false));
-    let click_start = Rc::new(Cell::new(None::<(f64, f64)>));
-    let commit_edit: Rc<dyn Fn()> = Rc::new({
-        let runtime = runtime.clone();
-        let state = state.clone();
-        let alarm = alarm.clone();
-        let label = label.clone();
-        let editor = editor.clone();
-        let stack = stack.clone();
-        let canvas = canvas.clone();
-        let editing = editing.clone();
-        let interaction = interaction.clone();
-        let card = card.clone();
-        let action = action.clone();
-        let hovered = hovered.clone();
-        move || {
-            if !editing.replace(false) {
-                return;
-            }
-            if let Some(seconds) = parse_timer_input(&editor.text()) {
-                let seconds = seconds.clamp(1, 24 * 3600);
-                let mut timer = runtime.borrow_mut();
-                timer.duration_seconds = seconds;
-                timer.remaining = Duration::from_secs(seconds as u64);
-                timer.target = None;
-                timer.started = false;
-                timer.alarm = false;
-                timer.phase = 0.0;
-                alarm.set(false);
-                label.set_text(&format_duration(seconds));
-                state.borrow_mut().timer_seconds = seconds;
-                let _ = state.borrow().save();
-            }
-            card.style_context().remove_class("alarm");
-            label.style_context().remove_class("timer-alarm-value");
-            interaction.set_above_child(true);
-            stack.set_visible_child_name("time");
-            if hovered.get() {
-                action.set_text(timer_action_text(&runtime.borrow()));
-                label.set_opacity(0.28);
-                action.show();
-            } else {
-                label.set_opacity(1.0);
-                action.hide();
-            }
-            canvas.queue_draw();
-        }
-    });
-    let cancel_edit: Rc<dyn Fn()> = Rc::new({
-        let runtime = runtime.clone();
-        let label = label.clone();
-        let stack = stack.clone();
-        let canvas = canvas.clone();
-        let editing = editing.clone();
-        let interaction = interaction.clone();
-        let action = action.clone();
-        let hovered = hovered.clone();
-        move || {
-            if !editing.replace(false) {
-                return;
-            }
-            label.set_text(&format_duration_ceil(runtime.borrow().remaining));
-            interaction.set_above_child(true);
-            stack.set_visible_child_name("time");
-            if hovered.get() {
-                label.set_opacity(0.28);
-                action.set_text(timer_action_text(&runtime.borrow()));
-                action.show();
-            } else {
-                label.set_opacity(1.0);
-                action.hide();
-            }
-            canvas.queue_draw();
-        }
-    });
-    editor.connect_activate({
-        let commit_edit = commit_edit.clone();
-        move |_| commit_edit()
-    });
-    editor.connect_changed({
-        let commit_edit = commit_edit.clone();
-        let auto_formatting = Rc::new(Cell::new(false));
-        move |entry| {
-            if auto_formatting.get() {
-                return;
-            }
-            let raw = entry.text();
-            if raw.len() != 4 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-                return;
-            }
-            let formatted = format!("{}:{}", &raw[..2], &raw[2..]);
-            if parse_timer_input(&formatted).is_none() {
-                return;
-            }
-            auto_formatting.set(true);
-            entry.set_text(&formatted);
-            entry.set_position(-1);
-            auto_formatting.set(false);
-            commit_edit();
-        }
-    });
-    editor.connect_focus_out_event({
-        let cancel_edit = cancel_edit.clone();
-        move |_, _| {
-            cancel_edit();
-            glib::Propagation::Proceed
-        }
-    });
-    editor.connect_key_press_event({
-        let cancel_edit = cancel_edit.clone();
-        move |_, event| {
-            if event.keyval() == gdk::keys::constants::Escape {
-                cancel_edit();
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        }
-    });
-
-    interaction.connect_enter_notify_event({
-        let hovered = hovered.clone();
-        let runtime = runtime.clone();
-        let label = label.clone();
-        let action = action.clone();
-        let editing = editing.clone();
-        move |_, _| {
-            hovered.set(true);
-            if !editing.get() {
-                action.set_text(timer_action_text(&runtime.borrow()));
-                label.set_opacity(0.28);
-                action.show();
-            }
-            glib::Propagation::Proceed
-        }
-    });
-    interaction.connect_leave_notify_event({
-        let hovered = hovered.clone();
-        let label = label.clone();
-        let action = action.clone();
-        let editing = editing.clone();
-        move |_, _| {
-            hovered.set(false);
-            if !editing.get() {
-                label.set_opacity(1.0);
-                action.hide();
-            }
-            glib::Propagation::Proceed
-        }
-    });
-    interaction.connect_motion_notify_event({
-        let hovered = hovered.clone();
-        let runtime = runtime.clone();
-        let label = label.clone();
-        let action = action.clone();
-        let editing = editing.clone();
-        move |_, _| {
-            hovered.set(true);
-            if !editing.get() {
-                action.set_text(timer_action_text(&runtime.borrow()));
-                label.set_opacity(0.28);
-                action.show();
-            }
-            glib::Propagation::Proceed
-        }
-    });
-    interaction.connect_button_press_event({
-        let click_start = click_start.clone();
-        move |_, event| {
-            if event.button() == 1 && event.event_type() == gdk::EventType::ButtonPress {
-                // Root, not widget-local: the card slides with the pointer.
-                click_start.set(Some(event.root()));
-            }
-            glib::Propagation::Proceed
-        }
-    });
-    interaction.connect_button_release_event({
-        let runtime = runtime.clone();
-        let alarm = alarm.clone();
-        let label = label.clone();
-        let action = action.clone();
-        let canvas = canvas.clone();
-        let card = card.clone();
-        let wake_updates = wake_updates.clone();
-        let click_start = click_start.clone();
-        move |_, event| {
-            if event.button() != 1 {
-                return glib::Propagation::Proceed;
-            }
-            let Some((start_x, start_y)) = click_start.replace(None) else {
-                return glib::Propagation::Proceed;
-            };
-            if click_became_drag((start_x, start_y), event.root()) {
-                return glib::Propagation::Proceed;
-            }
-            let mut timer = runtime.borrow_mut();
-            if timer.alarm {
-                timer.alarm = false;
-                timer.target = None;
-                timer.started = false;
-                timer.remaining = Duration::from_secs(timer.duration_seconds as u64);
-                alarm.set(false);
-                card.style_context().remove_class("alarm");
-                label.style_context().remove_class("timer-alarm-value");
-            } else if let Some(target) = timer.target.take() {
-                timer.remaining = target.saturating_duration_since(Instant::now());
-            } else {
-                if timer.remaining.is_zero() {
-                    timer.remaining = Duration::from_secs(timer.duration_seconds as u64);
-                }
-                timer.started = true;
-                timer.target = Some(Instant::now() + timer.remaining);
-            }
-            label.set_text(&format_duration_ceil(timer.remaining));
-            action.set_text(timer_action_text(&timer));
-            drop(timer);
-            canvas.queue_draw();
-            if let Some(wake) = wake_updates.borrow().as_ref() {
-                wake();
-            }
-            glib::Propagation::Stop
-        }
-    });
-
-    let open_edit: Rc<dyn Fn()> = Rc::new({
-        let runtime = runtime.clone();
-        let label = label.clone();
-        let action = action.clone();
-        let editor = editor.clone();
-        let stack = stack.clone();
-        let editing = editing.clone();
-        let interaction = interaction.clone();
-        let canvas = canvas.clone();
-        move || {
-            if editing.replace(true) {
-                return;
-            }
-            let mut timer = runtime.borrow_mut();
-            if let Some(target) = timer.target.take() {
-                timer.remaining = target.saturating_duration_since(Instant::now());
-                timer.started = true;
-            }
-            label.set_text(&format_duration_ceil(timer.remaining));
-            action.set_text(timer_action_text(&timer));
-            drop(timer);
-            editor.set_text(&format_duration(runtime.borrow().duration_seconds));
-            label.set_opacity(1.0);
-            action.hide();
-            stack.set_visible_child_name("editor");
-            interaction.set_above_child(false);
-            editor.grab_focus();
-            editor.select_region(0, -1);
-            canvas.queue_draw();
-        }
-    });
-
-    TimerCard {
-        card,
-        drag,
-        color_mode,
-        style,
-        style_size,
-        typography,
-        canvas,
-        stack,
-        label,
-        action,
-        runtime,
-        alarm,
-        hovered,
-        open_edit,
-        commit_edit,
-        resize,
-        wake_updates,
-    }
-}
-
-fn timer_action_text(timer: &TimerRuntime) -> &'static str {
-    if timer.alarm {
-        "DISMISS"
-    } else if timer.target.is_some() {
-        "PAUSE"
-    } else if timer.started {
-        "RESUME"
-    } else {
-        "START"
-    }
-}
-
-fn parse_timer_input(value: &str) -> Option<i64> {
-    let parts: Vec<&str> = value.trim().split(':').collect();
-    let seconds = match parts.as_slice() {
-        [minutes] => minutes.parse::<i64>().ok()?.checked_mul(60)?,
-        [minutes, seconds] => {
-            let minutes = minutes.parse::<i64>().ok()?;
-            let seconds = seconds.parse::<i64>().ok()?;
-            if !(0..60).contains(&seconds) {
-                return None;
-            }
-            minutes.checked_mul(60)?.checked_add(seconds)?
-        }
-        [hours, minutes, seconds] => {
-            let hours = hours.parse::<i64>().ok()?;
-            let minutes = minutes.parse::<i64>().ok()?;
-            let seconds = seconds.parse::<i64>().ok()?;
-            if !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
-                return None;
-            }
-            hours
-                .checked_mul(3600)?
-                .checked_add(minutes.checked_mul(60)?)?
-                .checked_add(seconds)?
-        }
-        _ => return None,
-    };
-    (seconds > 0).then_some(seconds)
-}
-
-fn draw_timer_style(
-    area: &gtk::DrawingArea,
-    ctx: &Context,
-    timer: &TimerRuntime,
-    color_mode: Foreground,
-    style: TimerStyle,
-) {
-    match style {
-        TimerStyle::Ring => draw_timer_ring(area, ctx, timer, color_mode),
-        TimerStyle::Digital => draw_timer_digital_alarm(area, ctx, timer, color_mode),
-        TimerStyle::Ticks => draw_timer_ticks(area, ctx, timer, color_mode),
-        TimerStyle::Arc => draw_timer_arc(area, ctx, timer, color_mode),
-    }
-}
-
-fn timer_gray(color_mode: Foreground) -> f64 {
-    match color_mode {
-        Foreground::Light => 0.91,
-        Foreground::Dark => 0.12,
-    }
-}
-
-fn timer_ratio(timer: &TimerRuntime) -> f64 {
-    (timer.remaining.as_secs_f64() / timer.duration_seconds.max(1) as f64).clamp(0.0, 1.0)
-}
-
-fn timer_center(area: &gtk::DrawingArea, inset: f64) -> (f64, f64, f64) {
-    let allocation = area.allocation();
-    let cx = f64::from(allocation.width()) / 2.0;
-    let cy = f64::from(allocation.height()) / 2.0;
-    (cx, cy, (cx.min(cy) - inset).max(1.0))
-}
-
-fn draw_timer_ring(
-    area: &gtk::DrawingArea,
-    ctx: &Context,
-    timer: &TimerRuntime,
-    color_mode: Foreground,
-) {
-    let (cx, cy, radius) = timer_center(area, 9.0);
-    let gray = timer_gray(color_mode);
-    let ratio = timer_ratio(timer);
-    let start = -PI / 2.0;
-
-    ctx.set_line_width(8.0);
-    ctx.set_line_cap(cairo::LineCap::Round);
-    ctx.set_source_rgba(gray, gray, gray, 0.16);
-    ctx.new_sub_path();
-    ctx.arc(cx, cy, radius, 0.0, TAU);
-    let _ = ctx.stroke();
-
-    if timer.alarm {
-        let pulse = 0.42 + 0.48 * (timer.phase.sin() * 0.5 + 0.5);
-        ctx.set_source_rgba(gray, gray, gray, pulse);
-        ctx.new_sub_path();
-        ctx.arc(cx, cy, radius, 0.0, TAU);
-        let _ = ctx.stroke();
-    } else if ratio > 0.0 {
-        ctx.set_source_rgba(gray, gray, gray, 0.92);
-        ctx.new_sub_path();
-        ctx.arc(cx, cy, radius, start, start + TAU * ratio);
-        let _ = ctx.stroke();
-    }
-}
-
-fn draw_timer_digital_alarm(
-    area: &gtk::DrawingArea,
-    ctx: &Context,
-    timer: &TimerRuntime,
-    color_mode: Foreground,
-) {
-    if !timer.alarm {
-        return;
-    }
-    let (cx, cy, radius) = timer_center(area, 11.0);
-    let pulse = 0.25 + 0.6 * (timer.phase.sin() * 0.5 + 0.5);
-    let gray = timer_gray(color_mode);
-    ctx.set_source_rgba(gray, gray, gray, pulse);
-    ctx.set_line_width(2.0);
-    ctx.set_line_cap(cairo::LineCap::Round);
-    for direction in [-1.0, 1.0] {
-        let x = cx + direction * radius * 0.82;
-        ctx.move_to(x, cy - radius * 0.18);
-        ctx.line_to(x + direction * 5.0, cy);
-        ctx.line_to(x, cy + radius * 0.18);
-    }
-    let _ = ctx.stroke();
-}
-
-fn draw_timer_ticks(
-    area: &gtk::DrawingArea,
-    ctx: &Context,
-    timer: &TimerRuntime,
-    color_mode: Foreground,
-) {
-    let (cx, cy, radius) = timer_center(area, 8.0);
-    let gray = timer_gray(color_mode);
-    let ratio = timer_ratio(timer);
-    let active_ticks = (ratio * 24.0).ceil() as usize;
-    let pulse = 0.38 + 0.52 * (timer.phase.sin() * 0.5 + 0.5);
-    ctx.set_line_width(2.3);
-    ctx.set_line_cap(cairo::LineCap::Round);
-    for index in 0..24 {
-        let angle = -PI / 2.0 + TAU * index as f64 / 24.0;
-        let (sin, cos) = angle.sin_cos();
-        let inner = radius - if index % 6 == 0 { 7.0 } else { 4.5 };
-        let alpha = if timer.alarm {
-            pulse
-        } else if index < active_ticks {
-            0.9
-        } else {
-            0.2
-        };
-        ctx.set_source_rgba(gray, gray, gray, alpha);
-        ctx.move_to(cx + cos * inner, cy + sin * inner);
-        ctx.line_to(cx + cos * radius, cy + sin * radius);
-        let _ = ctx.stroke();
-    }
-}
-
-fn draw_timer_arc(
-    area: &gtk::DrawingArea,
-    ctx: &Context,
-    timer: &TimerRuntime,
-    color_mode: Foreground,
-) {
-    let (cx, cy, radius) = timer_center(area, 8.0);
-    let gray = timer_gray(color_mode);
-    let ratio = timer_ratio(timer);
-    let start = -PI * 0.84;
-    let sweep = TAU * 0.74;
-    ctx.set_line_width(3.2);
-    ctx.set_line_cap(cairo::LineCap::Round);
-    ctx.set_source_rgba(gray, gray, gray, 0.2);
-    ctx.new_sub_path();
-    ctx.arc(cx, cy, radius, start, start + sweep);
-    let _ = ctx.stroke();
-
-    let alpha = if timer.alarm {
-        0.38 + 0.52 * (timer.phase.sin() * 0.5 + 0.5)
-    } else {
-        0.92
-    };
-    ctx.set_source_rgba(gray, gray, gray, alpha);
-    ctx.new_sub_path();
-    ctx.arc(
-        cx,
-        cy,
-        radius,
-        start,
-        start + if timer.alarm { sweep } else { sweep * ratio },
-    );
-    let _ = ctx.stroke();
-}
-
-fn start_timer_updates(
-    timer_ui: TimerCard,
-    _state: Rc<RefCell<AppState>>,
-    window: gtk::ApplicationWindow,
-    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
-    interactive: Rc<Cell<bool>>,
-) {
-    let source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    let alarm_was_active = Rc::new(Cell::new(false));
-    let wake_updates: Rc<dyn Fn()> = Rc::new({
-        let source = source.clone();
-        let runtime = timer_ui.runtime.clone();
-        let label = timer_ui.label.clone();
-        let action = timer_ui.action.clone();
-        let stack = timer_ui.stack.clone();
-        let canvas = timer_ui.canvas.clone();
-        let card = timer_ui.card.clone();
-        let alarm = timer_ui.alarm.clone();
-        let hovered = timer_ui.hovered.clone();
-        let alarm_was_active = alarm_was_active.clone();
-        move || {
-            if source.borrow().is_some() {
-                return;
-            }
-            let active = {
-                let timer = runtime.borrow();
-                timer.target.is_some() || timer.alarm
-            };
-            if !active {
-                return;
-            }
-
-            let source_for_tick = source.clone();
-            let runtime = runtime.clone();
-            let label = label.clone();
-            let action = action.clone();
-            let stack = stack.clone();
-            let canvas = canvas.clone();
-            let card = card.clone();
-            let alarm = alarm.clone();
-            let hovered = hovered.clone();
-            let alarm_was_active = alarm_was_active.clone();
-            let window = window.clone();
-            let registry = registry.clone();
-            let interactive = interactive.clone();
-            let id = glib::timeout_add_local(Duration::from_millis(100), move || {
-                let mut timer = runtime.borrow_mut();
-                timer.phase += 0.2;
-                if let Some(target) = timer.target {
-                    timer.remaining = target.saturating_duration_since(Instant::now());
-                    label.set_text(&format_duration_ceil(timer.remaining));
-                    if timer.remaining.is_zero() {
-                        timer.target = None;
-                        timer.alarm = true;
-                        alarm.set(true);
-                        label.set_text("TIME'S UP!");
-                        label.style_context().add_class("timer-alarm-value");
-                        card.style_context().add_class("alarm");
-                    }
-                }
-                let keep_running = timer.target.is_some() || timer.alarm;
-                if keep_running {
-                    canvas.queue_draw();
-                }
-                if hovered.get() && stack.visible_child_name().as_deref() != Some("editor") {
-                    action.set_text(timer_action_text(&timer));
-                    action.show();
-                }
-                let alarm_active = timer.alarm;
-                drop(timer);
-
-                if alarm_was_active.replace(alarm_active) != alarm_active {
-                    refresh_input_shape(&window, &registry, interactive.get());
-                }
-                if keep_running {
-                    glib::ControlFlow::Continue
-                } else {
-                    source_for_tick.borrow_mut().take();
-                    glib::ControlFlow::Break
-                }
-            });
-            *source.borrow_mut() = Some(id);
-        }
-    });
-    *timer_ui.wake_updates.borrow_mut() = Some(wake_updates);
 }
 
 // Dropping a note takes its per-note layout keys with it, and any image file it
@@ -8222,7 +7330,6 @@ fn rebuild_pinned_notes(
             state.clone(),
             registry.clone(),
             interactive.clone(),
-            None,
             Some(lookup.clone()),
             None,
             Some(highlight_menu.clone()),
@@ -8649,7 +7756,6 @@ struct WidgetPicker {
     plus: gtk::Button,
     revealer: gtk::Revealer,
     system: gtk::ToggleButton,
-    timer: gtk::ToggleButton,
     mode: gtk::Button,
     lock: gtk::Button,
     new_note: gtk::Button,
@@ -8690,7 +7796,6 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let choices = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     choices.style_context().add_class("widget-choices");
     let system = picker_toggle("SYSTEM");
-    let timer = picker_toggle("TIMER");
     let mode = picker_button(initial_color_mode.label());
     let lock = picker_button("LOCK");
     let new_note = picker_button("＋  NOTE");
@@ -8698,7 +7803,6 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let usage = picker_button("USAGE");
     let quit = picker_button("QUIT");
     choices.pack_start(&system, false, false, 0);
-    choices.pack_start(&timer, false, false, 0);
     choices.pack_start(&mode, false, false, 0);
     choices.pack_start(&lock, false, false, 0);
     choices.pack_start(&new_note, false, false, 0);
@@ -8715,7 +7819,6 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
         plus,
         revealer,
         system,
-        timer,
         mode,
         lock,
         new_note,
@@ -9399,7 +8502,6 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         ctx.state.clone(),
         ctx.registry.clone(),
         ctx.interactive.clone(),
-        None,
         Some(LookupActions {
             here: Rc::new(RefCell::new(Some(lookup.clone()))),
             new_window: ctx.lookup_new_window.clone(),
@@ -10973,7 +10075,6 @@ fn attach_color_mode_menu(
     state: Rc<RefCell<AppState>>,
     registry: Rc<RefCell<Vec<RegisteredWidget>>>,
     interactive: Rc<Cell<bool>>,
-    timer_style: Option<TimerStylePreview>,
     lookup: Option<LookupActions>,
     // Pops a menu for whatever the click landed on inside the widget, and says
     // whether it did. Only the history window has one (its note rows).
@@ -11127,48 +10228,6 @@ fn attach_color_mode_menu(
     menu.append(&font_item);
     keep_menu_controls_open(&menu, &color_item, &font_item, &font_buttons);
 
-    if let Some(timer_style) = timer_style {
-        let parent = gtk::MenuItem::with_label("STYLE");
-        let submenu = context_menu();
-        for style in TimerStyle::ALL {
-            let item = gtk::MenuItem::with_label(style.label());
-            item.connect_select({
-                let timer_style = timer_style.clone();
-                move |_| apply_timer_style(&timer_style, style)
-            });
-            item.connect_activate({
-                let timer_style = timer_style.clone();
-                let state = state.clone();
-                move |_| {
-                    apply_timer_style(&timer_style, style);
-                    let mut data = state.borrow_mut();
-                    data.timer_style = style;
-                    data.sizes.insert("timer".into(), timer_style.size.get());
-                    let _ = data.save();
-                }
-            });
-            submenu.append(&item);
-        }
-        parent.set_submenu(Some(&submenu));
-        menu.append(&parent);
-        menu.connect_selection_done({
-            let timer_style = timer_style.clone();
-            let state = state.clone();
-            move |_| apply_timer_style(&timer_style, state.borrow().timer_style)
-        });
-
-        let edit_time = gtk::MenuItem::with_label("EDIT TIME");
-        edit_time.connect_activate({
-            let open_edit = timer_style.open_edit.clone();
-            move |_| {
-                glib::timeout_add_local_once(Duration::from_millis(80), {
-                    let open_edit = open_edit.clone();
-                    move || open_edit()
-                });
-            }
-        });
-        menu.append(&edit_time);
-    }
     menu.show_all();
 
     let gesture = gtk::GestureMultiPress::new(widget);
@@ -12543,10 +11602,6 @@ fn drag_frame_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= DRAG_REDRAW_INTERVAL)
 }
 
-fn click_became_drag(press: (f64, f64), release: (f64, f64)) -> bool {
-    (release.0 - press.0).abs() + (release.1 - press.1).abs() > CLICK_DRAG_SLOP
-}
-
 // A drag slides the GdkWindow and size-allocates the card, but leaves
 // GtkFixed's stored child x/y alone so the whole desk is not relaid out
 // on every tick. A sibling that later queue-resizes (the usage card's
@@ -13037,7 +12092,6 @@ fn focus_overlay_for_typing(window: &gtk::ApplicationWindow) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShapePart {
     Rect(i32, i32, i32, i32),
-    Circle(i32, i32, i32, i32),
 }
 
 thread_local! {
@@ -13840,9 +12894,6 @@ fn refresh_input_shape(
             ShapePart::Rect(x, y, width, height) => {
                 let _ = region.union_rectangle(&RectangleInt::new(x, y, width, height));
             }
-            ShapePart::Circle(x, y, width, height) => {
-                union_circle_region(&region, x, y, width, height);
-            }
         }
     }
     gdk_window.input_shape_combine_region(&region, 0, 0);
@@ -13855,7 +12906,6 @@ fn collect_widget_input_shape(
     parts: &mut Vec<ShapePart>,
 ) {
     for item in registry.borrow().iter() {
-        let lock_timer = item.key == "timer";
         let settings = item.key == "picker";
         // Notes and the history list keep receiving input in lock mode so
         // their content can still be scrolled; editing is disabled separately
@@ -13863,21 +12913,14 @@ fn collect_widget_input_shape(
         let lock_note = receives_input_when_locked(&item.key);
         if interactive
             || settings
-            || lock_timer
             || lock_note
-            || item.widget.style_context().has_class("alarm")
         {
             if !item.widget.is_visible() || !item.widget.is_mapped() {
                 continue;
             }
             let allocation = item.widget.allocation();
             if allocation.width() > 1 && allocation.height() > 1 {
-                let part = if !interactive && lock_timer {
-                    ShapePart::Circle
-                } else {
-                    ShapePart::Rect
-                };
-                parts.push(part(
+                parts.push(ShapePart::Rect(
                     allocation.x(),
                     allocation.y(),
                     allocation.width(),
@@ -13890,16 +12933,6 @@ fn collect_widget_input_shape(
 
 fn receives_input_when_locked(key: &str) -> bool {
     key.starts_with("note:") || key.starts_with("dict:") || key == "notes" || key == "usage"
-}
-
-fn union_circle_region(region: &Region, x: i32, y: i32, width: i32, height: i32) {
-    let radius = (width.min(height) / 2 - 10).clamp(1, 62);
-    let cx = x + width / 2;
-    let cy = y + height / 2;
-    for dy in (-radius..=radius).step_by(2) {
-        let half = ((radius * radius - dy * dy) as f64).sqrt() as i32;
-        let _ = region.union_rectangle(&RectangleInt::new(cx - half, cy + dy, half * 2 + 1, 2));
-    }
 }
 
 /// Describe the root-window image and how monitor coordinates map into it.
@@ -14060,74 +13093,6 @@ fn apply_widget_palette(
         context.add_class("mode-glass");
     }
     widget.queue_draw();
-}
-
-fn apply_timer_style(preview: &TimerStylePreview, style: TimerStyle) {
-    let previous = preview.style.get();
-    if previous != style {
-        let size = timer_style_size(preview.size.get(), previous, style);
-        preview.size.set(size);
-        preview.card.set_size_request(size.width, size.height);
-        preview.card.queue_resize();
-    }
-    preview.style.set(style);
-    let context = preview.card.style_context();
-    for style in TimerStyle::ALL {
-        context.remove_class(style.css_class());
-    }
-    context.add_class(style.css_class());
-    apply_timer_typography(
-        &preview.typography,
-        style,
-        preview.size.get(),
-        widget_font_scale(&preview.card),
-    );
-    preview.canvas.queue_draw();
-    glib::idle_add_local_once({
-        let window = preview.window.clone();
-        let registry = preview.registry.clone();
-        let interactive = preview.interactive.clone();
-        move || refresh_input_shape(&window, &registry, interactive.get())
-    });
-}
-
-fn apply_timer_typography(
-    provider: &gtk::CssProvider,
-    style: TimerStyle,
-    size: Size,
-    font_scale: f64,
-) {
-    let reference = style.default_size();
-    let scale = (f64::from(size.width.max(1)) / f64::from(reference.width))
-        .min(f64::from(size.height.max(1)) / f64::from(reference.height))
-        .clamp(0.45, 3.2)
-        * font_scale;
-    let (value_base, action_base, editor_base) = match style {
-        TimerStyle::Digital => (25.0, 9.0, 17.0),
-        TimerStyle::Ring | TimerStyle::Ticks | TimerStyle::Arc => (25.0, 11.0, 18.0),
-    };
-    let value = (value_base * scale).round().max(10.0);
-    let action = (action_base * scale).round().max(7.0);
-    let editor = (editor_base * scale).round().max(10.0);
-    // The alarm message has many more glyphs than a time value, but must
-    // still track resizing. The action scale keeps it inside every style's
-    // default footprint and grows proportionally with the widget.
-    let alarm = action;
-    let css = format!(
-        ".timer-value {{ font-size: {value}px; }}\n.timer-alarm-value {{ font-size: {alarm}px; }}\n.timer-action {{ font-size: {action}px; }}\n.timer-editor {{ font-size: {editor}px; }}"
-    );
-    let _ = provider.load_from_data(css.as_bytes());
-}
-
-fn timer_style_size(size: Size, from: TimerStyle, to: TimerStyle) -> Size {
-    let from_default = from.default_size();
-    let to_default = to.default_size();
-    let factor = (f64::from(size.width.max(1)) / f64::from(from_default.width))
-        .min(f64::from(size.height.max(1)) / f64::from(from_default.height));
-    Size {
-        width: (f64::from(to_default.width) * factor).round().max(1.0) as i32,
-        height: (f64::from(to_default.height) * factor).round().max(1.0) as i32,
-    }
 }
 
 // Every right-click menu in Sysi wears the same chrome. Left to the desktop
@@ -14312,23 +13277,6 @@ fn icon_button(icon_name: &str, tooltip: &str) -> gtk::Button {
     button
 }
 
-fn format_duration(seconds: i64) -> String {
-    let seconds = seconds.max(0);
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    let secs = seconds % 60;
-    if hours > 0 {
-        format!("{hours:02}:{minutes:02}:{secs:02}")
-    } else {
-        format!("{minutes:02}:{secs:02}")
-    }
-}
-
-fn format_duration_ceil(duration: Duration) -> String {
-    let millis = duration.as_millis();
-    format_duration(millis.div_ceil(1000) as i64)
-}
-
 fn truncate_chars(text: &str, max: usize) -> String {
     let mut chars = text.chars();
     let mut result: String = chars.by_ref().take(max).collect();
@@ -14372,10 +13320,10 @@ fn install_css(screen: &gdk::Screen) {
 }
 
 #[cfg(test)]
-mod timer_input_tests {
+mod tests {
     use super::{
         clamp_to_screens, clip_screen_to_overlay, dictate_capture_answer,
-        click_became_drag, dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area,
+        dictate_rect_from_drag, drag_frame_due, ellipsize, fit_to_work_area,
         fit_within_bounds, held_slide_point, top_child_at, top_raised_child_at,
         foreground_for_mode, highlight_at,
         image_room, monitor_coordinate_divisor, pasted_image_size, repaired_image_size,
@@ -14384,18 +13332,18 @@ mod timer_input_tests {
         age_label, centre_on_screen, clamp_scroll_value, note_snippets, note_sort_key, notes_delete_eats_key,
         notes_pointer_global, notes_pointer_live, notes_place_point, palette_for_mode, palette_size, parse_note_widget_id, parse_panel_anchor,
         fit_point_to_screens, read_compositor_pointer, NOTES_POINTER, PANEL_ANCHOR,
-        parse_timer_input, pinned_note_sync, push_recent_search,
+        pinned_note_sync, push_recent_search,
         receives_input_when_locked, record_note_undo, reopen_point,
         rescaled_from, resize_ceiling, resize_rect, resize_width_limit, ResizeBounds, ResizeEdges, resized_image_size, room_on_screen,
         round_pixbuf_corners, sanitize_highlights, screen_in_overlay,
-        timer_style_size, Foreground, NoteSearchMatch,
+        Foreground, NoteSearchMatch,
         NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ScreenRect, WidgetPalette,
         DRAG_REDRAW_INTERVAL, NOTE_HEIGHT,
         NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_IMAGE_PASTE_MAX,
         NOTE_WIDTH,
     };
     use crate::state::{
-        ColorMode, HighlightColor, Note, NoteHighlight, NoteImage, Point, Size, TimerStyle,
+        ColorMode, HighlightColor, Note, NoteHighlight, NoteImage, Point, Size,
         IMAGE_PLACEHOLDER,
     };
     use gdk_pixbuf::{Colorspace, Pixbuf};
@@ -14421,16 +13369,6 @@ mod timer_input_tests {
             start + DRAG_REDRAW_INTERVAL - std::time::Duration::from_millis(1)
         ));
         assert!(drag_frame_due(Some(start), start + DRAG_REDRAW_INTERVAL));
-    }
-
-    #[test]
-    fn a_timer_wobble_is_still_a_click_but_moving_it_is_not() {
-        assert!(!click_became_drag((40.0, 80.0), (42.0, 81.0)));
-        assert!(!click_became_drag((40.0, 80.0), (40.0, 80.0)));
-        // The card followed the pointer, so widget-local press and release
-        // would look identical. Root coordinates still see the slide.
-        assert!(click_became_drag((40.0, 80.0), (40.0, 88.0)));
-        assert!(click_became_drag((120.0, 40.0), (200.0, 40.0)));
     }
 
     #[test]
@@ -15440,20 +14378,6 @@ mod timer_input_tests {
 
 
     #[test]
-    fn parses_supported_timer_formats() {
-        assert_eq!(parse_timer_input("10"), Some(600));
-        assert_eq!(parse_timer_input("10:50"), Some(650));
-        assert_eq!(parse_timer_input("1:02:03"), Some(3_723));
-    }
-
-    #[test]
-    fn rejects_invalid_timer_formats() {
-        assert_eq!(parse_timer_input("0"), None);
-        assert_eq!(parse_timer_input("10:99"), None);
-        assert_eq!(parse_timer_input("hello"), None);
-    }
-
-    #[test]
     fn shifted_overlay_clamps_to_real_monitor_edges() {
         // Both GDK origins and normalized work areas are logical pixels.
         // 29 logical pixels is the reported 58px panel at 200% scaling.
@@ -15586,23 +14510,6 @@ mod timer_input_tests {
                 width: 3840,
                 height: 1080,
             }
-        );
-    }
-
-    #[test]
-    fn digital_timer_style_uses_a_compact_rectangular_container() {
-        let ring = TimerStyle::Ring.default_size();
-        let digital = timer_style_size(ring, TimerStyle::Ring, TimerStyle::Digital);
-        assert_eq!(
-            digital,
-            Size {
-                width: 84,
-                height: 36
-            }
-        );
-        assert_eq!(
-            timer_style_size(digital, TimerStyle::Digital, TimerStyle::Ring),
-            ring
         );
     }
 

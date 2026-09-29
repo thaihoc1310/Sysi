@@ -117,6 +117,10 @@ uniform float uAppear;
 uniform float uRim;
 // The actor's paint opacity: a shell menu fades in and out with its own.
 uniform float uOpacity;
+// 1 where the actor leaves room around the glass for its shadow, 0 for a
+// shell menu, whose box ends at the glass: cut off there, the shadow squared
+// the corners.
+uniform float uShadow;
 uniform float uPress;
 uniform vec2 uPressAt;
 
@@ -177,7 +181,7 @@ if (cover < 1.0) {
     // A hairline of darkness right at the rim keeps the edge crisp on light
     // backdrops.
     shade = max(shade, 0.14 * uRim * exp(-max(d, 0.0) * uScale));
-    result = vec4(0.0, 0.0, 0.0, shade * uAppear * (1.0 - cover));
+    result = vec4(0.0, 0.0, 0.0, shade * uAppear * uShadow * (1.0 - cover));
 }
 
 if (cover > 0.0) {
@@ -751,6 +755,7 @@ const GlassCard = GObject.registerClass({
         setUniform(pipeline, 'uPressAt', ...this._pressAt);
         setUniform(pipeline, 'uRim', this._rim);
         setUniform(pipeline, 'uOpacity', 1);
+        setUniform(pipeline, 'uShadow', 1);
     }
 
     repaintSoon() {
@@ -975,6 +980,7 @@ class MenuGlass {
         setUniform(pipeline, 'uPressAt', 0, 0);
         setUniform(pipeline, 'uRim', 0);
         setUniform(pipeline, 'uOpacity', box.get_paint_opacity() / 255);
+        setUniform(pipeline, 'uShadow', 0);
     }
 
     repaintSoon() {

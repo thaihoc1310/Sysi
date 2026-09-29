@@ -8,10 +8,13 @@ package_root="$(mktemp -d)"
 trap 'rm -rf "$package_root"' EXIT
 
 if command -v node >/dev/null; then
-  for script in extension.js glass.js system.js; do
+  for script in extension.js glass.js system.js timer.js duration.js; do
     node --check --input-type=module \
       <"$project_dir/packaging/gnome-shell-extension/$script"
   done
+  # The timer field's parser, checked on a few inputs of each form.
+  (cd "$project_dir/packaging/gnome-shell-extension" &&
+    node --input-type=module -e "import('./duration.js').then(m => m.check())")
 fi
 
 cargo build --manifest-path "$project_dir/Cargo.toml" --release --locked
@@ -31,6 +34,10 @@ install -Dm644 "$project_dir/packaging/gnome-shell-extension/glass.js" \
   "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/glass.js"
 install -Dm644 "$project_dir/packaging/gnome-shell-extension/system.js" \
   "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/system.js"
+install -Dm644 "$project_dir/packaging/gnome-shell-extension/timer.js" \
+  "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/timer.js"
+install -Dm644 "$project_dir/packaging/gnome-shell-extension/duration.js" \
+  "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/duration.js"
 install -Dm644 "$project_dir/packaging/gnome-shell-extension/stylesheet.css" \
   "$package_root/usr/share/gnome-shell/extensions/sysi-panel@thaihoc/stylesheet.css"
 install -Dm644 "$project_dir/README.md" \

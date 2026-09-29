@@ -44,51 +44,6 @@ impl ColorMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum TimerStyle {
-    #[default]
-    Ring,
-    Digital,
-    Ticks,
-    Arc,
-}
-
-impl TimerStyle {
-    pub const ALL: [Self; 4] = [Self::Ring, Self::Digital, Self::Ticks, Self::Arc];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Ring => "RING",
-            Self::Digital => "DIGITAL",
-            Self::Ticks => "TICKS",
-            Self::Arc => "ARC",
-        }
-    }
-
-    pub fn css_class(self) -> &'static str {
-        match self {
-            Self::Ring => "timer-style-ring",
-            Self::Digital => "timer-style-digital",
-            Self::Ticks => "timer-style-ticks",
-            Self::Arc => "timer-style-arc",
-        }
-    }
-
-    pub fn default_size(self) -> Size {
-        match self {
-            Self::Ring | Self::Ticks | Self::Arc => Size {
-                width: 116,
-                height: 116,
-            },
-            Self::Digital => Size {
-                width: 84,
-                height: 36,
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
@@ -104,8 +59,6 @@ pub struct Size {
 pub struct Settings {
     #[serde(default = "default_true")]
     pub system: bool,
-    #[serde(default = "default_true")]
-    pub timer: bool,
     #[serde(default = "default_true")]
     pub settings_button: bool,
     #[serde(default)]
@@ -132,7 +85,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             system: true,
-            timer: true,
             settings_button: true,
             translate_open: false,
             usage_open: false,
@@ -344,10 +296,6 @@ pub struct AppState {
     /// The last few dictionary queries, most recent first.
     #[serde(default)]
     pub recent_searches: Vec<String>,
-    #[serde(default = "default_timer")]
-    pub timer_seconds: i64,
-    #[serde(default)]
-    pub timer_style: TimerStyle,
     #[serde(default = "default_next_id")]
     pub next_note_id: u64,
     #[serde(default = "default_next_id")]
@@ -371,8 +319,6 @@ impl Default for AppState {
             notes: Vec::new(),
             dictionaries: Vec::new(),
             recent_searches: Vec::new(),
-            timer_seconds: default_timer(),
-            timer_style: TimerStyle::default(),
             next_note_id: 1,
             next_dictionary_id: 1,
             next_image_id: 1,
@@ -390,10 +336,6 @@ fn default_usage_source() -> String {
 
 fn default_usage_period() -> String {
     "30d".to_owned()
-}
-
-fn default_timer() -> i64 {
-    25 * 60
 }
 
 fn default_next_id() -> u64 {
@@ -527,7 +469,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, ColorMode, HighlightColor, TimerStyle};
+    use super::{AppState, ColorMode, HighlightColor};
 
     #[test]
     fn a_pink_highlight_saved_before_red_loads_as_red() {
@@ -653,10 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn old_state_defaults_to_ring_timer_style() {
-        let state: AppState = serde_json::from_str(r#"{"timer_seconds":120}"#)
-            .expect("state without a timer style should remain readable");
-        assert_eq!(state.timer_style, TimerStyle::Ring);
+    fn state_from_before_the_timer_moved_to_the_top_bar_still_loads() {
+        let state: AppState = serde_json::from_str(
+            r#"{"settings":{"timer":false},"timer_seconds":900,"timer_style":"digital","next_note_id":7}"#,
+        )
+        .expect("the desk timer's old fields are ignored");
+        assert_eq!(state.next_note_id, 7);
     }
 
     #[test]
