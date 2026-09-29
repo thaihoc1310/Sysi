@@ -318,6 +318,8 @@ fn set_live(window: &gtk::Window, live: bool) {
 /// Popups (a card's context menu, its search options) take on the glass of
 /// the card they belong to.
 const GLASS_POPUP: &str = "glass-popup";
+/// A menu opened on a LIGHT card, white like it.
+const LIGHT_MENU: &str = "menu-light";
 /// The inset a popover's glass keeps around its content.
 const POPOVER_PAD: i32 = 6;
 /// Matches `.sysi-menu`'s corner radius.
@@ -428,13 +430,22 @@ fn popover_samples(root: &gtk::Container) -> Vec<CardSample> {
     })
 }
 
-/// Give a context menu glass while it was opened on a glass card; a
-/// submenu follows the menu it hangs off. A menu is a window of its own, so
-/// its glass goes to the extension under the menu's own X window.
+/// Dress a context menu like the card it was opened on: on glass over a
+/// glass card, white over a LIGHT one, its dark plate otherwise. A submenu
+/// follows the menu it hangs off. A menu is a window of its own, so its
+/// glass goes to the extension under the menu's own X window.
 pub fn glass_menu(menu: &gtk::Menu) {
     menu.connect_map(|menu| {
-        let glass = glass_is_live() && menu_opened_on_glass(menu);
+        let (glass, light) = match parent_menu(menu) {
+            Some(parent) => {
+                let parent = parent.style_context();
+                (parent.has_class(GLASS_POPUP), parent.has_class(LIGHT_MENU))
+            }
+            None => card_under_pointer().map_or((false, false), |card| menu_look(&card)),
+        };
+        let glass = glass && glass_is_live();
         set_class(menu, GLASS_POPUP, glass);
+        set_class(menu, LIGHT_MENU, light);
         if glass {
             let menu = menu.clone();
             glib::idle_add_local_once(move || send_menu(&menu, true, 6));
@@ -442,53 +453,52 @@ pub fn glass_menu(menu: &gtk::Menu) {
     });
 }
 
-/// Put an open menu on glass or take it off it when the card it was opened
-/// on changes mode under it: the colour item keeps the menu open, and it
-/// would otherwise stay the way it opened until it closed.
+/// Dress an open menu again when the card it was opened on changes mode
+/// under it: the colour item keeps the menu open, and it would otherwise
+/// stay the way it opened until it closed.
 pub fn restyle_menu(menu: &gtk::Menu, card: &impl IsA<gtk::Widget>) {
-    let glass = glass_is_live() && has_glass(card);
-    if !menu.is_mapped() || glass == menu.style_context().has_class(GLASS_POPUP) {
+    if !menu.is_mapped() {
         return;
     }
-    set_class(menu, GLASS_POPUP, glass);
-    send_menu(menu, glass, 6);
+    let (glass, light) = menu_look(card);
+    let glass = glass && glass_is_live();
+    set_class(menu, LIGHT_MENU, light);
+    if glass != menu.style_context().has_class(GLASS_POPUP) {
+        set_class(menu, GLASS_POPUP, glass);
+        send_menu(menu, glass, 6);
+    }
 }
 
-fn menu_opened_on_glass(menu: &gtk::Menu) -> bool {
-    if let Some(parent) = menu
-        .attach_widget()
+/// Whether a menu opened on this card goes on glass, and whether it is white.
+fn menu_look(card: &impl IsA<gtk::Widget>) -> (bool, bool) {
+    let context = card.style_context();
+    (
+        has_glass(card),
+        context.has_class("mode-light") && context.has_class("mode-solid"),
+    )
+}
+
+/// The menu a submenu hangs off.
+fn parent_menu(menu: &gtk::Menu) -> Option<gtk::Menu> {
+    menu.attach_widget()
         .and_then(|item| item.parent())
         .and_then(|parent| parent.downcast::<gtk::Menu>().ok())
-    {
-        return parent.style_context().has_class(GLASS_POPUP);
-    }
-    let Some(root) = root() else {
-        return false;
-    };
-    // Menus open under the pointer, on the card it is over.
-    let Some(surface) = root.window() else {
-        return false;
-    };
-    let Some(pointer) = root
-        .display()
-        .default_seat()
-        .and_then(|seat| seat.pointer())
-    else {
-        return false;
-    };
+}
+
+/// The card under the pointer: menus open where they were asked for.
+fn card_under_pointer() -> Option<gtk::Widget> {
+    let root = root()?;
+    let surface = root.window()?;
+    let pointer = root.display().default_seat()?.pointer()?;
     let (_, x, y, _) = surface.device_position(&pointer);
-    paint_order(&root)
-        .into_iter()
-        .rev()
-        .find(|card| {
-            let rect = card.allocation();
-            card.is_mapped()
-                && x >= rect.x()
-                && y >= rect.y()
-                && x < rect.x() + rect.width()
-                && y < rect.y() + rect.height()
-        })
-        .is_some_and(|card| has_glass(&card))
+    paint_order(&root).into_iter().rev().find(|card| {
+        let rect = card.allocation();
+        card.is_mapped()
+            && x >= rect.x()
+            && y >= rect.y()
+            && x < rect.x() + rect.width()
+            && y < rect.y() + rect.height()
+    })
 }
 
 /// Ask for glass under a menu's window, or (`on` false) for it to go. The

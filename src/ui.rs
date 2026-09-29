@@ -1531,7 +1531,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         (settings.system, settings.color_mode)
     };
     widget_picker.system.set_active(system_enabled);
-    widget_picker.mode.set_label(color_mode.label());
+    // Like LOCK, the button says what a click turns everything to.
+    widget_picker.mode.set_label(color_mode.next().label());
 
     // SYSTEM lives in the GNOME top bar now; see `panel_system`.
     let panel_system = crate::panel_system::PanelSystem::start(state.clone());
@@ -1554,7 +1555,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 data.widget_color_modes.clear();
             }
             let _ = state.borrow().save();
-            button.set_label(next.label());
+            button.set_label(next.next().label());
             apply_color_mode(&registry, next);
             publish_panel_state(interactive.get(), &state.borrow());
         }
@@ -7796,7 +7797,7 @@ fn build_widget_picker(initial_color_mode: ColorMode) -> WidgetPicker {
     let choices = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     choices.style_context().add_class("widget-choices");
     let system = picker_toggle("SYSTEM");
-    let mode = picker_button(initial_color_mode.label());
+    let mode = picker_button(initial_color_mode.next().label());
     let lock = picker_button("LOCK");
     let new_note = picker_button("＋  NOTE");
     let notes_btn = picker_button("NOTES");

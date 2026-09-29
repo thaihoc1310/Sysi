@@ -1199,6 +1199,56 @@ scrolledwindow overshoot.right:backdrop {
   background-color: rgba(255, 255, 255, 0.18);
 }
 
+/* A menu opened on a LIGHT card is white like the card, with its ink. */
+.sysi-menu.menu-light {
+  background-color: rgba(242, 242, 244, 0.96);
+}
+
+.sysi-menu.menu-light menuitem {
+  color: alpha(#1c1c1e, 0.86);
+}
+
+.sysi-menu.menu-light menuitem:hover {
+  background-color: rgba(0, 0, 0, 0.07);
+  color: #111113;
+}
+
+.sysi-menu.menu-light menuitem:disabled {
+  color: alpha(#1c1c1e, 0.34);
+}
+
+.sysi-menu.menu-light menuitem.menu-destructive:hover {
+  background-color: rgba(206, 84, 78, 0.14);
+  color: #b3372f;
+}
+
+.sysi-menu.menu-light separator {
+  background-color: rgba(0, 0, 0, 0.10);
+}
+
+.sysi-menu.menu-light menuitem arrow {
+  color: alpha(#1c1c1e, 0.5);
+}
+
+.sysi-menu.menu-light menuitem check {
+  border-color: rgba(0, 0, 0, 0.30);
+  color: #f4f4f4;
+}
+
+.sysi-menu.menu-light menuitem check:checked {
+  background-color: #1c1c1e;
+  border-color: #1c1c1e;
+}
+
+.sysi-menu.menu-light menuitem.font-controls:hover {
+  background-color: transparent;
+}
+
+.sysi-menu.menu-light button.font-step:hover,
+.sysi-menu.menu-light button.font-step:focus {
+  background-color: rgba(0, 0, 0, 0.10);
+}
+
 /* GLASS. The shell extension draws liquid glass under every card and Sysi
    leaves the card clear over it. The glass dims itself behind white ink, so
    the ink here is fixed. Until the extension says it is drawing (the window

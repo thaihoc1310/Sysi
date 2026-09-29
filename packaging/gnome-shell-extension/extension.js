@@ -15,6 +15,9 @@ import {SystemPanel} from './system.js';
 import {TimerPanel} from './timer.js';
 
 const UUID = 'sysi-panel@thaihoc';
+// What the colour item switches every card to from each mode, in the order
+// Sysi cycles them (ColorMode::next).
+const NEXT_MODE = {glass: 'light', light: 'dark', dark: 'glass'};
 // Opens and closes the Notes palette. Ctrl+Alt+N until 0.1.77.
 const NOTES_BINDING = '<Super><Shift>l';
 const NOTES_LEGACY_BINDING = '<control><alt>n';
@@ -251,7 +254,9 @@ export default class SysiPanelExtension extends Extension {
             this._syncPanelState();
             this._settingsMenu.toggle();
         });
-        const mode = new PopupMenu.PopupMenuItem(this._readColorMode());
+        // Says what a click turns every card to, the way lock / unlock
+        // does and a card's own menu does.
+        const mode = new PopupMenu.PopupMenuItem(NEXT_MODE[this._readColorMode()]);
         this._modeLabel = mode.label;
         mode.label.x_align = Clutter.ActorAlign.CENTER;
         mode.label.x_expand = true;
@@ -819,7 +824,7 @@ export default class SysiPanelExtension extends Extension {
         if (this._hideLabel)
             this._hideLabel.text = this._overlayWindow() ? 'hide' : 'show';
         if (this._modeLabel)
-            this._modeLabel.text = mode ?? this._readColorMode();
+            this._modeLabel.text = NEXT_MODE[mode ?? this._readColorMode()];
     }
 
     _writeCacheFile(name, contents) {
