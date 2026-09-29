@@ -252,9 +252,11 @@ export class SystemPanel {
     }
 
     // How much of the bar the readings may take: from beside the gear to a
-    // little short of the clock.
+    // little short of the clock's words. Not of its button: the button's
+    // padding is empty bar, and the row may use it.
     _room() {
-        const clock = Main.panel.statusArea.dateMenu ?? Main.panel._centerBox;
+        const menu = Main.panel.statusArea.dateMenu;
+        const clock = menu?._clockDisplay ?? menu ?? Main.panel._centerBox;
         const [clockX] = clock.get_transformed_position();
         const [gearX] = this._gear.get_transformed_position();
         const start = gearX + this._gear.width + this._readout.get_theme_node().get_margin(St.Side.LEFT);
