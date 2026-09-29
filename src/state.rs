@@ -163,6 +163,9 @@ pub struct SystemDetails {
     pub gpu_temp: bool,
     #[serde(default)]
     pub ssd_temp: bool,
+    /// Each GPU's own video memory, used over total.
+    #[serde(default)]
+    pub gpu_memory: bool,
     /// How full each drive is.
     #[serde(default)]
     pub ssd_usage: bool,
@@ -184,6 +187,7 @@ impl Default for SystemDetails {
             cpu_temp: false,
             gpu_temp: false,
             ssd_temp: false,
+            gpu_memory: false,
             ssd_usage: false,
             amounts: false,
             network: false,

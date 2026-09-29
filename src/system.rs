@@ -48,6 +48,10 @@ pub struct GpuSnapshot {
     /// load, which is all a passthrough card or an older AMD driver offers.
     pub percent: Option<f64>,
     pub temperature: Option<f64>,
+    /// Its own video memory in use. For a GPU built into the processor this
+    /// is only the slice of RAM set aside for it, which it overflows into
+    /// shared memory, so it often reads close to full.
+    pub memory: Option<Usage>,
 }
 
 /// One physical drive: what to call it, how full the filesystems mounted from
@@ -227,7 +231,7 @@ impl SystemReader {
         }
         let output = Command::new("nvidia-smi")
             .args([
-                "--query-gpu=index,name,utilization.gpu,temperature.gpu",
+                "--query-gpu=index,name,utilization.gpu,temperature.gpu,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
             ])
             .stdin(Stdio::null())
@@ -252,24 +256,33 @@ impl SystemReader {
 fn parse_nvidia_gpus(raw: &str) -> Vec<GpuSnapshot> {
     raw.lines()
         .filter_map(|line| {
+            // index, name, load, temperature, memory used, memory total (MiB).
             // Counted from the right, because a card whose name has a comma in
             // it would otherwise shift every column along.
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
             let _index = fields.first()?.parse::<usize>().ok()?;
-            let (percent, temperature) = match fields.len() {
-                0..=2 => return None,
-                3 => (fields[2], None),
-                length => (fields[length - 2], Some(fields[length - 1])),
-            };
+            let length = fields.len();
+            if length < 6 {
+                return None;
+            }
             // A driver that answers "[N/A]" for one column still means what it
-            // says in the other, so neither reading is allowed to take the
-            // card's whole row down with it.
-            let percent = percent.parse::<f64>().ok().map(clamp_percent);
-            let temperature = temperature.and_then(|value| value.parse::<f64>().ok());
-            (percent.is_some() || temperature.is_some()).then(|| GpuSnapshot {
+            // says in the others, so no reading is allowed to take the card's
+            // whole row down with it.
+            let number = |field: &str| field.parse::<f64>().ok();
+            let percent = number(fields[length - 4]).map(clamp_percent);
+            let temperature = number(fields[length - 3]);
+            let memory = match (number(fields[length - 2]), number(fields[length - 1])) {
+                (Some(used), Some(total)) if total > 0.0 => Some(Usage {
+                    used_kib: (used * 1024.0) as u64,
+                    total_kib: (total * 1024.0) as u64,
+                }),
+                _ => None,
+            };
+            (percent.is_some() || temperature.is_some() || memory.is_some()).then(|| GpuSnapshot {
                 label: "NVIDIA".into(),
                 percent,
                 temperature,
+                memory,
             })
         })
         .collect()
@@ -335,13 +348,26 @@ fn read_amd_gpus() -> Vec<GpuSnapshot> {
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .map(clamp_percent);
         let temperature = amd_gpu_temperature(&device);
-        if percent.is_none() && temperature.is_none() {
+        let bytes = |name: &str| {
+            fs::read_to_string(device.join(name))
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        };
+        let memory = match (bytes("mem_info_vram_used"), bytes("mem_info_vram_total")) {
+            (Some(used), Some(total)) if total > 0 => Some(Usage {
+                used_kib: used / 1024,
+                total_kib: total / 1024,
+            }),
+            _ => None,
+        };
+        if percent.is_none() && temperature.is_none() && memory.is_none() {
             continue;
         }
         values.push(GpuSnapshot {
             label: "AMD".into(),
             percent,
             temperature,
+            memory,
         });
     }
     values
@@ -836,29 +862,37 @@ mod tests {
     #[test]
     fn nvidia_csv_keeps_every_gpu_and_clamps_what_the_driver_reports() {
         let values = parse_nvidia_gpus(
-            "0, NVIDIA GeForce RTX 4060 Laptop GPU, 57, 43\n1, NVIDIA GTX 1080, 101, 62\n",
+            "0, NVIDIA GeForce RTX 4060 Laptop GPU, 57, 43, 20, 8188\n\
+             1, NVIDIA GTX 1080, 101, 62, 4096, 8192\n",
         );
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].percent, Some(57.0));
         assert_eq!(values[0].temperature, Some(43.0));
+        assert_eq!(
+            values[0].memory,
+            Some(Usage {
+                used_kib: 20 * 1024,
+                total_kib: 8188 * 1024
+            })
+        );
         assert_eq!(values[1].percent, Some(100.0));
         assert_eq!(values[1].temperature, Some(62.0));
-        // A driver too old to answer for the temperature still reports a load.
-        let older = parse_nvidia_gpus("0, NVIDIA GTX 1080, 12\n");
-        assert_eq!(older[0].percent, Some(12.0));
-        assert_eq!(older[0].temperature, None);
-        // "[N/A]" in one column does not take the other one down with it: a
-        // card that knows its temperature and not its load keeps the reading
-        // it has, and vice versa.
-        let hot = parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], 51\n");
+        // A name with a comma in it does not shift the columns along.
+        let comma = parse_nvidia_gpus("0, NVIDIA RTX, Ada, 12, 40, 100, 4096\n");
+        assert_eq!(comma[0].percent, Some(12.0));
+        assert_eq!(comma[0].temperature, Some(40.0));
+        // "[N/A]" in one column does not take the others down with it.
+        let hot = parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], 51, [N/A], [N/A]\n");
         assert_eq!(hot[0].percent, None);
         assert_eq!(hot[0].temperature, Some(51.0));
-        let busy = parse_nvidia_gpus("0, NVIDIA RTX A2000, 34, [N/A]\n");
+        assert_eq!(hot[0].memory, None);
+        let busy = parse_nvidia_gpus("0, NVIDIA RTX A2000, 34, [N/A], 512, 6144\n");
         assert_eq!(busy[0].percent, Some(34.0));
         assert_eq!(busy[0].temperature, None);
-        // A line with nothing usable in either column is skipped rather than
+        assert!(busy[0].memory.is_some());
+        // A line with nothing usable in any column is skipped rather than
         // shown as zero.
-        assert!(parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], [N/A]\n").is_empty());
+        assert!(parse_nvidia_gpus("0, NVIDIA RTX A2000, [N/A], [N/A], [N/A], [N/A]\n").is_empty());
         assert!(parse_nvidia_gpus("nvidia-smi: command failed\n").is_empty());
     }
 
@@ -973,6 +1007,7 @@ mod tests {
             label: label.into(),
             percent: Some(0.0),
             temperature: None,
+            memory: None,
         };
         // The hybrid laptop this was written for: one of each, no numbering.
         let mut mixed = vec![gpu("NVIDIA"), gpu("AMD")];

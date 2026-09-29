@@ -190,7 +190,7 @@ struct Metric {
     set: fn(&mut SystemDetails, bool),
 }
 
-const METRICS: [Metric; 9] = [
+const METRICS: [Metric; 10] = [
     Metric {
         key: "cpu",
         name: "cpu",
@@ -226,6 +226,12 @@ const METRICS: [Metric; 9] = [
         name: "gpu temp",
         enabled: |d| d.gpu_temp,
         set: |d, on| d.gpu_temp = on,
+    },
+    Metric {
+        key: "gpu_memory",
+        name: "gpu memory",
+        enabled: |d| d.gpu_memory,
+        set: |d, on| d.gpu_memory = on,
     },
     Metric {
         key: "ssd_usage",
@@ -293,6 +299,10 @@ fn size(kib: u64, units: Units) -> String {
         Units::Decimal => (1e9, 1000.0),
     };
     let gigabytes = bytes / giga;
+    if gigabytes < 0.995 {
+        // Video memory is often under a gigabyte: 20M, 481M.
+        return format!("{:.0}M", gigabytes * step);
+    }
     if gigabytes >= 999.5 {
         let terabytes = gigabytes / step;
         let text = format!("{terabytes:.1}");
@@ -468,6 +478,16 @@ fn groups(
                     now.and_then(|g| g.temperature).map(celsius),
                 ));
             }
+            // Always used/total: as a percentage it would read like the load
+            // beside it.
+            if let Some(memory) = gpu.memory {
+                cells.push(cell(
+                    "gpu_memory",
+                    fullness_widest(memory.total_kib, Units::Binary, true),
+                    now.and_then(|g| g.memory)
+                        .map(|memory| fullness(memory, Units::Binary, true)),
+                ));
+            }
             Device {
                 label: caption(&gpu.label),
                 cells,
@@ -552,7 +572,8 @@ pub fn read_options(details: &SystemDetails) -> SystemReadOptions {
     SystemReadOptions {
         gpus: details.gpus,
         cpu_temp: details.cpu_temp,
-        gpu_temp: details.gpu_temp,
+        // One read of the GPUs answers for load, temperature and memory.
+        gpu_temp: details.gpu_temp || details.gpu_memory,
         ssd_temp: details.ssd_temp,
         ssd_usage: details.ssd_usage,
         network: details.network,
@@ -676,11 +697,19 @@ mod tests {
                     label: "NVIDIA".into(),
                     percent: Some(12.0),
                     temperature: Some(45.0),
+                    memory: Some(Usage {
+                        used_kib: 20 * 1024,
+                        total_kib: 8 * GIB,
+                    }),
                 },
                 GpuSnapshot {
                     label: "AMD".into(),
                     percent: None,
                     temperature: Some(38.0),
+                    memory: Some(Usage {
+                        used_kib: 481 * 1024,
+                        total_kib: 512 * 1024,
+                    }),
                 },
             ],
             cpu_temperature: Some(56.0),
@@ -716,6 +745,7 @@ mod tests {
             swap: true,
             gpus: true,
             gpu_temp: true,
+            gpu_memory: true,
             ssd_usage: true,
             ssd_temp: true,
             network: true,
@@ -761,7 +791,7 @@ mod tests {
         let machine = machine();
         assert_eq!(
             bar(&groups(&everything(), &machine, Some(&machine))),
-            "CPU 13% 56°C | RAM 75%  SWAP 5% | NVI 12% 45°C  AMD 38°C | SAM 9% 42°C  UMI 38°C | NET ↓9K ↑28K"
+            "CPU 13% 56°C | RAM 75%  SWAP 5% | NVI 12% 45°C 20M/8G  AMD 38°C 481M/512M | SAM 9% 42°C  UMI 38°C | NET ↓9K ↑28K"
         );
     }
 
@@ -791,7 +821,7 @@ mod tests {
         };
         assert_eq!(
             bar(&groups(&details, &machine, Some(&machine))),
-            "RAM 12G/16G  SWAP 0.1G/2G | SAM 90G/1T"
+            "RAM 12G/16G  SWAP 102M/2G | SAM 90G/1T"
         );
     }
 
