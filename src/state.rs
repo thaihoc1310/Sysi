@@ -242,6 +242,63 @@ pub struct NoteHighlight {
     pub color: HighlightColor,
 }
 
+/// One stretch of pasted text that kept the look it was copied in: a colour,
+/// bold, italic or faint. Kept the way highlights are (see `NoteHighlight`):
+/// GTK moves the tag with the words, and these are read back out on save.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NoteInk {
+    pub start: i32,
+    pub end: i32,
+    /// As copied, saved as `#rrggbb`. Drawn lighter or darker to read on the
+    /// note. Held as bytes: the undo history keeps a copy of every stretch
+    /// per step.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "write_ink_color",
+        deserialize_with = "read_ink_color"
+    )]
+    pub color: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dim: bool,
+}
+
+pub fn hex_color(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+}
+
+/// `#rrggbb` back to its channels.
+pub fn parse_hex_color(text: &str) -> Option<[u8; 3]> {
+    let digits = text.strip_prefix('#')?;
+    if digits.len() != 6 || !digits.is_ascii() {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?])
+}
+
+fn write_ink_color<S: serde::Serializer>(
+    color: &Option<[u8; 3]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    color.map(hex_color).serialize(serializer)
+}
+
+/// A colour that does not read is dropped, never the state file it is in.
+fn read_ink_color<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u8; 3]>, D::Error> {
+    let text = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(text
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_hex_color))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Note {
     pub id: u64,
@@ -258,6 +315,8 @@ pub struct Note {
     pub images: Vec<NoteImage>,
     #[serde(default)]
     pub highlights: Vec<NoteHighlight>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ink: Vec<NoteInk>,
     /// The tags it was given in Notes, in the order they were added.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -579,7 +638,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_tag, AppState, ColorMode, HighlightColor};
+    use super::{clean_tag, AppState, ColorMode, HighlightColor, Note, NoteInk};
 
     #[test]
     fn tags_are_counted_from_the_notes_and_toggle_on_and_off() {
@@ -631,6 +690,31 @@ mod tests {
         let old: HighlightColor = serde_json::from_str("\"pink\"").unwrap();
         assert_eq!(old, HighlightColor::Red);
         assert_eq!(serde_json::to_string(&old).unwrap(), "\"red\"");
+    }
+
+    #[test]
+    fn a_notes_ink_saves_compactly_and_a_bad_colour_loses_only_itself() {
+        let ink = NoteInk {
+            start: 2,
+            end: 5,
+            color: Some([0x09, 0x69, 0xda]),
+            bold: true,
+            ..NoteInk::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&ink).unwrap(),
+            r##"{"start":2,"end":5,"color":"#0969da","bold":true}"##
+        );
+        let note: Note = serde_json::from_str(
+            r##"{"id":1,"text":"hello","ink":[{"start":0,"end":2,"color":"teal","dim":true},{"start":2,"end":4,"color":7}]}"##,
+        )
+        .unwrap();
+        assert_eq!(note.ink[0].color, None);
+        assert!(note.ink[0].dim);
+        assert_eq!(note.ink[1].color, None);
+        // A note without any is saved without the field.
+        let plain: Note = serde_json::from_str(r#"{"id":2,"text":"x"}"#).unwrap();
+        assert!(!serde_json::to_string(&plain).unwrap().contains("ink"));
     }
 
     #[test]

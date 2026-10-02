@@ -2,7 +2,7 @@ use crate::{
     platform,
     state::{
         AppState, ColorMode, DictionaryWindow, HighlightColor, Note, NoteHighlight, NoteImage,
-        Point, Size, IMAGE_PLACEHOLDER,
+        NoteInk, Point, Size, IMAGE_PLACEHOLDER,
     },
     translate,
     usage::{self, Source as UsageSource},
@@ -1677,6 +1677,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         position,
                         images: Vec::new(),
                         highlights: Vec::new(),
+                        ink: Vec::new(),
                         tags: Vec::new(),
                     });
                     let _ = data.save();
@@ -4909,6 +4910,7 @@ struct NoteSnapshot {
     text: String,
     images: Vec<NoteImage>,
     highlights: Vec<NoteHighlight>,
+    ink: Vec<NoteInk>,
     cursor: i32,
     size: Size,
 }
@@ -5531,32 +5533,17 @@ impl HighlightTags {
     /// tag toggle rather than character by character, so a long note costs the
     /// number of stretches it has and not its length.
     fn read(&self, buffer: &gtk::TextBuffer) -> Vec<NoteHighlight> {
-        let last = buffer.end_iter().offset();
         let mut found = Vec::new();
         for (color, tag) in self.0.iter() {
-            let mut iter = buffer.start_iter();
-            loop {
-                if !iter.starts_tag(Some(tag)) && !iter.forward_to_tag_toggle(Some(tag)) {
-                    break;
-                }
-                if !iter.starts_tag(Some(tag)) {
-                    continue;
-                }
-                let start = iter.offset();
-                let end = if iter.forward_to_tag_toggle(Some(tag)) {
-                    iter.offset()
-                } else {
-                    last
-                };
-                found.push(NoteHighlight {
-                    start,
-                    end,
-                    color: *color,
-                });
-                if end >= last {
-                    break;
-                }
-            }
+            found.extend(
+                tag_runs(buffer, tag)
+                    .into_iter()
+                    .map(|(start, end)| NoteHighlight {
+                        start,
+                        end,
+                        color: *color,
+                    }),
+            );
         }
         found.sort_by_key(|highlight| (highlight.start, highlight.end));
         found
@@ -5571,6 +5558,192 @@ impl HighlightTags {
             self.apply(buffer, (highlight.start, highlight.end), highlight.color);
         }
     }
+}
+
+/// Every stretch `tag` covers, as character offsets. Walked by tag toggle
+/// rather than character by character, so a long note costs the number of
+/// stretches it has and not its length.
+fn tag_runs(buffer: &gtk::TextBuffer, tag: &gtk::TextTag) -> Vec<(i32, i32)> {
+    let last = buffer.end_iter().offset();
+    let mut runs = Vec::new();
+    let mut iter = buffer.start_iter();
+    loop {
+        if !iter.starts_tag(Some(tag)) && !iter.forward_to_tag_toggle(Some(tag)) {
+            break;
+        }
+        if !iter.starts_tag(Some(tag)) {
+            continue;
+        }
+        let start = iter.offset();
+        let end = if iter.forward_to_tag_toggle(Some(tag)) {
+            iter.offset()
+        } else {
+            last
+        };
+        runs.push((start, end));
+        if end >= last {
+            break;
+        }
+    }
+    runs
+}
+
+/// The look pasted text kept (see `rich_paste`) is one tag per combination of
+/// colour, bold, italic and faint, named for it: the name alone says how to
+/// draw the tag and what to save for it.
+const INK_TAG_PREFIX: &str = "sysi-ink:";
+/// How much of its colour faint text keeps.
+const INK_DIM_ALPHA: f64 = 0.55;
+
+fn ink_tag_name(ink: &NoteInk) -> Option<String> {
+    if ink.color.is_none() && !ink.bold && !ink.italic && !ink.dim {
+        return None;
+    }
+    Some(format!(
+        "{INK_TAG_PREFIX}{}:{}{}{}",
+        ink.color.map(crate::state::hex_color).unwrap_or_default(),
+        u8::from(ink.bold),
+        u8::from(ink.italic),
+        u8::from(ink.dim),
+    ))
+}
+
+fn ink_from_tag_name(name: &str) -> Option<NoteInk> {
+    let (color, flags) = name.strip_prefix(INK_TAG_PREFIX)?.split_once(':')?;
+    let [bold, italic, dim] = flags.as_bytes() else {
+        return None;
+    };
+    Some(NoteInk {
+        color: crate::state::parse_hex_color(color),
+        bold: *bold == b'1',
+        italic: *italic == b'1',
+        dim: *dim == b'1',
+        ..NoteInk::default()
+    })
+}
+
+/// The look tags this buffer has, whether or not any text still wears them.
+fn ink_tags(buffer: &gtk::TextBuffer) -> Vec<(gtk::TextTag, NoteInk)> {
+    let mut tags = Vec::new();
+    if let Some(table) = buffer.tag_table() {
+        table.foreach(|tag| {
+            if let Some(ink) = tag.name().as_deref().and_then(ink_from_tag_name) {
+                tags.push((tag.clone(), ink));
+            }
+        });
+    }
+    tags
+}
+
+/// Lay the stretches over the text, `offset` characters in. The colours are
+/// set for the note they land in by `recolor_note_ink`.
+fn apply_note_ink(view: &gtk::TextView, inks: &[NoteInk], offset: i32) {
+    let Some(buffer) = view.buffer() else {
+        return;
+    };
+    let Some(table) = buffer.tag_table() else {
+        return;
+    };
+    let count = buffer.char_count();
+    for ink in inks {
+        let Some(name) = ink_tag_name(ink) else {
+            continue;
+        };
+        let start = ink.start.saturating_add(offset).clamp(0, count);
+        let end = ink.end.saturating_add(offset).clamp(0, count);
+        if end <= start {
+            continue;
+        }
+        let tag = table.lookup(&name).unwrap_or_else(|| {
+            let tag = gtk::TextTag::new(Some(&name));
+            if ink.bold {
+                tag.set_weight(700);
+            }
+            if ink.italic {
+                tag.set_style(gtk::pango::Style::Italic);
+            }
+            table.add(&tag);
+            tag
+        });
+        buffer.apply_tag(
+            &tag,
+            &buffer.iter_at_offset(start),
+            &buffer.iter_at_offset(end),
+        );
+    }
+    recolor_note_ink(view);
+}
+
+/// Give the buffer exactly these stretches, as when a note is opened.
+fn fill_note_ink(view: &gtk::TextView, inks: &[NoteInk]) {
+    let Some(buffer) = view.buffer() else {
+        return;
+    };
+    let (start, end) = buffer.bounds();
+    for (tag, _) in ink_tags(&buffer) {
+        buffer.remove_tag(&tag, &start, &end);
+    }
+    apply_note_ink(view, inks, 0);
+}
+
+fn read_note_ink(buffer: &gtk::TextBuffer) -> Vec<NoteInk> {
+    let mut found = Vec::new();
+    for (tag, ink) in ink_tags(buffer) {
+        found.extend(
+            tag_runs(buffer, &tag)
+                .into_iter()
+                .map(|(start, end)| NoteInk { start, end, ..ink }),
+        );
+    }
+    found.sort_by_key(|ink| (ink.start, ink.end));
+    found
+}
+
+/// Draw every copied colour so it reads on this note in its current mode,
+/// and faint text as a fainter version of it or of the note's own text. The
+/// colours are worked out from the note's text colour, so a mode change only
+/// has to call this again (see `follow_note_ink`).
+fn recolor_note_ink(view: &gtk::TextView) {
+    let Some(buffer) = view.buffer() else {
+        return;
+    };
+    let text = view.style_context().color(gtk::StateFlags::NORMAL);
+    let text_rgb = [text.red(), text.green(), text.blue()];
+    for (tag, ink) in ink_tags(&buffer) {
+        if ink.color.is_none() && !ink.dim {
+            continue;
+        }
+        let [red, green, blue] = ink
+            .color
+            .map(|color| crate::rich_paste::legible(color, text_rgb))
+            .unwrap_or(text_rgb);
+        let alpha = text.alpha() * if ink.dim { INK_DIM_ALPHA } else { 1.0 };
+        let rgba = gdk::RGBA::new(red, green, blue, alpha);
+        if tag.foreground_rgba().as_ref() != Some(&rgba) {
+            tag.set_foreground_rgba(Some(&rgba));
+        }
+    }
+}
+
+/// Recolour the copied colours whenever the note's text colour changes: a
+/// LIGHT note needs a terminal's yellow darker than a DARK one does.
+fn follow_note_ink(view: &gtk::TextView) {
+    view.connect_style_updated(recolor_note_ink);
+    recolor_note_ink(view);
+}
+
+/// The look the clipboard's HTML flavour gives `text`, which is what will be
+/// pasted (already tidied by `markdown::clean_paste`). Empty when the copy
+/// carried no HTML, as from most terminals, or nothing worth keeping.
+fn clipboard_ink(clipboard: &gtk::Clipboard, text: &str) -> Vec<NoteInk> {
+    let html = gdk::Atom::intern("text/html");
+    if !clipboard.wait_is_target_available(&html) {
+        return Vec::new();
+    }
+    let Some(data) = clipboard.wait_for_contents(&html) else {
+        return Vec::new();
+    };
+    crate::rich_paste::html_ink(&crate::rich_paste::decode_html(&data.data()), text)
 }
 
 /// What a right-click found to work with: the stretch it landed in, and the
@@ -5677,6 +5850,7 @@ fn note_snapshot(
     let text = note_buffer_text(buffer);
     let images = note_buffer_images(buffer, &text, state);
     let highlights = target.highlights.read(buffer);
+    let ink = read_note_ink(buffer);
     let cursor = buffer
         .get_insert()
         .map(|mark| buffer.iter_at_mark(&mark).offset())
@@ -5695,6 +5869,7 @@ fn note_snapshot(
         text,
         images,
         highlights,
+        ink,
         cursor,
         size,
     }
@@ -5706,6 +5881,7 @@ fn record_note_undo(history: &NoteUndoState, before: NoteSnapshot, after: &NoteS
     if before.text == after.text
         && before.images == after.images
         && before.highlights == after.highlights
+        && before.ink == after.ink
         && before.size == after.size
     {
         return;
@@ -5838,13 +6014,17 @@ fn mono_box_drawing_lines(buffer: &gtk::TextBuffer) {
 }
 
 fn fill_note_buffer(
-    buffer: &gtk::TextBuffer,
+    view: &gtk::TextView,
     note: &Note,
     originals: &ImageOriginals,
     highlights: &HighlightTags,
     scale: i32,
     max_width: i32,
 ) -> bool {
+    let Some(buffer) = view.buffer() else {
+        return false;
+    };
+    let buffer = &buffer;
     let repaired = fill_note_content(
         buffer,
         &note.text,
@@ -5854,6 +6034,7 @@ fn fill_note_buffer(
         max_width,
     );
     highlights.fill(buffer, &note.highlights);
+    fill_note_ink(view, &note.ink);
     repaired
 }
 
@@ -6032,8 +6213,8 @@ fn copy_focused_image(
 }
 
 /// A chatbot answer copied as Markdown goes in as the text it reads as, its
-/// tables drawn to fit this note. Anything that is not Markdown is left to
-/// GTK's own paste.
+/// tables drawn to fit this note, and a copy from a terminal, an editor or a
+/// page keeps its colours, bold, italics and faint text (see `rich_paste`).
 /// Paste text tidied by `markdown::clean_paste`, and widen the note for a
 /// drawing in it: a diagram wrapped at the note's edge is no diagram at all.
 /// False leaves the paste to GTK, as it came.
@@ -6051,15 +6232,34 @@ fn paste_note_text(
     };
     let cleaned = crate::markdown::clean_paste(&text, note_mono_columns(editor));
     let pasted = cleaned.as_deref().unwrap_or(&text);
+    let ink = clipboard_ink(&clipboard, pasted);
     let drawing = crate::markdown::diagram_lines(pasted);
-    if cleaned.is_none() && drawing.is_empty() {
+    if cleaned.is_none() && drawing.is_empty() && ink.is_empty() {
         return false;
     }
     let Some(buffer) = editor.buffer() else {
         return false;
     };
     buffer.delete_selection(true, true);
-    buffer.insert_interactive_at_cursor(pasted, true);
+    let at = buffer
+        .get_insert()
+        .map(|mark| buffer.iter_at_mark(&mark).offset())
+        .unwrap_or(0);
+    if !buffer.insert_interactive_at_cursor(pasted, true) {
+        return true;
+    }
+    if !ink.is_empty() {
+        // Pasted inside a stretch, the new words took its look as they went
+        // in; they wear only their own.
+        let end = buffer.iter_at_offset(at + pasted.chars().count() as i32);
+        for (tag, _) in ink_tags(&buffer) {
+            buffer.remove_tag(&tag, &buffer.iter_at_offset(at), &end);
+        }
+        apply_note_ink(editor, &ink, at);
+        // A tag is not a text change, so the change handler that just saved
+        // the text did not see the look.
+        store_note_highlights(&buffer, target, state);
+    }
     let lines: Vec<&str> = pasted.split('\n').collect();
     let widest = drawing
         .iter()
@@ -6216,6 +6416,7 @@ fn apply_note_snapshot(
         i32::MAX,
     );
     target.highlights.fill(&buffer, &snapshot.highlights);
+    fill_note_ink(editor, &snapshot.ink);
     store_note_highlights(&buffer, target, state);
     let cursor = snapshot.cursor.clamp(0, buffer.char_count());
     buffer.place_cursor(&buffer.iter_at_offset(cursor));
@@ -7143,6 +7344,7 @@ fn store_note_highlights(
     state: &Rc<RefCell<AppState>>,
 ) {
     let highlights = target.highlights.read(buffer);
+    let ink = read_note_ink(buffer);
     if let Some(note) = state
         .borrow_mut()
         .notes
@@ -7150,6 +7352,7 @@ fn store_note_highlights(
         .find(|note| note.id == target.id)
     {
         note.highlights = highlights;
+        note.ink = ink;
     }
 }
 
@@ -7516,13 +7719,14 @@ fn rebuild_pinned_notes(
             &state,
         );
         let repaired = fill_note_buffer(
-            &editor.buffer().expect("note buffer"),
+            &editor,
             &note,
             &image_originals,
             &highlight_tags,
             editor.scale_factor(),
             i32::MAX,
         );
+        follow_note_ink(&editor);
         if repaired {
             let editor = editor.clone();
             let state = state.clone();
@@ -7557,10 +7761,12 @@ fn rebuild_pinned_notes(
                 // GTK has already moved every tag along with the text it
                 // covers; this is where those new offsets are written down.
                 let highlights = highlight_tags.read(buffer);
+                let ink = read_note_ink(buffer);
                 if let Some(note) = state.borrow_mut().notes.iter_mut().find(|n| n.id == id) {
                     note.text = text;
                     note.images = images;
                     note.highlights = highlights;
+                    note.ink = ink;
                     note.updated_at = now_ms();
                 }
                 if let Some(source) = pending_save.borrow_mut().take() {
@@ -7731,7 +7937,7 @@ fn fill_notes_preview(
         return;
     };
     fill_note_buffer(
-        &buffer,
+        preview,
         note,
         originals,
         highlights,
@@ -7940,6 +8146,7 @@ fn build_notes_palette(initial_color_mode: Foreground) -> NotesPalette {
 
     let buffer = preview.buffer().expect("notes preview buffer");
     let highlights = HighlightTags::install(&buffer);
+    follow_note_ink(&preview);
     let match_tag = gtk::TextTag::new(Some("sysi-notes-search-match"));
     match_tag.set_background_rgba(Some(&gdk::RGBA::new(0.98, 0.78, 0.20, 0.42)));
     let current_tag = gtk::TextTag::new(Some("sysi-notes-search-current"));
@@ -14807,6 +15014,7 @@ mod tests {
             text: "hello".into(),
             images: vec![],
             highlights: vec![],
+            ink: vec![],
             cursor: 5,
             size: Size {
                 width: NOTE_WIDTH,
@@ -14821,6 +15029,7 @@ mod tests {
                 height: 100,
             }],
             highlights: vec![],
+            ink: vec![],
             cursor: 6,
             size: Size {
                 width: 224,
@@ -15175,6 +15384,7 @@ mod tests {
             position: Point { x: 0, y: 0 },
             images: Vec::new(),
             highlights: Vec::new(),
+            ink: Vec::new(),
             tags: Vec::new(),
         }
     }
@@ -15453,6 +15663,7 @@ mod tests {
             position: Point { x: 0, y: 0 },
             images: Vec::new(),
             highlights: Vec::new(),
+            ink: Vec::new(),
             tags: vec!["speaking".to_owned(), "part 2".to_owned()],
         };
         assert_eq!(

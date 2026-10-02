@@ -2,6 +2,7 @@ mod glass;
 mod markdown;
 mod panel_system;
 mod platform;
+mod rich_paste;
 mod state;
 mod system;
 mod translate;
