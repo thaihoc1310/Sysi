@@ -477,9 +477,11 @@ fn split_unescaped_pipes(line: &str) -> Vec<String> {
     cells
 }
 
-fn split_row(row: &str) -> Vec<String> {
+/// `outer` is whether the table draws its outer pipes; without them a leading
+/// pipe opens an empty first cell rather than the row.
+fn split_row(row: &str, outer: bool) -> Vec<String> {
     let mut cells = split_unescaped_pipes(row.trim());
-    if cells.len() > 1 && cells.first().is_some_and(|c| c.trim().is_empty()) {
+    if outer && cells.len() > 1 && cells.first().is_some_and(|c| c.trim().is_empty()) {
         cells.remove(0);
     }
     if cells.len() > 1 && cells.last().is_some_and(|c| c.trim().is_empty()) {
@@ -503,8 +505,9 @@ fn is_table_start(lines: &[&str], i: usize) -> bool {
 /// Draws the table that starts at `start` and returns it with the index of
 /// the first line after it.
 fn render_table(lines: &[&str], start: usize, width: usize) -> (Vec<String>, usize) {
-    let header = split_row(lines[start]);
-    let aligns: Vec<Align> = split_row(lines[start + 1])
+    let outer = lines[start].trim_start().starts_with('|');
+    let header = split_row(lines[start], outer);
+    let aligns: Vec<Align> = split_row(lines[start + 1], outer)
         .iter()
         .map(|cell| match (cell.starts_with(':'), cell.ends_with(':')) {
             (true, true) => Align::Center,
@@ -512,7 +515,7 @@ fn render_table(lines: &[&str], start: usize, width: usize) -> (Vec<String>, usi
             _ => Align::Left,
         })
         .collect();
-    let mut rows = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
     let mut j = start + 2;
     while j < lines.len() {
         let line = lines[j];
@@ -525,7 +528,7 @@ fn render_table(lines: &[&str], start: usize, width: usize) -> (Vec<String>, usi
         // with blank lines between. The row is still open while it lacks its
         // closing pipe; take lines until one supplies it, but never swallow
         // the next row.
-        if row.trim_start().starts_with('|') && !ends_with_unescaped_pipe(&row) {
+        if outer && row.trim_start().starts_with('|') && !ends_with_unescaped_pipe(&row) {
             let mut k = j;
             while k < lines.len() && k < j + 40 {
                 let next = lines[k];
@@ -545,7 +548,23 @@ fn render_table(lines: &[&str], start: usize, width: usize) -> (Vec<String>, usi
                 k += 1;
             }
         }
-        rows.push(split_row(&row));
+        let cells = split_row(&row, outer);
+        // A table copied off a terminal wraps a long cell onto lines whose
+        // first cell is blank; those carry on the row above.
+        match rows.last_mut() {
+            Some(above) if !outer && cells.first().is_some_and(|c| c.is_empty()) => {
+                above.resize(above.len().max(cells.len()), String::new());
+                for (cell, more) in above.iter_mut().zip(&cells) {
+                    if !more.is_empty() {
+                        if !cell.is_empty() {
+                            cell.push(' ');
+                        }
+                        cell.push_str(more);
+                    }
+                }
+            }
+            _ => rows.push(cells),
+        }
     }
     let columns = rows
         .iter()
@@ -1608,6 +1627,20 @@ Mẹo so sánh:
         assert_eq!(
             clean_pasted_markdown(text, 10).unwrap(),
             "Title\n\nbody\n\n──────────\n\nend"
+        );
+    }
+
+    #[test]
+    fn a_table_copied_off_a_terminal_keeps_its_wrapped_cells_in_their_columns() {
+        let table = " Hook     | Khi nào         | Làm gì\n----------|-----------------|--------\n PreSync  | Chạy trước khi  | DB migration\n          | deploy app.     |\n          |                 | trước khi nâng cấp.\n Skip     | Bỏ qua.         | Ignore.\n";
+        assert_eq!(
+            clean_pasted_markdown(table, 0).unwrap(),
+            "┌─────────┬────────────────────────────┬──────────────────────────────────┐\n\
+             │ Hook    │ Khi nào                    │ Làm gì                           │\n\
+             ├─────────┼────────────────────────────┼──────────────────────────────────┤\n\
+             │ PreSync │ Chạy trước khi deploy app. │ DB migration trước khi nâng cấp. │\n\
+             │ Skip    │ Bỏ qua.                    │ Ignore.                          │\n\
+             └─────────┴────────────────────────────┴──────────────────────────────────┘\n"
         );
     }
 
