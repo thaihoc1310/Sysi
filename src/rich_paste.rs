@@ -63,15 +63,19 @@ const GREY_CHROMA: f64 = 0.1;
 /// terminal (Claude Code's 153,153,153), which is faint text; darker or
 /// lighter, it is the body text of a light or a dark theme.
 const DIM_GREY: (f64, f64) = (0.30, 0.72);
-/// An element whose colour covers this share of the text is the source's own
-/// text colour (VS Code wraps a copy in a `<div>` of it), as is a colour that
-/// covers that much of the text on its own.
+/// The outermost coloured element, covering this share of the text, is the
+/// source's own text colour when other colours sit inside it (VS Code wraps a
+/// copy in a `<div>` of its theme's text colour) or when it is a grey. One
+/// colour alone is a copy of coloured words: a keyword, a link.
 const BASE_SHARE: f64 = 0.85;
 /// No more stretches than this are kept from one paste: they are saved with
 /// the note on every edit.
 const MAX_RUNS: usize = 12_000;
 /// Text this long is pasted without its look rather than make the paste slow.
 const MAX_CHARS: usize = 400_000;
+/// Nor is HTML this long read: Chrome writes every computed style inline, so
+/// its HTML runs to tens of bytes per character. About a quarter of a second.
+const MAX_HTML_BYTES: usize = 8 << 20;
 
 /// The text of a `text/html` clipboard flavour. Chromium and Electron write
 /// UTF-8; Firefox has written UTF-16, with and without a byte-order mark.
@@ -104,7 +108,7 @@ pub fn decode_html(bytes: &[u8]) -> String {
 /// from the start of `text`. Empty when the HTML has no look to keep, or holds
 /// text too unlike `text` to be laid over it.
 pub fn html_ink(html: &str, text: &str) -> Vec<NoteInk> {
-    if html.len() > MAX_CHARS * 8 || text.chars().count() > MAX_CHARS {
+    if html.len() > MAX_HTML_BYTES || text.chars().count() > MAX_CHARS {
         return Vec::new();
     }
     let source = styled_chars(html);
@@ -138,7 +142,8 @@ const UNSHOWN: &[&str] = &[
 struct Frame {
     name: String,
     look: Look,
-    /// The colour this element set itself, and where its text began.
+    /// The colour this element set itself, when no element around it had set
+    /// one, and where its text began.
     declared: Option<[u8; 3]>,
     start: usize,
 }
@@ -148,7 +153,7 @@ struct Frame {
 fn styled_chars(html: &str) -> Vec<(char, Ink)> {
     let mut out: Vec<(char, Look)> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
-    // Elements that set a colour: (colour, first char, end char).
+    // The outermost elements that set a colour: (colour, first char, end).
     let mut painted: Vec<([u8; 3], usize, usize)> = Vec::new();
     let mut rest = html;
     let current = |stack: &[Frame]| stack.last().map(|frame| frame.look).unwrap_or_default();
@@ -209,6 +214,8 @@ fn styled_chars(html: &str) -> Vec<(char, Ink)> {
         }
         let parent = current(&stack);
         let (look, declared) = element_look(&name, tag, parent);
+        // Only the outermost colour can be the source's text colour.
+        let declared = declared.filter(|_| parent.color.is_none());
         if tag.trim_end().ends_with('/') {
             continue;
         }
@@ -554,27 +561,19 @@ fn resolve(out: &[(char, Look)], painted: &[([u8; 3], usize, usize)]) -> Vec<(ch
         shown[at + 1] = shown[at] + usize::from(!c.is_whitespace());
     }
     let total = shown[out.len()];
-    let covers = |count: usize| total > 0 && count as f64 >= total as f64 * BASE_SHARE;
-    let mut base: Vec<[u8; 3]> = painted
+    let base: Vec<[u8; 3]> = painted
         .iter()
-        .filter(|(_, start, end)| covers(shown[*end] - shown[*start]))
+        .filter(|(color, start, end)| {
+            let covered = shown[*end] - shown[*start];
+            total > 0
+                && covered as f64 >= total as f64 * BASE_SHARE
+                && (is_grey(*color)
+                    || out[*start..*end]
+                        .iter()
+                        .any(|(_, look)| look.color.is_some_and(|inner| inner != *color)))
+        })
         .map(|(color, _, _)| *color)
         .collect();
-    let mut counts: Vec<([u8; 3], usize)> = Vec::new();
-    for (c, look) in out {
-        if let (Some(color), false) = (look.color, c.is_whitespace()) {
-            match counts.iter_mut().find(|(seen, _)| *seen == color) {
-                Some((_, count)) => *count += 1,
-                None => counts.push((color, 1)),
-            }
-        }
-    }
-    base.extend(
-        counts
-            .iter()
-            .filter(|(_, count)| covers(*count))
-            .map(|(color, _)| *color),
-    );
     out.iter()
         .map(|&(c, look)| {
             let mut dim = look.color_alpha * look.opacity < DIM_BELOW;
@@ -613,6 +612,9 @@ const RESYNC_RUN: usize = 4;
 /// of `source`. Only characters that are not spaces are matched. `None` when
 /// too few match for the look to belong to this text.
 fn align(source: &[(char, Ink)], target: &[char]) -> Option<Vec<Ink>> {
+    // A box-drawing line one side has and the other lacks, the border of a
+    // table the paste redrew, can run past the resync window: step over it.
+    let boxed = |c: char| ('\u{2500}'..='\u{257f}').contains(&c);
     let from: Vec<usize> = (0..source.len())
         .filter(|&at| !source[at].0.is_whitespace())
         .collect();
@@ -633,6 +635,15 @@ fn align(source: &[(char, Ink)], target: &[char]) -> Option<Vec<Ink>> {
             matched += 1;
             t += 1;
             s += 1;
+            continue;
+        }
+        let (here, there) = (target[to[t]], source[from[s]].0);
+        if boxed(here) != boxed(there) {
+            if boxed(here) {
+                t += 1;
+            } else {
+                s += 1;
+            }
             continue;
         }
         let skip = (1..=RESYNC_WINDOW).find_map(|k| {
@@ -870,6 +881,56 @@ mod tests {
                 italic: true,
                 ..ink(0, 5)
             }]
+        );
+    }
+
+    #[test]
+    fn a_copy_of_only_coloured_words_keeps_their_colour() {
+        // One keyword from a terminal: its span is the outermost colour.
+        let html = "<div style=\"font-family: monospace; white-space: pre;\">\
+            <span style=\"color: rgb(152, 195, 121);\">apiVersion</span></div>";
+        assert_eq!(
+            html_ink(html, "apiVersion"),
+            vec![NoteInk {
+                color: parse_hex_color("#98c379"),
+                ..ink(0, 10)
+            }]
+        );
+        // One keyword from VS Code, inside its text-colour wrapper.
+        let html = "<div style=\"color: #cccccc;\"><div><span style=\"color: #569cd6;\">const</span></div></div>";
+        assert_eq!(
+            html_ink(html, "const"),
+            vec![NoteInk {
+                color: parse_hex_color("#569cd6"),
+                ..ink(0, 5)
+            }]
+        );
+        // A grey theme's text alone is the text colour, not faint text.
+        let html = "<div style=\"color: #839496;\"><span>plain words</span></div>";
+        assert!(html_ink(html, "plain words").is_empty());
+    }
+
+    #[test]
+    fn a_table_border_wider_than_the_resync_window_is_stepped_over() {
+        let html = format!(
+            "<span style=\"color: #61afef;\">Name</span> | <span style=\"color: #e06c75;\">Value</span>{}",
+            " | more words that follow".repeat(3)
+        );
+        let border = "─".repeat(150);
+        let text = format!(
+            "┌{border}┐\n│ Name │ Value │{}\n└{border}┘",
+            " │ more words that follow".repeat(3)
+        );
+        let runs = html_ink(&html, &text);
+        let chars: Vec<char> = text.chars().collect();
+        let word = |run: &NoteInk| {
+            chars[run.start as usize..run.end as usize]
+                .iter()
+                .collect::<String>()
+        };
+        assert_eq!(
+            runs.iter().map(word).collect::<Vec<_>>(),
+            vec!["Name", "Value"]
         );
     }
 
