@@ -1060,10 +1060,24 @@ fn parse_omp_report(
         });
         return;
     }
+    // Antigravity lists a quota shared by several model families once per
+    // family (Claude and GPT draw on one "3p" pool): one row is the pool.
+    let mut shared_groups: Vec<&str> = Vec::new();
     for limit in limits.unwrap() {
         let Some(limit_object) = limit.as_object() else {
             continue;
         };
+        let scope = limit_object.get("scope");
+        if let Some(group) = scope
+            .filter(|scope| scope.get("shared").and_then(Value::as_bool) == Some(true))
+            .and_then(|scope| scope.get("sharedGroup"))
+            .and_then(Value::as_str)
+        {
+            if shared_groups.contains(&group) {
+                continue;
+            }
+            shared_groups.push(group);
+        }
         let percent = limit_object.get("amount").and_then(amount_percent);
         let window = limit_object.get("window").and_then(Value::as_object);
         let reset = window.and_then(|window| {
@@ -1076,6 +1090,19 @@ fn parse_omp_report(
             .get("label")
             .and_then(Value::as_str)
             .unwrap_or("Usage");
+        // One quota is often limited over two windows, a 5 hour and a weekly,
+        // under the same label: say which window this row is.
+        let span = window
+            .and_then(|window| window.get("label").or_else(|| window.get("id")))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|span| {
+                !span.is_empty() && !label.to_lowercase().contains(&span.to_lowercase())
+            });
+        let label = match span {
+            Some(span) => format!("{label} · {span}"),
+            None => label.to_owned(),
+        };
         let account = limit_object
             .get("scope")
             .and_then(|scope| scope.get("accountId"))
@@ -2313,6 +2340,59 @@ mod tests {
         );
         assert_eq!(snapshot.0[0].remaining_percent, Some(66.0));
         assert_eq!(snapshot.1, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn omp_shows_a_shared_pool_once_and_names_each_window() {
+        let limit = |label: &str, family: &str, window: &str, shared: bool| {
+            json!({
+                "id": format!("google-antigravity:{family}:default:{window}"),
+                "label": label,
+                "scope": {"provider": "google-antigravity", "windowId": window,
+                          "shared": shared, "sharedGroup": format!("3p-{window}:{window}")},
+                "window": {"id": window, "label": if window == "5h" { "5 Hour" } else { "Weekly" }},
+                "amount": {"usedFraction": 0.0, "remainingFraction": 1.0}
+            })
+        };
+        let report = json!({
+            "provider": "google-antigravity",
+            "metadata": {"email": "a@example.com"},
+            "limits": [
+                limit("Gemini", "google", "weekly", false),
+                limit("Gemini", "google", "5h", false),
+                limit("Claude & GPT (shared)", "anthropic", "weekly", true),
+                limit("Claude & GPT (shared)", "openai", "weekly", true),
+                limit("Claude & GPT (shared)", "anthropic", "5h", true),
+                limit("Claude & GPT (shared)", "openai", "5h", true),
+            ]
+        });
+        let mut windows = Vec::new();
+        parse_omp_report(&report, &mut windows, &mut Vec::new(), &mut 0);
+        let labels: Vec<&str> = windows.iter().map(|window| window.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "google-antigravity · a@example.com · Gemini · Weekly",
+                "google-antigravity · a@example.com · Gemini · 5 Hour",
+                "google-antigravity · a@example.com · Claude & GPT (shared) · Weekly",
+                "google-antigravity · a@example.com · Claude & GPT (shared) · 5 Hour",
+            ]
+        );
+        // A label that already names its window is not told twice.
+        let mut windows = Vec::new();
+        parse_omp_report(
+            &json!({"provider": "anthropic", "limits": [{
+                "label": "5 Hour limit", "window": {"label": "5 hour"},
+                "amount": {"usedFraction": 0.5}
+            }]}),
+            &mut windows,
+            &mut Vec::new(),
+            &mut 0,
+        );
+        assert_eq!(
+            windows[0].label,
+            "anthropic · account unspecified · 5 Hour limit"
+        );
     }
 
     #[test]
