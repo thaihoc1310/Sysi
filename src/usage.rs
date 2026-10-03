@@ -1140,29 +1140,22 @@ fn parse_omp_report(
     }
 }
 
-/// Rows of one heading together, the headings in the order they first came,
-/// so each provider, account and model is shown once.
+/// Rows of one heading together, so each provider, account and model is
+/// shown once, in an order that holds from one refresh to the next: OMP lists
+/// its reports and limits in whatever order they finished. Headings go by
+/// name, and windows shortest first, 5 hour before weekly.
 fn gather_groups(windows: &mut [Window]) {
-    let mut seen: Vec<&[String]> = Vec::new();
-    let mut keys: Vec<Vec<usize>> = Vec::new();
-    for window in windows.iter() {
-        let key = (1..=window.group.len())
-            .map(|depth| {
-                let prefix = &window.group[..depth];
-                seen.iter()
-                    .position(|known| *known == prefix)
-                    .unwrap_or_else(|| {
-                        seen.push(prefix);
-                        seen.len() - 1
-                    })
-            })
-            .collect();
-        keys.push(key);
-    }
-    let mut order: Vec<usize> = (0..windows.len()).collect();
-    order.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
-    let sorted: Vec<Window> = order.iter().map(|&at| windows[at].clone()).collect();
-    windows.clone_from_slice(&sorted);
+    windows.sort_by_cached_key(|window| {
+        (
+            window
+                .group
+                .iter()
+                .map(|heading| heading.to_lowercase())
+                .collect::<Vec<_>>(),
+            window.duration_ms.is_none(),
+            window.duration_ms,
+        )
+    });
 }
 
 fn invalidate_omp_cache() {
@@ -2434,23 +2427,31 @@ mod tests {
     }
 
     #[test]
-    fn omp_gathers_each_heading_in_the_order_it_first_came() {
-        let row = |group: &[&str], label: &str| Window {
+    fn omp_rows_keep_one_order_whatever_order_omp_lists_them_in() {
+        let row = |group: &[&str], label: &str, duration_ms: Option<i64>| Window {
             group: group.iter().map(|part| part.to_string()).collect(),
             label: label.to_owned(),
             used_percent: None,
             remaining_percent: None,
             reset_at_ms: None,
-            duration_ms: None,
+            duration_ms,
         };
+        let week = Some(604_800_000);
+        let five = Some(18_000_000);
         let mut windows = vec![
-            row(&["p", "b@x", "Gemini"], "Weekly"),
-            row(&["q", "a@x", "Model"], "Weekly"),
-            row(&["p", "a@x", "Gemini"], "Weekly"),
-            row(&["p", "b@x", "Gemini"], "5 Hour"),
-            row(&["p", "a@x", "Gemini"], "5 Hour"),
+            row(&["p", "b@x", "Gemini"], "Weekly", week),
+            row(&["q", "a@x", "Model"], "Usage", None),
+            row(&["p", "a@x", "Gemini"], "Weekly", week),
+            row(&["p", "b@x", "Claude & GPT (shared)"], "5 Hour", five),
+            row(&["p", "b@x", "Gemini"], "5 Hour", five),
+            row(&["p", "a@x", "Gemini"], "5 Hour", five),
+            row(&["p", "b@x", "Claude & GPT (shared)"], "Weekly", week),
         ];
+        let mut shuffled = windows.clone();
+        shuffled.reverse();
         gather_groups(&mut windows);
+        gather_groups(&mut shuffled);
+        assert_eq!(windows, shuffled);
         let rows: Vec<String> = windows
             .iter()
             .map(|window| format!("{}/{}", window.group.join("/"), window.label))
@@ -2458,11 +2459,13 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "p/b@x/Gemini/Weekly",
-                "p/b@x/Gemini/5 Hour",
-                "p/a@x/Gemini/Weekly",
                 "p/a@x/Gemini/5 Hour",
-                "q/a@x/Model/Weekly",
+                "p/a@x/Gemini/Weekly",
+                "p/b@x/Claude & GPT (shared)/5 Hour",
+                "p/b@x/Claude & GPT (shared)/Weekly",
+                "p/b@x/Gemini/5 Hour",
+                "p/b@x/Gemini/Weekly",
+                "q/a@x/Model/Usage",
             ]
         );
     }
