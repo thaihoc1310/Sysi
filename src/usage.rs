@@ -66,6 +66,10 @@ impl Source {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Window {
+    /// The headings this row sits under, outermost first: an OMP row is under
+    /// its provider, its account and its model. Empty for a source with one
+    /// account and one model.
+    pub group: Vec<String>,
     pub label: String,
     pub used_percent: Option<f64>,
     pub remaining_percent: Option<f64>,
@@ -227,6 +231,7 @@ fn window_from_percent(
 ) -> Option<Window> {
     let used_percent = used_percent.filter(|value| value.is_finite())?.max(0.0);
     Some(Window {
+        group: Vec::new(),
         label: label.into(),
         used_percent: Some(used_percent),
         remaining_percent: Some((100.0 - used_percent).clamp(0.0, 100.0)),
@@ -1052,7 +1057,8 @@ fn parse_omp_report(
             .and_then(Value::as_str)
             .unwrap_or("account unspecified");
         windows.push(Window {
-            label: format!("{provider} · {account} · No quota reported"),
+            group: vec![provider.to_owned(), account.to_owned()],
+            label: "No quota reported".to_owned(),
             used_percent: None,
             remaining_percent: None,
             reset_at_ms: None,
@@ -1099,10 +1105,6 @@ fn parse_omp_report(
             .filter(|span| {
                 !span.is_empty() && !label.to_lowercase().contains(&span.to_lowercase())
             });
-        let label = match span {
-            Some(span) => format!("{label} · {span}"),
-            None => label.to_owned(),
-        };
         let account = limit_object
             .get("scope")
             .and_then(|scope| scope.get("accountId"))
@@ -1114,11 +1116,21 @@ fn parse_omp_report(
                     .and_then(|metadata| metadata.get("email"))
                     .and_then(Value::as_str)
             });
-        let label = match account {
-            Some(account) => format!("{provider} · {account} · {label}"),
-            None => format!("{provider} · account unspecified · {label}"),
+        let mut group = vec![
+            provider.to_owned(),
+            account.unwrap_or("account unspecified").to_owned(),
+        ];
+        // A row per window under its model; a label that names its own
+        // window is the row itself.
+        let label = match span {
+            Some(span) => {
+                group.push(label.to_owned());
+                span.to_owned()
+            }
+            None => label.to_owned(),
         };
         windows.push(Window {
+            group,
             label,
             used_percent: percent.map(|(used, _)| used),
             remaining_percent: percent.map(|(_, remaining)| remaining),
@@ -1126,6 +1138,31 @@ fn parse_omp_report(
             duration_ms: duration,
         });
     }
+}
+
+/// Rows of one heading together, the headings in the order they first came,
+/// so each provider, account and model is shown once.
+fn gather_groups(windows: &mut [Window]) {
+    let mut seen: Vec<&[String]> = Vec::new();
+    let mut keys: Vec<Vec<usize>> = Vec::new();
+    for window in windows.iter() {
+        let key = (1..=window.group.len())
+            .map(|depth| {
+                let prefix = &window.group[..depth];
+                seen.iter()
+                    .position(|known| *known == prefix)
+                    .unwrap_or_else(|| {
+                        seen.push(prefix);
+                        seen.len() - 1
+                    })
+            })
+            .collect();
+        keys.push(key);
+    }
+    let mut order: Vec<usize> = (0..windows.len()).collect();
+    order.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
+    let sorted: Vec<Window> = order.iter().map(|&at| windows[at].clone()).collect();
+    windows.clone_from_slice(&sorted);
 }
 
 fn invalidate_omp_cache() {
@@ -1166,6 +1203,7 @@ fn fetch_omp(force: bool) -> Result<Snapshot, String> {
     for report in reports {
         parse_omp_report(report, &mut windows, &mut accounts, &mut fetched);
     }
+    gather_groups(&mut windows);
     if windows.is_empty() {
         return Err("OMP has no reported quota windows".to_owned());
     }
@@ -2121,8 +2159,9 @@ mod tests {
             &mut 0,
         );
         assert_eq!(windows.len(), 20);
-        assert_ne!(windows[0].label, windows[1].label);
-        assert!(windows[19].label.contains("account-19"));
+        assert_ne!(windows[0].group, windows[1].group);
+        assert_eq!(windows[19].group, ["codex", "account-19"]);
+        assert_eq!(windows[19].label, "Weekly");
     }
 
     #[test]
@@ -2334,16 +2373,14 @@ mod tests {
             }
             (windows, fetched)
         };
-        assert_eq!(
-            snapshot.0[0].label,
-            "anthropic · account unspecified · 5 Hour limit"
-        );
+        assert_eq!(snapshot.0[0].group, ["anthropic", "account unspecified"]);
+        assert_eq!(snapshot.0[0].label, "5 Hour limit");
         assert_eq!(snapshot.0[0].remaining_percent, Some(66.0));
         assert_eq!(snapshot.1, 1_700_000_000_000);
     }
 
     #[test]
-    fn omp_shows_a_shared_pool_once_and_names_each_window() {
+    fn omp_rows_sit_under_provider_account_and_model_with_a_shared_pool_once() {
         let limit = |label: &str, family: &str, window: &str, shared: bool| {
             json!({
                 "id": format!("google-antigravity:{family}:default:{window}"),
@@ -2368,14 +2405,17 @@ mod tests {
         });
         let mut windows = Vec::new();
         parse_omp_report(&report, &mut windows, &mut Vec::new(), &mut 0);
-        let labels: Vec<&str> = windows.iter().map(|window| window.label.as_str()).collect();
+        let rows: Vec<String> = windows
+            .iter()
+            .map(|window| format!("{} / {}", window.group.join(" / "), window.label))
+            .collect();
         assert_eq!(
-            labels,
+            rows,
             [
-                "google-antigravity · a@example.com · Gemini · Weekly",
-                "google-antigravity · a@example.com · Gemini · 5 Hour",
-                "google-antigravity · a@example.com · Claude & GPT (shared) · Weekly",
-                "google-antigravity · a@example.com · Claude & GPT (shared) · 5 Hour",
+                "google-antigravity / a@example.com / Gemini / Weekly",
+                "google-antigravity / a@example.com / Gemini / 5 Hour",
+                "google-antigravity / a@example.com / Claude & GPT (shared) / Weekly",
+                "google-antigravity / a@example.com / Claude & GPT (shared) / 5 Hour",
             ]
         );
         // A label that already names its window is not told twice.
@@ -2389,9 +2429,41 @@ mod tests {
             &mut Vec::new(),
             &mut 0,
         );
+        assert_eq!(windows[0].group, ["anthropic", "account unspecified"]);
+        assert_eq!(windows[0].label, "5 Hour limit");
+    }
+
+    #[test]
+    fn omp_gathers_each_heading_in_the_order_it_first_came() {
+        let row = |group: &[&str], label: &str| Window {
+            group: group.iter().map(|part| part.to_string()).collect(),
+            label: label.to_owned(),
+            used_percent: None,
+            remaining_percent: None,
+            reset_at_ms: None,
+            duration_ms: None,
+        };
+        let mut windows = vec![
+            row(&["p", "b@x", "Gemini"], "Weekly"),
+            row(&["q", "a@x", "Model"], "Weekly"),
+            row(&["p", "a@x", "Gemini"], "Weekly"),
+            row(&["p", "b@x", "Gemini"], "5 Hour"),
+            row(&["p", "a@x", "Gemini"], "5 Hour"),
+        ];
+        gather_groups(&mut windows);
+        let rows: Vec<String> = windows
+            .iter()
+            .map(|window| format!("{}/{}", window.group.join("/"), window.label))
+            .collect();
         assert_eq!(
-            windows[0].label,
-            "anthropic · account unspecified · 5 Hour limit"
+            rows,
+            [
+                "p/b@x/Gemini/Weekly",
+                "p/b@x/Gemini/5 Hour",
+                "p/a@x/Gemini/Weekly",
+                "p/a@x/Gemini/5 Hour",
+                "q/a@x/Model/Weekly",
+            ]
         );
     }
 

@@ -1104,6 +1104,39 @@ scrolledwindow overshoot.right:backdrop {
   text-shadow: none;
 }
 
+/* OMP rows sit under their provider, account and model. */
+.usage-group-provider {
+  color: alpha(currentColor, 0.58);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+  padding-top: 3px;
+  text-shadow: none;
+}
+
+.usage-group-provider.usage-group-next {
+  padding-top: 10px;
+}
+
+.usage-group-account {
+  color: alpha(currentColor, 0.82);
+  font-size: 12px;
+  padding-top: 1px;
+  text-shadow: none;
+}
+
+.usage-group-account.usage-group-next {
+  padding-top: 8px;
+}
+
+.usage-group-model {
+  color: currentColor;
+  font-size: 12px;
+  font-weight: 700;
+  padding-top: 4px;
+  text-shadow: none;
+}
+
 .usage-row-percent {
   color: currentColor;
   font-size: 12px;

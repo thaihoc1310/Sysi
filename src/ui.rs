@@ -3519,6 +3519,9 @@ fn render_token_tab(card: &UsageCard) {
     card.tokens_canvas.queue_draw();
 }
 
+/// How far a usage row steps in under each heading below its account.
+const USAGE_GROUP_INDENT: i32 = 10;
+
 fn render_usage_card(
     card: &UsageCard,
     tab: UsageTab,
@@ -3560,14 +3563,55 @@ fn render_usage_card(
     card.updated
         .set_label(&usage_age_label(snapshot.fetched_at_ms, now));
 
+    let mut previous: &[String] = &[];
     for window in &snapshot.windows {
+        // A heading for every level of the row's group the row above was not
+        // under: provider, then account, then model.
+        let fresh = window
+            .group
+            .iter()
+            .zip(previous)
+            .take_while(|(heading, above)| heading == above)
+            .count();
+        for (depth, heading) in window.group.iter().enumerate().skip(fresh) {
+            // GTK 3 CSS has no text-transform.
+            let shown = if depth == 0 {
+                heading.to_uppercase()
+            } else {
+                heading.clone()
+            };
+            let label = gtk::Label::new(Some(&shown));
+            label.set_xalign(0.0);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_tooltip_text(Some(heading));
+            label.set_margin_start(USAGE_GROUP_INDENT * depth.saturating_sub(1) as i32);
+            let class = match depth {
+                0 => "usage-group-provider",
+                1 => "usage-group-account",
+                _ => "usage-group-model",
+            };
+            label.style_context().add_class(class);
+            // Space above the first heading of a new provider or account.
+            if depth == fresh && depth < 2 && !previous.is_empty() {
+                label.style_context().add_class("usage-group-next");
+            }
+            card.rows.pack_start(&label, false, false, 0);
+        }
+        previous = &window.group;
         let row = gtk::Box::new(gtk::Orientation::Vertical, 1);
         row.style_context().add_class("usage-row");
+        row.set_margin_start(USAGE_GROUP_INDENT * window.group.len().saturating_sub(1) as i32);
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let label = gtk::Label::new(Some(&window.label));
         label.set_xalign(0.0);
         label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        label.set_tooltip_text(Some(&window.label));
+        let path: Vec<&str> = window
+            .group
+            .iter()
+            .map(String::as_str)
+            .chain([window.label.as_str()])
+            .collect();
+        label.set_tooltip_text(Some(&path.join(" · ")));
         label.set_hexpand(true);
         label.style_context().add_class("usage-row-label");
         let remaining = gtk::Label::new(Some(&usage_percent_label(window.remaining_percent)));
@@ -3826,7 +3870,14 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
                     .updated
                     .set_label(&usage_age_label(snapshot.fetched_at_ms, now));
                 // Update only reset labels/tooltips; keep rows and scroll position intact.
-                for (row, window) in card_for_timer.rows.children().iter().zip(&snapshot.windows) {
+                // The group headings between the rows are not rows.
+                let rows: Vec<gtk::Widget> = card_for_timer
+                    .rows
+                    .children()
+                    .into_iter()
+                    .filter(|child| child.style_context().has_class("usage-row"))
+                    .collect();
+                for (row, window) in rows.iter().zip(&snapshot.windows) {
                     if let Some(row) = row.downcast_ref::<gtk::Box>() {
                         if let Some(top) = row
                             .children()
@@ -16287,6 +16338,7 @@ mod usage_ui_tests {
             fetched_at_ms: usage_now_ms(),
             windows: (0..20)
                 .map(|i| usage::Window {
+                    group: Vec::new(),
                     label: format!("account-{i}"),
                     used_percent: Some(34.0),
                     remaining_percent: Some(66.0),
