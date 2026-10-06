@@ -14028,7 +14028,7 @@ fn install_voice(
                     *bar = wave_bar_step(*bar, i, level, t);
                 }
                 let elapsed = data.start_time.map_or(0, |t| t.elapsed().as_secs());
-                // The recorder has finished by itself (its 10-minute cap, or
+                // The recorder has finished by itself (its 7-minute cap, or
                 // PipeWire gone): take what it has rather than count on.
                 let ended = data
                     .active_recording

@@ -17,7 +17,10 @@ pub const BYTES_PER_SAMPLE: usize = 2;
 const CHUNK_DURATION_MS: u32 = 20;
 const CHUNK_SAMPLES: usize = (SAMPLE_RATE as usize * CHUNK_DURATION_MS as usize) / 1000; // 320 samples
 const CHUNK_BYTES: usize = CHUNK_SAMPLES * BYTES_PER_SAMPLE; // 640 bytes
-pub const MAX_RECORDING_SECS: u64 = 600; // 10 minutes
+
+// 7 minutes: as base64 WAV that is about 18 MB, under the 20 MB Gemini takes
+// inline in one request.
+pub const MAX_RECORDING_SECS: u64 = 420;
 pub const MIN_RECORDING_SECS: f32 = 0.4;
 const SILENCE_THRESHOLD_RMS: f32 = 0.035;
 
