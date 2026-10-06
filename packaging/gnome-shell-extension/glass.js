@@ -933,6 +933,9 @@ class MenuGlass {
         this._effect = new GlassEffect(this);
         this._box.add_effect(this._effect);
         menu.actor.add_style_class_name('sysi-glass-menu');
+        // Blur my Shell skips its own actors by this class. Without it, its
+        // popup blur lays a second, differently cornered slab under ours.
+        menu.actor.add_style_class_name('bms-popup-blurred-widget');
         // The box pointer paints itself offscreen, and glass there would copy
         // that empty buffer rather than the screen. Painted straight on,
         // every actor takes the menu's fading opacity itself (uOpacity).
@@ -1001,6 +1004,7 @@ class MenuGlass {
         logError(error, 'Sysi menu glass failed');
         this._box.remove_effect(this._effect);
         this._menu.actor.remove_style_class_name('sysi-glass-menu');
+        this._menu.actor.remove_style_class_name('bms-popup-blurred-widget');
     }
 }
 

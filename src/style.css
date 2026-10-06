@@ -1589,3 +1589,33 @@ window.glass-live .mode-glass .history-header {
   border-color: alpha(currentColor, 0.22);
   border-radius: 7px;
 }
+
+/* Voice dictation HUD */
+.voice-hud {
+  background-color: transparent;
+  border-radius: 9999px;
+}
+
+.mode-solid.mode-light .voice-hud {
+  background-color: rgba(242, 242, 244, 0.95);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 9999px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
+.mode-solid.mode-dark .voice-hud {
+  background-color: rgba(22, 22, 24, 0.93);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 9999px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.mode-glass .voice-hud {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 9999px;
+}
+
+window:not(.glass-live) .mode-glass .voice-hud {
+  background-color: rgba(24, 24, 26, 0.88);
+  border-radius: 9999px;
+}

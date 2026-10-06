@@ -1761,6 +1761,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         Rc::new(move || notes.is_visible() || interactive.get())
     });
 
+    let voice = install_voice(&window, &root, &registry, &interactive, state.clone());
+
     let dispatch_panel_action: Rc<dyn Fn()> = {
         let panel_system = panel_system.clone();
         let mode = widget_picker.mode.clone();
@@ -1780,6 +1782,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let dictate_start = dictate.start.clone();
         let dictate_cancel = dictate.cancel.clone();
         let window = window.clone();
+        let voice_toggle = voice.toggle.clone();
+        let voice_cancel = voice.cancel.clone();
         Rc::new(move || {
             for action in take_panel_actions() {
                 // Held only for as long as the action runs, so a widget opened
@@ -1800,6 +1804,19 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 match action.name.as_str() {
                     name if crate::panel_system::apply_action(&panel_system, name) => {}
                     "next-color-mode" => mode.clicked(),
+                    action if action.starts_with("set-voice-model:") => {
+                        let model_str = &action["set-voice-model:".len()..];
+                        if let Some(model) = crate::state::VoiceModel::from_key(model_str) {
+                            state.borrow_mut().settings.voice_model = model;
+                            let _ = state.borrow().save();
+                            let dir = crate::state::cache_dir();
+                            let _ = std::fs::write(
+                                dir.join("voice-model"),
+                                format!("{}\n", model.key()),
+                            );
+                            publish_panel_state(interactive.get(), &state.borrow());
+                        }
+                    }
                     "font-smaller" | "font-larger" => {
                         let delta = if action.name == "font-larger" { 1 } else { -1 };
                         state.borrow_mut().change_font_size(None, delta);
@@ -1848,6 +1865,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     "cancel-ocr" => {
                         let _ = dictate_cancel();
                     }
+                    "voice" => voice_toggle(),
+                    "cancel-voice" => {
+                        let _ = voice_cancel();
+                    }
                     "quit" => quit.clicked(),
                     _ => {}
                 }
@@ -1863,7 +1884,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let handle_notes_keys = handle_notes_keys.clone();
         let translate_close_search = translate_close_search.clone();
         let dictate_cancel = dictate.cancel.clone();
+        let voice_cancel = voice.cancel.clone();
         move |_, event| {
+            if event.keyval() == gdk::keys::constants::Escape && voice_cancel() {
+                return glib::Propagation::Stop;
+            }
             if event.keyval() == gdk::keys::constants::Escape && dictate_cancel() {
                 return glib::Propagation::Stop;
             }
@@ -13407,6 +13432,714 @@ fn install_dictate(
     Dictate { start, cancel }
 }
 
+// Clock, meter and stop button, a hand's width apart. The stop button sits
+// in the pill's round end, centred on the same point as its curve.
+const VOICE_HUD_WIDTH: i32 = 128;
+const VOICE_HUD_HEIGHT: i32 = 30;
+const VOICE_CLOCK_X: f64 = 13.0;
+const VOICE_STOP_X: f64 = (VOICE_HUD_WIDTH - VOICE_HUD_HEIGHT / 2) as f64;
+// The level meter between the clock and the stop button: a few solid bars
+// that all answer the voice at once, tallest in the middle, dots in silence.
+const WAVE_BARS: usize = 9;
+const WAVE_BAR_WIDTH: f64 = 3.0;
+const WAVE_BAR_GAP: f64 = 2.5;
+const WAVE_LEFT: f64 = 46.0;
+const WAVE_REST: f32 = 3.0;
+const WAVE_PEAK: f32 = 16.0;
+
+#[derive(Clone, Debug, PartialEq)]
+enum VoiceHudStatus {
+    Idle,
+    Recording,
+    Transcribing,
+    Done(&'static str),
+    Error(String),
+}
+
+struct VoiceHudState {
+    status: VoiceHudStatus,
+    start_time: Option<Instant>,
+    /// When the recording stopped: the clock holds there while it transcribes.
+    stop_time: Option<Instant>,
+    smoothed_level: f32,
+    bars: [f32; WAVE_BARS],
+    transcribe_phase: f64,
+    stop_hovered: bool,
+    active_recording: Option<crate::voice::ActiveRecording>,
+    tick_source: Option<glib::SourceId>,
+    hide_source: Option<glib::SourceId>,
+    /// Bumped by every start and cancel, so a transcription that comes back
+    /// after one of them is dropped instead of pasted.
+    generation: u64,
+}
+
+struct Voice {
+    toggle: Rc<dyn Fn()>,
+    cancel: Rc<dyn Fn() -> bool>,
+}
+
+fn publish_voice_state(on: bool) {
+    let dir = crate::state::cache_dir();
+    let path = dir.join("voice-state");
+    let body = if on {
+        format!("recording\t{}\n", now_ms())
+    } else {
+        String::new()
+    };
+    let _ = fs::create_dir_all(&dir).and_then(|_| fs::write(path, body));
+}
+
+fn publish_voice_paste(text: &str) {
+    let dir = crate::state::cache_dir();
+    let path = dir.join("voice-paste");
+    let body = format!("{}\t{}\n", now_ms(), text);
+    let _ = fs::create_dir_all(&dir).and_then(|_| fs::write(path, body));
+}
+
+fn place_voice_hud(root: &gtk::Fixed, anchor: Option<Point>) -> Point {
+    let screens = overlay_screen_rects(root);
+    let primary = overlay_primary_screen(root);
+    let pointer = anchor.map(|p| (p.x as f64, p.y as f64));
+    let host = screen_containing(pointer, &screens).unwrap_or(primary);
+
+    Point {
+        x: host.x + (host.width - VOICE_HUD_WIDTH) / 2,
+        y: host.y + host.height - VOICE_HUD_HEIGHT - 64,
+    }
+}
+
+/// One bar's next height. All bars follow the voice level at once; the middle
+/// ones reach highest, and each sways at its own pace so speech does not
+/// lift the row as one flat block. Up fast, down slower, then back to a dot.
+fn wave_bar_step(height: f32, index: usize, level: f32, seconds: f32) -> f32 {
+    let middle = (WAVE_BARS - 1) as f32 / 2.0;
+    let off_centre = (index as f32 - middle) / middle;
+    let reach = 1.0 - 0.55 * off_centre * off_centre;
+    let sway = 0.8 + 0.2 * (seconds * (7.0 + 1.3 * index as f32) + index as f32 * 1.7).sin();
+    // A speaking voice sits low on the linear level; the root lifts it into
+    // the meter's upper half without letting a shout overflow it.
+    let target = WAVE_REST + (WAVE_PEAK - WAVE_REST) * level.sqrt() * reach * sway;
+    let follow = if target > height { 0.65 } else { 0.35 };
+    let next = height + (target - height) * follow;
+    if level == 0.0 && next - WAVE_REST < 0.05 {
+        WAVE_REST
+    } else {
+        next.clamp(WAVE_REST, WAVE_PEAK)
+    }
+}
+
+/// The recording clock at the pill's left, its text centred on `cy`.
+fn voice_clock(cr: &Context, clock: &str, cy: f64, ink: (f64, f64, f64), alpha: f64) {
+    cr.select_font_face("Sans", FontSlant::Normal, FontWeight::Bold);
+    cr.set_font_size(11.0);
+    cr.set_source_rgba(ink.0, ink.1, ink.2, alpha);
+    cr.move_to(VOICE_CLOCK_X, cy + 4.0);
+    let _ = cr.show_text(clock);
+}
+
+/// A line of runs centred in the pill. One too long for it (an error from
+/// the recorder, say) loses its tail to an ellipsis rather than the pill's
+/// edge.
+fn voice_message(cr: &Context, cy: f64, runs: &[(&str, FontWeight, (f64, f64, f64), f64)]) {
+    let room = f64::from(VOICE_HUD_WIDTH) - 2.0 * VOICE_CLOCK_X;
+    cr.set_font_size(11.0);
+    let advance = |text: &str, weight: FontWeight| {
+        cr.select_font_face("Sans", FontSlant::Normal, weight);
+        cr.text_extents(text)
+            .map_or(0.0, |extents| extents.x_advance())
+    };
+    let mut texts: Vec<String> = runs.iter().map(|run| run.0.to_owned()).collect();
+    let width = |texts: &[String]| -> f64 {
+        texts
+            .iter()
+            .zip(runs)
+            .map(|(text, run)| advance(text, run.1))
+            .sum()
+    };
+    while width(&texts) > room {
+        let Some(last) = texts.iter_mut().rev().find(|text| !text.is_empty()) else {
+            break;
+        };
+        let mut kept: Vec<char> = last.trim_end_matches('…').chars().collect();
+        kept.pop();
+        *last = if kept.is_empty() {
+            String::new()
+        } else {
+            format!("{}…", kept.into_iter().collect::<String>().trim_end())
+        };
+    }
+    let mut x = (f64::from(VOICE_HUD_WIDTH) - width(&texts)) / 2.0;
+    for (text, run) in texts.iter().zip(runs) {
+        let (_, weight, ink, alpha) = *run;
+        cr.select_font_face("Sans", FontSlant::Normal, weight);
+        cr.set_source_rgba(ink.0, ink.1, ink.2, alpha);
+        cr.move_to(x, cy + 4.0);
+        let _ = cr.show_text(text);
+        x += advance(text, weight);
+    }
+}
+
+/// The meter's bars, centred on `cy`, in the source colour already set.
+fn draw_wave_bars(cr: &Context, bars: &[f32], cy: f64) {
+    for (i, height) in bars.iter().enumerate() {
+        let h = f64::from(*height);
+        let x = WAVE_LEFT + i as f64 * (WAVE_BAR_WIDTH + WAVE_BAR_GAP);
+        rounded_rectangle(cr, x, cy - h / 2.0, WAVE_BAR_WIDTH, h, WAVE_BAR_WIDTH / 2.0);
+        let _ = cr.fill();
+    }
+}
+
+fn schedule_voice_hide(
+    card: &gtk::EventBox,
+    state: &Rc<RefCell<VoiceHudState>>,
+    window: &gtk::ApplicationWindow,
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+    interactive: &Rc<Cell<bool>>,
+    root: &gtk::Fixed,
+    delay: Duration,
+) {
+    if let Some(src) = state.borrow_mut().hide_source.take() {
+        src.remove();
+    }
+    let card_hide = card.clone();
+    let state_hide = state.clone();
+    let window_hide = window.clone();
+    let registry_hide = registry.clone();
+    let interactive_hide = interactive.clone();
+    let root_hide = root.clone();
+    let id = glib::timeout_add_local_once(delay, move || {
+        state_hide.borrow_mut().status = VoiceHudStatus::Idle;
+        state_hide.borrow_mut().hide_source = None;
+        card_hide.hide();
+        publish_voice_state(false);
+        invalidate_input_shape_cache();
+        refresh_input_shape(&window_hide, &registry_hide, interactive_hide.get());
+        invalidate_visual_shape_cache();
+        refresh_visual_shape(&window_hide, &root_hide, None);
+    });
+    state.borrow_mut().hide_source = Some(id);
+}
+
+fn install_voice(
+    window: &gtk::ApplicationWindow,
+    root: &gtk::Fixed,
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+    interactive: &Rc<Cell<bool>>,
+    state: Rc<RefCell<AppState>>,
+) -> Voice {
+    publish_voice_state(false);
+    let card = gtk::EventBox::new();
+    card.set_widget_name("voice");
+    card.set_visible_window(true);
+    card.style_context().add_class("card");
+    card.style_context().add_class("voice-hud");
+    card.set_no_show_all(true);
+    card.set_can_focus(false);
+    card.set_size_request(VOICE_HUD_WIDTH, VOICE_HUD_HEIGHT);
+    card.add_events(
+        gdk::EventMask::BUTTON_PRESS_MASK
+            | gdk::EventMask::BUTTON_RELEASE_MASK
+            | gdk::EventMask::POINTER_MOTION_MASK
+            | gdk::EventMask::ENTER_NOTIFY_MASK
+            | gdk::EventMask::LEAVE_NOTIFY_MASK,
+    );
+
+    let area = gtk::DrawingArea::new();
+    area.set_size_request(VOICE_HUD_WIDTH, VOICE_HUD_HEIGHT);
+    area.show();
+    card.add(&area);
+    root.put(&card, 0, 0);
+    card.hide();
+
+    let initial_color_mode = saved_color_mode(&state.borrow(), "voice");
+    let color_mode = Rc::new(Cell::new(foreground_for_mode(initial_color_mode)));
+    register(
+        registry,
+        "voice",
+        &card,
+        color_mode.clone(),
+        initial_color_mode,
+    );
+
+    let hud_state = Rc::new(RefCell::new(VoiceHudState {
+        status: VoiceHudStatus::Idle,
+        start_time: None,
+        stop_time: None,
+        smoothed_level: 0.0,
+        bars: [WAVE_REST; WAVE_BARS],
+        transcribe_phase: 0.0,
+        stop_hovered: false,
+        active_recording: None,
+        tick_source: None,
+        hide_source: None,
+        generation: 0,
+    }));
+
+    card.connect_motion_notify_event({
+        let state = hud_state.clone();
+        let area = area.clone();
+        move |_, event| {
+            let (x, y) = event.position();
+            let dx = x - VOICE_STOP_X;
+            let dy = y - (VOICE_HUD_HEIGHT as f64 / 2.0);
+            let inside = dx * dx + dy * dy <= 12.0 * 12.0;
+            if state.borrow().stop_hovered != inside {
+                state.borrow_mut().stop_hovered = inside;
+                area.queue_draw();
+            }
+            glib::Propagation::Proceed
+        }
+    });
+
+    card.connect_leave_notify_event({
+        let state = hud_state.clone();
+        let area = area.clone();
+        move |_, _| {
+            if state.borrow().stop_hovered {
+                state.borrow_mut().stop_hovered = false;
+                area.queue_draw();
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    area.connect_draw({
+        let state = hud_state.clone();
+        let color_mode = color_mode.clone();
+        move |_, cr| {
+            let (status, elapsed_secs, smoothed_level, bars, transcribe_phase, stop_hovered) = {
+                let data = state.borrow();
+                let elapsed = data.start_time.map_or(0, |start| {
+                    data.stop_time
+                        .unwrap_or_else(Instant::now)
+                        .duration_since(start)
+                        .as_secs()
+                });
+                (
+                    data.status.clone(),
+                    elapsed,
+                    data.smoothed_level,
+                    data.bars,
+                    data.transcribe_phase,
+                    data.stop_hovered,
+                )
+            };
+
+            let fg = color_mode.get();
+            let (ink_r, ink_g, ink_b) = match fg {
+                Foreground::Dark => (0.12, 0.12, 0.13),
+                Foreground::Light => (0.96, 0.96, 0.97),
+            };
+            let cy = VOICE_HUD_HEIGHT as f64 / 2.0;
+
+            let ink = (ink_r, ink_g, ink_b);
+            let clock = format!("{}:{:02}", elapsed_secs / 60, elapsed_secs % 60);
+            match &status {
+                VoiceHudStatus::Recording => {
+                    voice_clock(cr, &clock, cy, ink, 1.0);
+
+                    // The level meter, brighter while there is voice
+                    let alpha = f64::from(0.55 + smoothed_level * 0.45).min(1.0);
+                    cr.set_source_rgba(ink_r, ink_g, ink_b, alpha);
+                    draw_wave_bars(cr, &bars, cy);
+
+                    let (red_r, red_g, red_b) = if stop_hovered {
+                        (1.0, 0.27, 0.23)
+                    } else {
+                        (1.0, 0.23, 0.19)
+                    };
+                    cr.arc(VOICE_STOP_X, cy, 7.5, 0.0, 2.0 * std::f64::consts::PI);
+                    cr.set_source_rgb(red_r, red_g, red_b);
+                    let _ = cr.fill();
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    rounded_rectangle(cr, VOICE_STOP_X - 2.5, cy - 2.5, 5.0, 5.0, 1.0);
+                    let _ = cr.fill();
+                }
+                VoiceHudStatus::Transcribing => {
+                    // The clock held at the length recorded, the meter at rest,
+                    // and a spinner where the stop button was.
+                    voice_clock(cr, &clock, cy, ink, 0.5);
+                    cr.set_source_rgba(ink_r, ink_g, ink_b, 0.35);
+                    draw_wave_bars(cr, &[WAVE_REST; WAVE_BARS], cy);
+
+                    cr.set_line_width(1.6);
+                    cr.set_line_cap(cairo::LineCap::Round);
+                    cr.set_source_rgba(ink_r, ink_g, ink_b, 0.22);
+                    cr.arc(VOICE_STOP_X, cy, 5.5, 0.0, 2.0 * std::f64::consts::PI);
+                    let _ = cr.stroke();
+                    cr.set_source_rgba(ink_r, ink_g, ink_b, 0.90);
+                    cr.arc(
+                        VOICE_STOP_X,
+                        cy,
+                        5.5,
+                        transcribe_phase * 2.0,
+                        transcribe_phase * 2.0 + 1.3 * std::f64::consts::PI,
+                    );
+                    let _ = cr.stroke();
+                }
+                VoiceHudStatus::Done(provider) => {
+                    // "copied" first, the model after it in a quieter voice.
+                    let model = format!(" · {provider}");
+                    voice_message(
+                        cr,
+                        cy,
+                        &[
+                            ("copied", FontWeight::Bold, ink, 1.0),
+                            (&model, FontWeight::Normal, ink, 0.6),
+                        ],
+                    );
+                }
+                VoiceHudStatus::Error(msg) => {
+                    voice_message(cr, cy, &[(msg, FontWeight::Bold, (1.0, 0.27, 0.23), 1.0)]);
+                }
+                VoiceHudStatus::Idle => {}
+            }
+
+            glib::Propagation::Proceed
+        }
+    });
+
+    let app_state_for_transcribe = state.clone();
+    let stop_and_transcribe = {
+        let state = hud_state.clone();
+        let card = card.clone();
+        let area = area.clone();
+        let window = window.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let root = root.clone();
+        let app_state = app_state_for_transcribe.clone();
+        Rc::new(move || {
+            let active = state.borrow_mut().active_recording.take();
+            let Some(rec) = active else {
+                return;
+            };
+            publish_voice_state(false);
+            rec.stop();
+            state.borrow_mut().stop_time = Some(Instant::now());
+
+            if let Some(src) = state.borrow_mut().tick_source.take() {
+                src.remove();
+            }
+
+            state.borrow_mut().status = VoiceHudStatus::Transcribing;
+            area.queue_draw();
+
+            let shimmer_area = area.clone();
+            let shimmer_state = state.clone();
+            let shimmer_id = glib::timeout_add_local(Duration::from_millis(33), move || {
+                let status = shimmer_state.borrow().status.clone();
+                if status == VoiceHudStatus::Transcribing {
+                    shimmer_state.borrow_mut().transcribe_phase += 0.20;
+                    shimmer_area.queue_draw();
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
+            });
+            state.borrow_mut().tick_source = Some(shimmer_id);
+            let voice_pref = app_state.borrow().settings.voice_model;
+            let generation = state.borrow().generation;
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::Builder::new()
+                .name("sysi-transcribe".to_owned())
+                .spawn(move || {
+                    let outcome = rec.outcome_rx.recv_blocking();
+                    match outcome {
+                        Ok(Ok(pcm)) => {
+                            let res = crate::voice::transcribe_audio_multi(&pcm, voice_pref);
+                            let _ = tx.send_blocking(res);
+                        }
+                        Ok(Err(e)) => {
+                            let _ = tx.send_blocking(Err(e));
+                        }
+                        Err(_) => {
+                            let _ = tx.send_blocking(Err("AUDIO ERROR".to_owned()));
+                        }
+                    }
+                })
+                .ok();
+
+            glib::MainContext::default().spawn_local({
+                let state = state.clone();
+                let card = card.clone();
+                let area = area.clone();
+                let window = window.clone();
+                let registry = registry.clone();
+                let interactive = interactive.clone();
+                let root = root.clone();
+                async move {
+                    let Ok(res) = rx.recv().await else {
+                        return;
+                    };
+                    if state.borrow().generation != generation {
+                        return;
+                    }
+                    if let Some(src) = state.borrow_mut().tick_source.take() {
+                        src.remove();
+                    }
+                    match res {
+                        Ok(result) => {
+                            let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+                            clipboard.set_text(&result.text);
+                            clipboard.store();
+                            publish_voice_paste(&result.text);
+                            state.borrow_mut().status = VoiceHudStatus::Done(result.provider);
+                            area.queue_draw();
+                            schedule_voice_hide(
+                                &card,
+                                &state,
+                                &window,
+                                &registry,
+                                &interactive,
+                                &root,
+                                // Long enough to read which model wrote it; a click
+                                // on the pill puts it away sooner.
+                                Duration::from_secs(5),
+                            );
+                        }
+                        Err(err) => {
+                            state.borrow_mut().status = VoiceHudStatus::Error(err);
+                            area.queue_draw();
+                            schedule_voice_hide(
+                                &card,
+                                &state,
+                                &window,
+                                &registry,
+                                &interactive,
+                                &root,
+                                Duration::from_millis(2200),
+                            );
+                        }
+                    }
+                }
+            });
+        })
+    };
+
+    let start = {
+        let state = hud_state.clone();
+        let card = card.clone();
+        let area = area.clone();
+        let window = window.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let root = root.clone();
+        let stop_and_transcribe = stop_and_transcribe.clone();
+        Rc::new(move || {
+            state.borrow_mut().generation += 1;
+            if let Some(src) = state.borrow_mut().hide_source.take() {
+                src.remove();
+            }
+            if let Some(src) = state.borrow_mut().tick_source.take() {
+                src.remove();
+            }
+            if let Some(rec) = state.borrow_mut().active_recording.take() {
+                rec.cancel();
+            }
+
+            let recording = match crate::voice::start_recording() {
+                Ok(rec) => rec,
+                Err(err) => {
+                    state.borrow_mut().status = VoiceHudStatus::Error(err);
+                    let pos = place_voice_hud(&root, PANEL_ANCHOR.with(|c| c.get()));
+                    root.remove(&card);
+                    root.put(&card, pos.x, pos.y);
+                    area.show();
+                    card.show();
+                    area.queue_draw();
+                    invalidate_input_shape_cache();
+                    refresh_input_shape(&window, &registry, interactive.get());
+                    schedule_voice_hide(
+                        &card,
+                        &state,
+                        &window,
+                        &registry,
+                        &interactive,
+                        &root,
+                        Duration::from_millis(2500),
+                    );
+                    return;
+                }
+            };
+
+            let level_rx = recording.level_rx.clone();
+            state.borrow_mut().active_recording = Some(recording);
+            state.borrow_mut().status = VoiceHudStatus::Recording;
+            state.borrow_mut().start_time = Some(Instant::now());
+            state.borrow_mut().stop_time = None;
+            state.borrow_mut().smoothed_level = 0.0;
+            state.borrow_mut().bars = [WAVE_REST; WAVE_BARS];
+
+            publish_voice_state(true);
+
+            let pos = place_voice_hud(&root, PANEL_ANCHOR.with(|c| c.get()));
+            root.remove(&card);
+            root.put(&card, pos.x, pos.y);
+            area.show();
+            card.show();
+            area.queue_draw();
+            invalidate_input_shape_cache();
+            refresh_input_shape(&window, &registry, interactive.get());
+            invalidate_visual_shape_cache();
+            refresh_visual_shape(&window, &root, None);
+
+            let tick_area = area.clone();
+            let tick_state = state.clone();
+            let tick_stop = stop_and_transcribe.clone();
+            // What the last frame showed: in silence the bars lie flat, and only
+            // the clock's second needs the pill drawn again (and the glass under
+            // it copied again with it).
+            let mut drawn: Option<(u64, bool)> = None;
+            let tick_id = glib::timeout_add_local(Duration::from_millis(33), move || {
+                let status = tick_state.borrow().status.clone();
+                if status != VoiceHudStatus::Recording {
+                    return glib::ControlFlow::Break;
+                }
+                let mut latest_level: Option<f32> = None;
+                while let Ok(level) = level_rx.try_recv() {
+                    if latest_level.is_none_or(|cur| level > cur) {
+                        latest_level = Some(level);
+                    }
+                }
+                let mut data = tick_state.borrow_mut();
+                if let Some(lvl) = latest_level {
+                    // Noise gate: cut out ambient room hiss and fan noise
+                    let gated = if lvl < 0.045 {
+                        0.0
+                    } else {
+                        ((lvl - 0.045) / (1.0 - 0.045)).powf(1.15)
+                    };
+
+                    if gated > data.smoothed_level {
+                        data.smoothed_level = data.smoothed_level * 0.25 + gated * 0.75;
+                    } else {
+                        data.smoothed_level = data.smoothed_level * 0.75 + gated * 0.25;
+                    }
+                } else {
+                    data.smoothed_level *= 0.82;
+                }
+                if data.smoothed_level < 0.005 {
+                    data.smoothed_level = 0.0;
+                }
+
+                let level = data.smoothed_level;
+                let t = data.start_time.map_or(0.0, |t| t.elapsed().as_secs_f32());
+                for (i, bar) in data.bars.iter_mut().enumerate() {
+                    *bar = wave_bar_step(*bar, i, level, t);
+                }
+                let elapsed = data.start_time.map_or(0, |t| t.elapsed().as_secs());
+                // The recorder has finished by itself (its 10-minute cap, or
+                // PipeWire gone): take what it has rather than count on.
+                let ended = data
+                    .active_recording
+                    .as_ref()
+                    .is_some_and(|rec| !rec.outcome_rx.is_empty());
+                if ended || elapsed >= crate::voice::MAX_RECORDING_SECS {
+                    drop(data);
+                    tick_stop();
+                    return glib::ControlFlow::Break;
+                }
+                let flat = data.bars.iter().all(|bar| *bar == WAVE_REST);
+                if drawn != Some((elapsed, true)) || !flat {
+                    drawn = Some((elapsed, flat));
+                    tick_area.queue_draw();
+                }
+                glib::ControlFlow::Continue
+            });
+            state.borrow_mut().tick_source = Some(tick_id);
+        })
+    };
+
+    let cancel = {
+        let state = hud_state.clone();
+        let card = card.clone();
+        let window = window.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let root = root.clone();
+        Rc::new(move || {
+            let status = state.borrow().status.clone();
+            if status == VoiceHudStatus::Idle {
+                return false;
+            }
+            state.borrow_mut().generation += 1;
+            if let Some(rec) = state.borrow_mut().active_recording.take() {
+                rec.cancel();
+            }
+            if let Some(src) = state.borrow_mut().tick_source.take() {
+                src.remove();
+            }
+            if let Some(src) = state.borrow_mut().hide_source.take() {
+                src.remove();
+            }
+            publish_voice_state(false);
+            state.borrow_mut().status = VoiceHudStatus::Idle;
+            card.hide();
+            invalidate_input_shape_cache();
+            refresh_input_shape(&window, &registry, interactive.get());
+            invalidate_visual_shape_cache();
+            refresh_visual_shape(&window, &root, None);
+            true
+        })
+    };
+
+    card.connect_button_press_event({
+        let state = hud_state.clone();
+        let start = start.clone();
+        let stop_and_transcribe = stop_and_transcribe.clone();
+        let cancel = cancel.clone();
+        move |_, event| {
+            if event.button() == 1 {
+                let (x, y) = event.position();
+                let status = state.borrow().status.clone();
+                match status {
+                    VoiceHudStatus::Recording => {
+                        let dx = x - VOICE_STOP_X;
+                        let dy = y - (VOICE_HUD_HEIGHT as f64 / 2.0);
+                        if dx * dx + dy * dy <= 14.0 * 14.0 {
+                            stop_and_transcribe();
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    VoiceHudStatus::Error(_) => {
+                        start();
+                        return glib::Propagation::Stop;
+                    }
+                    VoiceHudStatus::Done(_) => {
+                        cancel();
+                        return glib::Propagation::Stop;
+                    }
+                    _ => {}
+                }
+            } else if event.button() == 3 {
+                cancel();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+
+    let toggle = {
+        let state = hud_state.clone();
+        let start = start.clone();
+        let stop_and_transcribe = stop_and_transcribe.clone();
+        Rc::new(move || {
+            let status = state.borrow().status.clone();
+            match status {
+                VoiceHudStatus::Idle | VoiceHudStatus::Done(_) | VoiceHudStatus::Error(_) => {
+                    start();
+                }
+                VoiceHudStatus::Recording => {
+                    stop_and_transcribe();
+                }
+                VoiceHudStatus::Transcribing => {}
+            }
+        })
+    };
+
+    Voice { toggle, cancel }
+}
+
 fn refresh_input_shape(
     window: &gtk::ApplicationWindow,
     registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
@@ -13478,7 +14211,11 @@ fn collect_widget_input_shape(
 }
 
 fn receives_input_when_locked(key: &str) -> bool {
-    key.starts_with("note:") || key.starts_with("dict:") || key == "notes" || key == "usage"
+    key.starts_with("note:")
+        || key.starts_with("dict:")
+        || key == "notes"
+        || key == "usage"
+        || key == "voice"
 }
 
 /// Describe the root-window image and how monitor coordinates map into it.
@@ -14649,11 +15386,11 @@ mod tests {
         read_compositor_pointer, receives_input_when_locked, record_note_undo, reopen_point,
         repaired_image_size, rescaled_from, resize_ceiling, resize_rect, resize_width_limit,
         resized_image_size, room_on_screen, round_pixbuf_corners, sanitize_highlights,
-        screen_in_overlay, tag_choices, top_child_at, top_raised_child_at, Foreground,
-        NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState, ResizeBounds,
-        ResizeEdges, ScreenRect, WidgetPalette, DRAG_REDRAW_INTERVAL, NOTES_POINTER, NOTE_HEIGHT,
-        NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN, NOTE_IMAGE_PASTE_MAX, NOTE_WIDTH,
-        PANEL_ANCHOR,
+        screen_in_overlay, tag_choices, top_child_at, top_raised_child_at, wave_bar_step,
+        Foreground, NoteSearchMatch, NoteSearchOptions, NoteSnapshot, NoteUndo, NoteUndoState,
+        ResizeBounds, ResizeEdges, ScreenRect, WidgetPalette, DRAG_REDRAW_INTERVAL, NOTES_POINTER,
+        NOTE_HEIGHT, NOTE_IMAGE_BORDER_RADIUS, NOTE_IMAGE_MAX, NOTE_IMAGE_MIN,
+        NOTE_IMAGE_PASTE_MAX, NOTE_WIDTH, PANEL_ANCHOR, WAVE_BARS, WAVE_PEAK, WAVE_REST,
     };
     use crate::state::{
         ColorMode, HighlightColor, Note, NoteHighlight, NoteImage, Point, Size, IMAGE_PLACEHOLDER,
@@ -14885,6 +15622,26 @@ mod tests {
         for (start, end) in corners {
             assert_eq!(dictate_rect_from_drag(start, end), Some(expected));
         }
+    }
+
+    #[test]
+    fn the_voice_meter_rises_in_the_middle_and_settles_to_dots() {
+        let mut bars = [WAVE_REST; WAVE_BARS];
+        for frame in 0..10 {
+            let t = frame as f32 * 0.033;
+            for (i, bar) in bars.iter_mut().enumerate() {
+                *bar = wave_bar_step(*bar, i, 1.0, t);
+            }
+        }
+        let middle = WAVE_BARS / 2;
+        assert!(bars[middle] > bars[0] && bars[middle] > bars[WAVE_BARS - 1]);
+        assert!(bars.iter().all(|bar| (WAVE_REST..=WAVE_PEAK).contains(bar)));
+        for frame in 0..40 {
+            for (i, bar) in bars.iter_mut().enumerate() {
+                *bar = wave_bar_step(*bar, i, 0.0, frame as f32 * 0.033);
+            }
+        }
+        assert_eq!(bars, [WAVE_REST; WAVE_BARS]);
     }
 
     #[test]

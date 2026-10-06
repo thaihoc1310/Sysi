@@ -44,6 +44,70 @@ impl ColorMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VoiceModel {
+    #[default]
+    GeminiFlashLite,
+    GeminiFlashLiteLatest,
+    GeminiTranscribe,
+    GroqWhisper,
+}
+
+impl VoiceModel {
+    pub const ALL: [VoiceModel; 4] = [
+        VoiceModel::GeminiFlashLite,
+        VoiceModel::GeminiFlashLiteLatest,
+        VoiceModel::GeminiTranscribe,
+        VoiceModel::GroqWhisper,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::GeminiFlashLite => "gemini-flash-lite",
+            Self::GeminiFlashLiteLatest => "gemini-flash-lite-latest",
+            Self::GeminiTranscribe => "gemini-transcribe",
+            Self::GroqWhisper => "groq-whisper",
+        }
+    }
+
+    /// The short name the settings menu and the voice HUD show.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GeminiFlashLite => "3.5-fl",
+            Self::GeminiFlashLiteLatest => "fl-latest",
+            Self::GeminiTranscribe => "3.5-trans",
+            Self::GroqWhisper => "groq",
+        }
+    }
+
+    /// The Gemini model behind this choice; Groq's Whisper has none.
+    pub fn gemini_model(self) -> Option<&'static str> {
+        match self {
+            Self::GeminiFlashLite => Some("gemini-3.5-flash-lite"),
+            Self::GeminiFlashLiteLatest => Some("gemini-flash-lite-latest"),
+            Self::GeminiTranscribe => Some("gemini-3.5-transcribe"),
+            Self::GroqWhisper => None,
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "gemini-flash-lite" | "flash-lite" | "3.5-flash-lite" | "gemini-3.5-flash-lite" => {
+                Some(Self::GeminiFlashLite)
+            }
+            "gemini-flash-lite-latest" | "flash-lite-latest" | "lite-latest" => {
+                Some(Self::GeminiFlashLiteLatest)
+            }
+            "gemini-transcribe" | "transcribe" | "3.5-transcribe" | "gemini-3.5-transcribe" => {
+                Some(Self::GeminiTranscribe)
+            }
+            "groq" | "groq-whisper" | "whisper" | "whisper-large-v3" => Some(Self::GroqWhisper),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
@@ -79,6 +143,8 @@ pub struct Settings {
     pub font_size: i32,
     #[serde(default)]
     pub system_details: SystemDetails,
+    #[serde(default)]
+    pub voice_model: VoiceModel,
 }
 
 impl Default for Settings {
@@ -94,6 +160,7 @@ impl Default for Settings {
             highlight_color: HighlightColor::default(),
             font_size: default_font_size(),
             system_details: SystemDetails::default(),
+            voice_model: VoiceModel::default(),
         }
     }
 }

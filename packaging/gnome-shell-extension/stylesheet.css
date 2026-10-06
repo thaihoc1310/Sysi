@@ -62,13 +62,28 @@
   color: #ffffff;
 }
 
+#panel .sysi-voice-recording {
+  color: #ff3b30;
+}
+
+#panel .sysi-voice-recording:hover,
+#panel .sysi-voice-recording:focus {
+  color: #ff453a;
+}
+
 /* Match the translucent GTK context menus instead of the Shell's solid card. */
-.sysi-settings-menu {
+.sysi-settings-menu,
+.sysi-settings-menu.popup-menu-boxpointer,
+.sysi-settings-menu.popup-menu {
   min-width: 0;
+  background-color: transparent;
+  background-gradient-direction: none;
+  border: none;
+  box-shadow: none;
   -arrow-background-color: transparent;
-  -arrow-border-color: rgba(255, 255, 255, 0.08);
+  -arrow-border-color: transparent;
   -arrow-border-width: 0px;
-  -arrow-border-radius: 8px;
+  -arrow-border-radius: 0px;
   -arrow-rise: 0px;
   color: #f4f4f4;
   font-size: 11px;
@@ -95,6 +110,32 @@
   spacing: 2px;
   border-radius: 5px;
   color: #f4f4f4;
+}
+
+/* The voice model row: no grey pill while its list is open, and the list
+   sits flush in the menu rather than in a box of its own. */
+.sysi-settings-menu .sysi-voice-model:open,
+.sysi-settings-menu .sysi-voice-model:checked {
+  background-color: transparent;
+}
+
+.sysi-settings-menu .sysi-voice-model:hover,
+.sysi-settings-menu .sysi-voice-model:focus {
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
+.sysi-settings-menu .popup-sub-menu {
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+}
+
+/* The other models, a shade quieter than the menu's own rows, so the open
+   list reads as belonging to the row above it. */
+.sysi-settings-menu .sysi-voice-option {
+  color: rgba(244, 244, 244, 0.62);
 }
 
 .sysi-settings-menu .sysi-font-control {

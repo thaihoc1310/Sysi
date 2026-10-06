@@ -8,6 +8,7 @@ mod system;
 mod translate;
 mod ui;
 mod usage;
+pub mod voice;
 
 use fs2::FileExt;
 use gtk::prelude::*;
@@ -48,6 +49,54 @@ fn main() {
             eprintln!("Could not install the Sysi panel extension: {error}");
             process::exit(1);
         }
+        return;
+    }
+    if let Some(key) = option_value("--set-groq-key") {
+        match voice::save_groq_key(&key) {
+            Ok(()) => {
+                println!("Groq API key saved to {:?}", voice::groq_key_path());
+            }
+            Err(error) => {
+                eprintln!("Could not save Groq API key: {error}");
+                process::exit(1);
+            }
+        }
+        return;
+    }
+    if let Some(key) = option_value("--set-gemini-key") {
+        match voice::save_gemini_key(&key) {
+            Ok(()) => {
+                println!("Gemini API key saved to {:?}", voice::gemini_key_path());
+            }
+            Err(error) => {
+                eprintln!("Could not save Gemini API key: {error}");
+                process::exit(1);
+            }
+        }
+        return;
+    }
+    if let Some(model_str) = option_value("--set-voice-model") {
+        let Some(model) = state::VoiceModel::from_key(&model_str) else {
+            eprintln!("Unknown voice model '{model_str}'. Choose: flash-lite, lite-latest, transcribe, or groq");
+            process::exit(1);
+        };
+        // A running overlay holds its own copy of the state and would write
+        // the old model back on its next save, so hand the change to it.
+        let action = format!("set-voice-model:{}", model.key());
+        if signal_running(0).is_ok()
+            && write_panel_action(&action, None).is_ok()
+            && signal_running(libc::SIGWINCH).is_ok()
+        {
+            println!("Voice model set to: {}", model.label());
+            return;
+        }
+        let mut app_state = state::AppState::load();
+        app_state.settings.voice_model = model;
+        if let Err(error) = app_state.save() {
+            eprintln!("Could not save settings: {error}");
+            process::exit(1);
+        }
+        println!("Voice model set to: {}", model.label());
         return;
     }
     if std::env::args().any(|arg| arg == "--toggle") {
@@ -99,6 +148,9 @@ fn main() {
     }
     if let Err(error) = install_ocr_hotkey() {
         eprintln!("Could not register Super+Shift+A as a GNOME shortcut: {error}");
+    }
+    if let Err(error) = install_voice_hotkey() {
+        eprintln!("Could not register Super+Shift+V as a GNOME shortcut: {error}");
     }
     write_pid();
 
@@ -349,6 +401,22 @@ fn install_ocr_hotkey() -> io::Result<()> {
         OCR_HOTKEY_COMMAND,
         OCR_HOTKEY_BINDING,
         |binding| binding_is_super_shift(binding, "a"),
+    )
+}
+
+const VOICE_HOTKEY_PATH: &str =
+    "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sysi-voice/";
+const VOICE_HOTKEY_NAME: &str = "Sysi Voice";
+const VOICE_HOTKEY_COMMAND: &str = "sysi --panel-action voice";
+const VOICE_HOTKEY_BINDING: &str = "<Super><Shift>v";
+
+fn install_voice_hotkey() -> io::Result<()> {
+    install_custom_hotkey(
+        VOICE_HOTKEY_PATH,
+        VOICE_HOTKEY_NAME,
+        VOICE_HOTKEY_COMMAND,
+        VOICE_HOTKEY_BINDING,
+        |binding| binding_is_super_shift(binding, "v"),
     )
 }
 

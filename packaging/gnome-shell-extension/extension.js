@@ -18,6 +18,22 @@ const UUID = 'sysi-panel@thaihoc';
 // What the colour item switches every card to from each mode, in the order
 // Sysi cycles them (ColorMode::next).
 const NEXT_MODE = {glass: 'light', light: 'dark', dark: 'glass'};
+// The voice models in Sysi's order (VoiceModel::ALL), each with the short
+// name the settings menu shows for it.
+const VOICE_MODEL_NAMES = {
+    'flash-lite': '3.5-fl',
+    'lite-latest': 'fl-latest',
+    'transcribe': '3.5-trans',
+    'groq': 'groq',
+};
+
+function formatVoiceModel(raw) {
+    if (!raw) return 'flash-lite';
+    if (raw.includes('transcribe')) return 'transcribe';
+    if (raw.includes('lite-latest')) return 'lite-latest';
+    if (raw.includes('groq') || raw.includes('whisper')) return 'groq';
+    return 'flash-lite';
+}
 // Opens and closes the Notes palette. Ctrl+Alt+N until 0.1.77.
 const NOTES_BINDING = '<Super><Shift>l';
 const NOTES_LEGACY_BINDING = '<control><alt>n';
@@ -79,6 +95,7 @@ export default class SysiPanelExtension extends Extension {
         this._addAction('usage', 'toggle-usage');
         this._addAction('dictionary', 'toggle-translate');
         this._addAction('ocr', 'ocr');
+        this._voiceButton = this._addAction('voice', 'voice');
         this._buildSettings();
 
         this._gear.connect('clicked', () => {
@@ -180,6 +197,35 @@ export default class SysiPanelExtension extends Extension {
         } catch (error) {
             logError(error, 'Sysi could not watch OCR Escape');
         }
+        this._voiceStateFile = Gio.File.new_for_path(
+            GLib.build_filenamev([cacheDir, 'voice-state']),
+        );
+        if (!this._voiceStateFile.query_exists(null))
+            GLib.file_set_contents(this._voiceStateFile.get_path(), '');
+        try {
+            this._voiceStateMonitor = this._voiceStateFile.monitor_file(
+                Gio.FileMonitorFlags.NONE,
+                null,
+            );
+            this._voiceStateMonitor.connect('changed', () => this._syncVoiceState());
+        } catch (error) {
+            logError(error, 'Sysi could not watch voice state');
+        }
+        this._voicePasteFile = Gio.File.new_for_path(
+            GLib.build_filenamev([cacheDir, 'voice-paste']),
+        );
+        if (!this._voicePasteFile.query_exists(null))
+            GLib.file_set_contents(this._voicePasteFile.get_path(), '');
+        try {
+            this._voicePasteMonitor = this._voicePasteFile.monitor_file(
+                Gio.FileMonitorFlags.NONE,
+                null,
+            );
+            this._voicePasteMonitor.connect('changed', () => this._handleVoicePaste());
+        } catch (error) {
+            logError(error, 'Sysi could not watch voice paste');
+        }
+        this._bindVoiceHotkey();
         this._bindNotesHotkey();
         this._bindOcrHotkey();
         // Xwayland never sees Super while a Wayland app has focus. Grab these here instead.
@@ -191,6 +237,7 @@ export default class SysiPanelExtension extends Extension {
             this._grabKey('<Super><Shift>u', 'toggle-usage'),
         ].filter(Boolean);
         this._syncOcrEscape();
+        this._syncVoiceState();
         this._syncPanelState();
         this._syncVisibility();
         this._glass = new GlassManager();
@@ -210,6 +257,16 @@ export default class SysiPanelExtension extends Extension {
         this._panelStateMonitor = null;
         this._unbindNotesHotkey();
         this._unbindOcrHotkey();
+        this._unbindVoiceHotkey();
+        this._unbindVoiceEscape();
+        this._voiceStateMonitor?.cancel();
+        this._voiceStateMonitor = null;
+        this._voiceStateFile = null;
+        this._voicePasteMonitor?.cancel();
+        this._voicePasteMonitor = null;
+        this._voicePasteFile = null;
+        this._voiceButton = null;
+        this._virtualKeyboard = null;
         for (const grab of this._plainGrabs ?? [])
             this._ungrabKey(grab);
         this._plainGrabs = [];
@@ -236,6 +293,8 @@ export default class SysiPanelExtension extends Extension {
         this._system = null;
         this._timer = null;
         this._modeLabel = null;
+        this._voiceModelLabel = null;
+        this._voiceItems = null;
         this._lockLabel = null;
         this._hideLabel = null;
         this._pidFile = null;
@@ -263,6 +322,36 @@ export default class SysiPanelExtension extends Extension {
         // Do not emit PopupMenuItem's activate signal: it closes the menu.
         mode.activate = () => this._runAction('next-color-mode', button);
         this._settingsMenu.addMenuItem(mode);
+
+        // A pick of four rather than a toggle: the row names the model in
+        // use and opens on a click to the others, each switching to itself.
+        const voice = new PopupMenu.PopupSubMenuMenuItem('');
+        voice.add_style_class_name('sysi-voice-model');
+        this._voiceModelLabel = voice.label;
+        voice.label.x_align = Clutter.ActorAlign.CENTER;
+        voice.label.x_expand = true;
+        // Only the word, centred like the rows around it: no expander, no arrow.
+        for (const child of voice.get_children()) {
+            if (child !== voice.label)
+                child.hide();
+        }
+        this._voiceItems = {};
+        for (const [model, name] of Object.entries(VOICE_MODEL_NAMES)) {
+            const item = new PopupMenu.PopupMenuItem(name);
+            item.add_style_class_name('sysi-voice-option');
+            item.label.x_align = Clutter.ActorAlign.CENTER;
+            item.label.x_expand = true;
+            item.activate = () => {
+                // Sysi writes the new model a moment later; show it now.
+                this._showVoiceModel(model);
+                this._runAction(`set-voice-model:${model}`, button);
+                voice.menu.close(true);
+            };
+            voice.menu.addMenuItem(item);
+            this._voiceItems[model] = item;
+        }
+        this._settingsMenu.addMenuItem(voice);
+        this._showVoiceModel(formatVoiceModel(this._readVoiceModel()));
 
         const row = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
         row.add_style_class_name('sysi-font-row');
@@ -349,6 +438,36 @@ export default class SysiPanelExtension extends Extension {
         }
     }
 
+    // The row names the model in use, so its list holds only the others.
+    _showVoiceModel(model) {
+        this._voiceModelLabel.text = VOICE_MODEL_NAMES[model];
+        for (const [name, item] of Object.entries(this._voiceItems ?? {}))
+            item.visible = name !== model;
+    }
+
+    _readVoiceModel() {
+        try {
+            const cachePath = GLib.build_filenamev([GLib.get_user_cache_dir(), 'sysi', 'voice-model']);
+            const [cacheOk, cacheContents] = GLib.file_get_contents(cachePath);
+            if (cacheOk) {
+                const text = new TextDecoder().decode(cacheContents).trim();
+                if (text) return text;
+            }
+            const path = GLib.build_filenamev([
+                GLib.get_user_config_dir(),
+                'sysi',
+                'state.json',
+            ]);
+            const [ok, contents] = GLib.file_get_contents(path);
+            const model = ok
+                ? JSON.parse(new TextDecoder().decode(contents))?.settings?.voice_model
+                : null;
+            return model || 'flash-lite';
+        } catch (_) {
+            return 'flash-lite';
+        }
+    }
+
     // The overlay cannot work out where this button is on its own. The panel is
     // the compositor's own surface, so while the pointer is over it the X server
     // sees nothing — asking it returns wherever the mouse last crossed an X
@@ -360,14 +479,16 @@ export default class SysiPanelExtension extends Extension {
         // Snapshot the target before we steal focus. Activating the
         // overlay first made Notes see Sysi itself (or the mouse) and
         // walk the palette to the other monitor a frame later.
+        if (action === 'voice')
+            this._lastFocusedWindow = global.display.focus_window;
         const notes = action === 'toggle-notes' || action === 'toggle-history';
         const ocr = action === 'ocr' || action === 'dictate';
-        // A new note or dictionary is for typing into straight away.
+        const voice = action === 'voice';
         const typing = action === 'new-note' || action === 'new-dictionary';
         const cancelOcr = action === 'cancel-ocr';
-        const anchor = button
+        const anchor = button && !voice
             ? this._anchorOf(button)
-            : notes ? this._focusAnchor() : this._pointerAnchor();
+            : (notes || voice) ? this._focusAnchor() : this._pointerAnchor();
         if (notes || ocr || typing)
             this._activateOverlaySoon();
         if (cancelOcr) {
@@ -699,6 +820,202 @@ export default class SysiPanelExtension extends Extension {
         this._restoreCustomOcrShortcut();
     }
 
+    _voiceShortcutSettings() {
+        try {
+            return new Gio.Settings({
+                schema_id: 'org.gnome.settings-daemon.plugins.media-keys.custom-keybinding',
+                path: '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sysi-voice/',
+            });
+        } catch (_) {
+            return null;
+        }
+    }
+
+    _silenceCustomVoiceShortcut() {
+        const settings = this._voiceShortcutSettings();
+        if (!settings)
+            return;
+        if (settings.get_string('command') !== 'sysi --panel-action voice')
+            return;
+        const binding = settings.get_string('binding');
+        if (!binding)
+            return;
+        this._voiceShortcutBinding = binding;
+        settings.set_string('binding', '');
+    }
+
+    _restoreCustomVoiceShortcut() {
+        const settings = this._voiceShortcutSettings();
+        if (!settings || !this._voiceShortcutBinding)
+            return;
+        if (!settings.get_string('binding'))
+            settings.set_string('binding', this._voiceShortcutBinding);
+        this._voiceShortcutBinding = null;
+    }
+
+    _bindVoiceHotkey() {
+        this._silenceCustomVoiceShortcut();
+        try {
+            this._voiceAccelAction = global.display.grab_accelerator(
+                '<Super><Shift>v',
+                Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            );
+        } catch (error) {
+            logError(error, 'Sysi could not grab Super+Shift+V');
+            this._voiceAccelAction = 0;
+            this._restoreCustomVoiceShortcut();
+            return;
+        }
+        if (!this._voiceAccelAction || this._voiceAccelAction === Meta.KeyBindingAction.NONE) {
+            this._voiceAccelAction = 0;
+            this._restoreCustomVoiceShortcut();
+            return;
+        }
+        this._voiceAccelName = Meta.external_binding_name_for_action(this._voiceAccelAction);
+        Main.wm.allowKeybinding(
+            this._voiceAccelName,
+            Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+        );
+        this._voiceAccelId = global.display.connect(
+            'accelerator-activated',
+            (_display, action) => {
+                if (action !== this._voiceAccelAction)
+                    return;
+                this._lastFocusedWindow = global.display.focus_window;
+                this._runAction('voice', null);
+            },
+        );
+    }
+
+    _unbindVoiceHotkey() {
+        if (this._voiceAccelId) {
+            global.display.disconnect(this._voiceAccelId);
+            this._voiceAccelId = 0;
+        }
+        if (this._voiceAccelName)
+            Main.wm.allowKeybinding(this._voiceAccelName, Shell.ActionMode.NONE);
+        if (this._voiceAccelAction)
+            global.display.ungrab_accelerator(this._voiceAccelAction);
+        this._voiceAccelAction = 0;
+        this._voiceAccelName = null;
+        this._restoreCustomVoiceShortcut();
+    }
+
+    _voiceRecording() {
+        if (!this._voiceStateFile || this._readPid() <= 0)
+            return false;
+        try {
+            const [ok, contents] = GLib.file_get_contents(this._voiceStateFile.get_path());
+            return ok && new TextDecoder().decode(contents).trim().startsWith('recording');
+        } catch (_) {
+            return false;
+        }
+    }
+
+    _syncVoiceState() {
+        const recording = this._voiceRecording();
+        if (this._voiceButton) {
+            const label = this._voiceButton.get_first_child();
+            if (label) {
+                if (recording) {
+                    label.text = '● voice';
+                    this._voiceButton.add_style_class_name('sysi-voice-recording');
+                } else {
+                    label.text = 'voice';
+                    this._voiceButton.remove_style_class_name('sysi-voice-recording');
+                }
+            }
+        }
+        if (recording)
+            this._bindVoiceEscape();
+        else
+            this._unbindVoiceEscape();
+    }
+
+    _bindVoiceEscape() {
+        this._voiceEscapeGrab ??= this._grabKey('Escape', 'cancel-voice') ??
+            this._grabKey('<Escape>', 'cancel-voice');
+    }
+
+    _unbindVoiceEscape() {
+        if (this._voiceEscapeGrab)
+            this._ungrabKey(this._voiceEscapeGrab);
+        this._voiceEscapeGrab = null;
+    }
+
+    _handleVoicePaste() {
+        if (!this._voicePasteFile || this._readPid() <= 0)
+            return;
+        try {
+            const [ok, contents] = GLib.file_get_contents(this._voicePasteFile.get_path());
+            if (!ok)
+                return;
+            const text = new TextDecoder().decode(contents).trim();
+            if (!text)
+                return;
+            const tabIdx = text.indexOf('\t');
+            if (tabIdx === -1)
+                return;
+            const nonce = text.substring(0, tabIdx);
+            if (this._lastPasteNonce === nonce)
+                return;
+            this._lastPasteNonce = nonce;
+            const payload = text.substring(tabIdx + 1);
+            // The dictation is on the clipboard now; keep none of it on disk.
+            GLib.file_set_contents(this._voicePasteFile.get_path(), '');
+
+            St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, payload);
+
+            if (this._lastFocusedWindow)
+                this._lastFocusedWindow.activate(global.get_current_time());
+
+            const targetWin = global.display.focus_window || this._lastFocusedWindow;
+            const wmClass = targetWin ? (targetWin.get_wm_class() || '').toLowerCase() : '';
+            const isTerminal = /terminal|kitty|ghostty|alacritty|wezterm|ptyxis|foot|xterm/.test(wmClass);
+
+            this._simulatePaste(isTerminal);
+        } catch (error) {
+            logError(error, 'Sysi voice paste failed');
+        }
+    }
+
+    _simulatePaste(isTerminal) {
+        try {
+            const seat = Clutter.get_default_backend().get_default_seat();
+            if (!this._virtualKeyboard) {
+                this._virtualKeyboard = seat.create_virtual_device(
+                    Clutter.InputDeviceType.KEYBOARD_DEVICE,
+                );
+            }
+            const vk = this._virtualKeyboard;
+            const KEY_CTRL = Clutter.KEY_Control_L || 0xffe3;
+            const KEY_SHIFT = Clutter.KEY_Shift_L || 0xffe1;
+            const KEY_V = Clutter.KEY_v || 0x0076;
+
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 40, () => {
+                const t1 = GLib.get_monotonic_time();
+                vk.notify_keyval(t1, KEY_CTRL, Clutter.KeyState.PRESSED);
+                if (isTerminal)
+                    vk.notify_keyval(t1, KEY_SHIFT, Clutter.KeyState.PRESSED);
+
+                const t2 = t1 + 8000;
+                vk.notify_keyval(t2, KEY_V, Clutter.KeyState.PRESSED);
+
+                const t3 = t2 + 8000;
+                vk.notify_keyval(t3, KEY_V, Clutter.KeyState.RELEASED);
+
+                const t4 = t3 + 8000;
+                if (isTerminal)
+                    vk.notify_keyval(t4, KEY_SHIFT, Clutter.KeyState.RELEASED);
+                vk.notify_keyval(t4, KEY_CTRL, Clutter.KeyState.RELEASED);
+
+                return GLib.SOURCE_REMOVE;
+            });
+        } catch (error) {
+            logError(error, 'Sysi voice virtual keyboard paste simulation failed');
+        }
+    }
+
     _writeAnchor(text) {
         try {
             GLib.file_set_contents(
@@ -825,6 +1142,8 @@ export default class SysiPanelExtension extends Extension {
             this._hideLabel.text = this._overlayWindow() ? 'hide' : 'show';
         if (this._modeLabel)
             this._modeLabel.text = NEXT_MODE[mode ?? this._readColorMode()];
+        if (this._voiceModelLabel)
+            this._showVoiceModel(formatVoiceModel(this._readVoiceModel()));
     }
 
     _writeCacheFile(name, contents) {

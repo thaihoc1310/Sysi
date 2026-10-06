@@ -48,6 +48,16 @@ impl Outline {
         }
     }
 
+    pub fn pill(x: f64, y: f64, width: f64, height: f64) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            radius: (width / 2.0).min(height / 2.0),
+        }
+    }
+
     pub fn trace(&self, cr: &Context) {
         let Self {
             x,
@@ -100,12 +110,21 @@ pub fn wire_cards(samples: &[CardSample], scale: f64) -> Vec<WireCard> {
         // A hidden card keeps a 1x1 allocation.
         .filter(|card| card.width > 1 && card.height > 1)
         .map(|card| {
-            let outline = Outline::new(
-                f64::from(card.x),
-                f64::from(card.y),
-                f64::from(card.width),
-                f64::from(card.height),
-            );
+            let outline = if card.key == "voice" {
+                Outline::pill(
+                    f64::from(card.x),
+                    f64::from(card.y),
+                    f64::from(card.width),
+                    f64::from(card.height),
+                )
+            } else {
+                Outline::new(
+                    f64::from(card.x),
+                    f64::from(card.y),
+                    f64::from(card.width),
+                    f64::from(card.height),
+                )
+            };
             (
                 card.key.clone(),
                 outline.x * scale,
