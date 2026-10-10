@@ -9,6 +9,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 
 import {GlassManager, glassMenu} from './glass.js';
 import {SystemPanel} from './system.js';
@@ -37,6 +38,9 @@ function formatVoiceModel(raw) {
 // Opens and closes the Notes palette. Ctrl+Alt+N until 0.1.77.
 const NOTES_BINDING = '<Super><Shift>l';
 const NOTES_LEGACY_BINDING = '<control><alt>n';
+// How long another input source (Vietnamese) stays on before the first one
+// in the list (English) comes back.
+const IME_REVERT_SECONDS = 60;
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
 
@@ -90,10 +94,9 @@ export default class SysiPanelExtension extends Extension {
         this._system = this._buildPanelButton('system');
         // Opens the timer's menu; see timer.js.
         this._timer = this._buildPanelButton('timer');
-        this._addAction('+ note', 'new-note');
-        this._addAction('notes', 'toggle-notes');
+        this._buildNotes();
         this._addAction('usage', 'toggle-usage');
-        this._addAction('dictionary', 'toggle-translate');
+        this._addAction('dict', 'toggle-translate');
         this._addAction('ocr', 'ocr');
         this._voiceButton = this._addAction('voice', 'voice');
         this._buildSettings();
@@ -242,9 +245,44 @@ export default class SysiPanelExtension extends Extension {
         this._syncVisibility();
         this._glass = new GlassManager();
         this._glass.enable();
+        this._inputSources = getInputSourceManager();
+        // Also emitted when the current IBus engine merely updates its
+        // properties, so only a real switch restarts the countdown.
+        this._inputSourceId = this._inputSources.connect('current-source-changed', () => {
+            if (this._inputSources.currentSource !== this._lastInputSource)
+                this._scheduleImeRevert();
+        });
+        this._scheduleImeRevert();
+    }
+
+    // Through the shell's own manager, so the top bar indicator and the
+    // Super+Space order stay in step with the switch.
+    _scheduleImeRevert() {
+        this._clearImeRevert();
+        this._lastInputSource = this._inputSources.currentSource;
+        const first = this._inputSources.inputSources[0];
+        if (!first || this._lastInputSource === first)
+            return;
+        this._imeRevertId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, IME_REVERT_SECONDS, () => {
+            this._imeRevertId = 0;
+            this._inputSources.inputSources[0]?.activate(true);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _clearImeRevert() {
+        if (this._imeRevertId)
+            GLib.source_remove(this._imeRevertId);
+        this._imeRevertId = 0;
     }
 
     disable() {
+        if (this._inputSourceId)
+            this._inputSources.disconnect(this._inputSourceId);
+        this._inputSourceId = 0;
+        this._clearImeRevert();
+        this._inputSources = null;
+        this._lastInputSource = null;
         this._glass?.destroy();
         this._glass = null;
         this._timerPanel?.destroy();
@@ -282,6 +320,8 @@ export default class SysiPanelExtension extends Extension {
         this._dictateRequestFile = null;
         this._dictateCapturing = false;
         this._dictateNonce = null;
+        this._notesMenu?.destroy();
+        this._notesMenu = null;
         this._settingsMenu?.destroy();
         this._settingsMenu = null;
         this._fontLabel = null;
@@ -299,6 +339,25 @@ export default class SysiPanelExtension extends Extension {
         this._hideLabel = null;
         this._pidFile = null;
         this._panelStateFile = null;
+    }
+
+    // A small menu like settings': a new note, or the list of them.
+    _buildNotes() {
+        const button = this._buildPanelButton('notes');
+        this._notesMenu = new PopupMenu.PopupMenu(button, 0.5, St.Side.TOP);
+        this._notesMenu.actor.add_style_class_name('sysi-settings-menu');
+        glassMenu(this._notesMenu);
+        Main.uiGroup.add_child(this._notesMenu.actor);
+        this._notesMenu.actor.hide();
+        Main.panel.menuManager.addMenu(this._notesMenu);
+        button.connect('clicked', () => this._notesMenu.toggle());
+        for (const [label, action] of [['new', 'new-note'], ['list', 'toggle-notes']]) {
+            const item = new PopupMenu.PopupMenuItem(label);
+            item.label.x_align = Clutter.ActorAlign.CENTER;
+            item.label.x_expand = true;
+            item.connect('activate', () => this._runAction(action, button));
+            this._notesMenu.addMenuItem(item);
+        }
     }
 
     _buildSettings() {
@@ -388,8 +447,10 @@ export default class SysiPanelExtension extends Extension {
     // The strip covers the readings and the timer while it is open.
     _setStripOpen(open) {
         this._strip.visible = open;
-        if (!open)
+        if (!open) {
             this._settingsMenu?.close();
+            this._notesMenu?.close();
+        }
         this._systemPanel?.setStripOpen(open);
         this._timerPanel?.setStripOpen(open);
     }
