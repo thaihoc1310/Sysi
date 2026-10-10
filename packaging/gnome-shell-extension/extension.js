@@ -94,8 +94,9 @@ export default class SysiPanelExtension extends Extension {
         this._system = this._buildPanelButton('system');
         // Opens the timer's menu; see timer.js.
         this._timer = this._buildPanelButton('timer');
-        this._buildNotes();
-        this._addAction('usage', 'toggle-usage');
+        this._notesMenu = this._buildMenuButton('notes', [['new', 'new-note'], ['list', 'toggle-notes']]);
+        // The usage card's quota tabs, or its SESSIONS tab.
+        this._agentMenu = this._buildMenuButton('agent', [['usage', 'toggle-usage'], ['sessions', 'toggle-sessions']]);
         this._addAction('dict', 'toggle-translate');
         this._addAction('ocr', 'ocr');
         this._voiceButton = this._addAction('voice', 'voice');
@@ -322,6 +323,8 @@ export default class SysiPanelExtension extends Extension {
         this._dictateNonce = null;
         this._notesMenu?.destroy();
         this._notesMenu = null;
+        this._agentMenu?.destroy();
+        this._agentMenu = null;
         this._settingsMenu?.destroy();
         this._settingsMenu = null;
         this._fontLabel = null;
@@ -341,23 +344,24 @@ export default class SysiPanelExtension extends Extension {
         this._panelStateFile = null;
     }
 
-    // A small menu like settings': a new note, or the list of them.
-    _buildNotes() {
-        const button = this._buildPanelButton('notes');
-        this._notesMenu = new PopupMenu.PopupMenu(button, 0.5, St.Side.TOP);
-        this._notesMenu.actor.add_style_class_name('sysi-settings-menu');
-        glassMenu(this._notesMenu);
-        Main.uiGroup.add_child(this._notesMenu.actor);
-        this._notesMenu.actor.hide();
-        Main.panel.menuManager.addMenu(this._notesMenu);
-        button.connect('clicked', () => this._notesMenu.toggle());
-        for (const [label, action] of [['new', 'new-note'], ['list', 'toggle-notes']]) {
-            const item = new PopupMenu.PopupMenuItem(label);
+    // A small menu like settings', each item one action.
+    _buildMenuButton(label, items) {
+        const button = this._buildPanelButton(label);
+        const menu = new PopupMenu.PopupMenu(button, 0.5, St.Side.TOP);
+        menu.actor.add_style_class_name('sysi-settings-menu');
+        glassMenu(menu);
+        Main.uiGroup.add_child(menu.actor);
+        menu.actor.hide();
+        Main.panel.menuManager.addMenu(menu);
+        button.connect('clicked', () => menu.toggle());
+        for (const [text, action] of items) {
+            const item = new PopupMenu.PopupMenuItem(text);
             item.label.x_align = Clutter.ActorAlign.CENTER;
             item.label.x_expand = true;
             item.connect('activate', () => this._runAction(action, button));
-            this._notesMenu.addMenuItem(item);
+            menu.addMenuItem(item);
         }
+        return menu;
     }
 
     _buildSettings() {
@@ -450,6 +454,7 @@ export default class SysiPanelExtension extends Extension {
         if (!open) {
             this._settingsMenu?.close();
             this._notesMenu?.close();
+            this._agentMenu?.close();
         }
         this._systemPanel?.setStripOpen(open);
         this._timerPanel?.setStripOpen(open);

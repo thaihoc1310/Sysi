@@ -1,5 +1,5 @@
 use crate::{
-    platform,
+    platform, sessions,
     state::{
         AppState, ColorMode, DictionaryWindow, HighlightColor, Note, NoteHighlight, NoteImage,
         NoteInk, Point, Size, IMAGE_PLACEHOLDER,
@@ -192,6 +192,29 @@ struct UsageCard {
     updated: gtk::Label,
     color_mode: Rc<Cell<Foreground>>,
     resize: ResizeHandle,
+    sessions: Rc<RefCell<SessionsState>>,
+}
+
+/// The sessions tab: the last pass over `/proc`, and what the user has done
+/// to it since. Kept on the card so a click can redraw it without waiting
+/// for the next pass.
+#[derive(Default)]
+struct SessionsState {
+    report: Option<sessions::Report>,
+    loading: bool,
+    expanded: HashSet<i32>,
+    closing: HashSet<i32>,
+    /// A session one more click on × will stop by force, and since when.
+    confirm: Option<(i32, i64)>,
+    /// What the last action did, shown in place of the totals for a while.
+    note: Option<(String, i64)>,
+    /// Starts a fresh pass at once; set by the controller.
+    rescan: Option<Rc<dyn Fn()>>,
+    /// A fresh pass was asked for while one was running.
+    pending: bool,
+    /// Everything the rows showed last time, so a pass that changes nothing
+    /// on screen leaves the widgets (and a press or tooltip on them) alone.
+    last_view: String,
 }
 
 #[derive(Clone)]
@@ -681,13 +704,23 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         })
     };
 
+    // The quota tab USAGE in the panel menu goes back to, when the card is
+    // showing SESSIONS.
+    let last_quota_tab = Rc::new(Cell::new(match initial_usage_tab {
+        UsageTab::Sessions => UsageTab::Source(UsageSource::Codex),
+        tab => tab,
+    }));
     for (tab, button) in usage.tabs.clone() {
         let selected = usage_controller.tab.clone();
         let request = usage_controller.request.clone();
         let show = usage_controller.show.clone();
         let tabs = usage.tabs.clone();
         let state = state.clone();
+        let last_quota_tab = last_quota_tab.clone();
         button.connect_clicked(move |_| {
+            if tab != UsageTab::Sessions {
+                last_quota_tab.set(tab);
+            }
             selected.set(tab);
             set_usage_tab_active(&tabs, tab);
             state.borrow_mut().settings.usage_source = tab.key().to_owned();
@@ -717,6 +750,45 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let refresh = usage_controller.refresh.clone();
         move |_| refresh()
     });
+    // The panel's AGENT menu opens the card on a tab: on that tab already, it
+    // closes; elsewhere, or closed, it opens there.
+    let show_usage_tab: Rc<dyn Fn(UsageTab)> = {
+        let card = usage.card.clone();
+        let tabs = usage.tabs.clone();
+        let selected = usage_controller.tab.clone();
+        let toggle_usage = toggle_usage.clone();
+        let last_quota_tab = last_quota_tab.clone();
+        let state = state.clone();
+        Rc::new(move |tab: UsageTab| {
+            if !card.is_visible() {
+                // Chosen before opening, so the open loads this tab rather
+                // than fetching for the one left selected.
+                selected.set(tab);
+                if tab != UsageTab::Sessions {
+                    last_quota_tab.set(tab);
+                }
+                state.borrow_mut().settings.usage_source = tab.key().to_owned();
+                let _ = state.borrow().save();
+                toggle_usage();
+            } else if selected.get() == tab {
+                toggle_usage();
+            } else if let Some((_, button)) = tabs.iter().find(|(candidate, _)| *candidate == tab) {
+                button.clicked();
+            }
+        })
+    };
+    let toggle_usage_quota: Rc<dyn Fn()> = {
+        let selected = usage_controller.tab.clone();
+        let toggle_usage = toggle_usage.clone();
+        let show_usage_tab = show_usage_tab.clone();
+        Rc::new(move || {
+            if selected.get() == UsageTab::Sessions {
+                show_usage_tab(last_quota_tab.get());
+            } else {
+                toggle_usage();
+            }
+        })
+    };
     usage.hide.connect_clicked({
         let toggle_usage = toggle_usage.clone();
         move |_| toggle_usage()
@@ -1772,7 +1844,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let toggle_notes = toggle_notes.clone();
         let follow_notes_pointer = follow_notes_pointer.clone();
         let notes_opened_at = notes_opened_at.clone();
-        let toggle_usage = toggle_usage.clone();
+        let toggle_usage_quota = toggle_usage_quota.clone();
+        let show_usage_tab = show_usage_tab.clone();
         let toggle_translate = toggle_translate.clone();
         let translate_spawn = translate_spawn.clone();
         let translate_any_visible = translate_any_visible.clone();
@@ -1846,7 +1919,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                             toggle_notes();
                         }
                     }
-                    "toggle-usage" => toggle_usage(),
+                    "toggle-usage" => toggle_usage_quota(),
+                    "toggle-sessions" => show_usage_tab(UsageTab::Sessions),
                     "toggle-translate" => {
                         // The entry is edit chrome, so a translate window
                         // opened while locked would have nothing to type into;
@@ -2165,8 +2239,8 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     let hide = small_button("\u{2212}");
     hide.style_context().add_class("note-window-button");
     hide.style_context().add_class("note-hide");
-    hide.set_tooltip_text(Some("Hide Usage"));
-    let title = gtk::Label::new(Some("USAGE"));
+    hide.set_tooltip_text(Some("Hide"));
+    let title = gtk::Label::new(Some("AGENT"));
     title.set_xalign(0.0);
     title.set_hexpand(true);
     title.style_context().add_class("history-title");
@@ -2345,6 +2419,7 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
         updated,
         color_mode,
         resize,
+        sessions: Rc::new(RefCell::new(SessionsState::default())),
     }
 }
 
@@ -2459,20 +2534,24 @@ fn set_usage_tab_active<T: Copy + PartialEq>(choices: &[(T, gtk::Button)], activ
 enum UsageTab {
     Source(UsageSource),
     Tokens,
+    /// The agents running right now and the memory they hold.
+    Sessions,
 }
 
 impl UsageTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Source(UsageSource::Codex),
         Self::Source(UsageSource::Claude),
         Self::Source(UsageSource::Omp),
         Self::Tokens,
+        Self::Sessions,
     ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Source(source) => source.label(),
             Self::Tokens => "TOKENS",
+            Self::Sessions => "SESSIONS",
         }
     }
 
@@ -2480,6 +2559,7 @@ impl UsageTab {
         match self {
             Self::Source(source) => source.key(),
             Self::Tokens => "tokens",
+            Self::Sessions => "sessions",
         }
     }
 
@@ -2488,6 +2568,7 @@ impl UsageTab {
     fn from_key(value: &str) -> Self {
         match value {
             "tokens" => Self::Tokens,
+            "sessions" => Self::Sessions,
             other => Self::Source(UsageSource::from_key(other)),
         }
     }
@@ -3563,8 +3644,16 @@ fn render_usage_card(
     card.scroller.set_visible(!tokens);
     card.tokens_pane.set_visible(tokens);
     set_usage_tab_active(&card.tabs, tab);
+    if tab != UsageTab::Sessions {
+        // The rows are about to hold another tab's; SESSIONS must refill.
+        card.sessions.borrow_mut().last_view.clear();
+    }
     if tokens {
         render_token_tab(card);
+        return;
+    }
+    if tab == UsageTab::Sessions {
+        render_sessions_tab(card, scroll);
         return;
     }
     clear_usage_rows(&card.rows);
@@ -3673,6 +3762,659 @@ fn render_usage_card(
     }
 }
 
+/// How often the sessions tab re-reads `/proc` while it is up.
+const SESSIONS_RESCAN_MS: i64 = 3_000;
+/// How long a second click on × stays armed, and a note stays in the status:
+/// long enough to read the note that asks for it.
+const SESSIONS_CONFIRM_MS: i64 = 15_000;
+/// Idle this long and a session is offered to the bulk close.
+const SESSIONS_IDLE_CLOSE_MS: i64 = 2 * 3_600_000;
+/// Long enough for an agent to exit after its Ctrl+D.
+const SESSIONS_QUIT_WAIT: Duration = Duration::from_secs(3);
+
+fn format_kib(kib: u64) -> String {
+    let mb = kib as f64 / 1024.0;
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else {
+        format!("{mb:.0} MB")
+    }
+}
+
+/// A context size the way agents print it: `248K`, `1M`, `1.5M`.
+fn format_context(tokens: u64) -> String {
+    let one = |value: f64, unit: &str| {
+        let text = format!("{value:.1}");
+        format!("{}{unit}", text.trim_end_matches(".0"))
+    };
+    if tokens >= 1_000_000 {
+        one(tokens as f64 / 1e6, "M")
+    } else if tokens >= 1_000 {
+        format!("{:.0}K", tokens as f64 / 1e3)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_span(ms: i64) -> String {
+    let seconds = (ms / 1000).max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+/// `claude-opus-5-5` reads `opus-5-5`; `google-antigravity/gemini-3.8-flash`
+/// reads `gemini-3.8-flash`.
+fn short_model(model: &str) -> &str {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    model.strip_prefix("claude-").unwrap_or(model)
+}
+
+fn short_cwd(cwd: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && cwd == home {
+        return "~".into();
+    }
+    cwd.rsplit('/').next().unwrap_or(cwd).to_owned()
+}
+
+/// What the row says about a session's state, beside its memory.
+fn session_state_label(session: &sessions::Session, state: &SessionsState, now: i64) -> String {
+    if state.closing.contains(&session.pid) {
+        "closing…".into()
+    } else if state
+        .confirm
+        .is_some_and(|(pid, at)| pid == session.pid && now - at < SESSIONS_CONFIRM_MS)
+    {
+        "× again".into()
+    } else if session.working() {
+        "working".into()
+    } else if let Some(idle) = session.idle_ms(now) {
+        format!("idle {}", format_span(idle))
+    } else if let Some(quiet) = session.quiet_ms(now) {
+        // Outside herdr: when it last wrote, not whether it is waiting.
+        format!("{} ago", format_span(quiet))
+    } else {
+        String::new()
+    }
+}
+
+fn session_name(session: &sessions::Session) -> String {
+    session
+        .pane
+        .as_ref()
+        .and_then(|pane| pane.title.clone())
+        .unwrap_or_else(|| short_cwd(&session.cwd))
+}
+
+/// Every text the rows would show, in order. Two passes that read the same
+/// leave the widgets alone.
+fn sessions_view(report: &sessions::Report, state: &SessionsState, now: i64) -> String {
+    let mut view = String::new();
+    for (label, list) in session_groups(report) {
+        let total: u64 = list.iter().map(|session| session.kib).sum();
+        view.push_str(&format!("{label}|{}\n", format_kib(total)));
+        for session in list {
+            view.push_str(&format!(
+                "{}|{}|{}|{}|{}|{}\n",
+                session.pid,
+                session_name(session),
+                session_state_label(session, state, now),
+                format_kib(session.kib),
+                session_detail(session),
+                state.closing.contains(&session.pid),
+            ));
+            if state.expanded.contains(&session.pid) {
+                for part in &session.parts {
+                    view.push_str(&format!(
+                        " {}|{}|{}\n",
+                        part.label,
+                        part.procs,
+                        format_kib(part.kib)
+                    ));
+                }
+            }
+        }
+    }
+    for orphan in &report.orphans {
+        view.push_str(&format!(
+            "orphan|{}|{}|{}\n",
+            orphan.pid,
+            orphan.label,
+            format_kib(orphan.kib)
+        ));
+    }
+    let idle = idle_sessions(report, now);
+    let freed: u64 = idle.iter().map(|session| session.kib).sum();
+    view.push_str(&format!("bulk|{}|{}", idle.len(), format_kib(freed)));
+    view
+}
+
+/// The line under a session's name: context, tokens, model.
+fn session_detail(session: &sessions::Session) -> String {
+    let mut detail = Vec::new();
+    if let Some(context) = session.context {
+        detail.push(match session.context_limit {
+            Some(limit) => format!(
+                "{} / {} context",
+                format_context(context),
+                format_context(limit)
+            ),
+            None => format!("{} context", format_context(context)),
+        });
+    }
+    if let Some(tokens) = session.tokens.filter(|tokens| tokens.total() > 0) {
+        detail.push(format!("{} tokens", format_tokens(tokens.total())));
+    }
+    if let Some(model) = &session.model {
+        detail.push(short_model(model).to_owned());
+    }
+    detail.join(" · ")
+}
+
+/// The sessions worth closing in one go: waiting, not just now, for hours.
+fn idle_sessions(report: &sessions::Report, now: i64) -> Vec<&sessions::Session> {
+    report
+        .sessions
+        .iter()
+        .filter(|session| {
+            session
+                .idle_ms(now)
+                .is_some_and(|idle| idle >= SESSIONS_IDLE_CLOSE_MS)
+        })
+        .collect()
+}
+
+/// herdr's workspaces in herdr's order, then everything started elsewhere.
+fn session_groups(report: &sessions::Report) -> Vec<(String, Vec<&sessions::Session>)> {
+    let mut groups: Vec<(String, Vec<&sessions::Session>)> = report
+        .workspaces
+        .iter()
+        .map(|label| (label.to_uppercase(), Vec::new()))
+        .collect();
+    let mut other = Vec::new();
+    for session in &report.sessions {
+        let slot = session.pane.as_ref().and_then(|pane| {
+            report
+                .workspaces
+                .iter()
+                .position(|label| *label == pane.workspace)
+        });
+        match slot {
+            Some(index) => groups[index].1.push(session),
+            None => other.push(session),
+        }
+    }
+    groups.push(("OTHER TERMINALS".into(), other));
+    groups.retain(|(_, list)| !list.is_empty());
+    groups
+}
+
+fn sessions_note(card: &UsageCard, text: impl Into<String>) {
+    card.sessions.borrow_mut().note = Some((text.into(), usage_now_ms()));
+}
+
+fn sessions_rescan(card: &UsageCard) {
+    let rescan = card.sessions.borrow().rescan.clone();
+    if let Some(rescan) = rescan {
+        rescan();
+    }
+}
+
+fn redraw_sessions(card: &UsageCard) {
+    render_sessions_tab(card, Some(card.scroller.vadjustment().value()));
+}
+
+fn copy_to_clipboard(text: &str) {
+    let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+    clipboard.set_text(text);
+    clipboard.store();
+}
+
+/// × on a session. An idle agent is quit the way a person would, with Ctrl+D
+/// at its prompt, and its resume command goes to the clipboard first so the
+/// conversation is one paste away. A busy one, or one that ignored the Ctrl+D
+/// (a draft in its prompt), needs a second click, which hangs it up.
+fn close_session(card: &UsageCard, session: sessions::Session) {
+    let now = usage_now_ms();
+    let armed = card
+        .sessions
+        .borrow()
+        .confirm
+        .is_some_and(|(pid, at)| pid == session.pid && now - at < SESSIONS_CONFIRM_MS);
+    if armed {
+        card.sessions.borrow_mut().confirm = None;
+        if let Some(command) = session.resume_command() {
+            copy_to_clipboard(&command);
+        }
+        match sessions::hang_up(&session) {
+            Ok(()) => sessions_note(card, format!("Stopped {}", session.agent.label())),
+            Err(error) => sessions_note(card, error),
+        }
+        redraw_sessions(card);
+        sessions_rescan(card);
+        return;
+    }
+    if session.working() || !session.status_known() {
+        card.sessions.borrow_mut().confirm = Some((session.pid, now));
+        sessions_note(
+            card,
+            if session.working() {
+                "It is working: × again to stop it"
+            } else {
+                "Outside herdr there is no telling if it is busy: × again to stop it"
+            },
+        );
+        redraw_sessions(card);
+        return;
+    }
+    let copied = session
+        .resume_command()
+        .inspect(|command| copy_to_clipboard(command))
+        .is_some();
+    card.sessions.borrow_mut().closing.insert(session.pid);
+    sessions_note(card, "Closing…");
+    redraw_sessions(card);
+    let card = card.clone();
+    let pid = session.pid;
+    let agent = session.agent;
+    sessions::spawn(
+        move || {
+            let sent = sessions::quit(&session);
+            std::thread::sleep(SESSIONS_QUIT_WAIT);
+            (sent, sessions::alive(pid))
+        },
+        move |(sent, alive)| {
+            card.sessions.borrow_mut().closing.remove(&pid);
+            match (sent, alive) {
+                (Err(error), _) => sessions_note(&card, error),
+                (Ok(()), true) => {
+                    card.sessions.borrow_mut().confirm = Some((pid, usage_now_ms()));
+                    sessions_note(
+                        &card,
+                        "Still running (a draft in its prompt?): × again to force",
+                    );
+                }
+                (Ok(()), false) => sessions_note(
+                    &card,
+                    if copied {
+                        format!("Closed {} · resume command copied", agent.label())
+                    } else {
+                        format!("Closed {}", agent.label())
+                    },
+                ),
+            }
+            redraw_sessions(&card);
+            sessions_rescan(&card);
+        },
+    );
+}
+
+/// Quits every session that has sat idle for hours, one after another, and
+/// leaves all their resume commands on the clipboard.
+fn close_idle_sessions(card: &UsageCard) {
+    let idle: Vec<sessions::Session> = {
+        let state = card.sessions.borrow();
+        let Some(report) = state.report.as_ref() else {
+            return;
+        };
+        idle_sessions(report, usage_now_ms())
+            .into_iter()
+            .filter(|session| !state.closing.contains(&session.pid))
+            .cloned()
+            .collect()
+    };
+    if idle.is_empty() {
+        return;
+    }
+    let commands: Vec<String> = idle
+        .iter()
+        .filter_map(sessions::Session::resume_command)
+        .collect();
+    if !commands.is_empty() {
+        copy_to_clipboard(&commands.join("\n"));
+    }
+    let pids: Vec<i32> = idle.iter().map(|session| session.pid).collect();
+    card.sessions
+        .borrow_mut()
+        .closing
+        .extend(pids.iter().copied());
+    sessions_note(card, format!("Closing {} idle sessions…", idle.len()));
+    redraw_sessions(card);
+    let card = card.clone();
+    sessions::spawn(
+        move || {
+            let errors: Vec<String> = idle
+                .iter()
+                .filter_map(|session| sessions::quit(session).err())
+                .collect();
+            std::thread::sleep(SESSIONS_QUIT_WAIT);
+            let left = idle
+                .iter()
+                .filter(|session| sessions::alive(session.pid))
+                .count();
+            (idle.len(), left, errors)
+        },
+        move |(total, left, errors)| {
+            card.sessions
+                .borrow_mut()
+                .closing
+                .retain(|pid| !pids.contains(pid));
+            let mut note = format!("Closed {} of {total}", total - left);
+            if !commands.is_empty() {
+                note.push_str(" · resume commands copied");
+            }
+            if let Some(error) = errors.first() {
+                note = format!("{note} · {error}");
+            }
+            sessions_note(&card, note);
+            redraw_sessions(&card);
+            sessions_rescan(&card);
+        },
+    );
+}
+
+fn sessions_heading(rows: &gtk::Box, text: &str, next: bool) {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.style_context().add_class("usage-group-provider");
+    if next {
+        label.style_context().add_class("usage-group-next");
+    }
+    rows.pack_start(&label, false, false, 0);
+}
+
+fn session_row(
+    card: &UsageCard,
+    session: &sessions::Session,
+    state: &SessionsState,
+    now: i64,
+) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    row.style_context().add_class("usage-row");
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    let expanded = state.expanded.contains(&session.pid);
+    let name = session_name(session);
+    // A label in an event box rather than a button: the theme's button
+    // padding would make every row twice as tall as a quota row.
+    let title_label = gtk::Label::new(Some(&format!(
+        "{}  {} · {name}",
+        if expanded { "\u{25be}" } else { "\u{25b8}" },
+        session.agent.label()
+    )));
+    title_label.set_xalign(0.0);
+    title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title_label.style_context().add_class("session-title");
+    let title = gtk::EventBox::new();
+    title.set_visible_window(false);
+    title.set_hexpand(true);
+    title.add(&title_label);
+    let mut tip = vec![session.cwd.clone(), format!("pid {}", session.pid)];
+    if let Some(model) = &session.model {
+        tip.push(model.clone());
+    }
+    if let Some(command) = session.resume_command() {
+        tip.push(command);
+    }
+    title.set_tooltip_text(Some(&tip.join("\n")));
+    title.connect_button_release_event({
+        let card = card.clone();
+        let pid = session.pid;
+        move |_, event| {
+            if event.button() != 1 {
+                return glib::Propagation::Proceed;
+            }
+            {
+                let mut state = card.sessions.borrow_mut();
+                if !state.expanded.remove(&pid) {
+                    state.expanded.insert(pid);
+                }
+            }
+            // Not from inside the handler: the row it belongs to is about to
+            // be torn down.
+            let card = card.clone();
+            glib::idle_add_local_once(move || redraw_sessions(&card));
+            glib::Propagation::Stop
+        }
+    });
+    let status = gtk::Label::new(Some(&session_state_label(session, state, now)));
+    status.set_xalign(1.0);
+    status.style_context().add_class("usage-row-reset");
+    let memory = gtk::Label::new(Some(&format_kib(session.kib)));
+    memory.set_xalign(1.0);
+    memory.set_tooltip_text(Some("This agent and everything running under it"));
+    memory.style_context().add_class("usage-row-percent");
+    top.pack_start(&title, true, true, 0);
+    top.pack_start(&status, false, false, 0);
+    top.pack_start(&memory, false, false, 0);
+    if let Some(pane) = session.pane_id.clone() {
+        let focus = small_button("\u{2197}");
+        focus.style_context().add_class("session-action");
+        focus.set_valign(gtk::Align::Center);
+        focus.set_tooltip_text(Some("Show it in herdr"));
+        let card = card.clone();
+        focus.connect_clicked(move |_| {
+            let card = card.clone();
+            let pane = pane.clone();
+            sessions::spawn(
+                move || sessions::focus(&pane),
+                move |result| {
+                    if let Err(error) = result {
+                        sessions_note(&card, error);
+                        redraw_sessions(&card);
+                    }
+                },
+            );
+        });
+        top.pack_start(&focus, false, false, 0);
+    }
+    let close = small_button("\u{d7}");
+    close.style_context().add_class("session-action");
+    close.set_valign(gtk::Align::Center);
+    close.set_tooltip_text(Some(if session.pane_id.is_some() {
+        "Quit with Ctrl+D (resume command goes to the clipboard)"
+    } else {
+        "Quit (resume command goes to the clipboard)"
+    }));
+    close.set_sensitive(!state.closing.contains(&session.pid));
+    close.connect_clicked({
+        let card = card.clone();
+        let session = session.clone();
+        move |_| close_session(&card, session.clone())
+    });
+    top.pack_start(&close, false, false, 0);
+    row.pack_start(&top, false, false, 0);
+
+    let detail = session_detail(session);
+    if !detail.is_empty() {
+        let label = gtk::Label::new(Some(&detail));
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.style_context().add_class("session-detail");
+        if let Some(tokens) = session.tokens {
+            label.set_tooltip_text(Some(&format!(
+                "Context is what the last turn sent the model; a compaction brings it down.\nThis session so far: {} input, {} output, {} cache read, {} cache write",
+                group_digits(tokens.input),
+                group_digits(tokens.output),
+                group_digits(tokens.cache_read),
+                group_digits(tokens.cache_write),
+            )));
+        }
+        row.pack_start(&label, false, false, 0);
+    }
+    if let (Some(context), Some(limit)) = (session.context, session.context_limit) {
+        let progress = gtk::ProgressBar::new();
+        progress.set_show_text(false);
+        progress.set_fraction((context as f64 / limit.max(1) as f64).clamp(0.0, 1.0));
+        progress.style_context().add_class("usage-progress");
+        row.pack_start(&progress, false, false, 0);
+    }
+    if expanded {
+        for part in &session.parts {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            line.set_margin_start(USAGE_GROUP_INDENT + 4);
+            let name = if part.procs > 1 {
+                format!("{} \u{d7}{}", part.label, part.procs)
+            } else {
+                part.label.clone()
+            };
+            let label = gtk::Label::new(Some(&name));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let size = gtk::Label::new(Some(&format_kib(part.kib)));
+            size.set_xalign(1.0);
+            for widget in [&label, &size] {
+                widget.style_context().add_class("session-part");
+            }
+            line.pack_start(&label, true, true, 0);
+            line.pack_start(&size, false, false, 0);
+            row.pack_start(&line, false, false, 0);
+        }
+    }
+    row
+}
+
+fn render_sessions_tab(card: &UsageCard, scroll: Option<f64>) {
+    let now = usage_now_ms();
+    let state = card.sessions.borrow();
+    card.refresh.set_sensitive(!state.loading);
+    card.refresh
+        .set_label(if state.loading { "…" } else { "↻" });
+    card.refresh.set_tooltip_text(Some("Refresh sessions"));
+    let Some(report) = state.report.as_ref() else {
+        drop(state);
+        clear_usage_rows(&card.rows);
+        card.sessions.borrow_mut().last_view.clear();
+        card.status.set_label("Reading sessions…");
+        card.status.set_tooltip_text(None);
+        card.updated.set_label("");
+        return;
+    };
+    let note = state
+        .note
+        .as_ref()
+        .filter(|(_, at)| now - at < SESSIONS_CONFIRM_MS)
+        .map(|(text, _)| text.clone());
+    let mut summary = format!(
+        "{} agents · {} of {} RAM",
+        report.sessions.len(),
+        format_kib(report.total_kib()),
+        format_kib(report.mem_total_kib)
+    );
+    if !report.herdr {
+        summary.push_str(" · herdr not running");
+    }
+    card.status.set_label(&note.unwrap_or(summary));
+    card.status.set_tooltip_text(Some(
+        "Memory is proportional (PSS) plus swap: a page shared by several processes is split between them, so the figures add up without counting it twice. Each agent includes everything running under it: MCP servers, shells, builds.",
+    ));
+    card.updated
+        .set_label(&usage_age_label(report.collected_at_ms, now));
+    let view = sessions_view(report, &state, now);
+    if view == state.last_view {
+        return;
+    }
+    clear_usage_rows(&card.rows);
+    if report.sessions.is_empty() && report.orphans.is_empty() {
+        let empty = gtk::Label::new(Some("No Claude Code, OMP or Codex running"));
+        empty.set_xalign(0.0);
+        empty.style_context().add_class("session-detail");
+        card.rows.pack_start(&empty, false, false, 0);
+    }
+    for (index, (label, list)) in session_groups(report).into_iter().enumerate() {
+        let total: u64 = list.iter().map(|session| session.kib).sum();
+        sessions_heading(
+            &card.rows,
+            &format!("{label} · {}", format_kib(total)),
+            index > 0,
+        );
+        for session in list {
+            card.rows
+                .pack_start(&session_row(card, session, &state, now), false, false, 0);
+        }
+    }
+    if !report.orphans.is_empty() {
+        let total: u64 = report.orphans.iter().map(|orphan| orphan.kib).sum();
+        sessions_heading(
+            &card.rows,
+            &format!("ORPHANED MCP SERVERS · {}", format_kib(total)),
+            !report.sessions.is_empty(),
+        );
+        for orphan in &report.orphans {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+            line.style_context().add_class("usage-row");
+            let label = gtk::Label::new(Some(&orphan.label));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_tooltip_text(Some(&format!(
+                "pid {}: its agent has exited, so nothing will ever talk to it",
+                orphan.pid
+            )));
+            label.style_context().add_class("usage-row-label");
+            let size = gtk::Label::new(Some(&format_kib(orphan.kib)));
+            size.style_context().add_class("usage-row-percent");
+            let kill = small_button("\u{d7}");
+            kill.style_context().add_class("session-action");
+            kill.set_valign(gtk::Align::Center);
+            kill.set_tooltip_text(Some("Stop it (SIGTERM)"));
+            kill.connect_clicked({
+                let card = card.clone();
+                let orphan = orphan.clone();
+                move |_| {
+                    match sessions::terminate(&orphan) {
+                        Ok(()) => sessions_note(&card, "Stopped the orphaned server"),
+                        Err(error) => sessions_note(&card, error),
+                    }
+                    redraw_sessions(&card);
+                    sessions_rescan(&card);
+                }
+            });
+            line.pack_start(&label, true, true, 0);
+            line.pack_start(&size, false, false, 0);
+            line.pack_start(&kill, false, false, 0);
+            card.rows.pack_start(&line, false, false, 0);
+        }
+    }
+    let idle = idle_sessions(report, now);
+    if !idle.is_empty() {
+        let freed: u64 = idle.iter().map(|session| session.kib).sum();
+        let bulk = picker_button(&format!(
+            "Close {} idle over {}h · frees {}",
+            idle.len(),
+            SESSIONS_IDLE_CLOSE_MS / 3_600_000,
+            format_kib(freed)
+        ));
+        bulk.style_context().add_class("session-bulk");
+        bulk.set_tooltip_text(Some(
+            "Ctrl+D to each; their resume commands go to the clipboard, one per line",
+        ));
+        bulk.connect_clicked({
+            let card = card.clone();
+            move |_| close_idle_sessions(&card)
+        });
+        card.rows.pack_start(&bulk, false, false, 0);
+    }
+    drop(state);
+    card.sessions.borrow_mut().last_view = view;
+    card.rows.show_all();
+    if let Some(value) = scroll {
+        let adjustment = card.scroller.vadjustment();
+        glib::idle_add_local_once(move || {
+            let maximum = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+            adjustment.set_value(value.clamp(adjustment.lower(), maximum));
+        });
+    }
+}
+
 fn update_usage_refresh(card: &UsageCard, schedule: &usage::Schedule, now: i64) {
     let seconds = schedule.retry_seconds(now);
     let (enabled, icon, hint) = if schedule.busy {
@@ -3702,6 +4444,7 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
     let (tx, rx) =
         async_channel::bounded::<(UsageSource, Result<usage::Snapshot, usage::FetchError>)>(3);
     let (token_tx, token_rx) = async_channel::bounded::<usage::TokenReport>(1);
+    let (sessions_tx, sessions_rx) = async_channel::bounded::<sessions::Report>(1);
     let render = {
         let card = card.clone();
         let schedules = schedules.clone();
@@ -3774,15 +4517,58 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
             });
         });
     }
+    // Walking /proc is cheap once the transcripts have been read the first
+    // time, so the tab is kept current every few seconds while it is up and
+    // left alone otherwise.
+    let scan_sessions = {
+        let card = card.clone();
+        Rc::new(move |manual: bool| {
+            {
+                let state = card.sessions.borrow();
+                let age = state
+                    .report
+                    .as_ref()
+                    .map(|report| usage_now_ms().saturating_sub(report.collected_at_ms));
+                if !state.loading && (manual || age.is_none_or(|age| age >= SESSIONS_RESCAN_MS)) {
+                    drop(state);
+                } else {
+                    let loading = state.loading;
+                    drop(state);
+                    // Run again once the pass under way lands: it may have
+                    // read /proc before the change this asks to see.
+                    if loading && manual {
+                        card.sessions.borrow_mut().pending = true;
+                    }
+                    return;
+                }
+            }
+            card.sessions.borrow_mut().loading = true;
+            card.refresh.set_sensitive(false);
+            card.refresh.set_label("…");
+            let sessions_tx = sessions_tx.clone();
+            std::thread::spawn(move || {
+                let _ = sessions_tx.send_blocking(sessions::collect());
+            });
+        }) as Rc<dyn Fn(bool)>
+    };
+    card.sessions.borrow_mut().rescan = Some({
+        let scan_sessions = scan_sessions.clone();
+        Rc::new(move || scan_sessions(true))
+    });
     let send = {
         let tab = tab.clone();
         let card = card.clone();
         let schedules = schedules.clone();
         let snapshots = snapshots.clone();
         let scan = scan.clone();
+        let scan_sessions = scan_sessions.clone();
         Rc::new(move |manual: bool| {
             let UsageTab::Source(which) = tab.get() else {
-                scan(manual, false);
+                if tab.get() == UsageTab::Sessions {
+                    scan_sessions(manual);
+                } else {
+                    scan(manual, false);
+                }
                 return;
             };
             let now = usage_now_ms();
@@ -3856,6 +4642,36 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
             }
         });
     }
+    {
+        let card = card.clone();
+        let tab = tab.clone();
+        let render = render.clone();
+        let scan_sessions = scan_sessions.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(report) = sessions_rx.recv().await {
+                let pending = {
+                    let mut state = card.sessions.borrow_mut();
+                    // A session that is gone is no longer closing or waiting
+                    // for a second click.
+                    let live: HashSet<i32> = report.sessions.iter().map(|s| s.pid).collect();
+                    state.closing.retain(|pid| live.contains(pid));
+                    state.expanded.retain(|pid| live.contains(pid));
+                    if state.confirm.is_some_and(|(pid, _)| !live.contains(&pid)) {
+                        state.confirm = None;
+                    }
+                    state.report = Some(report);
+                    state.loading = false;
+                    std::mem::take(&mut state.pending)
+                };
+                if tab.get() == UsageTab::Sessions {
+                    render(UsageTab::Sessions);
+                }
+                if pending {
+                    scan_sessions(true);
+                }
+            }
+        });
+    }
     let show = {
         let render = render.clone();
         Rc::new(move |which| {
@@ -3887,6 +4703,7 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
                     }
                     None
                 }
+                UsageTab::Sessions => None,
             };
             if let Some(snapshot) =
                 selected.and_then(|source| snapshots.borrow().get(&source).cloned())

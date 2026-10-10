@@ -826,6 +826,11 @@ fn read_memory() -> Option<MemoryInfo> {
     parse_memory(&fs::read_to_string("/proc/meminfo").ok()?)
 }
 
+/// The machine's RAM, for the sessions tab to measure the agents against.
+pub fn memory_total_kib() -> u64 {
+    read_memory().map_or(0, |info| info.memory.total_kib)
+}
+
 fn parse_memory(raw: &str) -> Option<MemoryInfo> {
     let mut total = None;
     let mut available = None;

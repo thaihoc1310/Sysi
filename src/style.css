@@ -1203,6 +1203,39 @@ scrolledwindow overshoot.right:backdrop {
   text-shadow: none;
 }
 
+/* SESSIONS: one agent per row. A click on the name opens the row onto what
+ * runs under it; the actions are the header's tiny buttons cut down to fit
+ * beside the figures. */
+.session-title {
+  color: currentColor;
+  font-size: 12px;
+  text-shadow: none;
+}
+
+.tiny-button.session-action {
+  min-height: 16px;
+  min-width: 16px;
+  padding: 0 4px;
+  font-size: 10px;
+}
+
+.session-detail {
+  color: alpha(currentColor, 0.58);
+  font-size: 10px;
+  text-shadow: none;
+}
+
+.session-part {
+  color: alpha(currentColor, 0.72);
+  font-size: 10px;
+  text-shadow: none;
+}
+
+.session-bulk {
+  margin-top: 8px;
+  font-size: 10px;
+}
+
 .mode-light .usage-tab-active {
   background-color: rgba(20, 20, 20, 0.13);
 }

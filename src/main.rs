@@ -3,6 +3,7 @@ mod markdown;
 mod panel_system;
 mod platform;
 mod rich_paste;
+mod sessions;
 mod state;
 mod system;
 mod translate;

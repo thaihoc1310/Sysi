@@ -186,7 +186,7 @@ pub fn fetch(source: Source, force: bool) -> Result<Snapshot, FetchError> {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -407,7 +407,7 @@ fn terminate_child(child: &mut std::process::Child) {
 /// fills the pipe while this side waits on its exit status would deadlock
 /// against us. stdin is closed so a CLI that would otherwise wait for input
 /// gives up immediately instead of hanging until the timeout.
-fn run_cli(
+pub(crate) fn run_cli(
     label: &str,
     program: &str,
     args: &[&str],
