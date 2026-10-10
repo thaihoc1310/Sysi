@@ -79,6 +79,10 @@ pub struct Session {
     pub agent: Agent,
     pub pid: i32,
     pub cwd: String,
+    /// Codex's app-server daemon: one process every Codex session talks to,
+    /// not a session of its own, so it has nothing to resume and closing it
+    /// would end them all.
+    pub shared: bool,
     pub pane_id: Option<String>,
     pub pane: Option<Pane>,
     /// Claude Code's session id, or the path of OMP's session file.
@@ -232,9 +236,13 @@ pub fn collect() -> Report {
                 session.tokens = Some(tallied.tokens);
                 session.context = (tallied.context > 0).then_some(tallied.context);
                 session.context_limit = tallied
-                    .model
-                    .as_deref()
-                    .and_then(|model| context_limit(session.agent, model))
+                    .limit
+                    .or_else(|| {
+                        tallied
+                            .model
+                            .as_deref()
+                            .and_then(|model| context_limit(session.agent, model))
+                    })
                     // A model that took more than its listed window evidently
                     // has the larger one.
                     .map(|limit| match session.context {
@@ -337,24 +345,37 @@ pub fn build(
             procs: 1,
         }];
         let mut grouped: Vec<Part> = Vec::new();
-        for child in children.get(&proc.pid).into_iter().flatten() {
-            let Some(child_proc) = by_pid.get(child) else {
+        let mut add = |label: String, size: u64, procs: usize| match grouped
+            .iter_mut()
+            .find(|part| part.label == label)
+        {
+            Some(part) => {
+                part.kib += size;
+                part.procs += procs;
+            }
+            None => grouped.push(Part {
+                label,
+                kib: size,
+                procs,
+            }),
+        };
+        // Each child with everything under it is one part, named for what it
+        // is. An agent under the agent (Codex's app-server, a `claude -p`)
+        // is a hub of its own, so it counts alone and its children are
+        // parts in their own right rather than all wearing one name.
+        let mut stack: Vec<i32> = children.get(&proc.pid).cloned().unwrap_or_default();
+        while let Some(child) = stack.pop() {
+            let Some(child_proc) = by_pid.get(&child) else {
                 continue;
             };
-            let below = subtree(*child);
-            let label = part_label(child_proc, &below, &by_pid);
-            let size: u64 = below.iter().map(|pid| kib(*pid)).sum();
-            match grouped.iter_mut().find(|part| part.label == label) {
-                Some(part) => {
-                    part.kib += size;
-                    part.procs += below.len();
-                }
-                None => grouped.push(Part {
-                    label,
-                    kib: size,
-                    procs: below.len(),
-                }),
+            if is_agent(child) {
+                add(command_name(child_proc), kib(child), 1);
+                stack.extend(children.get(&child).into_iter().flatten());
+                continue;
             }
+            let below = subtree(child);
+            let size: u64 = below.iter().map(|pid| kib(*pid)).sum();
+            add(part_label(child_proc, &below, &by_pid), size, below.len());
         }
         grouped.sort_by(|a, b| b.kib.cmp(&a.kib).then_with(|| a.label.cmp(&b.label)));
         parts.extend(grouped);
@@ -362,6 +383,7 @@ pub fn build(
             agent,
             pid: proc.pid,
             cwd: proc_cwd(proc.pid),
+            shared: agent == Agent::Codex && proc.cmd.iter().any(|word| word == "app-server"),
             // The variable is inherited, so a process that left herdr's tree
             // (double-forked, or started by something running in a pane)
             // still carries it; only one herdr still holds names a pane.
@@ -473,10 +495,14 @@ fn command_name(proc: &Proc) -> String {
 
 /// `/x/node_modules/@scope/server-github/dist/index.js` is `server-github`:
 /// an entry point named `index` says nothing, the package it sits in does.
+/// So is `.../unified-computer-use/26.901.41600/scripts/launch.mjs`: past a
+/// generic name and a version, to the plugin.
 fn script_name(path: &str) -> String {
-    const GENERIC: [&str; 8] = [
-        "index", "main", "cli", "server", "dist", "build", "lib", "bin",
+    const GENERIC: [&str; 13] = [
+        "index", "main", "cli", "server", "dist", "build", "lib", "bin", "src", "scripts",
+        "launch", "start", "run",
     ];
+    let version = |part: &str| part.chars().all(|c| c.is_ascii_digit() || c == '.');
     let stem = |part: &str| {
         part.trim_end_matches(".js")
             .trim_end_matches(".mjs")
@@ -486,7 +512,7 @@ fn script_name(path: &str) -> String {
     };
     path.rsplit('/')
         .map(stem)
-        .find(|part| !part.is_empty() && !GENERIC.contains(&part.as_str()) && part != "src")
+        .find(|part| !part.is_empty() && !GENERIC.contains(&part.as_str()) && !version(part))
         .unwrap_or_else(|| stem(path.rsplit('/').next().unwrap_or(path)))
 }
 
@@ -654,7 +680,11 @@ fn session_of(agent: Agent, pid: i32, cmd: &[String], pane: Option<&Pane>) -> Op
             .and_then(|value| value["sessionId"].as_str().map(str::to_owned))
             .or_else(from_pane),
         Agent::Omp => from_pane().or_else(|| resume_arg(cmd)),
-        Agent::Codex => from_pane(),
+        // `codex resume <id>` names it; a fresh `codex` names it nowhere.
+        Agent::Codex => from_pane().or_else(|| {
+            let at = cmd.iter().position(|word| word == "resume")?;
+            cmd.get(at + 1).filter(|id| !id.starts_with('-')).cloned()
+        }),
     }
 }
 
@@ -707,7 +737,7 @@ fn transcript(agent: Agent, session: &str, cwd: &str) -> Option<PathBuf> {
                 .map(|dir| dir.path().join(format!("{session}.jsonl")))
                 .find(|path| path.is_file())
         }
-        Agent::Codex => None,
+        Agent::Codex => codex_rollout(session),
     }
 }
 
@@ -723,6 +753,8 @@ struct Tally {
     /// The model the last reply came from, as OMP's catalog names it
     /// (`provider/id`) or as Claude Code records it.
     model: Option<String>,
+    /// The context window, when the transcript says (Codex does).
+    limit: Option<u64>,
 }
 
 /// What a pass found in a transcript.
@@ -730,6 +762,7 @@ pub struct Tallied {
     pub tokens: TokenTotals,
     pub context: u64,
     pub model: Option<String>,
+    pub limit: Option<u64>,
 }
 
 static TALLIES: Mutex<Option<HashMap<PathBuf, Tally>>> = Mutex::new(None);
@@ -767,11 +800,16 @@ fn tally(agent: Agent, path: &Path) -> Option<Tallied> {
         tokens: tally.tokens,
         context: tally.context,
         model: tally.model.clone(),
+        limit: tally.limit,
     })
 }
 
 fn add_line(agent: Agent, tally: &mut Tally, line: &[u8]) {
     let has = |needle: &[u8]| line.windows(needle.len()).any(|window| window == needle);
+    if agent == Agent::Codex {
+        add_codex_line(tally, line, has);
+        return;
+    }
     // Most lines are tool output; only replies and compactions are parsed.
     let compaction = has(b"\"compact_boundary\"") || has(b"\"type\":\"compaction\"");
     if !compaction && !has(b"\"usage\"") {
@@ -920,6 +958,104 @@ fn parse_omp_catalog(value: &Value) -> HashMap<String, u64> {
             Some((name, window))
         })
         .collect()
+}
+
+/// Codex keeps running totals rather than a usage per reply: each
+/// `token_count` says what the session has spent so far, what the last turn
+/// sent, and the window it was sent into.
+fn add_codex_line(tally: &mut Tally, line: &[u8], has: impl Fn(&[u8]) -> bool) {
+    let compacted = has(b"\"type\":\"compacted\"");
+    if !compacted && !has(b"\"token_count\"") && !has(b"\"turn_context\"") {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(line) else {
+        return;
+    };
+    // The record names no new size, and the next count says 0 until a turn
+    // runs: better no figure than the one from before.
+    if compacted {
+        tally.context = 0;
+        return;
+    }
+    if value["type"] == "turn_context" {
+        if let Some(model) = value.pointer("/payload/model").and_then(Value::as_str) {
+            tally.model = Some(model.to_owned());
+        }
+        return;
+    }
+    let Some(info) = value
+        .pointer("/payload/info")
+        .filter(|info| info.is_object())
+    else {
+        return;
+    };
+    let count = |usage: &str, key: &str| {
+        info.get(usage)
+            .and_then(|usage| usage.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    // Codex counts cached input inside its input.
+    let cached = count("total_token_usage", "cached_input_tokens");
+    tally.tokens = TokenTotals {
+        input: count("total_token_usage", "input_tokens").saturating_sub(cached),
+        output: count("total_token_usage", "output_tokens"),
+        cache_read: cached,
+        cache_write: count("total_token_usage", "cache_write_input_tokens"),
+    };
+    let context = count("last_token_usage", "input_tokens");
+    if context > 0 {
+        tally.context = context;
+    }
+    if let Some(window) = info.get("model_context_window").and_then(Value::as_u64) {
+        tally.limit = Some(window);
+    }
+}
+
+/// Codex files a session under the day it began:
+/// `~/.codex/sessions/2026/10/10/rollout-<time>-<id>.jsonl`. Found once and
+/// remembered, since the folders only grow.
+fn codex_rollout(session: &str) -> Option<PathBuf> {
+    static FOUND: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
+    let mut guard = FOUND.lock().ok()?;
+    let found = guard.get_or_insert_with(HashMap::new);
+    if let Some(path) = found.get(session).filter(|path| path.is_file()) {
+        return Some(path.clone());
+    }
+    let root = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| Some(PathBuf::from(env::var_os("HOME")?).join(".codex")))?
+        .join("sessions");
+    let path = find_rollout(&root, session)?;
+    found.insert(session.to_owned(), path.clone());
+    Some(path)
+}
+
+fn find_rollout(root: &Path, session: &str) -> Option<PathBuf> {
+    let suffix = format!("{session}.jsonl");
+    // Newest first: a running session is almost always from the last days.
+    let sorted = |dir: &Path| {
+        let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        entries.sort_unstable_by(|a, b| b.cmp(a));
+        entries
+    };
+    for year in sorted(root) {
+        for month in sorted(&year) {
+            for day in sorted(&month) {
+                let hit = sorted(&day).into_iter().find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(&suffix))
+                });
+                if hit.is_some() {
+                    return hit;
+                }
+            }
+        }
+    }
+    None
 }
 
 fn modified_ms(path: &Path) -> Option<i64> {
@@ -1100,6 +1236,20 @@ mod tests {
             proc(41, 40, "MainThread", "node codegraph.js serve --mcp"),
             proc(50, 900, "node", "node /srv/app.js"),
             proc(60, 900, "omp", "omp"),
+            proc(
+                70,
+                900,
+                "codex",
+                "/x/bin/codex app-server daemon pid-update-loop",
+            ),
+            proc(71, 70, "codex", "/x/bin/codex app-server --listen unix://"),
+            proc(
+                72,
+                71,
+                "node",
+                "node /home/u/.local/bin/codegraph serve --mcp",
+            ),
+            proc(73, 71, "codex-code-mode", "/x/bin/codex-code-mode-host"),
         ]
     }
 
@@ -1108,7 +1258,26 @@ mod tests {
         // 60 inherited a pane from its parent but has left herdr's tree.
         let panes = HashMap::from([(20, "wA:p1".to_owned()), (60, "wA:p1".to_owned())]);
         let (sessions, orphans) = build(&table(), &panes, |pid| pid as u64);
-        assert_eq!(sessions.len(), 3, "the nested claude belongs to its parent");
+        assert_eq!(sessions.len(), 4, "the nested claude belongs to its parent");
+        let daemon = sessions.iter().find(|s| s.pid == 70).unwrap();
+        assert!(daemon.shared, "Codex's app-server serves every session");
+        assert_eq!(daemon.kib, 70 + 71 + 72 + 73);
+        // The app-server under the daemon is split into what it runs.
+        let labels: Vec<(&str, u64)> = daemon
+            .parts
+            .iter()
+            .map(|part| (part.label.as_str(), part.kib))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("codex (main)", 70),
+                ("codex-code-mode-host", 73),
+                ("codegraph mcp", 72),
+                ("codex", 71)
+            ]
+        );
+        assert!(!sessions.iter().find(|s| s.pid == 20).unwrap().shared);
         let stray = sessions.iter().find(|s| s.pid == 60).unwrap();
         assert_eq!(stray.pane_id, None);
         let claude = sessions.iter().find(|s| s.agent == Agent::Claude).unwrap();
@@ -1200,6 +1369,57 @@ mod tests {
     }
 
     #[test]
+    fn codex_rollouts_give_running_totals_and_their_window() {
+        let dir = env::temp_dir().join(format!("sysi-codex-{}", std::process::id()));
+        let day = dir.join("2026/10/10");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(dir.join("2026/09/01")).unwrap();
+        let path = day.join("rollout-2026-10-10T17-12-00-01a1.jsonl");
+        let count = |total: u64, cached: u64, last: u64| {
+            format!(
+                r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{total},"cached_input_tokens":{cached},"cache_write_input_tokens":0,"output_tokens":10}},"last_token_usage":{{"input_tokens":{last}}},"model_context_window":258400}}}}}}"#
+            )
+        };
+        fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-6-luna\"}}}}\n{}\n{}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":null}}}}\n",
+                count(100, 60, 100),
+                count(300, 200, 200)
+            ),
+        )
+        .unwrap();
+        assert_eq!(find_rollout(&dir, "01a1"), Some(path.clone()));
+        assert_eq!(find_rollout(&dir, "nope"), None);
+        let tallied = tally(Agent::Codex, &path).unwrap();
+        // Totals replace, not add: they are running totals already.
+        assert_eq!(tallied.tokens.total(), 300 + 10);
+        assert_eq!(tallied.tokens.cache_read, 200);
+        assert_eq!(tallied.context, 200);
+        assert_eq!(tallied.limit, Some(258_400));
+        assert_eq!(tallied.model.as_deref(), Some("gpt-6-luna"));
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            b"{\"type\":\"compacted\",\"payload\":{\"message\":\"\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(tally(Agent::Codex, &path).unwrap().context, 0);
+        assert_eq!(
+            session_of(
+                Agent::Codex,
+                1,
+                &["codex".into(), "resume".into(), "01a1".into()],
+                None
+            )
+            .as_deref(),
+            Some("01a1")
+        );
+        assert_eq!(session_of(Agent::Codex, 1, &["codex".into()], None), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn context_limits_follow_the_model() {
         assert_eq!(claude_context_limit("claude-opus-5-5"), 1_000_000);
         assert_eq!(claude_context_limit("claude-sonnet-4-6"), 1_000_000);
@@ -1221,6 +1441,10 @@ mod tests {
             "server-github"
         );
         assert_eq!(script_name("/home/u/.local/bin/codegraph"), "codegraph");
+        assert_eq!(
+            script_name("/c/plugins/unified-computer-use/26.901.41600/scripts/launch.mjs"),
+            "unified-computer-use"
+        );
     }
 
     #[test]
@@ -1269,6 +1493,7 @@ mod tests {
             agent: Agent::Claude,
             pid: 2,
             cwd: "/home/u/my work".into(),
+            shared: false,
             pane_id: None,
             pane: Some(Pane::default()),
             session: Some("8c57".into()),

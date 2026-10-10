@@ -3826,7 +3826,9 @@ fn short_cwd(cwd: &str) -> String {
 
 /// What the row says about a session's state, beside its memory.
 fn session_state_label(session: &sessions::Session, state: &SessionsState, now: i64) -> String {
-    if state.closing.contains(&session.pid) {
+    if session.shared {
+        String::new()
+    } else if state.closing.contains(&session.pid) {
         "closing…".into()
     } else if state
         .confirm
@@ -3846,11 +3848,18 @@ fn session_state_label(session: &sessions::Session, state: &SessionsState, now: 
 }
 
 fn session_name(session: &sessions::Session) -> String {
-    session
-        .pane
-        .as_ref()
-        .and_then(|pane| pane.title.clone())
-        .unwrap_or_else(|| short_cwd(&session.cwd))
+    if session.shared {
+        return "app-server, shared by every Codex".into();
+    }
+    let folder = short_cwd(&session.cwd);
+    match session.pane.as_ref().and_then(|pane| pane.title.as_deref()) {
+        // Codex ends its title with ` | <folder>`.
+        Some(title) => title
+            .strip_suffix(&format!(" | {folder}"))
+            .unwrap_or(title)
+            .to_owned(),
+        None => folder,
+    }
 }
 
 /// Every text the rows would show, in order. Two passes that read the same
@@ -3939,7 +3948,12 @@ fn session_groups(report: &sessions::Report) -> Vec<(String, Vec<&sessions::Sess
         .map(|label| (label.to_uppercase(), Vec::new()))
         .collect();
     let mut other = Vec::new();
+    let mut shared = Vec::new();
     for session in &report.sessions {
+        if session.shared {
+            shared.push(session);
+            continue;
+        }
         let slot = session.pane.as_ref().and_then(|pane| {
             report
                 .workspaces
@@ -3952,6 +3966,7 @@ fn session_groups(report: &sessions::Report) -> Vec<(String, Vec<&sessions::Sess
         }
     }
     groups.push(("OTHER TERMINALS".into(), other));
+    groups.push(("SHARED".into(), shared));
     groups.retain(|(_, list)| !list.is_empty());
     groups
 }
@@ -4215,21 +4230,25 @@ fn session_row(
         });
         top.pack_start(&focus, false, false, 0);
     }
-    let close = small_button("\u{d7}");
-    close.style_context().add_class("session-action");
-    close.set_valign(gtk::Align::Center);
-    close.set_tooltip_text(Some(if session.pane_id.is_some() {
-        "Quit with Ctrl+D (resume command goes to the clipboard)"
-    } else {
-        "Quit (resume command goes to the clipboard)"
-    }));
-    close.set_sensitive(!state.closing.contains(&session.pid));
-    close.connect_clicked({
-        let card = card.clone();
-        let session = session.clone();
-        move |_| close_session(&card, session.clone())
-    });
-    top.pack_start(&close, false, false, 0);
+    // Stopping the shared app-server would end every Codex session at once;
+    // each is closed from its own row instead.
+    if !session.shared {
+        let close = small_button("\u{d7}");
+        close.style_context().add_class("session-action");
+        close.set_valign(gtk::Align::Center);
+        close.set_tooltip_text(Some(if session.pane_id.is_some() {
+            "Quit with Ctrl+D (resume command goes to the clipboard)"
+        } else {
+            "Quit (resume command goes to the clipboard)"
+        }));
+        close.set_sensitive(!state.closing.contains(&session.pid));
+        close.connect_clicked({
+            let card = card.clone();
+            let session = session.clone();
+            move |_| close_session(&card, session.clone())
+        });
+        top.pack_start(&close, false, false, 0);
+    }
     row.pack_start(&top, false, false, 0);
 
     let detail = session_detail(session);
@@ -4305,7 +4324,11 @@ fn render_sessions_tab(card: &UsageCard, scroll: Option<f64>) {
         .map(|(text, _)| text.clone());
     let mut summary = format!(
         "{} agents · {} of {} RAM",
-        report.sessions.len(),
+        report
+            .sessions
+            .iter()
+            .filter(|session| !session.shared)
+            .count(),
         format_kib(report.total_kib()),
         format_kib(report.mem_total_kib)
     );
