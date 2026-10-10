@@ -129,6 +129,8 @@ pub struct Settings {
     pub translate_open: bool,
     #[serde(default)]
     pub usage_open: bool,
+    #[serde(default)]
+    pub sessions_open: bool,
     #[serde(default = "default_usage_source")]
     pub usage_source: String,
     #[serde(default = "default_usage_period")]
@@ -154,6 +156,7 @@ impl Default for Settings {
             settings_button: true,
             translate_open: false,
             usage_open: false,
+            sessions_open: false,
             usage_source: default_usage_source(),
             usage_period: default_usage_period(),
             color_mode: ColorMode::default(),
@@ -868,6 +871,7 @@ mod tests {
         let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
             .expect("state without a usage flag should remain readable");
         assert!(!state.settings.usage_open);
+        assert!(!state.settings.sessions_open);
         assert_eq!(state.settings.usage_source, "codex");
         assert_eq!(state.settings.usage_period, "30d");
     }

@@ -36,6 +36,9 @@ const NOTE_HEIGHT: i32 = 124;
 const USAGE_WIDTH: i32 = 292;
 // Tall enough for the token tab's calendar of weeks and its three rows.
 const USAGE_HEIGHT: i32 = 212;
+/// SESSIONS opens taller than USAGE: a row per agent, and room for a few.
+const SESSIONS_WIDTH: i32 = 360;
+const SESSIONS_HEIGHT: i32 = 420;
 const TRANSLATE_WIDTH: i32 = 272;
 const TRANSLATE_EMPTY_HEIGHT: i32 = 44;
 const TRANSLATE_RESULTS_MAX_HEIGHT: i32 = 520;
@@ -192,10 +195,28 @@ struct UsageCard {
     updated: gtk::Label,
     color_mode: Rc<Cell<Foreground>>,
     resize: ResizeHandle,
+}
+
+/// The SESSIONS window: the agents running on this machine and what they
+/// hold. A card of its own beside USAGE, built the same way but with one
+/// list where USAGE has tabs.
+#[derive(Clone)]
+struct SessionsCard {
+    card: gtk::EventBox,
+    chrome: gtk::EventBox,
+    header: gtk::EventBox,
+    hide: gtk::Button,
+    refresh: gtk::Button,
+    scroller: gtk::ScrolledWindow,
+    rows: gtk::Box,
+    status: gtk::Label,
+    updated: gtk::Label,
+    color_mode: Rc<Cell<Foreground>>,
+    resize: ResizeHandle,
     sessions: Rc<RefCell<SessionsState>>,
 }
 
-/// The sessions tab: the last pass over `/proc`, and what the user has done
+/// The sessions list: the last pass over `/proc`, and what the user has done
 /// to it since. Kept on the card so a click can redraw it without waiting
 /// for the next pass.
 #[derive(Default)]
@@ -704,23 +725,13 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         })
     };
 
-    // The quota tab USAGE in the panel menu goes back to, when the card is
-    // showing SESSIONS.
-    let last_quota_tab = Rc::new(Cell::new(match initial_usage_tab {
-        UsageTab::Sessions => UsageTab::Source(UsageSource::Codex),
-        tab => tab,
-    }));
     for (tab, button) in usage.tabs.clone() {
         let selected = usage_controller.tab.clone();
         let request = usage_controller.request.clone();
         let show = usage_controller.show.clone();
         let tabs = usage.tabs.clone();
         let state = state.clone();
-        let last_quota_tab = last_quota_tab.clone();
         button.connect_clicked(move |_| {
-            if tab != UsageTab::Sessions {
-                last_quota_tab.set(tab);
-            }
             selected.set(tab);
             set_usage_tab_active(&tabs, tab);
             state.borrow_mut().settings.usage_source = tab.key().to_owned();
@@ -750,45 +761,6 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let refresh = usage_controller.refresh.clone();
         move |_| refresh()
     });
-    // The panel's AGENT menu opens the card on a tab: on that tab already, it
-    // closes; elsewhere, or closed, it opens there.
-    let show_usage_tab: Rc<dyn Fn(UsageTab)> = {
-        let card = usage.card.clone();
-        let tabs = usage.tabs.clone();
-        let selected = usage_controller.tab.clone();
-        let toggle_usage = toggle_usage.clone();
-        let last_quota_tab = last_quota_tab.clone();
-        let state = state.clone();
-        Rc::new(move |tab: UsageTab| {
-            if !card.is_visible() {
-                // Chosen before opening, so the open loads this tab rather
-                // than fetching for the one left selected.
-                selected.set(tab);
-                if tab != UsageTab::Sessions {
-                    last_quota_tab.set(tab);
-                }
-                state.borrow_mut().settings.usage_source = tab.key().to_owned();
-                let _ = state.borrow().save();
-                toggle_usage();
-            } else if selected.get() == tab {
-                toggle_usage();
-            } else if let Some((_, button)) = tabs.iter().find(|(candidate, _)| *candidate == tab) {
-                button.clicked();
-            }
-        })
-    };
-    let toggle_usage_quota: Rc<dyn Fn()> = {
-        let selected = usage_controller.tab.clone();
-        let toggle_usage = toggle_usage.clone();
-        let show_usage_tab = show_usage_tab.clone();
-        Rc::new(move || {
-            if selected.get() == UsageTab::Sessions {
-                show_usage_tab(last_quota_tab.get());
-            } else {
-                toggle_usage();
-            }
-        })
-    };
     usage.hide.connect_clicked({
         let toggle_usage = toggle_usage.clone();
         move |_| toggle_usage()
@@ -796,6 +768,141 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     widget_picker.usage.connect_clicked({
         let toggle_usage = toggle_usage.clone();
         move |_| toggle_usage()
+    });
+
+    // SESSIONS, a window of its own beside USAGE.
+    let sessions_color_mode = saved_color_mode(&state.borrow(), "sessions");
+    let sessions_card = build_sessions_window(foreground_for_mode(sessions_color_mode));
+    let sessions_position = state
+        .borrow()
+        .positions
+        .get("sessions")
+        .copied()
+        .unwrap_or(Point {
+            x: primary_screen.x + 28 + USAGE_WIDTH + 16,
+            y: primary_screen.y + 460,
+        });
+    apply_widget_size(
+        &sessions_card.card,
+        "sessions",
+        &state,
+        Size {
+            width: SESSIONS_WIDTH,
+            height: SESSIONS_HEIGHT,
+        },
+    );
+    place_card(&root, &sessions_card.card, sessions_position);
+    register(
+        &registry,
+        "sessions",
+        &sessions_card.card,
+        sessions_card.color_mode.clone(),
+        sessions_color_mode,
+    );
+    if let Some(item) = registry
+        .borrow_mut()
+        .iter_mut()
+        .find(|item| item.key == "sessions")
+    {
+        item.edit_only = Some(sessions_card.chrome.clone());
+    }
+    attach_color_mode_menu(
+        &sessions_card.card,
+        "sessions".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
+    attach_drag(
+        &sessions_card.header,
+        &sessions_card.card,
+        &root,
+        "sessions".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+    );
+    attach_resize(
+        &sessions_card.resize,
+        &sessions_card.card,
+        &root,
+        "sessions".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+        ResizeBounds {
+            min_width: 260,
+            min_height: 128,
+            max_width: Some(720),
+            max_height: Some(900),
+            aspect_ratio: None,
+            preserve_current_aspect: false,
+            height_for_width: None,
+        },
+    );
+    let scan_sessions = start_sessions_updates(sessions_card.clone());
+    let toggle_sessions: Rc<dyn Fn()> = {
+        let card = sessions_card.card.clone();
+        let chrome = sessions_card.chrome.clone();
+        let state = state.clone();
+        let window = window.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let root = root.clone();
+        let picker = widget_picker.card.clone();
+        let scan_sessions = scan_sessions.clone();
+        Rc::new(move || {
+            let open = !card.is_visible();
+            if open {
+                reopen_widget(
+                    &card,
+                    "sessions",
+                    &root,
+                    &state,
+                    Size {
+                        width: SESSIONS_WIDTH,
+                        height: SESSIONS_HEIGHT,
+                    },
+                    Some(&picker),
+                );
+                card.show_all();
+                raise_card(&card);
+                chrome.set_visible(interactive.get());
+                scan_sessions(false);
+            } else {
+                card.hide();
+            }
+            state.borrow_mut().settings.sessions_open = open;
+            let _ = state.borrow().save();
+            refresh_input_shape(&window, &registry, interactive.get());
+            glib::idle_add_local_once({
+                let window = window.clone();
+                let registry = registry.clone();
+                let interactive = interactive.clone();
+                let root = root.clone();
+                let state = state.clone();
+                move || {
+                    if open {
+                        clamp_registered_widgets(&root, &registry, &state);
+                    }
+                    refresh_input_shape(&window, &registry, interactive.get());
+                }
+            });
+        })
+    };
+    sessions_card.refresh.connect_clicked({
+        let scan_sessions = scan_sessions.clone();
+        move |_| scan_sessions(true)
+    });
+    sessions_card.hide.connect_clicked({
+        let toggle_sessions = toggle_sessions.clone();
+        move |_| toggle_sessions()
     });
 
     // Each dictionary is a window of its own, the way notes are, so several
@@ -1844,8 +1951,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let toggle_notes = toggle_notes.clone();
         let follow_notes_pointer = follow_notes_pointer.clone();
         let notes_opened_at = notes_opened_at.clone();
-        let toggle_usage_quota = toggle_usage_quota.clone();
-        let show_usage_tab = show_usage_tab.clone();
+        let toggle_usage = toggle_usage.clone();
+        let toggle_sessions = toggle_sessions.clone();
         let toggle_translate = toggle_translate.clone();
         let translate_spawn = translate_spawn.clone();
         let translate_any_visible = translate_any_visible.clone();
@@ -1919,8 +2026,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                             toggle_notes();
                         }
                     }
-                    "toggle-usage" => toggle_usage_quota(),
-                    "toggle-sessions" => show_usage_tab(UsageTab::Sessions),
+                    "toggle-usage" => toggle_usage(),
+                    "toggle-sessions" => toggle_sessions(),
                     "toggle-translate" => {
                         // The entry is edit chrome, so a translate window
                         // opened while locked would have nothing to type into;
@@ -2036,6 +2143,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     } else {
         usage.chrome.set_visible(interactive.get());
         (usage_controller.request)();
+    }
+    if !state.borrow().settings.sessions_open {
+        sessions_card.card.hide();
+    } else {
+        sessions_card.chrome.set_visible(interactive.get());
+        scan_sessions(false);
     }
     // Likewise the dictionary: show_all() dropped its query panel down, but a
     // window restored from the last session was not asked for just now.
@@ -2239,8 +2352,8 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     let hide = small_button("\u{2212}");
     hide.style_context().add_class("note-window-button");
     hide.style_context().add_class("note-hide");
-    hide.set_tooltip_text(Some("Hide"));
-    let title = gtk::Label::new(Some("AGENT"));
+    hide.set_tooltip_text(Some("Hide Usage"));
+    let title = gtk::Label::new(Some("USAGE"));
     title.set_xalign(0.0);
     title.set_hexpand(true);
     title.style_context().add_class("history-title");
@@ -2419,6 +2532,90 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
         updated,
         color_mode,
         resize,
+    }
+}
+
+/// SESSIONS: the same note-style card as USAGE, a list in place of its tabs.
+fn build_sessions_window(initial_color_mode: Foreground) -> SessionsCard {
+    let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
+    body.set_spacing(0);
+    card.set_visible_window(true);
+    card.style_context().add_class("pinned-note");
+    card.style_context().add_class("usage-window");
+
+    let chrome = gtk::EventBox::new();
+    chrome.set_visible_window(false);
+    let chrome_body = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    chrome.add(&chrome_body);
+    let header = gtk::EventBox::new();
+    header.set_visible_window(true);
+    header.set_hexpand(true);
+    header.style_context().add_class("note-header");
+    header.style_context().add_class("usage-header");
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    bar.set_hexpand(true);
+    let hide = small_button("\u{2212}");
+    hide.style_context().add_class("note-window-button");
+    hide.style_context().add_class("note-hide");
+    hide.set_tooltip_text(Some("Hide Sessions"));
+    let title = gtk::Label::new(Some("SESSIONS"));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    title.style_context().add_class("history-title");
+    let refresh = small_button("\u{21bb}");
+    refresh.style_context().add_class("note-window-button");
+    refresh.set_tooltip_text(Some("Refresh sessions"));
+    bar.pack_start(&hide, false, false, 0);
+    bar.pack_start(&title, true, true, 0);
+    bar.pack_end(&refresh, false, false, 0);
+    header.add(&bar);
+    chrome_body.pack_start(&header, false, false, 0);
+    chrome_body.show_all();
+    body.pack_start(&chrome, false, false, 0);
+
+    let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroller.set_overlay_scrolling(true);
+    scroller.set_shadow_type(gtk::ShadowType::None);
+    scroller.set_propagate_natural_width(false);
+    scroller.set_propagate_natural_height(false);
+    scroller.set_size_request(1, 82);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.style_context().add_class("usage-scroller");
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    rows.style_context().add_class("usage-rows");
+    scroller.add(&rows);
+    repaint_card_on_scroll(&scroller, &card);
+    let status = gtk::Label::new(Some("Reading sessions…"));
+    status.set_xalign(0.0);
+    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status.style_context().add_class("usage-status");
+    let updated = gtk::Label::new(None);
+    updated.set_xalign(0.0);
+    updated.style_context().add_class("usage-updated");
+    let plate = frost_plate();
+    let panes = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    panes.set_hexpand(true);
+    panes.set_vexpand(true);
+    panes.pack_start(&scroller, true, true, 0);
+    panes.pack_start(&status, false, false, 0);
+    panes.pack_start(&updated, false, false, 0);
+    plate.add(&panes);
+    body.pack_start(&plate, true, true, 0);
+
+    SessionsCard {
+        card,
+        chrome,
+        header,
+        hide,
+        refresh,
+        scroller,
+        rows,
+        status,
+        updated,
+        color_mode,
+        resize,
         sessions: Rc::new(RefCell::new(SessionsState::default())),
     }
 }
@@ -2534,24 +2731,20 @@ fn set_usage_tab_active<T: Copy + PartialEq>(choices: &[(T, gtk::Button)], activ
 enum UsageTab {
     Source(UsageSource),
     Tokens,
-    /// The agents running right now and the memory they hold.
-    Sessions,
 }
 
 impl UsageTab {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 4] = [
         Self::Source(UsageSource::Codex),
         Self::Source(UsageSource::Claude),
         Self::Source(UsageSource::Omp),
         Self::Tokens,
-        Self::Sessions,
     ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Source(source) => source.label(),
             Self::Tokens => "TOKENS",
-            Self::Sessions => "SESSIONS",
         }
     }
 
@@ -2559,7 +2752,6 @@ impl UsageTab {
         match self {
             Self::Source(source) => source.key(),
             Self::Tokens => "tokens",
-            Self::Sessions => "sessions",
         }
     }
 
@@ -2568,7 +2760,6 @@ impl UsageTab {
     fn from_key(value: &str) -> Self {
         match value {
             "tokens" => Self::Tokens,
-            "sessions" => Self::Sessions,
             other => Self::Source(UsageSource::from_key(other)),
         }
     }
@@ -3644,16 +3835,8 @@ fn render_usage_card(
     card.scroller.set_visible(!tokens);
     card.tokens_pane.set_visible(tokens);
     set_usage_tab_active(&card.tabs, tab);
-    if tab != UsageTab::Sessions {
-        // The rows are about to hold another tab's; SESSIONS must refill.
-        card.sessions.borrow_mut().last_view.clear();
-    }
     if tokens {
         render_token_tab(card);
-        return;
-    }
-    if tab == UsageTab::Sessions {
-        render_sessions_tab(card, scroll);
         return;
     }
     clear_usage_rows(&card.rows);
@@ -3762,7 +3945,7 @@ fn render_usage_card(
     }
 }
 
-/// How often the sessions tab re-reads `/proc` while it is up.
+/// How often SESSIONS re-reads `/proc` while it is open.
 const SESSIONS_RESCAN_MS: i64 = 3_000;
 /// How long a second click on × stays armed, and a note stays in the status:
 /// long enough to read the note that asks for it.
@@ -3971,18 +4154,18 @@ fn session_groups(report: &sessions::Report) -> Vec<(String, Vec<&sessions::Sess
     groups
 }
 
-fn sessions_note(card: &UsageCard, text: impl Into<String>) {
+fn sessions_note(card: &SessionsCard, text: impl Into<String>) {
     card.sessions.borrow_mut().note = Some((text.into(), usage_now_ms()));
 }
 
-fn sessions_rescan(card: &UsageCard) {
+fn sessions_rescan(card: &SessionsCard) {
     let rescan = card.sessions.borrow().rescan.clone();
     if let Some(rescan) = rescan {
         rescan();
     }
 }
 
-fn redraw_sessions(card: &UsageCard) {
+fn redraw_sessions(card: &SessionsCard) {
     render_sessions_tab(card, Some(card.scroller.vadjustment().value()));
 }
 
@@ -3996,7 +4179,7 @@ fn copy_to_clipboard(text: &str) {
 /// at its prompt, and its resume command goes to the clipboard first so the
 /// conversation is one paste away. A busy one, or one that ignored the Ctrl+D
 /// (a draft in its prompt), needs a second click, which hangs it up.
-fn close_session(card: &UsageCard, session: sessions::Session) {
+fn close_session(card: &SessionsCard, session: sessions::Session) {
     let now = usage_now_ms();
     let armed = card
         .sessions
@@ -4073,7 +4256,7 @@ fn close_session(card: &UsageCard, session: sessions::Session) {
 
 /// Quits every session that has sat idle for hours, one after another, and
 /// leaves all their resume commands on the clipboard.
-fn close_idle_sessions(card: &UsageCard) {
+fn close_idle_sessions(card: &SessionsCard) {
     let idle: Vec<sessions::Session> = {
         let state = card.sessions.borrow();
         let Some(report) = state.report.as_ref() else {
@@ -4147,7 +4330,7 @@ fn sessions_heading(rows: &gtk::Box, text: &str, next: bool) {
 }
 
 fn session_row(
-    card: &UsageCard,
+    card: &SessionsCard,
     session: &sessions::Session,
     state: &SessionsState,
     now: i64,
@@ -4301,7 +4484,7 @@ fn session_row(
     row
 }
 
-fn render_sessions_tab(card: &UsageCard, scroll: Option<f64>) {
+fn render_sessions_tab(card: &SessionsCard, scroll: Option<f64>) {
     let now = usage_now_ms();
     let state = card.sessions.borrow();
     card.refresh.set_sensitive(!state.loading);
@@ -4467,7 +4650,6 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
     let (tx, rx) =
         async_channel::bounded::<(UsageSource, Result<usage::Snapshot, usage::FetchError>)>(3);
     let (token_tx, token_rx) = async_channel::bounded::<usage::TokenReport>(1);
-    let (sessions_tx, sessions_rx) = async_channel::bounded::<sessions::Report>(1);
     let render = {
         let card = card.clone();
         let schedules = schedules.clone();
@@ -4540,58 +4722,15 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
             });
         });
     }
-    // Walking /proc is cheap once the transcripts have been read the first
-    // time, so the tab is kept current every few seconds while it is up and
-    // left alone otherwise.
-    let scan_sessions = {
-        let card = card.clone();
-        Rc::new(move |manual: bool| {
-            {
-                let state = card.sessions.borrow();
-                let age = state
-                    .report
-                    .as_ref()
-                    .map(|report| usage_now_ms().saturating_sub(report.collected_at_ms));
-                if !state.loading && (manual || age.is_none_or(|age| age >= SESSIONS_RESCAN_MS)) {
-                    drop(state);
-                } else {
-                    let loading = state.loading;
-                    drop(state);
-                    // Run again once the pass under way lands: it may have
-                    // read /proc before the change this asks to see.
-                    if loading && manual {
-                        card.sessions.borrow_mut().pending = true;
-                    }
-                    return;
-                }
-            }
-            card.sessions.borrow_mut().loading = true;
-            card.refresh.set_sensitive(false);
-            card.refresh.set_label("…");
-            let sessions_tx = sessions_tx.clone();
-            std::thread::spawn(move || {
-                let _ = sessions_tx.send_blocking(sessions::collect());
-            });
-        }) as Rc<dyn Fn(bool)>
-    };
-    card.sessions.borrow_mut().rescan = Some({
-        let scan_sessions = scan_sessions.clone();
-        Rc::new(move || scan_sessions(true))
-    });
     let send = {
         let tab = tab.clone();
         let card = card.clone();
         let schedules = schedules.clone();
         let snapshots = snapshots.clone();
         let scan = scan.clone();
-        let scan_sessions = scan_sessions.clone();
         Rc::new(move |manual: bool| {
             let UsageTab::Source(which) = tab.get() else {
-                if tab.get() == UsageTab::Sessions {
-                    scan_sessions(manual);
-                } else {
-                    scan(manual, false);
-                }
+                scan(manual, false);
                 return;
             };
             let now = usage_now_ms();
@@ -4665,36 +4804,6 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
             }
         });
     }
-    {
-        let card = card.clone();
-        let tab = tab.clone();
-        let render = render.clone();
-        let scan_sessions = scan_sessions.clone();
-        glib::MainContext::default().spawn_local(async move {
-            while let Ok(report) = sessions_rx.recv().await {
-                let pending = {
-                    let mut state = card.sessions.borrow_mut();
-                    // A session that is gone is no longer closing or waiting
-                    // for a second click.
-                    let live: HashSet<i32> = report.sessions.iter().map(|s| s.pid).collect();
-                    state.closing.retain(|pid| live.contains(pid));
-                    state.expanded.retain(|pid| live.contains(pid));
-                    if state.confirm.is_some_and(|(pid, _)| !live.contains(&pid)) {
-                        state.confirm = None;
-                    }
-                    state.report = Some(report);
-                    state.loading = false;
-                    std::mem::take(&mut state.pending)
-                };
-                if tab.get() == UsageTab::Sessions {
-                    render(UsageTab::Sessions);
-                }
-                if pending {
-                    scan_sessions(true);
-                }
-            }
-        });
-    }
     let show = {
         let render = render.clone();
         Rc::new(move |which| {
@@ -4726,7 +4835,6 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
                     }
                     None
                 }
-                UsageTab::Sessions => None,
             };
             if let Some(snapshot) =
                 selected.and_then(|source| snapshots.borrow().get(&source).cloned())
@@ -4774,6 +4882,83 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
         refresh,
         show,
     }
+}
+
+/// Keeps SESSIONS current: a pass over `/proc` every few seconds while it is
+/// open, none while it is hidden. Hands back the pass, forced or not.
+fn start_sessions_updates(card: SessionsCard) -> Rc<dyn Fn(bool)> {
+    let (sessions_tx, sessions_rx) = async_channel::bounded::<sessions::Report>(1);
+    let scan_sessions = {
+        let card = card.clone();
+        Rc::new(move |manual: bool| {
+            {
+                let state = card.sessions.borrow();
+                let age = state
+                    .report
+                    .as_ref()
+                    .map(|report| usage_now_ms().saturating_sub(report.collected_at_ms));
+                if state.loading || (!manual && age.is_some_and(|age| age < SESSIONS_RESCAN_MS)) {
+                    let loading = state.loading;
+                    drop(state);
+                    // Run again once the pass under way lands: it may have
+                    // read /proc before the change this asks to see.
+                    if loading && manual {
+                        card.sessions.borrow_mut().pending = true;
+                    }
+                    return;
+                }
+            }
+            card.sessions.borrow_mut().loading = true;
+            card.refresh.set_sensitive(false);
+            card.refresh.set_label("…");
+            let sessions_tx = sessions_tx.clone();
+            std::thread::spawn(move || {
+                let _ = sessions_tx.send_blocking(sessions::collect());
+            });
+        }) as Rc<dyn Fn(bool)>
+    };
+    card.sessions.borrow_mut().rescan = Some({
+        let scan_sessions = scan_sessions.clone();
+        Rc::new(move || scan_sessions(true))
+    });
+    {
+        let card = card.clone();
+        let scan_sessions = scan_sessions.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(report) = sessions_rx.recv().await {
+                let pending = {
+                    let mut state = card.sessions.borrow_mut();
+                    // A session that is gone is no longer closing or waiting
+                    // for a second click.
+                    let live: HashSet<i32> = report.sessions.iter().map(|s| s.pid).collect();
+                    state.closing.retain(|pid| live.contains(pid));
+                    state.expanded.retain(|pid| live.contains(pid));
+                    if state.confirm.is_some_and(|(pid, _)| !live.contains(&pid)) {
+                        state.confirm = None;
+                    }
+                    state.report = Some(report);
+                    state.loading = false;
+                    std::mem::take(&mut state.pending)
+                };
+                redraw_sessions(&card);
+                if pending {
+                    scan_sessions(true);
+                }
+            }
+        });
+    }
+    {
+        let card = card.clone();
+        let scan_sessions = scan_sessions.clone();
+        glib::timeout_add_local(Duration::from_secs(1), move || {
+            if card.card.is_visible() {
+                scan_sessions(false);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+    render_sessions_tab(&card, None);
+    scan_sessions
 }
 
 // Dropping a note takes its per-note layout keys with it, and any image file it
@@ -15055,6 +15240,7 @@ fn receives_input_when_locked(key: &str) -> bool {
         || key.starts_with("dict:")
         || key == "notes"
         || key == "usage"
+        || key == "sessions"
         || key == "voice"
 }
 
@@ -16397,6 +16583,7 @@ mod tests {
         assert!(receives_input_when_locked("note:7"));
         assert!(receives_input_when_locked("notes"));
         assert!(receives_input_when_locked("usage"));
+        assert!(receives_input_when_locked("sessions"));
         assert!(!receives_input_when_locked("system"));
         assert!(!receives_input_when_locked("translate"));
     }
