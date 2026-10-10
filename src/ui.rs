@@ -197,6 +197,60 @@ struct UsageCard {
     resize: ResizeHandle,
 }
 
+/// Opening and closing a utility card (USAGE, SESSIONS): back where it was
+/// left and on top when it opens, the open state saved, the input shape
+/// redrawn either way.
+struct CardToggle {
+    card: gtk::EventBox,
+    chrome: gtk::EventBox,
+    key: &'static str,
+    size: Size,
+    state: Rc<RefCell<AppState>>,
+    window: gtk::ApplicationWindow,
+    registry: Rc<RefCell<Vec<RegisteredWidget>>>,
+    interactive: Rc<Cell<bool>>,
+    root: gtk::Fixed,
+    picker: gtk::EventBox,
+}
+
+impl CardToggle {
+    fn toggle(&self, on_open: &dyn Fn(), remember: &dyn Fn(&mut AppState, bool)) {
+        let open = !self.card.is_visible();
+        if open {
+            reopen_widget(
+                &self.card,
+                self.key,
+                &self.root,
+                &self.state,
+                self.size,
+                Some(&self.picker),
+            );
+            self.card.show_all();
+            raise_card(&self.card);
+            self.chrome.set_visible(self.interactive.get());
+            on_open();
+        } else {
+            self.card.hide();
+        }
+        remember(&mut self.state.borrow_mut(), open);
+        let _ = self.state.borrow().save();
+        refresh_input_shape(&self.window, &self.registry, self.interactive.get());
+        glib::idle_add_local_once({
+            let window = self.window.clone();
+            let registry = self.registry.clone();
+            let interactive = self.interactive.clone();
+            let root = self.root.clone();
+            let state = self.state.clone();
+            move || {
+                if open {
+                    clamp_registered_widgets(&root, &registry, &state);
+                }
+                refresh_input_shape(&window, &registry, interactive.get());
+            }
+        });
+    }
+}
+
 /// The SESSIONS window: the agents running on this machine and what they
 /// hold. A card of its own beside USAGE, built the same way but with one
 /// list where USAGE has tabs.
@@ -673,55 +727,27 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     let usage_controller = start_usage_updates(usage.clone(), initial_usage_tab);
 
     let toggle_usage: Rc<dyn Fn()> = {
-        let card = usage.card.clone();
-        let chrome = usage.chrome.clone();
-        let state = state.clone();
-        let window = window.clone();
-        let registry = registry.clone();
-        let interactive = interactive.clone();
-        let root = root.clone();
-        let picker = widget_picker.card.clone();
+        let toggle = CardToggle {
+            card: usage.card.clone(),
+            chrome: usage.chrome.clone(),
+            key: "usage",
+            size: Size {
+                width: USAGE_WIDTH,
+                height: USAGE_HEIGHT,
+            },
+            state: state.clone(),
+            window: window.clone(),
+            registry: registry.clone(),
+            interactive: interactive.clone(),
+            root: root.clone(),
+            picker: widget_picker.card.clone(),
+        };
         let request = usage_controller.request.clone();
         let invalidate = usage_controller.show.clone();
         let selected = usage_controller.tab.clone();
         Rc::new(move || {
-            let open = !card.is_visible();
             invalidate(selected.get());
-            if open {
-                reopen_widget(
-                    &card,
-                    "usage",
-                    &root,
-                    &state,
-                    Size {
-                        width: USAGE_WIDTH,
-                        height: USAGE_HEIGHT,
-                    },
-                    Some(&picker),
-                );
-                card.show_all();
-                raise_card(&card);
-                chrome.set_visible(interactive.get());
-                request();
-            } else {
-                card.hide();
-            }
-            state.borrow_mut().settings.usage_open = open;
-            let _ = state.borrow().save();
-            refresh_input_shape(&window, &registry, interactive.get());
-            glib::idle_add_local_once({
-                let window = window.clone();
-                let registry = registry.clone();
-                let interactive = interactive.clone();
-                let root = root.clone();
-                let state = state.clone();
-                move || {
-                    if open {
-                        clamp_registered_widgets(&root, &registry, &state);
-                    }
-                    refresh_input_shape(&window, &registry, interactive.get());
-                }
-            });
+            toggle.toggle(&*request, &|data, open| data.settings.usage_open = open);
         })
     };
 
@@ -848,51 +874,25 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     );
     let scan_sessions = start_sessions_updates(sessions_card.clone());
     let toggle_sessions: Rc<dyn Fn()> = {
-        let card = sessions_card.card.clone();
-        let chrome = sessions_card.chrome.clone();
-        let state = state.clone();
-        let window = window.clone();
-        let registry = registry.clone();
-        let interactive = interactive.clone();
-        let root = root.clone();
-        let picker = widget_picker.card.clone();
+        let toggle = CardToggle {
+            card: sessions_card.card.clone(),
+            chrome: sessions_card.chrome.clone(),
+            key: "sessions",
+            size: Size {
+                width: SESSIONS_WIDTH,
+                height: SESSIONS_HEIGHT,
+            },
+            state: state.clone(),
+            window: window.clone(),
+            registry: registry.clone(),
+            interactive: interactive.clone(),
+            root: root.clone(),
+            picker: widget_picker.card.clone(),
+        };
         let scan_sessions = scan_sessions.clone();
         Rc::new(move || {
-            let open = !card.is_visible();
-            if open {
-                reopen_widget(
-                    &card,
-                    "sessions",
-                    &root,
-                    &state,
-                    Size {
-                        width: SESSIONS_WIDTH,
-                        height: SESSIONS_HEIGHT,
-                    },
-                    Some(&picker),
-                );
-                card.show_all();
-                raise_card(&card);
-                chrome.set_visible(interactive.get());
-                scan_sessions(false);
-            } else {
-                card.hide();
-            }
-            state.borrow_mut().settings.sessions_open = open;
-            let _ = state.borrow().save();
-            refresh_input_shape(&window, &registry, interactive.get());
-            glib::idle_add_local_once({
-                let window = window.clone();
-                let registry = registry.clone();
-                let interactive = interactive.clone();
-                let root = root.clone();
-                let state = state.clone();
-                move || {
-                    if open {
-                        clamp_registered_widgets(&root, &registry, &state);
-                    }
-                    refresh_input_shape(&window, &registry, interactive.get());
-                }
+            toggle.toggle(&|| scan_sessions(false), &|data, open| {
+                data.settings.sessions_open = open
             });
         })
     };
@@ -2327,7 +2327,25 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     track_widget_hover(registry, translate_scrollers);
 }
 
-fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
+/// What USAGE and SESSIONS share: a note-style card whose title bar holds
+/// hide, the title and refresh.
+struct UtilityShell {
+    card: gtk::EventBox,
+    body: gtk::Box,
+    chrome: gtk::EventBox,
+    header: gtk::EventBox,
+    hide: gtk::Button,
+    refresh: gtk::Button,
+    color_mode: Rc<Cell<Foreground>>,
+    resize: ResizeHandle,
+}
+
+fn utility_shell(
+    initial_color_mode: Foreground,
+    title: &str,
+    hide_tip: &str,
+    refresh_tip: &str,
+) -> UtilityShell {
     let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
     // Same flush stack a desk note uses: a 4px card-body gap here is a
     // hole straight through to the desktop once LIGHT / DARK fill the
@@ -2352,14 +2370,14 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     let hide = small_button("\u{2212}");
     hide.style_context().add_class("note-window-button");
     hide.style_context().add_class("note-hide");
-    hide.set_tooltip_text(Some("Hide Usage"));
-    let title = gtk::Label::new(Some("USAGE"));
+    hide.set_tooltip_text(Some(hide_tip));
+    let title = gtk::Label::new(Some(title));
     title.set_xalign(0.0);
     title.set_hexpand(true);
     title.style_context().add_class("history-title");
     let refresh = small_button("\u{21bb}");
     refresh.style_context().add_class("note-window-button");
-    refresh.set_tooltip_text(Some("Refresh usage"));
+    refresh.set_tooltip_text(Some(refresh_tip));
     bar.pack_start(&hide, false, false, 0);
     bar.pack_start(&title, true, true, 0);
     bar.pack_end(&refresh, false, false, 0);
@@ -2367,17 +2385,20 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     chrome_body.pack_start(&header, false, false, 0);
     chrome_body.show_all();
     body.pack_start(&chrome, false, false, 0);
-
-    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-    tab_bar.style_context().add_class("usage-tabs");
-    let mut tabs = Vec::new();
-    for tab in UsageTab::ALL {
-        let button = picker_button(tab.label());
-        button.style_context().add_class("usage-tab");
-        tab_bar.pack_start(&button, true, true, 0);
-        tabs.push((tab, button));
+    UtilityShell {
+        card,
+        body,
+        chrome,
+        header,
+        hide,
+        refresh,
+        color_mode,
+        resize,
     }
+}
 
+/// The scrolling list of rows both cards keep their figures in.
+fn utility_list(card: &gtk::EventBox) -> (gtk::ScrolledWindow, gtk::Box) {
     let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroller.set_overlay_scrolling(true);
@@ -2391,7 +2412,45 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
     let rows = gtk::Box::new(gtk::Orientation::Vertical, 3);
     rows.style_context().add_class("usage-rows");
     scroller.add(&rows);
-    repaint_card_on_scroll(&scroller, &card);
+    repaint_card_on_scroll(&scroller, card);
+    (scroller, rows)
+}
+
+/// The two faint lines under the list: what it shows, and how fresh it is.
+fn utility_footer(status: &str) -> (gtk::Label, gtk::Label) {
+    let status = gtk::Label::new(Some(status));
+    status.set_xalign(0.0);
+    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status.style_context().add_class("usage-status");
+    let updated = gtk::Label::new(None);
+    updated.set_xalign(0.0);
+    updated.style_context().add_class("usage-updated");
+    (status, updated)
+}
+
+fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
+    let UtilityShell {
+        card,
+        body,
+        chrome,
+        header,
+        hide,
+        refresh,
+        color_mode,
+        resize,
+    } = utility_shell(initial_color_mode, "USAGE", "Hide Usage", "Refresh usage");
+
+    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    tab_bar.style_context().add_class("usage-tabs");
+    let mut tabs = Vec::new();
+    for tab in UsageTab::ALL {
+        let button = picker_button(tab.label());
+        button.style_context().add_class("usage-tab");
+        tab_bar.pack_start(&button, true, true, 0);
+        tabs.push((tab, button));
+    }
+
+    let (scroller, rows) = utility_list(&card);
 
     let tokens = Rc::new(RefCell::new(TokenState::default()));
     let token_hits = Rc::new(RefCell::new(Vec::<TokenHit>::new()));
@@ -2484,13 +2543,7 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
         }
     });
     tokens_pane.pack_start(&tokens_canvas, true, true, 0);
-    let status = gtk::Label::new(Some("Loading usage…"));
-    status.set_xalign(0.0);
-    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    status.style_context().add_class("usage-status");
-    let updated = gtk::Label::new(None);
-    updated.set_xalign(0.0);
-    updated.style_context().add_class("usage-updated");
+    let (status, updated) = utility_footer("Loading usage…");
     let plate = frost_plate();
     let panes = gtk::Box::new(gtk::Orientation::Vertical, 0);
     panes.set_hexpand(true);
@@ -2537,63 +2590,14 @@ fn build_usage_window(initial_color_mode: Foreground) -> UsageCard {
 
 /// SESSIONS: the same note-style card as USAGE, a list in place of its tabs.
 fn build_sessions_window(initial_color_mode: Foreground) -> SessionsCard {
-    let (card, body, _drag, color_mode, resize) = card_shell("", "", initial_color_mode);
-    body.set_spacing(0);
-    card.set_visible_window(true);
-    card.style_context().add_class("pinned-note");
-    card.style_context().add_class("usage-window");
-
-    let chrome = gtk::EventBox::new();
-    chrome.set_visible_window(false);
-    let chrome_body = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    chrome.add(&chrome_body);
-    let header = gtk::EventBox::new();
-    header.set_visible_window(true);
-    header.set_hexpand(true);
-    header.style_context().add_class("note-header");
-    header.style_context().add_class("usage-header");
-    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-    bar.set_hexpand(true);
-    let hide = small_button("\u{2212}");
-    hide.style_context().add_class("note-window-button");
-    hide.style_context().add_class("note-hide");
-    hide.set_tooltip_text(Some("Hide Sessions"));
-    let title = gtk::Label::new(Some("SESSIONS"));
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-    title.style_context().add_class("history-title");
-    let refresh = small_button("\u{21bb}");
-    refresh.style_context().add_class("note-window-button");
-    refresh.set_tooltip_text(Some("Refresh sessions"));
-    bar.pack_start(&hide, false, false, 0);
-    bar.pack_start(&title, true, true, 0);
-    bar.pack_end(&refresh, false, false, 0);
-    header.add(&bar);
-    chrome_body.pack_start(&header, false, false, 0);
-    chrome_body.show_all();
-    body.pack_start(&chrome, false, false, 0);
-
-    let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    scroller.set_overlay_scrolling(true);
-    scroller.set_shadow_type(gtk::ShadowType::None);
-    scroller.set_propagate_natural_width(false);
-    scroller.set_propagate_natural_height(false);
-    scroller.set_size_request(1, 82);
-    scroller.set_hexpand(true);
-    scroller.set_vexpand(true);
-    scroller.style_context().add_class("usage-scroller");
-    let rows = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    rows.style_context().add_class("usage-rows");
-    scroller.add(&rows);
-    repaint_card_on_scroll(&scroller, &card);
-    let status = gtk::Label::new(Some("Reading sessions…"));
-    status.set_xalign(0.0);
-    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    status.style_context().add_class("usage-status");
-    let updated = gtk::Label::new(None);
-    updated.set_xalign(0.0);
-    updated.style_context().add_class("usage-updated");
+    let shell = utility_shell(
+        initial_color_mode,
+        "SESSIONS",
+        "Hide Sessions",
+        "Refresh sessions",
+    );
+    let (scroller, rows) = utility_list(&shell.card);
+    let (status, updated) = utility_footer("Reading sessions…");
     let plate = frost_plate();
     let panes = gtk::Box::new(gtk::Orientation::Vertical, 0);
     panes.set_hexpand(true);
@@ -2602,20 +2606,19 @@ fn build_sessions_window(initial_color_mode: Foreground) -> SessionsCard {
     panes.pack_start(&status, false, false, 0);
     panes.pack_start(&updated, false, false, 0);
     plate.add(&panes);
-    body.pack_start(&plate, true, true, 0);
-
+    shell.body.pack_start(&plate, true, true, 0);
     SessionsCard {
-        card,
-        chrome,
-        header,
-        hide,
-        refresh,
+        card: shell.card,
+        chrome: shell.chrome,
+        header: shell.header,
+        hide: shell.hide,
+        refresh: shell.refresh,
         scroller,
         rows,
         status,
         updated,
-        color_mode,
-        resize,
+        color_mode: shell.color_mode,
+        resize: shell.resize,
         sessions: Rc::new(RefCell::new(SessionsState::default())),
     }
 }
@@ -4166,7 +4169,7 @@ fn sessions_rescan(card: &SessionsCard) {
 }
 
 fn redraw_sessions(card: &SessionsCard) {
-    render_sessions_tab(card, Some(card.scroller.vadjustment().value()));
+    render_sessions(card, Some(card.scroller.vadjustment().value()));
 }
 
 fn copy_to_clipboard(text: &str) {
@@ -4342,18 +4345,29 @@ fn session_row(
     let name = session_name(session);
     // A label in an event box rather than a button: the theme's button
     // padding would make every row twice as tall as a quota row.
-    let title_label = gtk::Label::new(Some(&format!(
-        "{}  {} · {name}",
-        if expanded { "\u{25be}" } else { "\u{25b8}" },
-        session.agent.label()
-    )));
-    title_label.set_xalign(0.0);
-    title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title_label.style_context().add_class("session-title");
+    // The agent's name in its own colour, so the three kinds tell apart at a
+    // glance; the arrow and the title stay in the card's.
+    let arrow = gtk::Label::new(Some(if expanded { "\u{25be}  " } else { "\u{25b8}  " }));
+    let agent = gtk::Label::new(Some(session.agent.label()));
+    agent.style_context().add_class(match session.agent {
+        sessions::Agent::Claude => "session-agent-claude",
+        sessions::Agent::Omp => "session-agent-omp",
+        sessions::Agent::Codex => "session-agent-codex",
+    });
+    let rest = gtk::Label::new(Some(&format!(" · {name}")));
+    rest.set_xalign(0.0);
+    rest.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let title_line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    for label in [&arrow, &agent, &rest] {
+        label.style_context().add_class("session-title");
+    }
+    title_line.pack_start(&arrow, false, false, 0);
+    title_line.pack_start(&agent, false, false, 0);
+    title_line.pack_start(&rest, true, true, 0);
     let title = gtk::EventBox::new();
     title.set_visible_window(false);
     title.set_hexpand(true);
-    title.add(&title_label);
+    title.add(&title_line);
     let mut tip = vec![session.cwd.clone(), format!("pid {}", session.pid)];
     if let Some(model) = &session.model {
         tip.push(model.clone());
@@ -4484,7 +4498,7 @@ fn session_row(
     row
 }
 
-fn render_sessions_tab(card: &SessionsCard, scroll: Option<f64>) {
+fn render_sessions(card: &SessionsCard, scroll: Option<f64>) {
     let now = usage_now_ms();
     let state = card.sessions.borrow();
     card.refresh.set_sensitive(!state.loading);
@@ -4951,13 +4965,15 @@ fn start_sessions_updates(card: SessionsCard) -> Rc<dyn Fn(bool)> {
         let card = card.clone();
         let scan_sessions = scan_sessions.clone();
         glib::timeout_add_local(Duration::from_secs(1), move || {
-            if card.card.is_visible() {
+            // Mapped, not just visible: a card left open keeps its visible
+            // flag while the whole overlay is hidden.
+            if card.card.is_mapped() {
                 scan_sessions(false);
             }
             glib::ControlFlow::Continue
         });
     }
-    render_sessions_tab(&card, None);
+    render_sessions(&card, None);
     scan_sessions
 }
 
@@ -18070,6 +18086,111 @@ mod usage_ui_tests {
         assert_eq!(usage_reset_label(Some(1000), 1000).0, "Updating…");
         assert_eq!(usage_reset_label(None, 1000).0, "—");
         assert_ne!(usage_reset_label(Some(2000), 1000).0, "Updating…");
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; run under xvfb-run"]
+    fn sessions_card_groups_rows_and_keeps_widgets_when_nothing_changed() {
+        gtk::init().unwrap();
+        fn session(agent: sessions::Agent, pid: i32, workspace: Option<&str>) -> sessions::Session {
+            sessions::Session {
+                agent,
+                pid,
+                cwd: "/home/u/proj".into(),
+                shared: false,
+                pane_id: workspace.map(|_| format!("w:{pid}")),
+                pane: workspace.map(|workspace| sessions::Pane {
+                    workspace: workspace.into(),
+                    title: Some(format!("task {pid}")),
+                    working: false,
+                    session: Some(format!("id-{pid}")),
+                }),
+                session: Some(format!("id-{pid}")),
+                active_ms: Some(usage_now_ms() - 60_000),
+                context: Some(248_000),
+                context_limit: Some(1_000_000),
+                model: Some("claude-opus-5-5".into()),
+                tokens: None,
+                kib: 300 * 1024,
+                parts: vec![sessions::Part {
+                    label: "claude (main)".into(),
+                    kib: 300 * 1024,
+                    procs: 1,
+                }],
+                pids: vec![pid],
+            }
+        }
+        let mut daemon = session(sessions::Agent::Codex, 30, None);
+        daemon.shared = true;
+        let report = sessions::Report {
+            sessions: vec![
+                session(sessions::Agent::Claude, 10, Some("sysi")),
+                session(sessions::Agent::Omp, 20, None),
+                daemon,
+            ],
+            orphans: vec![sessions::Orphan {
+                pid: 40,
+                label: "codegraph mcp".into(),
+                kib: 1024,
+                procs: vec![(40, vec!["codegraph".into()])],
+            }],
+            mem_total_kib: 16 * 1024 * 1024,
+            workspaces: vec!["sysi".into()],
+            herdr: true,
+            collected_at_ms: usage_now_ms(),
+        };
+        let card = build_sessions_window(Foreground::Light);
+        card.sessions.borrow_mut().report = Some(report);
+        render_sessions(&card, None);
+
+        fn labels(widget: &gtk::Widget, out: &mut Vec<gtk::Label>) {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                out.push(label.clone());
+            }
+            if let Some(container) = widget.downcast_ref::<gtk::Container>() {
+                for child in container.children() {
+                    labels(&child, out);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        labels(card.rows.upcast_ref(), &mut found);
+        let texts: Vec<String> = found.iter().map(|label| label.text().to_string()).collect();
+        for heading in [
+            "SYSI · 300 MB",
+            "OTHER TERMINALS · 300 MB",
+            "SHARED · 300 MB",
+            "ORPHANED MCP SERVERS · 1 MB",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == heading),
+                "{heading} in {texts:?}"
+            );
+        }
+        assert!(texts
+            .iter()
+            .any(|text| text == "248K / 1M context · opus-5-5"));
+        // The shared app-server is not counted as an agent and has no ×:
+        // two sessions and the orphan do.
+        assert!(
+            card.status.text().starts_with("2 agents · "),
+            "{}",
+            card.status.text()
+        );
+        let closes = texts.iter().filter(|text| *text == "\u{d7}").count();
+        assert_eq!(closes, 3, "{texts:?}");
+        let claude = found.iter().find(|label| label.text() == "claude").unwrap();
+        assert!(claude.style_context().has_class("session-agent-claude"));
+        let codex = found.iter().find(|label| label.text() == "codex").unwrap();
+        assert!(codex.style_context().has_class("session-agent-codex"));
+
+        // A pass that changes nothing on screen leaves the widgets alone.
+        let first = card.rows.children()[0].clone();
+        render_sessions(&card, None);
+        assert_eq!(card.rows.children()[0], first);
+        card.sessions.borrow_mut().expanded.insert(10);
+        render_sessions(&card, None);
+        assert_ne!(card.rows.children()[0], first);
     }
 
     #[test]

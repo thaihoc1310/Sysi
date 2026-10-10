@@ -95,7 +95,7 @@ export default class SysiPanelExtension extends Extension {
         // Opens the timer's menu; see timer.js.
         this._timer = this._buildPanelButton('timer');
         this._notesMenu = this._buildMenuButton('notes', [['new', 'new-note'], ['list', 'toggle-notes']]);
-        // The usage card's quota tabs, or its SESSIONS tab.
+        // USAGE (the quota cards) and SESSIONS (the agents running now), each a window of its own.
         this._agentMenu = this._buildMenuButton('agent', [['usage', 'toggle-usage'], ['sessions', 'toggle-sessions']]);
         this._addAction('dict', 'toggle-translate');
         this._addAction('ocr', 'ocr');
@@ -239,6 +239,7 @@ export default class SysiPanelExtension extends Extension {
             this._grabKey('<Super><Shift>n', 'new-note'),
             this._grabKey('<Super><Shift>d', 'new-dictionary'),
             this._grabKey('<Super><Shift>u', 'toggle-usage'),
+            this._grabKey('<Super><Shift>r', 'toggle-sessions'),
         ].filter(Boolean);
         this._syncOcrEscape();
         this._syncVoiceState();

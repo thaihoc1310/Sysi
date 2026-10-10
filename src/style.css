@@ -1212,6 +1212,37 @@ scrolledwindow overshoot.right:backdrop {
   text-shadow: none;
 }
 
+/* Each agent's name in its own colour: Claude's clay, OMP purple, Codex
+ * green. A bright shade for DARK and GLASS, whose ink is white; a deeper one
+ * on LIGHT's pale plate. GLASS cards carry .mode-dark too (their chrome is
+ * dark), so only .mode-solid.mode-light may pick the deeper shade. */
+.session-agent-claude {
+  color: #ec8a63;
+  font-weight: 700;
+}
+
+.session-agent-omp {
+  color: #b58cff;
+  font-weight: 700;
+}
+
+.session-agent-codex {
+  color: #3fcf9c;
+  font-weight: 700;
+}
+
+.mode-solid.mode-light .session-agent-claude {
+  color: #bf532a;
+}
+
+.mode-solid.mode-light .session-agent-omp {
+  color: #7444d4;
+}
+
+.mode-solid.mode-light .session-agent-codex {
+  color: #0b8a63;
+}
+
 .tiny-button.session-action {
   min-height: 16px;
   min-width: 16px;
