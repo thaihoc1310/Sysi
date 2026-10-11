@@ -4035,7 +4035,11 @@ fn session_state_label(session: &sessions::Session, state: &SessionsState, now: 
 
 fn session_name(session: &sessions::Session) -> String {
     if session.shared {
-        return "app-server, shared by every Codex".into();
+        return match session.host.as_deref() {
+            None => "app-server, shared by every Codex".into(),
+            Some("code") => "app-server for VS Code".into(),
+            Some(host) => format!("app-server for {host}"),
+        };
     }
     let folder = short_cwd(&session.cwd);
     match session.pane.as_ref().and_then(|pane| pane.title.as_deref()) {
@@ -18098,6 +18102,7 @@ mod usage_ui_tests {
                 pid,
                 cwd: "/home/u/proj".into(),
                 shared: false,
+                host: None,
                 pane_id: workspace.map(|_| format!("w:{pid}")),
                 pane: workspace.map(|workspace| sessions::Pane {
                     workspace: workspace.into(),

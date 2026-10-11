@@ -83,6 +83,10 @@ pub struct Session {
     /// not a session of its own, so it has nothing to resume and closing it
     /// would end them all.
     pub shared: bool,
+    /// For a shared app-server, what started it: `None` for Codex's own
+    /// daemon (left to systemd), else the parent's name (`code` for the
+    /// VS Code extension).
+    pub host: Option<String>,
     pub pane_id: Option<String>,
     pub pane: Option<Pane>,
     /// Claude Code's session id, or the path of OMP's session file.
@@ -384,6 +388,10 @@ pub fn build(
             pid: proc.pid,
             cwd: proc_cwd(proc.pid),
             shared: agent == Agent::Codex && proc.cmd.iter().any(|word| word == "app-server"),
+            host: by_pid
+                .get(&proc.ppid)
+                .map(|parent| parent.comm.clone())
+                .filter(|comm| comm != "systemd" && comm != "init"),
             // The variable is inherited, so a process that left herdr's tree
             // (double-forked, or started by something running in a pane)
             // still carries it; only one herdr still holds names a pane.
@@ -485,6 +493,15 @@ fn command_name(proc: &Proc) -> String {
         if let Some(script) = proc.cmd.iter().skip(1).find(|word| !word.starts_with('-')) {
             return script_name(script);
         }
+    }
+    // OMP runs its helpers as itself: `omp __omp_worker_text_predict`.
+    if let Some(worker) = proc
+        .cmd
+        .get(1)
+        .and_then(|word| word.strip_prefix("__omp_worker_"))
+    {
+        let worker = worker.strip_prefix("daemon_").unwrap_or(worker);
+        return format!("{first} {}", worker.replace('_', "-"));
     }
     if first.is_empty() {
         proc.comm.clone()
@@ -1236,6 +1253,8 @@ mod tests {
             proc(41, 40, "MainThread", "node codegraph.js serve --mcp"),
             proc(50, 900, "node", "node /srv/app.js"),
             proc(60, 900, "omp", "omp"),
+            proc(61, 60, "omp", "/x/omp __omp_worker_daemon_broker"),
+            proc(62, 61, "omp", "/x/omp __omp_worker_text_predict"),
             proc(
                 70,
                 900,
@@ -1261,6 +1280,7 @@ mod tests {
         assert_eq!(sessions.len(), 4, "the nested claude belongs to its parent");
         let daemon = sessions.iter().find(|s| s.pid == 70).unwrap();
         assert!(daemon.shared, "Codex's app-server serves every session");
+        assert_eq!(daemon.host, None, "left to systemd: Codex's own daemon");
         assert_eq!(daemon.kib, 70 + 71 + 72 + 73);
         // The app-server under the daemon is split into what it runs.
         let labels: Vec<(&str, u64)> = daemon
@@ -1280,6 +1300,9 @@ mod tests {
         assert!(!sessions.iter().find(|s| s.pid == 20).unwrap().shared);
         let stray = sessions.iter().find(|s| s.pid == 60).unwrap();
         assert_eq!(stray.pane_id, None);
+        // OMP's helpers are named for what they do, not all "omp".
+        let names: Vec<&str> = stray.parts.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(names, ["omp (main)", "omp text-predict", "omp broker"]);
         let claude = sessions.iter().find(|s| s.agent == Agent::Claude).unwrap();
         assert_eq!(claude.pane_id.as_deref(), Some("wA:p1"));
         let total: u64 = [20, 21, 22, 23, 24, 25, 26].iter().map(|p| *p as u64).sum();
@@ -1494,6 +1517,7 @@ mod tests {
             pid: 2,
             cwd: "/home/u/my work".into(),
             shared: false,
+            host: None,
             pane_id: None,
             pane: Some(Pane::default()),
             session: Some("8c57".into()),
