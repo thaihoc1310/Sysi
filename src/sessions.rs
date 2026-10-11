@@ -300,10 +300,17 @@ pub fn build(
     for proc in procs {
         children.entry(proc.ppid).or_default().push(proc.pid);
     }
+    // By name or by the program it runs: OMP's broker retitles itself
+    // `omp daemon brok` but is still the `omp` binary.
     let is_agent = |pid: i32| {
-        by_pid
-            .get(&pid)
-            .is_some_and(|proc| Agent::from_comm(&proc.comm).is_some())
+        by_pid.get(&pid).is_some_and(|proc| {
+            Agent::from_comm(&proc.comm).is_some()
+                || proc
+                    .cmd
+                    .first()
+                    .and_then(|word| word.rsplit('/').next())
+                    .is_some_and(|program| Agent::from_comm(program).is_some())
+        })
     };
     let subtree = |root: i32| {
         let mut out = vec![root];
@@ -1253,7 +1260,12 @@ mod tests {
             proc(41, 40, "MainThread", "node codegraph.js serve --mcp"),
             proc(50, 900, "node", "node /srv/app.js"),
             proc(60, 900, "omp", "omp"),
-            proc(61, 60, "omp", "/x/omp __omp_worker_daemon_broker"),
+            proc(
+                61,
+                60,
+                "omp daemon brok",
+                "/x/omp __omp_worker_daemon_broker",
+            ),
             proc(62, 61, "omp", "/x/omp __omp_worker_text_predict"),
             proc(
                 70,
