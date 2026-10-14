@@ -1584,6 +1584,52 @@ fn session_root(source: Source) -> Option<PathBuf> {
     }
 }
 
+/// Claude Code on other machines, counted as Claude: one SSH host per line in
+/// `~/.config/sysi/claude-hosts`. Each host's transcripts are mirrored under
+/// the data dir and read like the local ones; a host that cannot be reached
+/// leaves its last mirror as it was.
+fn remote_claude_roots() -> Vec<PathBuf> {
+    let Ok(list) = fs::read_to_string(crate::state::config_dir().join("claude-hosts")) else {
+        return Vec::new();
+    };
+    list.lines()
+        .map(str::trim)
+        // A leading `-` would reach rsync as an option, and `/` or `:` would
+        // turn the mirror path or the remote spec into something else.
+        .filter(|host| {
+            !host.is_empty()
+                && !host.starts_with(['#', '-'])
+                && !host.contains(['/', ':', ' ', '\t'])
+        })
+        .map(|host| {
+            let mirror = crate::state::data_dir()
+                .join("remote")
+                .join(host)
+                .join("claude");
+            if fs::create_dir_all(&mirror).is_ok() {
+                let _ = Command::new("rsync")
+                    .args([
+                        "-a",
+                        "--delete",
+                        "--timeout=30",
+                        "--include=*/",
+                        "--include=*.jsonl",
+                        "--exclude=*",
+                        "-e",
+                        "ssh -o BatchMode=yes -o ConnectTimeout=5",
+                    ])
+                    .arg(format!("{host}:.claude/projects/"))
+                    .arg(&mirror)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            mirror
+        })
+        .collect()
+}
+
 /// Deep enough for every layout in play: Codex nests a rollout under year,
 /// month and day, and Claude Code keeps a session's subagent transcripts in a
 /// folder beside it. Those subagents spend real tokens and belong in the total.
@@ -1762,6 +1808,11 @@ pub fn scan_tokens() -> TokenReport {
         let mut files = Vec::new();
         if let Some(root) = session_root(source) {
             session_files(&root, SESSION_DEPTH, &mut files);
+        }
+        if source == Source::Claude {
+            for root in remote_claude_roots() {
+                session_files(&root, SESSION_DEPTH, &mut files);
+            }
         }
         for path in files {
             let metadata = fs::metadata(&path).ok();

@@ -75,6 +75,8 @@ Quota sources are the CLIs already installed on the machine: `codex app-server` 
 
 The `TOKENS` tab talks to nothing. It reads `~/.codex/sessions`, `~/.claude/projects` (subagent transcripts included) and `~/.omp/agent/sessions`, buckets every accounting record by local calendar day, and caches each file against its size and mtime so a rescan only re-reads the session still being written. Each source is counted the way it records itself: Claude Code repeats one response across streaming updates and again in a forked transcript, so a response is keyed and billed once however many files it appears in; Codex logs a running session total, so the tab reads its growth and discards a jump larger than a turn could be, which is the counter a fork inherits from its parent rather than tokens anyone spent. A full scan of a few hundred megabytes of transcripts takes about a third of a second and runs on its own thread, at most once every two minutes while the tab is open.
 
+Claude Code on other machines counts as Claude too: put one SSH host per line in `~/.config/sysi/claude-hosts`. Each scan mirrors that host's `~/.claude/projects` transcripts into `~/.local/share/sysi/remote/<host>/claude` with `rsync` over SSH (key login only, five-second connect timeout) and reads them with the local ones. A host that cannot be reached keeps its last mirror.
+
 ## Build
 
 Ubuntu 24.04 and 26.04 build dependencies:
