@@ -151,7 +151,7 @@ fn main() {
         eprintln!("Could not register Super+Shift+A as a GNOME shortcut: {error}");
     }
     if let Err(error) = install_voice_hotkey() {
-        eprintln!("Could not register Super+Shift+V as a GNOME shortcut: {error}");
+        eprintln!("Could not register Super+Shift+M as a GNOME shortcut: {error}");
     }
     write_pid();
 
@@ -409,7 +409,7 @@ const VOICE_HOTKEY_PATH: &str =
     "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sysi-voice/";
 const VOICE_HOTKEY_NAME: &str = "Sysi Voice";
 const VOICE_HOTKEY_COMMAND: &str = "sysi --panel-action voice";
-const VOICE_HOTKEY_BINDING: &str = "<Super><Shift>v";
+const VOICE_HOTKEY_BINDING: &str = "<Super><Shift>m";
 
 fn install_voice_hotkey() -> io::Result<()> {
     install_custom_hotkey(
@@ -417,7 +417,7 @@ fn install_voice_hotkey() -> io::Result<()> {
         VOICE_HOTKEY_NAME,
         VOICE_HOTKEY_COMMAND,
         VOICE_HOTKEY_BINDING,
-        |binding| binding_is_super_shift(binding, "v"),
+        |binding| binding_is_super_shift(binding, "m"),
     )
 }
 

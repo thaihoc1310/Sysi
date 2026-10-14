@@ -924,11 +924,11 @@ export default class SysiPanelExtension extends Extension {
         this._silenceCustomVoiceShortcut();
         try {
             this._voiceAccelAction = global.display.grab_accelerator(
-                '<Super><Shift>v',
+                '<Super><Shift>m',
                 Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
             );
         } catch (error) {
-            logError(error, 'Sysi could not grab Super+Shift+V');
+            logError(error, 'Sysi could not grab Super+Shift+M');
             this._voiceAccelAction = 0;
             this._restoreCustomVoiceShortcut();
             return;
