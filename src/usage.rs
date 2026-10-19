@@ -830,7 +830,7 @@ fn claude_extra_bucket(value: Option<&Value>, label: &str) -> Option<Window> {
     )
 }
 
-fn parse_claude_response(value: &Value, fetched_at_ms: i64) -> Result<Snapshot, String> {
+fn parse_claude_windows(value: &Value) -> Result<Vec<Window>, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "Claude returned an invalid usage response".to_owned())?;
@@ -887,6 +887,11 @@ fn parse_claude_response(value: &Value, fetched_at_ms: i64) -> Result<Snapshot, 
     if windows.is_empty() {
         return Err("Claude returned no usable usage windows".to_owned());
     }
+    Ok(windows)
+}
+
+fn parse_claude_response(value: &Value, fetched_at_ms: i64) -> Result<Snapshot, String> {
+    let windows = parse_claude_windows(value)?;
     Ok(Snapshot {
         source: Source::Claude,
         account: claude_email(),
@@ -899,8 +904,7 @@ fn parse_claude_response(value: &Value, fetched_at_ms: i64) -> Result<Snapshot, 
 /// answers even when the CLI will not, at the cost of one request against the
 /// same quota it reports on — which is why it is a fallback and not the
 /// default.
-fn fetch_claude_api() -> Result<Snapshot, FetchError> {
-    let token = read_claude_token()?;
+fn fetch_claude_api_value(token: &str, now: i64) -> Result<Value, FetchError> {
     let agent = ureq::builder()
         .timeout_connect(HTTP_TIMEOUT)
         .timeout(HTTP_TIMEOUT)
@@ -916,7 +920,7 @@ fn fetch_claude_api() -> Result<Snapshot, FetchError> {
         .map_err(|error| {
             let delay = match &error {
                 ureq::Error::Status(_, response) => {
-                    retry_after(response.header("Retry-After"), now_ms())
+                    retry_after(response.header("Retry-After"), now)
                 }
                 _ => Duration::ZERO,
             };
@@ -951,18 +955,95 @@ fn fetch_claude_api() -> Result<Snapshot, FetchError> {
     let body = response
         .into_string()
         .map_err(|error| format!("Could not read Claude usage: {error}"))?;
-    let value: Value =
-        serde_json::from_str(&body).map_err(|_| "Claude returned invalid usage JSON".to_owned())?;
-    Ok(parse_claude_response(&value, now_ms())?)
+    serde_json::from_str(&body).map_err(|_| "Claude returned invalid usage JSON".to_owned().into())
 }
 
-/// Either Claude source can be shut out by the very quota it reports on — the
-/// CLI refuses to run while the account is limited, the endpoint answers 429 —
-/// so they cover for each other. The endpoint is asked first because it answers
-/// in one request instead of booting a CLI; whichever answered last is asked
-/// first after that, and a failure falls straight through to the other, so the
-/// pair keeps swapping instead of hammering the side that is currently blocked.
-fn fetch_claude() -> Result<Snapshot, FetchError> {
+fn fetch_claude_api() -> Result<Snapshot, FetchError> {
+    let token = read_claude_token()?;
+    let now = now_ms();
+    let value = fetch_claude_api_value(&token, now)?;
+    Ok(parse_claude_response(&value, now)?)
+}
+
+fn fetch_claude_secondary_windows(token: &str, now: i64) -> Result<Vec<Window>, FetchError> {
+    match fetch_claude_api_value(token, now) {
+        Ok(value) => parse_claude_windows(&value).map_err(Into::into),
+        Err(err) => {
+            if err.retry_after > Duration::ZERO {
+                let reset_at_ms = Some(now + err.retry_after.as_millis() as i64);
+                Ok(vec![Window {
+                    group: Vec::new(),
+                    label: "Session".to_owned(),
+                    used_percent: Some(100.0),
+                    remaining_percent: Some(0.0),
+                    reset_at_ms,
+                    duration_ms: Some(5 * 60 * 60 * 1000),
+                }])
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn claude_secondary_token() -> Option<String> {
+    if let Ok(token) = env::var("CLAUDE2_OAUTH_TOKEN") {
+        if !token.trim().is_empty() {
+            return Some(token.trim().to_owned());
+        }
+    }
+    let config = crate::state::config_dir().join("claude2.token");
+    if let Ok(content) = fs::read_to_string(&config) {
+        let token = content.trim();
+        if !token.is_empty() {
+            return Some(token.to_owned());
+        }
+    }
+    None
+}
+
+fn claude_account_label(acc: usize) -> String {
+    match acc {
+        1 => {
+            let label_file = crate::state::config_dir().join("claude.label");
+            if let Ok(content) = fs::read_to_string(&label_file) {
+                let label = content.trim();
+                if !label.is_empty() {
+                    return label.to_owned();
+                }
+            }
+            let home = env::var_os("CLAUDE_CONFIG_DIR")
+                .or_else(|| env::var_os("HOME"))
+                .map(PathBuf::from);
+            home.and_then(|h| read_json(h.join(".claude.json")))
+                .and_then(|cfg| {
+                    let d = cfg.pointer("/oauthAccount/displayName").and_then(Value::as_str);
+                    let e = cfg.pointer("/oauthAccount/emailAddress").and_then(Value::as_str);
+                    match (d, e) {
+                        (Some(dn), Some(em)) if !dn.trim().is_empty() => {
+                            Some(format!("{} · {}", dn.trim(), em.trim()))
+                        }
+                        (_, Some(em)) => Some(em.trim().to_owned()),
+                        _ => None,
+                    }
+                })
+                .or_else(claude_email)
+                .unwrap_or_else(|| "Account 1 (Shared)".to_owned())
+        }
+        _ => {
+            let config = crate::state::config_dir().join("claude2.label");
+            if let Ok(content) = fs::read_to_string(&config) {
+                let label = content.trim();
+                if !label.is_empty() {
+                    return label.to_owned();
+                }
+            }
+            "Account 2 (Personal)".to_owned()
+        }
+    }
+}
+
+fn fetch_claude_primary() -> Result<Snapshot, FetchError> {
     static PREFER_CLI: AtomicBool = AtomicBool::new(false);
     let cli_first = PREFER_CLI.load(Ordering::Relaxed);
     let attempt = |cli: bool| {
@@ -981,14 +1062,82 @@ fn fetch_claude() -> Result<Snapshot, FetchError> {
             PREFER_CLI.store(!cli_first, Ordering::Relaxed);
             Ok(snapshot)
         }
-        // Both are out. Report what the preferred source said, and keep the
-        // shorter cooldown so the fallback's own limit does not hold back the
-        // next attempt.
         Err(second) => Err(FetchError {
             message: first.message,
             retry_after: first.retry_after.min(second.retry_after),
         }),
     }
+}
+
+fn fetch_claude() -> Result<Snapshot, FetchError> {
+    let primary = fetch_claude_primary();
+    let secondary_token = claude_secondary_token();
+
+    let Some(token2) = secondary_token else {
+        return primary;
+    };
+
+    let now = now_ms();
+    let acc1_name = claude_account_label(1);
+    let acc2_name = claude_account_label(2);
+
+    let mut windows = Vec::new();
+    let mut fetched_at_ms = now;
+
+    match primary {
+        Ok(snap) => {
+            fetched_at_ms = snap.fetched_at_ms;
+            for mut w in snap.windows {
+                w.group.insert(0, acc1_name.clone());
+                windows.push(w);
+            }
+        }
+        Err(err) => {
+            windows.push(Window {
+                group: vec![acc1_name.clone()],
+                label: format!("Offline · {}", err.message),
+                used_percent: None,
+                remaining_percent: None,
+                reset_at_ms: (err.retry_after > Duration::ZERO)
+                    .then(|| now + err.retry_after.as_millis() as i64),
+                duration_ms: None,
+            });
+        }
+    }
+
+    match fetch_claude_secondary_windows(&token2, now) {
+        Ok(w2) => {
+            for mut w in w2 {
+                w.group.insert(0, acc2_name.clone());
+                windows.push(w);
+            }
+        }
+        Err(err) => {
+            windows.push(Window {
+                group: vec![acc2_name.clone()],
+                label: format!("Offline · {}", err.message),
+                used_percent: None,
+                remaining_percent: None,
+                reset_at_ms: (err.retry_after > Duration::ZERO)
+                    .then(|| now + err.retry_after.as_millis() as i64),
+                duration_ms: None,
+            });
+        }
+    }
+
+    if windows.iter().all(|w| w.used_percent.is_none()) {
+        return Err(FetchError {
+            message: "All Claude accounts are offline".to_owned(),
+            retry_after: Duration::from_secs(60),
+        });
+    }
+
+    Ok(Snapshot {
+        source: Source::Claude,
+        account: None,
+        fetched_at_ms,
+        windows,
+    })
 }
 
 fn amount_percent(amount: &Value) -> Option<(f64, f64)> {
@@ -2289,6 +2438,30 @@ mod tests {
         let snapshot = parse_claude_response(&value, 10).expect("weekly fixture");
         assert_eq!(snapshot.windows.len(), 1);
         assert_eq!(snapshot.windows[0].remaining_percent, Some(88.0));
+    }
+
+    #[test]
+    fn claude_secondary_windows_parsed_from_response() {
+        let value = json!({
+            "five_hour": {"utilization": 25.0, "resets_at": "2030-09-14T12:00:00Z"},
+            "seven_day": {"utilization": 50.0, "resets_at": "2030-09-17T12:00:00Z"}
+        });
+        let windows = parse_claude_windows(&value).expect("valid windows");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].remaining_percent, Some(75.0));
+        assert_eq!(windows[1].label, "Weekly");
+        assert_eq!(windows[1].remaining_percent, Some(50.0));
+    }
+
+    #[test]
+    #[ignore = "requires live network and real Claude tokens"]
+    fn live_fetch_claude_two_accounts() {
+        let res = fetch_claude();
+        println!("fetch_claude result: {res:#?}");
+        assert!(res.is_ok(), "fetch_claude must succeed");
+        let snap = res.unwrap();
+        assert!(!snap.windows.is_empty(), "must have windows");
     }
 
     #[test]
