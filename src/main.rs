@@ -10,6 +10,7 @@ mod translate;
 mod ui;
 mod usage;
 pub mod voice;
+mod youtube;
 
 use fs2::FileExt;
 use gtk::prelude::*;

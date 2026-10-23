@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, io, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs, io,
+    path::PathBuf,
+};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -131,6 +135,25 @@ pub struct Settings {
     pub usage_open: bool,
     #[serde(default)]
     pub sessions_open: bool,
+    #[serde(default)]
+    pub youtube_open: bool,
+    /// The link or search last played in YOUTUBE, played again when it opens.
+    #[serde(default)]
+    pub youtube_url: String,
+    /// Where that link was left, in seconds.
+    #[serde(default)]
+    pub youtube_position: f64,
+    #[serde(default = "default_youtube_volume")]
+    pub youtube_volume: f64,
+    #[serde(default)]
+    pub youtube_muted: bool,
+    /// Play the video over again at its end.
+    #[serde(default)]
+    pub youtube_loop: bool,
+    /// The most lines of picture asked of YouTube; 0 is Auto, from the
+    /// card's size.
+    #[serde(default)]
+    pub youtube_height: u32,
     #[serde(default = "default_usage_source")]
     pub usage_source: String,
     #[serde(default = "default_usage_period")]
@@ -157,6 +180,13 @@ impl Default for Settings {
             translate_open: false,
             usage_open: false,
             sessions_open: false,
+            youtube_open: false,
+            youtube_url: String::new(),
+            youtube_position: 0.0,
+            youtube_volume: default_youtube_volume(),
+            youtube_muted: false,
+            youtube_loop: false,
+            youtube_height: 0,
             usage_source: default_usage_source(),
             usage_period: default_usage_period(),
             color_mode: ColorMode::default(),
@@ -455,6 +485,10 @@ pub struct AppState {
     pub next_dictionary_id: u64,
     #[serde(default = "default_next_id")]
     pub next_image_id: u64,
+    /// Cards locked on their own from their menu, by key: kept as lock mode
+    /// keeps every card while the rest stay editable.
+    #[serde(default)]
+    pub locked_cards: BTreeSet<String>,
 }
 
 impl Default for AppState {
@@ -475,6 +509,7 @@ impl Default for AppState {
             next_note_id: 1,
             next_dictionary_id: 1,
             next_image_id: 1,
+            locked_cards: BTreeSet::new(),
         }
     }
 }
@@ -523,6 +558,10 @@ pub fn cache_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("sysi")
+}
+
+fn default_youtube_volume() -> f64 {
+    100.0
 }
 
 pub fn default_font_size() -> i32 {

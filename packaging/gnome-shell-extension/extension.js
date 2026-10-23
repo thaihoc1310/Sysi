@@ -100,6 +100,7 @@ export default class SysiPanelExtension extends Extension {
         this._addAction('dict', 'toggle-translate');
         this._addAction('ocr', 'ocr');
         this._voiceButton = this._addAction('voice', 'voice');
+        this._addAction('youtube', 'toggle-youtube');
         this._buildSettings();
 
         this._gear.connect('clicked', () => {

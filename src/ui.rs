@@ -6,6 +6,7 @@ use crate::{
     },
     translate,
     usage::{self, Source as UsageSource},
+    youtube,
 };
 use cairo::{Context, Filter, FontSlant, FontWeight, Operator, RectangleInt, Region};
 use gdk::prelude::*;
@@ -15,7 +16,7 @@ use regex::RegexBuilder;
 use std::{
     cell::{Cell, RefCell},
     cmp::Reverse,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     f64::consts::{FRAC_PI_2, PI},
     fs,
     ops::RangeInclusive,
@@ -39,6 +40,8 @@ const USAGE_HEIGHT: i32 = 212;
 /// SESSIONS opens taller than USAGE: a row per agent, and room for a few.
 const SESSIONS_WIDTH: i32 = 360;
 const SESSIONS_HEIGHT: i32 = 420;
+const YOUTUBE_WIDTH: i32 = 480;
+const YOUTUBE_HEIGHT: i32 = 294;
 const TRANSLATE_WIDTH: i32 = 272;
 const TRANSLATE_EMPTY_HEIGHT: i32 = 44;
 const TRANSLATE_RESULTS_MAX_HEIGHT: i32 = 520;
@@ -375,6 +378,7 @@ struct ScreenRect {
 }
 
 pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
+    LOCKED_CARDS.with(|locked| *locked.borrow_mut() = state.borrow().locked_cards.clone());
     let window = gtk::ApplicationWindow::new(app);
     window.set_title("Sysi Overlay");
     window.set_decorated(false);
@@ -903,6 +907,648 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     sessions_card.hide.connect_clicked({
         let toggle_sessions = toggle_sessions.clone();
         move |_| toggle_sessions()
+    });
+
+    // YOUTUBE, mpv playing a link inside a card of its own.
+    let youtube_color_mode = saved_color_mode(&state.borrow(), "youtube");
+    let youtube_card = build_youtube_window(foreground_for_mode(youtube_color_mode));
+    youtube_card
+        .entry
+        .set_text(&state.borrow().settings.youtube_url);
+    let youtube_position = state
+        .borrow()
+        .positions
+        .get("youtube")
+        .copied()
+        .unwrap_or(Point {
+            x: primary_screen.x + 28 + USAGE_WIDTH + 16 + SESSIONS_WIDTH + 16,
+            y: primary_screen.y + 460,
+        });
+    apply_widget_size(
+        &youtube_card.card,
+        "youtube",
+        &state,
+        Size {
+            width: YOUTUBE_WIDTH,
+            height: YOUTUBE_HEIGHT,
+        },
+    );
+    place_card(&root, &youtube_card.card, youtube_position);
+    register(
+        &registry,
+        "youtube",
+        &youtube_card.card,
+        youtube_card.color_mode.clone(),
+        youtube_color_mode,
+    );
+    if let Some(item) = registry
+        .borrow_mut()
+        .iter_mut()
+        .find(|item| item.key == "youtube")
+    {
+        item.edit_only = Some(youtube_card.chrome.clone());
+    }
+    let youtube_menu = attach_color_mode_menu(
+        &youtube_card.card,
+        "youtube".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
+    attach_drag(
+        &youtube_card.header,
+        &youtube_card.card,
+        &root,
+        "youtube".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+    );
+    attach_resize(
+        &youtube_card.resize,
+        &youtube_card.card,
+        &root,
+        "youtube".into(),
+        state.clone(),
+        registry.clone(),
+        interactive.clone(),
+        window.clone(),
+        ResizeBounds {
+            min_width: 240,
+            min_height: 150,
+            max_width: None,
+            max_height: None,
+            aspect_ratio: None,
+            preserve_current_aspect: false,
+            // The video is 16:9; any other shape is black bars around it.
+            height_for_width: Some({
+                let card = youtube_card.clone();
+                Rc::new(move |width| youtube_card_height(&card, width))
+            }),
+        },
+    );
+    let (youtube_updates_tx, youtube_updates) = async_channel::unbounded();
+    let youtube_player = Rc::new(RefCell::new(youtube::Player::new(youtube_updates_tx)));
+    // yt-dlp takes a few seconds, so it runs off the main loop. Each lookup
+    // is numbered: only the latest one asked for gets to play.
+    let youtube_lookup = Rc::new(Cell::new(0u64));
+    let (youtube_tx, youtube_rx) =
+        async_channel::unbounded::<(u64, bool, Result<youtube::Streams, String>)>();
+    let play_youtube: Rc<dyn Fn(bool)> = {
+        let card = youtube_card.clone();
+        let player = youtube_player.clone();
+        let state = state.clone();
+        let lookup = youtube_lookup.clone();
+        Rc::new(move |paused| {
+            // Only an open link box is something to play; folded, whatever
+            // was half typed and abandoned stays out of it, and the link
+            // that played goes on.
+            let input = match WidgetExt::is_visible(&card.entry) {
+                true => card.entry.text().trim().to_string(),
+                false => state.borrow().settings.youtube_url.clone(),
+            };
+            if input.is_empty() {
+                return;
+            }
+            let changed = state.borrow().settings.youtube_url != input;
+            if changed {
+                // Stopped now, not when the new one is found, or its position
+                // would be noted as the new link's meanwhile.
+                player.borrow_mut().stop();
+                reset_youtube_controls(&card);
+                let mut data = state.borrow_mut();
+                data.settings.youtube_url = input.clone();
+                data.settings.youtube_position = 0.0;
+                let _ = data.save();
+            }
+            lookup.set(lookup.get() + 1);
+            let id = lookup.get();
+            *card.status.borrow_mut() = "Loading\u{2026}".to_string();
+            card.video.queue_draw();
+            let youtube_tx = youtube_tx.clone();
+            let height = match state.borrow().settings.youtube_height {
+                0 => youtube_auto_height(&card.video),
+                lines => lines,
+            };
+            std::thread::spawn(move || {
+                let _ = youtube_tx.send_blocking((id, paused, youtube::resolve(&input, height)));
+            });
+        })
+    };
+    glib::MainContext::default().spawn_local({
+        let card = youtube_card.clone();
+        let player = youtube_player.clone();
+        let state = state.clone();
+        let lookup = youtube_lookup.clone();
+        async move {
+            while let Ok((id, paused, streams)) = youtube_rx.recv().await {
+                if id != lookup.get() || !card.card.is_visible() {
+                    continue;
+                }
+                let xid = card
+                    .video
+                    .window()
+                    .and_then(|window| window.downcast::<gdkx11::X11Window>().ok())
+                    .map(|window| window.xid());
+                let (start, sound, looping) = {
+                    let settings = &state.borrow().settings;
+                    (
+                        settings.youtube_position,
+                        (settings.youtube_volume, settings.youtube_muted),
+                        settings.youtube_loop,
+                    )
+                };
+                let status = match (streams, xid) {
+                    (Err(reason), _) => reason,
+                    (Ok(_), None) => {
+                        continue;
+                    }
+                    (Ok(streams), Some(xid)) => {
+                        match player
+                            .borrow_mut()
+                            .play(xid, &streams, start, paused, sound, looping)
+                        {
+                            Ok(()) => {
+                                // A new mpv, a new window to round.
+                                card.video_shape.set(None);
+                                {
+                                    let mut preview = card.preview.borrow_mut();
+                                    preview.video += 1;
+                                    preview.board = streams.storyboard.clone();
+                                    preview.sheets.clear();
+                                    preview.asked.clear();
+                                }
+                                // A new mpv starts at normal speed, no subtitles.
+                                *card.media.borrow_mut() = YoutubeMedia {
+                                    subtitles: streams.subtitles.clone(),
+                                    ..YoutubeMedia::default()
+                                };
+                                card.playing.set_text(&streams.title);
+                                card.playing.set_tooltip_text(Some(&streams.title));
+                                streams.title
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                "mpv is not installed: sudo apt install mpv".to_string()
+                            }
+                            Err(error) => format!("Could not start mpv: {error}"),
+                        }
+                    }
+                };
+                *card.status.borrow_mut() = status;
+                card.video.queue_draw();
+            }
+        }
+    });
+    // What mpv reports, onto the controls. The position also goes into the
+    // state as it moves, so a closed card, a logout or a restart all come back
+    // where it was without asking mpv on the way out.
+    glib::MainContext::default().spawn_local({
+        let card = youtube_card.clone();
+        let player = youtube_player.clone();
+        let state = state.clone();
+        async move {
+            while let Ok((generation, update)) = youtube_updates.recv().await {
+                if generation != player.borrow().generation() {
+                    continue;
+                }
+                match update {
+                    youtube::Update::Position(position) => {
+                        state.borrow_mut().settings.youtube_position = position;
+                        card.seek.set_value(position);
+                        if !card.seek.dragging() {
+                            show_youtube_time(&card, position);
+                        }
+                    }
+                    youtube::Update::Duration(length) => {
+                        card.seek.set_max(length);
+                        show_youtube_time(&card, card.seek.value());
+                    }
+                    youtube::Update::Buffered(ahead) => card.seek.set_buffered(ahead),
+                    // The card is 16:9 only to the pixel, which leaves a
+                    // one-pixel bar beside a 16:9 picture; fill it. Any other
+                    // shape keeps its bars rather than being cropped.
+                    // mpv's window covers the card once lock hides its title
+                    // bar, and took the click; hand it to the card's menu.
+                    // Opened once the button is up: while it is held, mpv's
+                    // window keeps the pointer and the menu cannot take it,
+                    // which is why a quick click worked and a slow one not.
+                    youtube::Update::Menu => {
+                        let card = card.card.clone();
+                        let asked = now_ms();
+                        glib::timeout_add_local(Duration::from_millis(20), move || {
+                            let held = gdk::Display::default()
+                                .and_then(|display| display.default_seat())
+                                .and_then(|seat| seat.pointer())
+                                .zip(card.window())
+                                .is_some_and(|(pointer, window)| {
+                                    let (_, _, _, mask) = window.device_position(&pointer);
+                                    mask.contains(gdk::ModifierType::BUTTON3_MASK)
+                                });
+                            if held && now_ms() - asked < 3000 {
+                                return glib::ControlFlow::Continue;
+                            }
+                            right_click_at_pointer(&card);
+                            glib::ControlFlow::Break
+                        });
+                    }
+                    youtube::Update::Looping(looping) => {
+                        state.borrow_mut().settings.youtube_loop = looping;
+                    }
+                    youtube::Update::Aspect(aspect) => {
+                        let fill = (aspect - 16.0 / 9.0).abs() < 0.05;
+                        let panscan = if fill { 1.0 } else { 0.0 };
+                        player.borrow().command(serde_json::json!([
+                            "set_property",
+                            "panscan",
+                            panscan
+                        ]));
+                    }
+                    youtube::Update::Paused(paused) => {
+                        let (icon, tip) = match paused {
+                            true => ("media-playback-start-symbolic", "Play"),
+                            false => ("media-playback-pause-symbolic", "Pause"),
+                        };
+                        set_button_icon(&card.play, icon, tip);
+                        // On disk too: a pause is a natural place to stop
+                        // for the day, crash or not.
+                        if paused {
+                            let _ = state.borrow().save();
+                        }
+                    }
+                    youtube::Update::Volume(level) => {
+                        state.borrow_mut().settings.youtube_volume = level;
+                        card.volume.set_value(level);
+                        show_youtube_sound(&card, state.borrow().settings.youtube_muted);
+                    }
+                    youtube::Update::Muted(muted) => {
+                        state.borrow_mut().settings.youtube_muted = muted;
+                        show_youtube_sound(&card, muted);
+                    }
+                    // At its end, back to its first frame, paused, as YouTube
+                    // offers a replay: --keep-open leaves mpv on the last
+                    // frame, where play does nothing, and the position saved
+                    // there would reopen the card at the end.
+                    youtube::Update::Ended => {
+                        state.borrow_mut().settings.youtube_position = 0.0;
+                        let _ = state.borrow().save();
+                        let player = player.borrow();
+                        player.command(serde_json::json!(["seek", 0, "absolute"]));
+                        player.command(serde_json::json!(["set_property", "pause", true]));
+                    }
+                    // Not stopped by the card (that bumps the generation): mpv
+                    // quit on its own, most likely refused the stream. Say so,
+                    // and let play look the link up afresh.
+                    youtube::Update::Gone => {
+                        player.borrow_mut().stop();
+                        youtube::forget();
+                        card.video_shape.set(None);
+                        reset_youtube_controls(&card);
+                        *card.status.borrow_mut() =
+                            "Playback stopped \u{2014} press play to try again".to_string();
+                        card.video.queue_draw();
+                    }
+                }
+            }
+        }
+    });
+    // mpv's rounded corners follow the video as it is resized, not a poll
+    // later: cut at the old size, the picture showed as a smaller rounded
+    // box in black until the drag ended.
+    youtube_card.video.connect_size_allocate({
+        let card = youtube_card.clone();
+        move |_, _| round_youtube_video(&card)
+    });
+    {
+        let settings = &state.borrow().settings;
+        youtube_card.volume.set_value(settings.youtube_volume);
+        show_youtube_sound(&youtube_card, settings.youtube_muted);
+    }
+    youtube_card.play.connect_clicked({
+        let player = youtube_player.clone();
+        let play_youtube = play_youtube.clone();
+        move |_| {
+            if !player
+                .borrow()
+                .command(serde_json::json!(["cycle", "pause"]))
+            {
+                play_youtube(false);
+            }
+        }
+    });
+    // Seeking over the network fetches from the new place, so the drag only
+    // previews the time and the seek happens where the knob is let go.
+    youtube_card.seek.connect_changed({
+        let card = youtube_card.clone();
+        let player = youtube_player.clone();
+        move |position, done| {
+            show_youtube_time(&card, position);
+            if done {
+                player
+                    .borrow()
+                    .command(serde_json::json!(["seek", position, "absolute"]));
+            }
+        }
+    });
+    let (sheets_tx, sheets_rx) = async_channel::unbounded::<SheetFetched>();
+    youtube_card.seek.connect_hovered({
+        let card = youtube_card.clone();
+        let sheets_tx = sheets_tx.clone();
+        move |hover| {
+            card.preview.borrow_mut().hover = hover;
+            show_youtube_preview(&card, &sheets_tx);
+        }
+    });
+    glib::MainContext::default().spawn_local({
+        let card = youtube_card.clone();
+        async move {
+            while let Ok((video, index, bytes)) = sheets_rx.recv().await {
+                if video != card.preview.borrow().video {
+                    continue;
+                }
+                let loader = gdk_pixbuf::PixbufLoader::new();
+                let decoded = loader.write(&bytes).and_then(|()| loader.close());
+                let Some(sheet) = decoded.ok().and_then(|()| loader.pixbuf()) else {
+                    continue;
+                };
+                card.preview.borrow_mut().sheets.insert(index, sheet);
+                // Still over the bar: put the frame in now.
+                if card.preview.borrow().hover.is_some() {
+                    show_youtube_preview(&card, &sheets_tx);
+                }
+            }
+        }
+    });
+    youtube_card.volume.connect_changed({
+        let card = youtube_card.clone();
+        let player = youtube_player.clone();
+        let state = state.clone();
+        move |level, _| {
+            let level = level.round();
+            state.borrow_mut().settings.youtube_volume = level;
+            show_youtube_sound(&card, state.borrow().settings.youtube_muted);
+            player
+                .borrow()
+                .command(serde_json::json!(["set_property", "volume", level]));
+        }
+    });
+    // YOUTUBE's own row in its menu: play the video over again at its end.
+    let loop_row = highlight_row("LOOP", None, false);
+    loop_row.connect_activate({
+        let player = youtube_player.clone();
+        let state = state.clone();
+        move |_| {
+            let looping = !state.borrow().settings.youtube_loop;
+            state.borrow_mut().settings.youtube_loop = looping;
+            let _ = state.borrow().save();
+            let value = if looping { "inf" } else { "no" };
+            player
+                .borrow()
+                .command(serde_json::json!(["set_property", "loop-file", value]));
+        }
+    });
+    youtube_menu.prepend(&loop_row);
+    loop_row.show();
+    youtube_menu.connect_map({
+        let loop_row = loop_row.clone();
+        let state = state.clone();
+        // Mapped, not shown: the menu was shown once when it was built, and
+        // each popup only maps it again.
+        move |_| {
+            set_highlight_row(
+                &loop_row,
+                "LOOP",
+                None,
+                state.borrow().settings.youtube_loop,
+            );
+        }
+    });
+    youtube_card.settings.connect_clicked({
+        let card = youtube_card.clone();
+        let player = youtube_player.clone();
+        let state = state.clone();
+        let play_youtube = play_youtube.clone();
+        move |button| {
+            let menu = youtube_settings_menu(&card, &player, &state, &play_youtube);
+            menu.connect_show({
+                let open = card.settings_open.clone();
+                move |_| open.set(true)
+            });
+            menu.connect_hide({
+                let open = card.settings_open.clone();
+                move |menu| {
+                    open.set(false);
+                    // Built for this one showing. Gone once the item chosen,
+                    // which GTK activates after hiding the menu, has run.
+                    let menu = menu.clone();
+                    glib::idle_add_local_once(move || unsafe { menu.destroy() });
+                }
+            });
+            menu.popup_at_widget(
+                button,
+                gdk::Gravity::NorthEast,
+                gdk::Gravity::SouthEast,
+                None,
+            );
+        }
+    });
+    youtube_card.mute.connect_clicked({
+        let card = youtube_card.clone();
+        let player = youtube_player.clone();
+        let state = state.clone();
+        move |_| {
+            // Kept for the next mpv as well, so muting with nothing playing
+            // still means something.
+            let muted = !state.borrow().settings.youtube_muted;
+            state.borrow_mut().settings.youtube_muted = muted;
+            show_youtube_sound(&card, muted);
+            player
+                .borrow()
+                .command(serde_json::json!(["set_property", "mute", muted]));
+        }
+    });
+    // Polled like a note's hover: the pointer over mpv's window is over an X
+    // window GTK never hears from. Plyr's rule for when the controls show: a
+    // pointer moving on the card brings them up, and two and a half seconds
+    // without it moving puts them away, unless it rests on the controls
+    // themselves. Movement, not position: once the pointer crosses onto a
+    // Wayland window Xwayland keeps reporting where it left, inside the card.
+    // The speaker's level is polled too: its button and slider each have an
+    // input window of their own, beside the box's rather than inside it, so
+    // crossing onto them reads as leaving.
+    // Where the pointer was when it left Sysi's windows. Gone onto a Wayland
+    // window it reads as still there, so while it reads the same the controls
+    // go at once instead of waiting out the idle time; moved since, it is back
+    // on an X window (the controls' own, say) and reads true again.
+    let pointer_left: Rc<Cell<Option<(i32, i32)>>> = Rc::new(Cell::new(None));
+    for leaving in [
+        window.upcast_ref::<gtk::Widget>(),
+        youtube_card.overlay.upcast_ref::<gtk::Widget>(),
+    ] {
+        leaving.add_events(gdk::EventMask::LEAVE_NOTIFY_MASK | gdk::EventMask::ENTER_NOTIFY_MASK);
+        // Into one of Sysi's windows, from wherever: not gone.
+        leaving.connect_enter_notify_event({
+            let pointer_left = pointer_left.clone();
+            move |_, _| {
+                pointer_left.set(None);
+                glib::Propagation::Proceed
+            }
+        });
+        leaving.connect_leave_notify_event({
+            let pointer_left = pointer_left.clone();
+            move |_, event| {
+                if event.detail() != gdk::NotifyType::Inferior {
+                    let (x, y) = event.root();
+                    pointer_left.set(Some((x as i32, y as i32)));
+                }
+                glib::Propagation::Proceed
+            }
+        });
+    }
+    glib::timeout_add_local(Duration::from_millis(120), {
+        let card = youtube_card.clone();
+        let registry = registry.clone();
+        let pointer_left = pointer_left.clone();
+        let last_pointer = Cell::new((0, 0));
+        let moved_at = Cell::new(0i64);
+        move || {
+            // Mapped, not just visible: a hidden overlay hides the card's
+            // window but leaves the widget flagged visible. While the card is
+            // dragged the controls could only trail behind it.
+            if !card.card.is_mapped() {
+                card.overlay.hide();
+                card.tip.hide();
+                return glib::ControlFlow::Continue;
+            }
+            // mpv's window is above everything Sysi paints, OCR's dim included,
+            // and would take the press that starts a selection. Out of the
+            // way while one is up; the sound plays on.
+            let selecting = DICTATE_SHAPE.with(Cell::get);
+            if let Some(window) = card.video.window() {
+                if window.is_visible() == selecting {
+                    if selecting {
+                        window.hide();
+                    } else {
+                        window.show();
+                    }
+                }
+            }
+            if selecting {
+                card.overlay.hide();
+                card.tip.hide();
+                return glib::ControlFlow::Continue;
+            }
+            // The title bar comes and goes with lock mode; keep the video 16:9
+            // through that as well.
+            fit_youtube_card(&card);
+            if any_gesture_held(&registry) {
+                card.overlay.hide();
+                card.tip.hide();
+                return glib::ControlFlow::Continue;
+            }
+            let Some(device) = gdk::Display::default()
+                .and_then(|display| display.default_seat())
+                .and_then(|seat| seat.pointer())
+            else {
+                return glib::ControlFlow::Continue;
+            };
+            let (_, x, y) = device.position();
+            let gone = match pointer_left.get() {
+                Some(left) if left == (x, y) => true,
+                Some(_) => {
+                    pointer_left.set(None);
+                    false
+                }
+                None => false,
+            };
+            let on_card = !gone && widget_contains_pointer(&card.card, x, y);
+            if last_pointer.replace((x, y)) != (x, y) && on_card {
+                moved_at.set(now_ms());
+            }
+            let on_controls =
+                !gone && card.overlay.is_visible() && widget_contains_pointer(&card.overlay, x, y);
+            let held = card.seek.dragging() || card.volume.dragging() || card.settings_open.get();
+            if held || on_controls || (on_card && now_ms() - moved_at.get() < 2500) {
+                place_youtube_overlay(&card);
+                let on_sound =
+                    card.volume.dragging() || allocation_contains_pointer(&card.sound, x, y);
+                card.volume_reveal.set_reveal_child(on_sound);
+            } else {
+                card.overlay.hide();
+                card.tip.hide();
+                card.volume_reveal.set_reveal_child(false);
+            }
+            glib::ControlFlow::Continue
+        }
+    });
+    let toggle_youtube: Rc<dyn Fn()> = {
+        let toggle = CardToggle {
+            card: youtube_card.card.clone(),
+            chrome: youtube_card.chrome.clone(),
+            key: "youtube",
+            size: Size {
+                width: YOUTUBE_WIDTH,
+                height: YOUTUBE_HEIGHT,
+            },
+            state: state.clone(),
+            window: window.clone(),
+            registry: registry.clone(),
+            interactive: interactive.clone(),
+            root: root.clone(),
+            picker: widget_picker.card.clone(),
+        };
+        let play_youtube = play_youtube.clone();
+        let player = youtube_player.clone();
+        let card = youtube_card.clone();
+        Rc::new(move || {
+            // Closed, the card frees mpv and its couple of hundred MB; the
+            // place to carry on from is already in the state.
+            if card.card.is_visible() {
+                player.borrow_mut().stop();
+                reset_youtube_controls(&card);
+            }
+            toggle.toggle(&|| play_youtube(false), &|data, open| {
+                data.settings.youtube_open = open
+            });
+        })
+    };
+    youtube_card.entry.connect_activate({
+        let play_youtube = play_youtube.clone();
+        let card = youtube_card.clone();
+        move |_| {
+            play_youtube(false);
+            show_youtube_entry(&card, false);
+        }
+    });
+    youtube_card.find.connect_clicked({
+        let card = youtube_card.clone();
+        let state = state.clone();
+        move |_| {
+            let open = !WidgetExt::is_visible(&card.entry);
+            // Opens on the link that plays, not on a search abandoned before.
+            if open {
+                card.entry.set_text(&state.borrow().settings.youtube_url);
+            }
+            show_youtube_entry(&card, open);
+        }
+    });
+    youtube_card.entry.connect_key_press_event({
+        let card = youtube_card.clone();
+        move |_, event| {
+            if event.keyval() == gdk::keys::constants::Escape {
+                show_youtube_entry(&card, false);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    youtube_card.hide.connect_clicked({
+        let toggle_youtube = toggle_youtube.clone();
+        move |_| toggle_youtube()
     });
 
     // Each dictionary is a window of its own, the way notes are, so several
@@ -1953,6 +2599,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let notes_opened_at = notes_opened_at.clone();
         let toggle_usage = toggle_usage.clone();
         let toggle_sessions = toggle_sessions.clone();
+        let toggle_youtube = toggle_youtube.clone();
         let toggle_translate = toggle_translate.clone();
         let translate_spawn = translate_spawn.clone();
         let translate_any_visible = translate_any_visible.clone();
@@ -2028,6 +2675,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     }
                     "toggle-usage" => toggle_usage(),
                     "toggle-sessions" => toggle_sessions(),
+                    "toggle-youtube" => toggle_youtube(),
                     "toggle-translate" => {
                         // The entry is edit chrome, so a translate window
                         // opened while locked would have nothing to type into;
@@ -2149,6 +2797,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     } else {
         sessions_card.chrome.set_visible(interactive.get());
         scan_sessions(false);
+    }
+    if !state.borrow().settings.youtube_open {
+        youtube_card.card.hide();
+    } else {
+        youtube_card.chrome.set_visible(interactive.get());
+        // Back where it was after a restart, but paused: a login should not
+        // start talking.
+        play_youtube(true);
     }
     // Likewise the dictionary: show_all() dropped its query panel down, but a
     // window restored from the last session was not asked for just now.
@@ -2620,6 +3276,1147 @@ fn build_sessions_window(initial_color_mode: Foreground) -> SessionsCard {
         color_mode: shell.color_mode,
         resize: shell.resize,
         sessions: Rc::new(RefCell::new(SessionsState::default())),
+    }
+}
+
+/// YOUTUBE: a link box in the title bar, and below it the X window mpv draws
+/// the video into (see youtube.rs), with the card's own controls laid over
+/// its bottom while the pointer is on the card. Until mpv covers the video
+/// area, it says what is going on.
+#[derive(Clone)]
+struct YoutubeCard {
+    card: gtk::EventBox,
+    chrome: gtk::EventBox,
+    header: gtk::EventBox,
+    hide: gtk::Button,
+    /// Shown in place of the title while a link is typed.
+    entry: gtk::Entry,
+    /// The title of what plays, in the title bar while the link box is away.
+    playing: gtk::Label,
+    find: gtk::Button,
+    video: gtk::DrawingArea,
+    /// The controls, in a window of their own over the bottom of the video:
+    /// nothing inside the card can draw over mpv's window, but the compositor
+    /// can lay a translucent window over it. Shown while the pointer is on
+    /// the card or the video is paused, gone a moment after neither holds.
+    overlay: gtk::Window,
+    seek: MediaSlider,
+    play: gtk::Button,
+    mute: gtk::Button,
+    volume: MediaSlider,
+    volume_reveal: gtk::Revealer,
+    /// The speaker and its level: the pointer anywhere on it keeps the level
+    /// out.
+    sound: gtk::Box,
+    time: gtk::Label,
+    /// Where the pointer would seek to, floated over the video.
+    tip: HoverTip,
+    preview: Rc<RefCell<YoutubePreview>>,
+    /// What the settings menu offers and has chosen for this video.
+    media: Rc<RefCell<YoutubeMedia>>,
+    settings: gtk::Button,
+    /// True while the settings menu is up, so the controls it hangs from stay.
+    settings_open: Rc<Cell<bool>>,
+    /// The corners the video area paints clear: radius, and whether the top
+    /// ones too.
+    video_corners: Rc<Cell<(i32, bool)>>,
+    /// The X shape last given mpv's window: its size and corners in device
+    /// pixels. Cleared for each new mpv.
+    video_shape: Rc<Cell<Option<(i32, i32, i32, bool)>>>,
+    /// When the controls were last raised, in ms.
+    raised_at: Rc<Cell<i64>>,
+    status: Rc<RefCell<String>>,
+    color_mode: Rc<Cell<Foreground>>,
+    resize: ResizeHandle,
+}
+
+/// A media slider in the card's ink, YouTube's way: a thin track that
+/// thickens under the pointer, what is downloaded over it, what is played over
+/// that, and a knob only while the pointer is on it. GtkScale's theme nodes
+/// can neither thicken on hover nor show a downloaded range.
+#[derive(Clone)]
+struct MediaSlider {
+    area: gtk::DrawingArea,
+    state: Rc<RefCell<SliderState>>,
+}
+
+#[derive(Default)]
+struct SliderState {
+    value: f64,
+    max: f64,
+    buffered: f64,
+    /// Where the pointer is along the track, 0 to 1, while it is over it.
+    hover: Option<f64>,
+    dragging: bool,
+    /// The value while pressed and dragged, and once more, done, on release.
+    changed: Option<Rc<dyn Fn(f64, bool)>>,
+    /// The value under the pointer and the root point above it, or None when
+    /// it leaves.
+    hovered: Option<Rc<dyn Fn(Option<(f64, f64, f64)>)>>,
+}
+
+/// Room at each end for the knob.
+const SLIDER_INSET: f64 = 6.0;
+
+impl MediaSlider {
+    fn new(max: f64) -> Self {
+        let area = gtk::DrawingArea::new();
+        area.set_size_request(-1, 16);
+        area.set_valign(gtk::Align::Center);
+        area.add_events(
+            gdk::EventMask::BUTTON_PRESS_MASK
+                | gdk::EventMask::BUTTON_RELEASE_MASK
+                | gdk::EventMask::POINTER_MOTION_MASK
+                | gdk::EventMask::ENTER_NOTIFY_MASK
+                | gdk::EventMask::LEAVE_NOTIFY_MASK,
+        );
+        let state = Rc::new(RefCell::new(SliderState {
+            max,
+            ..SliderState::default()
+        }));
+        let slider = Self { area, state };
+        slider.area.connect_draw({
+            let state = slider.state.clone();
+            move |area, ctx| {
+                draw_media_slider(area, ctx, &state.borrow());
+                glib::Propagation::Stop
+            }
+        });
+        slider.area.connect_button_press_event({
+            let slider = slider.clone();
+            move |_, event| {
+                if event.button() != 1 {
+                    return glib::Propagation::Proceed;
+                }
+                let value = slider.value_at(event.position().0);
+                let changed = {
+                    let mut state = slider.state.borrow_mut();
+                    state.dragging = true;
+                    state.value = value;
+                    state.changed.clone()
+                };
+                slider.area.queue_draw();
+                if let Some(changed) = changed {
+                    changed(value, false);
+                }
+                glib::Propagation::Stop
+            }
+        });
+        slider.area.connect_motion_notify_event({
+            let slider = slider.clone();
+            move |area, event| {
+                let (x, _) = event.position();
+                let value = slider.value_at(x);
+                let (dragging, changed, hovered) = {
+                    let mut state = slider.state.borrow_mut();
+                    state.hover = Some(slider.fraction_at(x));
+                    if state.dragging {
+                        state.value = value;
+                    }
+                    (state.dragging, state.changed.clone(), state.hovered.clone())
+                };
+                area.queue_draw();
+                if let (true, Some(changed)) = (dragging, changed) {
+                    changed(value, false);
+                }
+                if let Some(hovered) = hovered {
+                    let (root_x, root_y) = event.root();
+                    hovered(Some((value, root_x, root_y - event.position().1)));
+                }
+                glib::Propagation::Stop
+            }
+        });
+        slider.area.connect_button_release_event({
+            let slider = slider.clone();
+            move |area, event| {
+                let (x, y) = event.position();
+                let inside = x >= 0.0
+                    && y >= 0.0
+                    && x < f64::from(area.allocated_width())
+                    && y < f64::from(area.allocated_height());
+                let (value, changed, hovered) = {
+                    let mut state = slider.state.borrow_mut();
+                    if !std::mem::take(&mut state.dragging) {
+                        return glib::Propagation::Proceed;
+                    }
+                    if !inside {
+                        state.hover = None;
+                    }
+                    (state.value, state.changed.clone(), state.hovered.clone())
+                };
+                area.queue_draw();
+                if let Some(changed) = changed {
+                    changed(value, true);
+                }
+                if let (false, Some(hovered)) = (inside, hovered) {
+                    hovered(None);
+                }
+                glib::Propagation::Stop
+            }
+        });
+        slider.area.connect_leave_notify_event({
+            let state = slider.state.clone();
+            move |area, _| {
+                let hovered = {
+                    let mut state = state.borrow_mut();
+                    // A drag keeps the pointer's place until it lets go.
+                    if state.dragging {
+                        return glib::Propagation::Proceed;
+                    }
+                    state.hover = None;
+                    state.hovered.clone()
+                };
+                area.queue_draw();
+                if let Some(hovered) = hovered {
+                    hovered(None);
+                }
+                glib::Propagation::Proceed
+            }
+        });
+        slider
+    }
+
+    fn fraction_at(&self, x: f64) -> f64 {
+        let span = (f64::from(self.area.allocated_width()) - 2.0 * SLIDER_INSET).max(1.0);
+        ((x - SLIDER_INSET) / span).clamp(0.0, 1.0)
+    }
+
+    fn value_at(&self, x: f64) -> f64 {
+        self.fraction_at(x) * self.state.borrow().max
+    }
+
+    fn dragging(&self) -> bool {
+        self.state.borrow().dragging
+    }
+
+    fn value(&self) -> f64 {
+        self.state.borrow().value
+    }
+
+    fn max(&self) -> f64 {
+        self.state.borrow().max
+    }
+
+    /// Ignored while the pointer drags the knob: it is the one saying where.
+    fn set_value(&self, value: f64) {
+        let mut state = self.state.borrow_mut();
+        if state.dragging || state.value == value {
+            return;
+        }
+        state.value = value;
+        drop(state);
+        self.area.queue_draw();
+    }
+
+    fn set_max(&self, max: f64) {
+        self.state.borrow_mut().max = max.max(0.0);
+        self.area.queue_draw();
+    }
+
+    fn set_buffered(&self, buffered: f64) {
+        self.state.borrow_mut().buffered = buffered;
+        self.area.queue_draw();
+    }
+
+    fn connect_changed(&self, changed: impl Fn(f64, bool) + 'static) {
+        self.state.borrow_mut().changed = Some(Rc::new(changed));
+    }
+
+    fn connect_hovered(&self, hovered: impl Fn(Option<(f64, f64, f64)>) + 'static) {
+        self.state.borrow_mut().hovered = Some(Rc::new(hovered));
+    }
+}
+
+fn draw_media_slider(area: &gtk::DrawingArea, ctx: &Context, state: &SliderState) {
+    let ink = area.style_context().color(gtk::StateFlags::NORMAL);
+    let width = f64::from(area.allocated_width());
+    let active = state.hover.is_some() || state.dragging;
+    let thickness = if active { 5.0 } else { 3.0 };
+    let top = (f64::from(area.allocated_height()) - thickness) / 2.0;
+    let span = (width - 2.0 * SLIDER_INSET).max(1.0);
+    let fraction = |value: f64| {
+        if state.max > 0.0 {
+            (value / state.max).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let bar = |from: f64, to: f64, alpha: f64| {
+        if to <= from {
+            return;
+        }
+        token_bar_path(
+            ctx,
+            SLIDER_INSET + from * span,
+            top,
+            (to - from) * span,
+            thickness,
+        );
+        ctx.set_source_rgba(ink.red(), ink.green(), ink.blue(), ink.alpha() * alpha);
+        let _ = ctx.fill();
+    };
+    let played = fraction(state.value);
+    bar(0.0, 1.0, 0.22);
+    bar(0.0, fraction(state.buffered), 0.22);
+    if let Some(hover) = state.hover {
+        bar(played, hover, 0.3);
+    }
+    bar(0.0, played, 0.95);
+    if active {
+        ctx.arc(
+            SLIDER_INSET + played * span,
+            top + thickness / 2.0,
+            6.0,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        ctx.set_source_rgba(ink.red(), ink.green(), ink.blue(), ink.alpha());
+        let _ = ctx.fill();
+    }
+}
+
+/// A time floated over the video, where the seek bar would go: a window of
+/// its own, as nothing in the card can draw over mpv's.
+#[derive(Clone)]
+struct HoverTip {
+    window: gtk::Window,
+    /// The frame there, from YouTube's storyboard, when it has one.
+    image: gtk::Image,
+    label: gtk::Label,
+    /// The root point the tip is centred above.
+    anchor: Rc<Cell<(i32, i32)>>,
+}
+
+impl HoverTip {
+    fn new() -> Self {
+        let window = gtk::Window::new(gtk::WindowType::Popup);
+        window.set_type_hint(gdk::WindowTypeHint::Tooltip);
+        // A transparent visual, or the rounded corners are drawn square.
+        if let Some(visual) = WidgetExt::screen(&window).and_then(|screen| screen.rgba_visual()) {
+            window.set_visual(Some(&visual));
+        }
+        window.style_context().add_class("youtube-tip");
+        let image = gtk::Image::new();
+        image.style_context().add_class("youtube-thumbnail");
+        image.set_no_show_all(true);
+        let label = gtk::Label::new(None);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.pack_start(&image, false, false, 0);
+        column.pack_start(&label, false, false, 0);
+        window.add(&column);
+        column.show_all();
+        // The pointer passes through: entering the tip would read as leaving
+        // the bar, and hide it.
+        window.input_shape_combine_region(Some(&Region::create()));
+        // Placed once its size is known: measured before, the frame was not
+        // counted yet and the tip came down over the pointer.
+        let anchor = Rc::new(Cell::new((0, 0)));
+        window.connect_size_allocate({
+            let anchor = anchor.clone();
+            move |window, allocation| {
+                let (x, y) = anchor.get();
+                let at = (x - allocation.width() / 2, y - allocation.height() - 6);
+                if window.position() != at {
+                    window.move_(at.0, at.1);
+                }
+            }
+        });
+        Self {
+            window,
+            image,
+            label,
+            anchor,
+        }
+    }
+
+    /// Centred above the root point `(x, y)`, with the frame over the time
+    /// when there is one.
+    fn show(&self, text: &str, x: f64, y: f64, frame: Option<&cairo::Surface>) {
+        self.label.set_text(text);
+        self.image.set_from_surface(frame);
+        self.image.set_visible(frame.is_some());
+        self.anchor.set((x.round() as i32, y.round() as i32));
+        let natural = self.window.preferred_size().1;
+        // Shrunk back too when the frame goes.
+        self.window.resize(natural.width, natural.height);
+        self.window.move_(
+            x.round() as i32 - natural.width / 2,
+            y.round() as i32 - natural.height - 6,
+        );
+        self.window.show();
+        // The overlay is raised as it works; this goes over it each time.
+        if let Some(window) = self.window.window() {
+            window.raise();
+        }
+    }
+
+    fn hide(&self) {
+        self.window.hide();
+    }
+}
+
+/// The seek bar's preview: the storyboard of what plays, the sheets of it
+/// fetched so far, and where the pointer is on the bar.
+#[derive(Default)]
+struct YoutubePreview {
+    board: Option<youtube::Storyboard>,
+    sheets: HashMap<usize, Pixbuf>,
+    asked: HashSet<usize>,
+    /// Counted per video, so a sheet of the one before is dropped.
+    video: u64,
+    hover: Option<(f64, f64, f64)>,
+}
+
+/// A row of the cog's menus, as wide as its words: highlight_row pads its
+/// rows for an ellipsis these never need, and the menus came out half empty.
+/// `ticked` makes it a choice, YouTube's way, the tick in a column on the
+/// left, there but clear on the rows not chosen so their words line up.
+fn choice_row(label: &str, ticked: Option<bool>) -> gtk::MenuItem {
+    let item = gtk::MenuItem::with_label(label);
+    let Some(text) = item
+        .child()
+        .and_then(|child| child.downcast::<gtk::Label>().ok())
+    else {
+        return item;
+    };
+    let mut chars = label.chars().count();
+    if let Some(ticked) = ticked {
+        let alpha = if ticked { "100%" } else { "1" };
+        text.set_markup(&format!(
+            "<span alpha=\"{alpha}\">\u{2713}</span>  {}",
+            glib::markup_escape_text(label).as_str()
+        ));
+        chars += 3;
+    }
+    // Asked for in characters, with one to spare for the letter-spacing: left
+    // to measure itself under the menu's CSS the label reckons it needs a
+    // second line, and the menu grew rows of empty space below its last.
+    text.set_width_chars(chars as i32 + 1);
+    item
+}
+
+/// The cog's menu, built afresh each time from what plays: SPEED, QUALITY and
+/// SUBTITLES, each a submenu with the current choice ticked.
+fn youtube_settings_menu(
+    card: &YoutubeCard,
+    player: &Rc<RefCell<youtube::Player>>,
+    state: &Rc<RefCell<AppState>>,
+    play: &Rc<dyn Fn(bool)>,
+) -> gtk::Menu {
+    let menu = context_menu();
+    let media = card.media.borrow();
+    // The rows name the setting only; what is chosen shows as the tick in
+    // its list, YouTube's way.
+    let row = |label: &str, choices: gtk::Menu| {
+        let row = choice_row(label, None);
+        row.set_submenu(Some(&choices));
+        menu.append(&row);
+    };
+
+    let speeds = context_menu();
+    for speed in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
+        let label = match speed == 1.0 {
+            true => "Normal".to_string(),
+            false => format!("{speed}\u{00d7}"),
+        };
+        let item = choice_row(&label, Some(media.speed == speed));
+        item.connect_activate({
+            let card = card.clone();
+            let player = player.clone();
+            move |_| {
+                card.media.borrow_mut().speed = speed;
+                player
+                    .borrow()
+                    .command(serde_json::json!(["set_property", "speed", speed]));
+            }
+        });
+        speeds.append(&item);
+    }
+    row("SPEED", speeds);
+
+    // A new height is a new lookup: the card plays again from where it is.
+    let heights = context_menu();
+    let height = state.borrow().settings.youtube_height;
+    // 0 is Auto: as many lines as the card shows (youtube_auto_height).
+    for choice in [0, 1080, 720, 480, 360] {
+        let label = match choice {
+            0 => "Auto".to_string(),
+            lines => format!("{lines}p"),
+        };
+        let item = choice_row(&label, Some(height == choice));
+        item.connect_activate({
+            let state = state.clone();
+            let play = play.clone();
+            move |_| {
+                if state.borrow().settings.youtube_height == choice {
+                    return;
+                }
+                state.borrow_mut().settings.youtube_height = choice;
+                let _ = state.borrow().save();
+                play(false);
+            }
+        });
+        heights.append(&item);
+    }
+    row("QUALITY", heights);
+
+    let tracks = context_menu();
+    let off = choice_row("Off", Some(media.subtitle.is_none()));
+    off.connect_activate({
+        let card = card.clone();
+        let player = player.clone();
+        move |_| {
+            card.media.borrow_mut().subtitle = None;
+            player
+                .borrow()
+                .command(serde_json::json!(["set_property", "sid", "no"]));
+        }
+    });
+    tracks.append(&off);
+    for track in &media.subtitles {
+        let chosen = media.subtitle.as_deref() == Some(track.label.as_str());
+        let item = choice_row(&track.label, Some(chosen));
+        item.connect_activate({
+            let card = card.clone();
+            let player = player.clone();
+            let track = track.clone();
+            move |_| {
+                card.media.borrow_mut().subtitle = Some(track.label.clone());
+                player.borrow().command(serde_json::json!([
+                    "sub-add",
+                    track.url,
+                    "select",
+                    track.label
+                ]));
+            }
+        });
+        tracks.append(&item);
+    }
+    row("SUBTITLES", tracks);
+    drop(media);
+    menu.show_all();
+    menu
+}
+
+/// Quality on Auto: the fewest lines that still fill the video area at its
+/// size on screen, in device pixels. 720 before the area has a size.
+fn youtube_auto_height(video: &gtk::DrawingArea) -> u32 {
+    let lines = video.allocated_height() * video.scale_factor();
+    if lines <= 1 {
+        return 720;
+    }
+    [360, 480, 720, 1080]
+        .into_iter()
+        .find(|standard| *standard >= lines as u32)
+        .unwrap_or(1080)
+}
+
+/// The settings menu's state for the video playing: its subtitle tracks and
+/// which is on, and the speed.
+struct YoutubeMedia {
+    subtitles: Vec<youtube::Subtitle>,
+    subtitle: Option<String>,
+    speed: f64,
+}
+
+impl Default for YoutubeMedia {
+    fn default() -> Self {
+        Self {
+            subtitles: Vec::new(),
+            subtitle: None,
+            speed: 1.0,
+        }
+    }
+}
+
+/// A storyboard sheet fetched off the main loop: for which video, which
+/// sheet, its bytes.
+type SheetFetched = (u64, usize, Vec<u8>);
+
+/// Show the time under the pointer, and the frame there once its sheet is in.
+/// A sheet not asked for yet is fetched; it calls this again when it lands.
+fn show_youtube_preview(card: &YoutubeCard, fetched: &async_channel::Sender<SheetFetched>) {
+    let mut preview = card.preview.borrow_mut();
+    let Some((position, x, y)) = preview.hover else {
+        card.tip.hide();
+        return;
+    };
+    let scale = card.video.scale_factor();
+    let frame = preview.board.clone().and_then(|board| {
+        let (index, left, top) = board.locate(position)?;
+        let Some(sheet) = preview.sheets.get(&index) else {
+            if preview.asked.insert(index) {
+                let url = board.sheet_url(index)?.to_string();
+                let (video, fetched) = (preview.video, fetched.clone());
+                std::thread::spawn(move || {
+                    if let Some(bytes) = youtube::fetch_sheet(&url) {
+                        let _ = fetched.send_blocking((video, index, bytes));
+                    }
+                });
+            }
+            return None;
+        };
+        // The last sheet can stop short of a full grid.
+        let fits = left + board.width <= sheet.width() && top + board.height <= sheet.height();
+        let tile = fits.then(|| sheet.new_subpixbuf(left, top, board.width, board.height))?;
+        // A 320-wide frame shown 160 wide: sharp at 200%, half size at 100%.
+        let shown = (160 * scale).min(board.width);
+        let tile = match tile.width() == shown {
+            true => tile,
+            false => tile.scale_simple(
+                shown,
+                shown * board.height / board.width,
+                InterpType::Bilinear,
+            )?,
+        };
+        tile.create_surface(scale, card.video.window().as_ref())
+    });
+    drop(preview);
+    card.tip.show(&clock(position), x, y, frame.as_ref());
+}
+
+/// The card's height at `width`: the title bar while it shows over the video
+/// at 16:9, any other shape being black bars around it.
+fn youtube_card_height(card: &YoutubeCard, width: i32) -> i32 {
+    let chrome = if card.chrome.is_visible() {
+        card.chrome.preferred_height().1
+    } else {
+        0
+    };
+    width * 9 / 16 + chrome
+}
+
+fn fit_youtube_card(card: &YoutubeCard) {
+    let width = match card.card.width_request() {
+        width if width > 0 => width,
+        _ => card.card.allocated_width(),
+    };
+    let height = youtube_card_height(card, width);
+    if width > 0 && card.card.height_request() != height {
+        card.card.set_size_request(width, height);
+    }
+    round_youtube_video(card);
+}
+
+/// The corners of the card's glass the video reaches: the bottom ones
+/// always, the top ones too while lock mode hides the title bar. The video
+/// area paints them clear itself; mpv's window inside it is square and
+/// opaque, so it gets an X shape. (Shaping the video area instead leaves what
+/// it uncovers black: GTK never paints under a window of its own.)
+fn round_youtube_video(card: &YoutubeCard) {
+    let radius = if card.card.style_context().has_class("mode-glass") {
+        14
+    } else {
+        4
+    };
+    let corners = (radius, !card.chrome.is_visible());
+    if card.video_corners.get() != corners {
+        card.video_corners.set(corners);
+        card.video.queue_draw();
+    }
+    // mpv's window is in device pixels: twice the card's at 200%.
+    let scale = card.video.scale_factor();
+    let (width, height) = (
+        card.video.allocated_width() * scale,
+        card.video.allocated_height() * scale,
+    );
+    let shape = (width, height, radius * scale, corners.1);
+    // Asked of X only when something changed: a new mpv clears the cache, and
+    // until its window turns up this keeps looking.
+    if card.video_shape.get() == Some(shape) {
+        return;
+    }
+    let Some((display, mpv)) = card
+        .video
+        .window()
+        .and_then(|window| foreign_child(&window))
+    else {
+        return;
+    };
+    card.video_shape.set(Some(shape));
+    let mut rows = rounded_rows(width, height, radius * scale, corners.1, true);
+    // GDK's own shape call does nothing to a window it did not make. mpv's
+    // window can be gone by the time the request lands (mpv stopped between
+    // the query and this), and an X error GDK has not been told to expect
+    // ends the whole program: trap it.
+    let trap = gdk::Display::default().and_then(|gdk| gdk.downcast::<gdkx11::X11Display>().ok());
+    if let Some(trap) = &trap {
+        trap.error_trap_push();
+    }
+    unsafe {
+        XShapeCombineRectangles(
+            display,
+            mpv,
+            SHAPE_BOUNDING,
+            0,
+            0,
+            rows.as_mut_ptr(),
+            rows.len() as i32,
+            SHAPE_SET,
+            0,
+        );
+    }
+    if let Some(trap) = &trap {
+        // Without a round trip: an error from the request is dropped
+        // whenever it arrives.
+        trap.error_trap_pop_ignored();
+    }
+}
+
+const SHAPE_SET: i32 = 0;
+const SHAPE_BOUNDING: i32 = 0;
+
+#[link(name = "Xext")]
+extern "C" {
+    fn XShapeCombineRectangles(
+        display: *mut x11::xlib::Display,
+        window: x11::xlib::Window,
+        kind: i32,
+        x_offset: i32,
+        y_offset: i32,
+        rectangles: *mut x11::xlib::XRectangle,
+        count: i32,
+        op: i32,
+        ordering: i32,
+    );
+}
+
+/// The window another program made inside `parent` (mpv's picture), and the
+/// X connection to reach it on.
+fn foreign_child(parent: &gdk::Window) -> Option<(*mut x11::xlib::Display, x11::xlib::Window)> {
+    let display = parent.display().downcast::<gdkx11::X11Display>().ok()?;
+    let xid = parent.downcast_ref::<gdkx11::X11Window>()?.xid();
+    let (mut root, mut owner) = (0, 0);
+    let mut children: *mut x11::xlib::Window = std::ptr::null_mut();
+    let mut count = 0u32;
+    unsafe {
+        use glib::translate::ToGlibPtr;
+        let xdisplay = gdkx11::ffi::gdk_x11_display_get_xdisplay(display.to_glib_none().0);
+        x11::xlib::XQueryTree(
+            xdisplay,
+            xid,
+            &mut root,
+            &mut owner,
+            &mut children,
+            &mut count,
+        );
+        let child = (count > 0).then(|| *children.add(count as usize - 1));
+        if !children.is_null() {
+            x11::xlib::XFree(children.cast());
+        }
+        Some((xdisplay, child?))
+    }
+}
+
+/// The same shape as `rounded_rows`, as a cairo path.
+fn rounded_rect_path(ctx: &Context, width: f64, height: f64, radius: f64, top: bool) {
+    let radius = radius.min(width / 2.0).min(height / 2.0).max(0.0);
+    let (top_radius, bottom_radius) = (if top { radius } else { 0.0 }, radius);
+    use std::f64::consts::{FRAC_PI_2, PI};
+    ctx.new_path();
+    ctx.arc(top_radius, top_radius, top_radius, PI, PI + FRAC_PI_2);
+    ctx.arc(width - top_radius, top_radius, top_radius, -FRAC_PI_2, 0.0);
+    ctx.arc(
+        width - bottom_radius,
+        height - bottom_radius,
+        bottom_radius,
+        0.0,
+        FRAC_PI_2,
+    );
+    ctx.arc(
+        bottom_radius,
+        height - bottom_radius,
+        bottom_radius,
+        FRAC_PI_2,
+        PI,
+    );
+    ctx.close_path();
+}
+
+/// A `width` x `height` rectangle with the chosen corners rounded to
+/// `radius`, as one-pixel rows, which is what an X shape is made of.
+fn rounded_rows(
+    width: i32,
+    height: i32,
+    radius: i32,
+    top: bool,
+    bottom: bool,
+) -> Vec<x11::xlib::XRectangle> {
+    let radius = radius.min(width / 2).min(height / 2).max(0);
+    let inset = |row: i32| {
+        let dy = f64::from(radius) - f64::from(row) - 0.5;
+        (f64::from(radius) - (f64::from(radius).powi(2) - dy * dy).max(0.0).sqrt()).round() as i32
+    };
+    (0..height)
+        .map(|row| {
+            let cut = if top && row < radius {
+                inset(row)
+            } else if bottom && height - 1 - row < radius {
+                inset(height - 1 - row)
+            } else {
+                0
+            };
+            x11::xlib::XRectangle {
+                x: cut as i16,
+                y: row as i16,
+                width: (width - 2 * cut).max(0) as u16,
+                height: 1,
+            }
+        })
+        .collect()
+}
+
+/// Lay the controls over the bottom of the video, its full width, and bring
+/// them up if they were away. The corner the card is resized by lets clicks
+/// through to it.
+fn place_youtube_overlay(card: &YoutubeCard) {
+    let Some(video) = card.video.window() else {
+        return;
+    };
+    let (_, x, y) = video.origin();
+    let width = card.video.allocated_width();
+    let height = card.overlay.preferred_height().1;
+    let top = y + card.video.allocated_height() - height;
+    let glass = card.card.style_context().has_class("mode-glass");
+    set_style_class(&card.overlay.style_context(), "mode-glass", glass);
+    if card.overlay.size() != (width, height) {
+        card.overlay.resize(width, height);
+        let input = Region::create_rectangle(&RectangleInt::new(0, 0, width, height));
+        let _ = input.subtract_rectangle(&RectangleInt::new(
+            width - RESIZE_HIT_SIZE,
+            height - RESIZE_HIT_SIZE,
+            RESIZE_HIT_SIZE,
+            RESIZE_HIT_SIZE,
+        ));
+        card.overlay.input_shape_combine_region(Some(&input));
+    }
+    if card.overlay.position() != (x, top) {
+        card.overlay.move_(x, top);
+    }
+    let shown = !card.overlay.is_visible();
+    if shown {
+        card.overlay.show_all();
+    }
+    // The overlay is raised as it works; this goes back over it, and the
+    // hover time over this: on showing, then once a second rather than every
+    // poll. Not while the cog's menu is up: it would go over that too.
+    if !(shown || now_ms() - card.raised_at.get() > 1000) || card.settings_open.get() {
+        return;
+    }
+    card.raised_at.set(now_ms());
+    if let Some(window) = card.overlay.window() {
+        window.raise();
+    }
+    if let Some(window) = card
+        .tip
+        .window
+        .window()
+        .filter(|_| card.tip.window.is_visible())
+    {
+        window.raise();
+    }
+}
+
+/// Unfold the link box over the title, or fold it back.
+fn show_youtube_entry(card: &YoutubeCard, open: bool) {
+    card.entry.set_visible(open);
+    card.playing.set_visible(!open);
+    if open {
+        card.entry.grab_focus();
+        card.entry.select_region(0, -1);
+    }
+}
+
+/// Press and release button 3 on `widget` where the pointer is, through GTK
+/// itself, so its own right-click gesture opens its menu.
+fn right_click_at_pointer(widget: &gtk::EventBox) {
+    use glib::translate::{ToGlibPtr, ToGlibPtrMut};
+    let Some(window) = widget.window() else {
+        return;
+    };
+    let Some(pointer) = gdk::Display::default()
+        .and_then(|display| display.default_seat())
+        .and_then(|seat| seat.pointer())
+    else {
+        return;
+    };
+    let (_, x, y, _) = window.device_position_double(&pointer);
+    let (_, root_x, root_y) = pointer.position_double();
+    for kind in [gdk::EventType::ButtonPress, gdk::EventType::ButtonRelease] {
+        let mut event = gdk::Event::new(kind);
+        // SAFETY: a button event just made; the window reference given to it
+        // is the event's to drop when it is freed.
+        unsafe {
+            let raw: *mut gdk::ffi::GdkEvent = ToGlibPtrMut::to_glib_none_mut(&mut event).0;
+            let button = raw as *mut gdk::ffi::GdkEventButton;
+            (*button).window = window.to_glib_full();
+            (*button).x = x;
+            (*button).y = y;
+            (*button).x_root = root_x;
+            (*button).y_root = root_y;
+            (*button).button = 3;
+            (*button).time = gtk::current_event_time();
+        }
+        event.set_device(Some(&pointer));
+        gtk::main_do_event(&mut event);
+    }
+}
+
+/// The controls with no mpv behind them: ready to play, at the start.
+fn reset_youtube_controls(card: &YoutubeCard) {
+    set_button_icon(&card.play, "media-playback-start-symbolic", "Play");
+    card.seek.set_value(0.0);
+    card.seek.set_max(0.0);
+    card.seek.set_buffered(0.0);
+    show_youtube_time(card, 0.0);
+}
+
+fn show_youtube_time(card: &YoutubeCard, position: f64) {
+    let length = card.seek.max();
+    let text = match length > 0.0 {
+        true => format!("{} / {}", clock(position), clock(length)),
+        false => clock(position),
+    };
+    card.time.set_text(&text);
+}
+
+fn show_youtube_sound(card: &YoutubeCard, muted: bool) {
+    let silent = muted || card.volume.value() <= 0.0;
+    let (icon, tip) = match (silent, card.volume.value() < 50.0) {
+        (true, _) => ("audio-volume-muted-symbolic", "Unmute"),
+        (false, true) => ("audio-volume-low-symbolic", "Mute"),
+        (false, false) => ("audio-volume-high-symbolic", "Mute"),
+    };
+    set_button_icon(&card.mute, icon, tip);
+}
+
+/// `m:ss`, or `h:mm:ss` past the hour.
+fn clock(seconds: f64) -> String {
+    let seconds = seconds.max(0.0) as u64;
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    match hours {
+        0 => format!("{minutes}:{seconds:02}"),
+        _ => format!("{hours}:{minutes:02}:{seconds:02}"),
+    }
+}
+
+fn set_button_icon(button: &gtk::Button, icon_name: &str, tooltip: &str) {
+    if let Some(image) = button
+        .child()
+        .and_then(|child| child.downcast::<gtk::Image>().ok())
+    {
+        image.set_from_icon_name(Some(icon_name), gtk::IconSize::Menu);
+    }
+    button.set_tooltip_text(Some(tooltip));
+}
+
+fn build_youtube_window(initial_color_mode: Foreground) -> YoutubeCard {
+    let shell = utility_shell(initial_color_mode, "YOUTUBE", "Hide YouTube", "Play");
+    // Known by name where it must not be re-parented (restack_overlay_card).
+    shell.card.set_widget_name("youtube");
+    // Enter in the link box and the play button cover what reload did.
+    shell.refresh.set_no_show_all(true);
+    shell.refresh.hide();
+    // The title bar names what plays. The link box stays folded behind a
+    // search button until wanted, and folds away again once used.
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("Link or search\u{2026}"));
+    entry.set_has_frame(false);
+    entry.set_width_chars(1);
+    entry.set_hexpand(true);
+    entry.style_context().add_class("note-search-entry");
+    entry.set_no_show_all(true);
+    let playing = gtk::Label::new(None);
+    playing.set_xalign(0.0);
+    playing.set_hexpand(true);
+    playing.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    playing.style_context().add_class("youtube-playing");
+    let find = icon_button("edit-find-symbolic", "Open a link or search");
+    if let Some(bar) = shell
+        .header
+        .child()
+        .and_then(|bar| bar.downcast::<gtk::Box>().ok())
+    {
+        // The title was packed to stretch; here what plays, or the link box,
+        // takes that room.
+        for child in bar.children() {
+            if child.is::<gtk::Label>() {
+                child.set_hexpand(false);
+                bar.set_child_packing(&child, false, false, 0, gtk::PackType::Start);
+            }
+        }
+        bar.pack_start(&playing, true, true, 0);
+        bar.pack_start(&entry, true, true, 0);
+        bar.pack_start(&find, false, false, 0);
+        bar.show_all();
+    }
+    // The resize corner sits over the video. A window GTK paints there gets
+    // carved out of the video's, and what that uncovers is never painted:
+    // a black square. As a native input-only window it takes the drag over
+    // mpv's picture and covers nothing; its arc goes unseen under the video.
+    let hitbox = &shell.resize.hitbox;
+    hitbox.set_visible_window(false);
+    hitbox.connect_realize(|hitbox| {
+        use glib::translate::ToGlibPtr;
+        let Some(parent) = hitbox.window() else {
+            return;
+        };
+        // GtkOverlay wraps the handle in a painted window of its own, and
+        // that wrapper carves the video just the same. GDK leaves composited
+        // windows out of what it carves; composited, the wrapper is no longer
+        // drawn for it (the arc is under the video anyway) and still passes
+        // the pointer on to the handle.
+        // SAFETY: a live, realized GdkWindow.
+        unsafe { gdk::ffi::gdk_window_set_composited(parent.to_glib_none().0, glib::ffi::GTRUE) };
+        let owner = hitbox.as_ptr() as glib::ffi::gpointer;
+        for window in parent.children() {
+            let mut data: glib::ffi::gpointer = std::ptr::null_mut();
+            // SAFETY: as in raise_owned_windows: compared, never dereferenced.
+            unsafe { gdk::ffi::gdk_window_get_user_data(window.to_glib_none().0, &mut data) };
+            if data == owner {
+                window.ensure_native();
+                let cursor =
+                    gdk::Cursor::for_display(&window.display(), gdk::CursorType::BottomRightCorner);
+                window.set_cursor(cursor.as_ref());
+            }
+        }
+    });
+    let status = Rc::new(RefCell::new(String::from("Paste a YouTube link above")));
+    let video_corners = Rc::new(Cell::new((14, false)));
+    let video = gtk::DrawingArea::new();
+    video.set_hexpand(true);
+    video.set_vexpand(true);
+    video.set_size_request(1, 90);
+    video.connect_draw({
+        let status = status.clone();
+        let corners = video_corners.clone();
+        move |area, ctx| {
+            // Black where the picture goes, clear in the corners the card's
+            // glass rounds off.
+            ctx.set_operator(Operator::Clear);
+            let _ = ctx.paint();
+            ctx.set_operator(Operator::Over);
+            let (radius, top) = corners.get();
+            rounded_rect_path(
+                ctx,
+                f64::from(area.allocated_width()),
+                f64::from(area.allocated_height()),
+                f64::from(radius),
+                top,
+            );
+            ctx.set_source_rgb(0.0, 0.0, 0.0);
+            let _ = ctx.fill();
+            // Cut to the card's width: a long complaint would run off it.
+            let room = f64::from(area.allocated_width()) - 24.0;
+            let mut text = status.borrow().clone();
+            while text.chars().count() > 1
+                && token_text_width(ctx, &text, 12.0, FontWeight::Normal) > room
+            {
+                text.pop();
+                text.pop();
+                text.push('\u{2026}');
+            }
+            let width = token_text_width(ctx, &text, 12.0, FontWeight::Normal);
+            let x = ((f64::from(area.allocated_width()) - width) / 2.0).max(6.0);
+            let y = f64::from(area.allocated_height()) / 2.0 + 4.0;
+            draw_token_text(
+                ctx,
+                x,
+                y,
+                &text,
+                12.0,
+                FontWeight::Normal,
+                (1.0, 1.0, 1.0),
+                0.7,
+            );
+            glib::Propagation::Stop
+        }
+    });
+    shell.body.pack_start(&video, true, true, 0);
+
+    // YouTube's layout: the seek bar across the whole width, and under it
+    // play, the speaker with its level sliding out beside it, and the time.
+    // All of it at the left, clear of the corner the card is resized by.
+    let seek = MediaSlider::new(0.0);
+    seek.area.set_hexpand(true);
+    let play = icon_button("media-playback-start-symbolic", "Play");
+    let mute = icon_button("audio-volume-high-symbolic", "Mute");
+    for button in [&play, &mute] {
+        button.style_context().add_class("youtube-button");
+        if let Some(image) = button
+            .child()
+            .and_then(|child| child.downcast::<gtk::Image>().ok())
+        {
+            image.set_pixel_size(14);
+        }
+    }
+    let volume = MediaSlider::new(100.0);
+    volume.area.set_size_request(64, 16);
+    let volume_reveal = gtk::Revealer::new();
+    volume_reveal.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+    volume_reveal.set_transition_duration(150);
+    volume_reveal.add(&volume.area);
+    let sound = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    sound.pack_start(&mute, false, false, 0);
+    sound.pack_start(&volume_reveal, false, false, 0);
+    let time = gtk::Label::new(Some("0:00"));
+    time.style_context().add_class("youtube-time");
+    // Speed, quality and subtitles, as YouTube keeps them behind a cog. Kept
+    // in from the right edge: the card's resize corner is there.
+    let settings = icon_button("emblem-system-symbolic", "Settings");
+    settings.style_context().add_class("youtube-button");
+    settings.set_margin_end(16);
+    if let Some(image) = settings
+        .child()
+        .and_then(|child| child.downcast::<gtk::Image>().ok())
+    {
+        image.set_pixel_size(14);
+    }
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.pack_end(&settings, false, false, 0);
+    buttons.pack_start(&play, false, false, 0);
+    buttons.pack_start(&sound, false, false, 0);
+    buttons.pack_start(&time, false, false, 0);
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    rows.pack_start(&seek.area, false, false, 0);
+    rows.pack_start(&buttons, false, false, 0);
+    rows.style_context().add_class("youtube-controls");
+    let overlay = gtk::Window::new(gtk::WindowType::Popup);
+    overlay.set_type_hint(gdk::WindowTypeHint::Utility);
+    // Translucent: a shade over the video, not a bar across it.
+    if let Some(visual) = WidgetExt::screen(&overlay).and_then(|screen| screen.rgba_visual()) {
+        overlay.set_visual(Some(&visual));
+    }
+    overlay.style_context().add_class("youtube-overlay");
+    overlay.add(&rows);
+    YoutubeCard {
+        card: shell.card,
+        chrome: shell.chrome,
+        header: shell.header,
+        hide: shell.hide,
+        entry,
+        playing,
+        find,
+        video,
+        overlay,
+        seek,
+        play,
+        mute,
+        volume,
+        volume_reveal,
+        sound,
+        time,
+        tip: HoverTip::new(),
+        preview: Rc::new(RefCell::new(YoutubePreview::default())),
+        media: Rc::new(RefCell::new(YoutubeMedia::default())),
+        settings,
+        settings_open: Rc::new(Cell::new(false)),
+        video_corners,
+        video_shape: Rc::new(Cell::new(None)),
+        raised_at: Rc::new(Cell::new(0)),
+        status,
+        color_mode: shell.color_mode,
+        resize: shell.resize,
     }
 }
 
@@ -8939,6 +10736,25 @@ fn widget_contains_pointer(widget: &impl IsA<gtk::Widget>, pointer_x: i32, point
     })
 }
 
+/// Like `widget_contains_pointer`, for a widget without a window of its own:
+/// its allocation is in its parent's window.
+fn allocation_contains_pointer(
+    widget: &impl IsA<gtk::Widget>,
+    pointer_x: i32,
+    pointer_y: i32,
+) -> bool {
+    widget.is_visible()
+        && widget.window().is_some_and(|window| {
+            let (_, origin_x, origin_y) = window.origin();
+            let area = widget.allocation();
+            let (x, y) = (origin_x + area.x(), origin_y + area.y());
+            pointer_x >= x
+                && pointer_x < x + area.width()
+                && pointer_y >= y
+                && pointer_y < y + area.height()
+        })
+}
+
 fn set_style_class(context: &gtk::StyleContext, class: &str, on: bool) {
     if context.has_class(class) == on {
         return;
@@ -11310,7 +13126,9 @@ fn restack_overlay_card(card: &gtk::EventBox) {
         .rev()
         .find(|child| child.widget_name() != "dictate")
         .is_some_and(|child| child == card.upcast_ref::<gtk::Widget>());
-    if already_top {
+    // Taking YOUTUBE out of the Fixed unrealizes it, and with its video
+    // window goes mpv's: raising its windows is all it gets.
+    if already_top || card.widget_name() == "youtube" {
         raise_card_windows(card);
         return;
     }
@@ -11522,16 +13340,39 @@ fn palette_for_mode(mode: ColorMode) -> WidgetPalette {
     }
 }
 
+thread_local! {
+    /// The cards locked on their own (AppState::locked_cards), by key.
+    static LOCKED_CARDS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+/// Locked from its own menu: kept as lock mode keeps every card, title bar
+/// hidden, not to be dragged or resized, a note read-only, while the cards
+/// around it stay in Edit Mode. It still takes the pointer in Edit Mode, so
+/// its menu can unlock it again.
+fn card_locked(key: &str) -> bool {
+    LOCKED_CARDS.with(|locked| locked.borrow().contains(key))
+}
+
+/// Edit chrome (title bar, editable note) for one card, given Edit Mode.
+fn show_card_chrome(item: &RegisteredWidget, interactive: bool) {
+    let shown = interactive && !card_locked(&item.key);
+    if let Some(edit_only) = &item.edit_only {
+        if edit_only.is_visible() != shown {
+            edit_only.set_visible(shown);
+        }
+    }
+    // Notes stay scrollable in lock mode (their rectangle stays in the
+    // input shape), so their editor turns read-only instead of editable.
+    if let Some(editor) = &item.editor {
+        if editor.is_editable() != shown {
+            editor.set_editable(shown);
+        }
+    }
+}
+
 fn set_edit_chrome_visibility(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, visible: bool) {
     for item in registry.borrow().iter() {
-        if let Some(edit_only) = &item.edit_only {
-            edit_only.set_visible(visible);
-        }
-        // Notes stay scrollable in lock mode (their rectangle stays in the
-        // input shape), so their editor turns read-only instead of editable.
-        if let Some(editor) = &item.editor {
-            editor.set_editable(visible);
-        }
+        show_card_chrome(item, visible);
     }
 }
 
@@ -11632,7 +13473,7 @@ fn attach_color_mode_menu(
     // A note on the desk is tagged from its menu too: its id, and what
     // rebuilds the Notes rows that show its tags.
     tags: Option<(u64, CallbackSlot)>,
-) {
+) -> gtk::Menu {
     let menu = context_menu();
     // A menu is a window of its own that no one else holds: it goes with the
     // card, or every note unpinned from the desk would leave its menu (and
@@ -11764,6 +13605,34 @@ fn attach_color_mode_menu(
         }
     });
     menu.append(&color_item);
+    let lock_item = gtk::MenuItem::with_label("LOCK");
+    lock_item.connect_activate({
+        let state = state.clone();
+        let registry = registry.clone();
+        let interactive = interactive.clone();
+        let key = key.clone();
+        let card = widget.clone();
+        move |_| {
+            let locked = !card_locked(&key);
+            LOCKED_CARDS.with(|cards| {
+                let mut cards = cards.borrow_mut();
+                if locked {
+                    cards.insert(key.clone());
+                } else {
+                    cards.remove(&key);
+                }
+                state.borrow_mut().locked_cards = cards.clone();
+            });
+            let _ = state.borrow().save();
+            if let Some(item) = registry.borrow().iter().find(|item| item.key == key) {
+                show_card_chrome(item, interactive.get());
+            }
+            // The title bar coming or going re-lays the card, and the reshape
+            // that follows takes it from there.
+            card.queue_resize();
+        }
+    });
+    menu.append(&lock_item);
     let font_item = gtk::MenuItem::new();
     font_item.style_context().add_class("font-controls");
     let font_row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
@@ -11801,11 +13670,62 @@ fn attach_color_mode_menu(
     keep_menu_controls_open(&menu, &color_item, &font_item, &font_buttons);
 
     menu.show_all();
+    // Handed back so a card can add rows of its own.
+    let handed_back = menu.clone();
 
     let gesture = gtk::GestureMultiPress::new(widget);
     gesture.set_button(3);
     gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
     let menu_card = widget.clone();
+    // Readied on the press, shown on the release: a menu that comes up under a
+    // button still held closes again when that button is let go off its rows,
+    // so a right-click held a moment opened nothing.
+    let ready = Rc::new(Cell::new(false));
+    gesture.connect_released({
+        let menu = menu.clone();
+        let ready = ready.clone();
+        move |_, _, _, _| {
+            if ready.replace(false) {
+                menu.popup_easy(0, gtk::current_event_time());
+            }
+        }
+    });
+    // A hand that drifts past the double-click distance before letting go
+    // ends the gesture with no release: wait for the button to come up here
+    // instead, or that right-click opened nothing.
+    gesture.connect_stopped({
+        let menu = menu.clone();
+        let ready = ready.clone();
+        let widget = widget.clone();
+        move |_| {
+            if !ready.get() {
+                return;
+            }
+            let menu = menu.clone();
+            let ready = ready.clone();
+            let widget = widget.clone();
+            let asked = now_ms();
+            glib::timeout_add_local(Duration::from_millis(20), move || {
+                if !ready.get() {
+                    return glib::ControlFlow::Break;
+                }
+                let held = gdk::Display::default()
+                    .and_then(|display| display.default_seat())
+                    .and_then(|seat| seat.pointer())
+                    .zip(widget.window())
+                    .is_some_and(|(pointer, window)| {
+                        let (_, _, _, mask) = window.device_position(&pointer);
+                        mask.contains(gdk::ModifierType::BUTTON3_MASK)
+                    });
+                if held && now_ms() - asked < 3000 {
+                    return glib::ControlFlow::Continue;
+                }
+                ready.set(false);
+                menu.popup_easy(0, gtk::current_event_time());
+                glib::ControlFlow::Break
+            });
+        }
+    });
     gesture.connect_pressed(move |gesture, _, x, y| {
         if !interactive.get() {
             gesture.set_state(gtk::EventSequenceState::Denied);
@@ -11843,6 +13763,7 @@ fn attach_color_mode_menu(
             }
         }
         color_item.set_label(saved_color_mode(&state.borrow(), &key).next().label());
+        lock_item.set_label(if card_locked(&key) { "UNLOCK" } else { "LOCK" });
         font_value.set_text(&state.borrow().font_size(&key).to_string());
         if let Some((item, new_item, open_item, separator)) = &lookup_item {
             let query = primary_selection();
@@ -11881,13 +13802,14 @@ fn attach_color_mode_menu(
         if let Some(tag) = &tag_menu {
             (tag.refill)();
         }
-        menu.popup_easy(3, gtk::current_event_time());
+        ready.set(true);
     });
 
     // GTK detaches event controllers when their final strong reference is dropped.
     unsafe {
         widget.set_data("sysi-color-menu-gesture", gesture);
     }
+    handed_back
 }
 
 fn place_card(root: &gtk::Fixed, card: &gtk::EventBox, point: Point) {
@@ -12629,7 +14551,7 @@ fn attach_resize(
         let registry = registry.clone();
         let key = key.clone();
         move |_, event| {
-            if !interactive.get() || event.button() != 1 {
+            if !interactive.get() || card_locked(&key) || event.button() != 1 {
                 return glib::Propagation::Proceed;
             }
             let allocation = card.allocation();
@@ -13027,7 +14949,7 @@ fn attach_edge_resize(
             let registry = registry.clone();
             let key = key.clone();
             move |_, event| {
-                if !interactive.get() || event.button() != 1 {
+                if !interactive.get() || card_locked(&key) || event.button() != 1 {
                     return glib::Propagation::Proceed;
                 }
                 let allocation = card.allocation();
@@ -13448,7 +15370,7 @@ fn attach_drag(
         let finish = finish.clone();
         let card_widget = card.clone().upcast::<gtk::Widget>();
         move |_, event| {
-            if !interactive.get() || event.button() != 1 {
+            if !interactive.get() || card_locked(&key) || event.button() != 1 {
                 return glib::Propagation::Proceed;
             }
             let allocation = card.allocation();
@@ -13908,7 +15830,7 @@ fn dictate_nonce() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-fn sysi_runtime_dir() -> std::path::PathBuf {
+pub(crate) fn sysi_runtime_dir() -> std::path::PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(|runtime| std::path::PathBuf::from(runtime).join("sysi"))
         .unwrap_or_else(crate::state::cache_dir)
@@ -15190,6 +17112,16 @@ fn refresh_input_shape(
     registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
     interactive: bool,
 ) {
+    // Everything that shows a card's title bar again (opening it, restoring
+    // it, a dictionary's query) ends in a reshape; a locked card's goes back
+    // here, so no path has to know about locks.
+    for item in registry
+        .borrow()
+        .iter()
+        .filter(|item| card_locked(&item.key))
+    {
+        show_card_chrome(item, interactive);
+    }
     let Some(gdk_window) = window.window() else {
         // No X window to shape yet; forget the cache so the refresh that runs
         // once it exists actually pushes a region.
@@ -15261,6 +17193,7 @@ fn receives_input_when_locked(key: &str) -> bool {
         || key == "notes"
         || key == "usage"
         || key == "sessions"
+        || key == "youtube"
         || key == "voice"
 }
 
@@ -15507,7 +17440,9 @@ fn set_highlight_row(
     // with room for the dot and the letter-spacing the menu's CSS adds on top
     // of what an average character is reckoned to be.
     let dot_chars = if color.is_some() { 3 } else { 0 };
-    text.set_width_chars((dot_chars + label.chars().count() + 4) as i32);
+    // The tick is counted too, or a ticked row came out as "1080p …".
+    let tick_chars = if ticked { 3 } else { 0 };
+    text.set_width_chars((dot_chars + label.chars().count() + tick_chars + 4) as i32);
 }
 
 /// The four pens to choose between, as a submenu.
@@ -18090,6 +20025,13 @@ mod usage_ui_tests {
         assert_eq!(usage_reset_label(Some(1000), 1000).0, "Updating…");
         assert_eq!(usage_reset_label(None, 1000).0, "—");
         assert_ne!(usage_reset_label(Some(2000), 1000).0, "Updating…");
+    }
+
+    #[test]
+    fn clock_reads_minutes_then_hours() {
+        assert_eq!(clock(-1.0), "0:00");
+        assert_eq!(clock(84.9), "1:24");
+        assert_eq!(clock(3725.0), "1:02:05");
     }
 
     #[test]
