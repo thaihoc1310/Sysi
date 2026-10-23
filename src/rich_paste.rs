@@ -82,12 +82,14 @@ const MAX_HTML_BYTES: usize = 8 << 20;
 pub fn decode_html(bytes: &[u8]) -> String {
     let utf16 = |little: bool, bytes: &[u8]| {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| {
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| {
                 if little {
-                    u16::from_le_bytes([pair[0], pair[1]])
+                    u16::from_le_bytes(pair)
                 } else {
-                    u16::from_be_bytes([pair[0], pair[1]])
+                    u16::from_be_bytes(pair)
                 }
             })
             .collect();

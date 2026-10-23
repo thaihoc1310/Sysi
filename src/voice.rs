@@ -240,8 +240,8 @@ pub fn compute_rms(chunk: &[u8]) -> f32 {
     }
     let mut sum_sq = 0.0f64;
     let mut count = 0usize;
-    for bytes in chunk.chunks_exact(2) {
-        let sample = i16::from_le_bytes([bytes[0], bytes[1]]) as f64;
+    for &pair in chunk.as_chunks::<2>().0 {
+        let sample = i16::from_le_bytes(pair) as f64;
         sum_sq += sample * sample;
         count += 1;
     }

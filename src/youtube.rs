@@ -759,6 +759,8 @@ impl Player {
             .arg(format!("--force-media-title={}", streams.title))
             .args(start.map(|start| format!("--start={start}")))
             .arg(format!("--volume={volume}"))
+            // The card's level slider ends at 100, and so does the Up key.
+            .arg("--volume-max=100")
             .arg(format!(
                 "--loop-file={}",
                 if looping { "inf" } else { "no" }

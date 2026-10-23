@@ -16,7 +16,7 @@ use regex::RegexBuilder;
 use std::{
     cell::{Cell, RefCell},
     cmp::Reverse,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     f64::consts::{FRAC_PI_2, PI},
     fs,
     ops::RangeInclusive,
@@ -1082,6 +1082,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                                     preview.board = streams.storyboard.clone();
                                     preview.sheets.clear();
                                     preview.asked.clear();
+                                    preview.arrived.clear();
                                 }
                                 // A new mpv starts at normal speed, no subtitles.
                                 *card.media.borrow_mut() = YoutubeMedia {
@@ -1275,7 +1276,19 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 let Some(sheet) = decoded.ok().and_then(|()| loader.pixbuf()) else {
                     continue;
                 };
-                card.preview.borrow_mut().sheets.insert(index, sheet);
+                {
+                    let mut preview = card.preview.borrow_mut();
+                    preview.sheets.insert(index, sheet);
+                    preview.arrived.push_back(index);
+                    // At most 16 held: dropped ones are fetched again if the
+                    // pointer goes back there.
+                    while preview.arrived.len() > 16 {
+                        if let Some(oldest) = preview.arrived.pop_front() {
+                            preview.sheets.remove(&oldest);
+                            preview.asked.remove(&oldest);
+                        }
+                    }
+                }
                 // Still over the bar: put the frame in now.
                 if card.preview.borrow().hover.is_some() {
                     show_youtube_preview(&card, &sheets_tx);
@@ -1371,6 +1384,56 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 .command(serde_json::json!(["set_property", "mute", muted]));
         }
     });
+    // YouTube's keys, while the pointer is on the card and nothing is being
+    // typed: mpv never has the keyboard (Sysi's window does), so they are
+    // handed on from here.
+    window.add_events(gdk::EventMask::KEY_PRESS_MASK);
+    window.connect_key_press_event({
+        let card = youtube_card.clone();
+        let player = youtube_player.clone();
+        let play_youtube = play_youtube.clone();
+        let root = root.clone();
+        move |window, event| {
+            if !card.card.is_mapped() {
+                return glib::Propagation::Proceed;
+            }
+            let typing = window.focused_widget().is_some_and(|focus| {
+                focus.is::<gtk::Entry>()
+                    || focus
+                        .downcast_ref::<gtk::TextView>()
+                        .is_some_and(|text| text.is_editable())
+            });
+            let Some(device) = gdk::Display::default()
+                .and_then(|display| display.default_seat())
+                .and_then(|seat| seat.pointer())
+            else {
+                return glib::Propagation::Proceed;
+            };
+            let (_, x, y) = device.position();
+            let over = youtube_card_on_top(&root, &card, x, y)
+                || (card.overlay.is_visible() && widget_contains_pointer(&card.overlay, x, y));
+            if typing || !over {
+                return glib::Propagation::Proceed;
+            }
+            use gdk::keys::constants as key;
+            let command = match event.keyval() {
+                key::space | key::k => serde_json::json!(["cycle", "pause"]),
+                // Exact, as YouTube's: a keyframe seek jumps by however far
+                // the next keyframe happens to be.
+                key::Left => serde_json::json!(["seek", -5, "relative+exact"]),
+                key::Right => serde_json::json!(["seek", 5, "relative+exact"]),
+                key::Up => serde_json::json!(["add", "volume", 5]),
+                key::Down => serde_json::json!(["add", "volume", -5]),
+                key::m | key::M => serde_json::json!(["cycle", "mute"]),
+                _ => return glib::Propagation::Proceed,
+            };
+            let is_pause = command[1] == "pause";
+            if !player.borrow().command(command) && is_pause {
+                play_youtube(false);
+            }
+            glib::Propagation::Stop
+        }
+    });
     // Polled like a note's hover: the pointer over mpv's window is over an X
     // window GTK never hears from. Plyr's rule for when the controls show: a
     // pointer moving on the card brings them up, and two and a half seconds
@@ -1412,6 +1475,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     glib::timeout_add_local(Duration::from_millis(120), {
         let card = youtube_card.clone();
         let registry = registry.clone();
+        let root = root.clone();
         let pointer_left = pointer_left.clone();
         let last_pointer = Cell::new((0, 0));
         let moved_at = Cell::new(0i64);
@@ -1445,6 +1509,23 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             // The title bar comes and goes with lock mode; keep the video 16:9
             // through that as well.
             fit_youtube_card(&card);
+            let resizing = any_gesture_held(&registry) && card.resize_handle.is_visible();
+            if let Some(device) = gdk::Display::default()
+                .and_then(|display| display.default_seat())
+                .and_then(|seat| seat.pointer())
+            {
+                let (_, x, y) = device.position();
+                let near = card.chrome.is_visible()
+                    && card.card.window().is_some_and(|window| {
+                        let (_, left, top) = window.origin();
+                        let (right, bottom) = (left + window.width(), top + window.height());
+                        (right - 32..right).contains(&x) && (bottom - 32..bottom).contains(&y)
+                    });
+                let wanted = resizing || near;
+                if card.resize_handle.is_visible() != wanted {
+                    card.resize_handle.set_visible(wanted);
+                }
+            }
             if any_gesture_held(&registry) {
                 card.overlay.hide();
                 card.tip.hide();
@@ -1465,7 +1546,9 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 }
                 None => false,
             };
-            let on_card = !gone && widget_contains_pointer(&card.card, x, y);
+            // On the card where it is the top one: a note laid over it keeps
+            // the pointer, and the controls stay away from the note.
+            let on_card = !gone && youtube_card_on_top(&root, &card, x, y);
             if last_pointer.replace((x, y)) != (x, y) && on_card {
                 moved_at.set(now_ms());
             }
@@ -3291,6 +3374,8 @@ struct YoutubeCard {
     hide: gtk::Button,
     /// Shown in place of the title while a link is typed.
     entry: gtk::Entry,
+    /// The resize handle, shown only near the corner (see build_youtube_window).
+    resize_handle: gtk::EventBox,
     /// The title of what plays, in the title bar while the link box is away.
     playing: gtk::Label,
     find: gtk::Button,
@@ -3661,6 +3746,9 @@ impl HoverTip {
 struct YoutubePreview {
     board: Option<youtube::Storyboard>,
     sheets: HashMap<usize, Pixbuf>,
+    /// Sheets in the order they came in, so the oldest goes first: each is
+    /// about 2 MB decoded, and a long video has dozens.
+    arrived: VecDeque<usize>,
     asked: HashSet<usize>,
     /// Counted per video, so a sheet of the one before is dropped.
     video: u64,
@@ -4127,6 +4215,11 @@ fn show_youtube_entry(card: &YoutubeCard, open: bool) {
     }
 }
 
+/// Whether the card is the topmost one at root point `(x, y)`.
+fn youtube_card_on_top(root: &gtk::Fixed, card: &YoutubeCard, x: i32, y: i32) -> bool {
+    overlay_card_at(root, f64::from(x), f64::from(y)).is_some_and(|top| top == card.card)
+}
+
 /// Press and release button 3 on `widget` where the pointer is, through GTK
 /// itself, so its own right-click gesture opens its menu.
 fn right_click_at_pointer(widget: &gtk::EventBox) {
@@ -4250,24 +4343,23 @@ fn build_youtube_window(initial_color_mode: Foreground) -> YoutubeCard {
         bar.pack_start(&find, false, false, 0);
         bar.show_all();
     }
-    // The resize corner sits over the video. A window GTK paints there gets
-    // carved out of the video's, and what that uncovers is never painted:
-    // a black square. As a native input-only window it takes the drag over
-    // mpv's picture and covers nothing; its arc goes unseen under the video.
+    // The resize corner sits over the video, and whatever GDK has there is
+    // carved out of the video's window: GtkOverlay wraps the handle in a
+    // painted window of its own, which uncovers a dark square. So the handle
+    // is only there while the pointer is at the corner (see the poll in
+    // build), and as a native input-only window it takes the drag over mpv's
+    // picture. Neither an empty shape (GDK then routes the pointer past it)
+    // nor a composited wrapper (GDK then repaints the card ~150 times a
+    // second) does without the square.
     let hitbox = &shell.resize.hitbox;
     hitbox.set_visible_window(false);
+    hitbox.set_no_show_all(true);
+    hitbox.hide();
     hitbox.connect_realize(|hitbox| {
         use glib::translate::ToGlibPtr;
         let Some(parent) = hitbox.window() else {
             return;
         };
-        // GtkOverlay wraps the handle in a painted window of its own, and
-        // that wrapper carves the video just the same. GDK leaves composited
-        // windows out of what it carves; composited, the wrapper is no longer
-        // drawn for it (the arc is under the video anyway) and still passes
-        // the pointer on to the handle.
-        // SAFETY: a live, realized GdkWindow.
-        unsafe { gdk::ffi::gdk_window_set_composited(parent.to_glib_none().0, glib::ffi::GTRUE) };
         let owner = hitbox.as_ptr() as glib::ffi::gpointer;
         for window in parent.children() {
             let mut data: glib::ffi::gpointer = std::ptr::null_mut();
@@ -4395,6 +4487,7 @@ fn build_youtube_window(initial_color_mode: Foreground) -> YoutubeCard {
         header: shell.header,
         hide: shell.hide,
         entry,
+        resize_handle: shell.resize.hitbox.clone(),
         playing,
         find,
         video,
