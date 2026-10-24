@@ -12897,11 +12897,8 @@ fn render_translate_result(
                         let audio_buttons = audio_buttons.clone();
                         let audio_tx = audio_tx.clone();
                         let url = pronunciation.audio_url.clone();
-                        let sources = crate::translate::audio_sources(
-                            &word.headword,
-                            &pronunciation.lang,
-                            &pronunciation.audio_url,
-                        );
+                        let sources =
+                            crate::translate::audio_sources(&word.headword, &pronunciation.lang);
                         move |button| {
                             // Disabled until the clip lands, so a slow download
                             // cannot be queued up a dozen times.

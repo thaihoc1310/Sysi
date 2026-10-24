@@ -241,19 +241,52 @@ pub fn spawn_suggest(prefix: String, request: Request, tx: Sender<TranslateEvent
     });
 }
 
-/// The clip URLs a speaker button should try. Cambridge is first; Youdao is
-/// the fallback when that download fails. A clip already on disk from either
-/// source is played as-is, without fetching the other.
-pub fn audio_sources(word: &str, lang: &str, primary: &str) -> Vec<String> {
-    let mut urls = Vec::new();
-    if !primary.is_empty() {
-        urls.push(primary.to_owned());
+/// The clip URLs a speaker button should try: Oxford Learner's recording of
+/// the word, then Youdao's when Oxford has no page for it. (Cambridge's own
+/// clips sit behind a Cloudflare challenge.) Oxford's is named by its page,
+/// with the accent after `#`, and found there when it is fetched. A clip
+/// already on disk from either source is played as-is.
+pub fn audio_sources(word: &str, lang: &str) -> Vec<String> {
+    let word = word.trim();
+    if word.is_empty() {
+        return Vec::new();
     }
-    let fallback = youdao_audio_url(word, lang);
-    if !fallback.is_empty() && !urls.iter().any(|url| url == &fallback) {
-        urls.push(fallback);
+    let accent = if lang.eq_ignore_ascii_case("us") {
+        "us"
+    } else {
+        "uk"
+    };
+    vec![
+        format!("{OXFORD_PAGE}{}#{accent}", cambridge_slug(word)),
+        youdao_audio_url(word, lang),
+    ]
+}
+
+const OXFORD_PAGE: &str = "https://www.oxfordlearnersdictionaries.com/definition/english/";
+
+/// The recording on an Oxford Learner's page in that accent, when the page is
+/// the word's own: Oxford sends an inflection to its root ("ran" can land on
+/// "run") and an unknown word to a list of guesses.
+fn oxford_clip_url(html: &str, slug: &str, accent: &str) -> Option<String> {
+    let headword = html.split("<h1").skip(1).find_map(|tag| {
+        let (attributes, rest) = tag.split_once('>')?;
+        attributes
+            .contains("class=\"headword\"")
+            .then(|| rest.split('<').next().unwrap_or_default())
+    })?;
+    if !cambridge_slug(headword).eq_ignore_ascii_case(slug) {
+        return None;
     }
-    urls
+    let folder = format!("/{accent}_pron/");
+    html.split("data-src-mp3=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        // Only Oxford's own media: the page is not ours to follow anywhere.
+        .find(|url| {
+            url.starts_with("https://www.oxfordlearnersdictionaries.com/media/")
+                && url.contains(&folder)
+        })
+        .map(str::to_owned)
 }
 
 fn youdao_audio_url(word: &str, lang: &str) -> String {
@@ -1378,6 +1411,22 @@ fn fnv1a(input: &str) -> u64 {
 }
 
 fn download_audio(url: &str, path: &Path) -> Result<(), String> {
+    let clip;
+    let url = match url.strip_prefix(OXFORD_PAGE) {
+        Some(rest) => {
+            let (slug, accent) = rest.split_once('#').unwrap_or((rest, "uk"));
+            let page = agent()
+                .get(&format!("{OXFORD_PAGE}{slug}"))
+                .call()
+                .map_err(|error| format!("Could not fetch Oxford's page: {error}"))?
+                .into_string()
+                .map_err(|error| format!("Could not read Oxford's page: {error}"))?;
+            clip = oxford_clip_url(&page, slug, accent)
+                .ok_or_else(|| "Oxford has no recording of this word".to_owned())?;
+            clip.as_str()
+        }
+        None => url,
+    };
     let response = agent()
         .get(url)
         .call()
@@ -1396,8 +1445,8 @@ fn download_audio(url: &str, path: &Path) -> Result<(), String> {
     if bytes.len() as u64 > MAX_AUDIO_BYTES {
         return Err("The audio was too large".into());
     }
-    // Cambridge's 403 arrives as HTML; a 200 challenge page would look the
-    // same. Caching either would replay silence until the file aged out.
+    // A refusal or a challenge page arrives as HTML, with a 200 as often
+    // as not. Caching either would replay silence until the file aged out.
     if !looks_like_mpeg(&bytes) {
         return Err("The audio was not an MPEG clip".into());
     }
@@ -1424,9 +1473,9 @@ fn download_audio(url: &str, path: &Path) -> Result<(), String> {
 mod tests {
     use super::{
         audio_sources, cached_audio_path, cambridge_headword_matches, cambridge_slug,
-        em_to_pango_bold, escape_markup, fnv1a, is_sentence, looks_like_mpeg, parse_cambridge,
-        parse_google, parse_tracau, parse_tracau_fulltext, percent_encode, should_probe_dictionary,
-        stale_clips, strip_tags, Request,
+        em_to_pango_bold, escape_markup, fnv1a, is_sentence, looks_like_mpeg, oxford_clip_url,
+        parse_cambridge, parse_google, parse_tracau, parse_tracau_fulltext, percent_encode,
+        should_probe_dictionary, stale_clips, strip_tags, Request,
     };
     use std::{
         path::PathBuf,
@@ -1991,26 +2040,45 @@ mod tests {
     }
 
     #[test]
-    fn pronunciation_audio_tries_cambridge_then_youdao() {
-        let urls = audio_sources("hello", "uk", "https://dictionary.cambridge.org/hello.mp3");
+    fn pronunciation_audio_tries_oxford_then_youdao() {
         assert_eq!(
-            urls,
+            audio_sources("hello", "uk"),
             [
-                "https://dictionary.cambridge.org/hello.mp3",
+                "https://www.oxfordlearnersdictionaries.com/definition/english/hello#uk",
                 "https://dict.youdao.com/dictvoice?audio=hello&type=2",
             ]
         );
-        let us = audio_sources("kick the bucket", "us", "https://example.test/us.mp3");
-        assert_eq!(us[0], "https://example.test/us.mp3");
+        let us = audio_sources("kick the bucket", "us");
+        assert_eq!(
+            us[0],
+            "https://www.oxfordlearnersdictionaries.com/definition/english/kick-the-bucket#us"
+        );
         assert_eq!(
             us[1],
             "https://dict.youdao.com/dictvoice?audio=kick%20the%20bucket&type=1"
         );
-        assert!(audio_sources("", "uk", "").is_empty());
+        assert!(audio_sources(" ", "uk").is_empty());
+    }
+
+    #[test]
+    fn oxford_clip_is_the_words_own_in_its_accent() {
+        let page = r#"<h1 class="headword" id="run_h_1" hclass="headword">run</h1>
+            <div data-src-mp3="https://www.oxfordlearnersdictionaries.com/media/english/uk_pron/r/run/run__gb_1.mp3"></div>
+            <div data-src-mp3="https://www.oxfordlearnersdictionaries.com/media/english/us_pron/r/run/run__us_1.mp3"></div>"#;
         assert_eq!(
-            audio_sources("hello", "us", ""),
-            ["https://dict.youdao.com/dictvoice?audio=hello&type=1"]
+            oxford_clip_url(page, "run", "us").as_deref(),
+            Some("https://www.oxfordlearnersdictionaries.com/media/english/us_pron/r/run/run__us_1.mp3")
         );
+        assert!(oxford_clip_url(page, "run", "uk")
+            .unwrap()
+            .ends_with("run__gb_1.mp3"));
+        // Sent on to the root: not this word's recording.
+        assert_eq!(oxford_clip_url(page, "ran", "uk"), None);
+        // No headword: a list of guesses.
+        assert_eq!(oxford_clip_url("<h1>Did you mean</h1>", "rnu", "uk"), None);
+        // Media anywhere else is not followed.
+        let elsewhere = r#"<h1 class="headword">run</h1><i data-src-mp3="https://example.test/uk_pron/run.mp3"></i>"#;
+        assert_eq!(oxford_clip_url(elsewhere, "run", "uk"), None);
     }
 
     #[test]
