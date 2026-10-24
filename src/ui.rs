@@ -69,9 +69,9 @@ const RESIZE_HIT_SIZE: i32 = 18;
 /// is correct.
 const VISUAL_SHAPE_MARGIN: i32 = 8;
 /// Repainting a transparent Xwayland surface wakes the compositor for a whole
-/// frame. Pointer devices can report far faster than that is useful, especially
-/// on this app's multi-monitor surface, so apply at most roughly 60 moves/s and
-/// always commit the exact pointer position on release.
+/// frame. Pointer devices can report far faster than that is useful, so the
+/// OCR dim, a full-screen redraw, follows a selection at most roughly 60
+/// times a second. (A card drag steps once per frame the overlay paints.)
 const DRAG_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
@@ -15711,7 +15711,11 @@ fn attach_drag(
             OVERLAY_DRAG_FINISH.with(|slot| *slot.borrow_mut() = Some(finish.clone()));
             if !ticking.get() {
                 ticking.set(true);
-                glib::timeout_add_local(DRAG_REDRAW_INTERVAL, {
+                // Once per frame the overlay paints, at the screen's own rate:
+                // a fixed timer held a 185 Hz screen to 62 moves a second and,
+                // out of step with its frames, moved twice in one and not at
+                // all in the next.
+                window.add_tick_callback({
                     let start = start.clone();
                     let live = live.clone();
                     let ticking = ticking.clone();
@@ -15721,7 +15725,7 @@ fn attach_drag(
                     let window = window.clone();
                     let gesture_screens = gesture_screens.clone();
                     let finish = finish.clone();
-                    move || {
+                    move |_, _| {
                         let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.get() else {
                             ticking.set(false);
                             return glib::ControlFlow::Break;
