@@ -15864,6 +15864,207 @@ fn move_overlay_card(
     root.move_(card, point.x, point.y);
 }
 
+/// How often a lifted card's window follows the pointer: above any screen's
+/// refresh, so the compositor always has the latest place to show.
+const FLOAT_POLL: Duration = Duration::from_millis(3);
+
+thread_local! {
+    /// The card a drag has lifted into a window of its own, by key: its glass
+    /// is that window's meanwhile, not the overlay's.
+    static LIFTED_CARD: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// A card being dragged, as a picture of it in a window of its own. The
+/// overlay is one window over the whole desk, and GTK under Xwayland paints
+/// it some 85 times a second, unevenly, so a card slid inside it trails the
+/// pointer in steps. A window of its own is moved by the compositor at the
+/// screen's rate, the way any other window is dragged, and its glass, drawn
+/// inside it by the extension, goes with it in the same frame.
+struct DragFloat {
+    window: gtk::Window,
+    /// The overlay's top left on the screen.
+    origin: (i32, i32),
+    /// Set once its glass is on (or it needs none). Until then the card is
+    /// still shown in the overlay and the picture does not move, so the two
+    /// never show apart.
+    ready: Cell<bool>,
+    /// Its glass would not go on: the drag slides the card in the overlay.
+    failed: Cell<bool>,
+    /// Put down already; a late answer about its glass changes nothing.
+    landed: Cell<bool>,
+    at: Cell<Point>,
+}
+
+/// Lift `card` into a window of its own, over where it is; None when it
+/// cannot be, and the drag slides the card in the overlay as before.
+fn lift_card(
+    window: &gtk::ApplicationWindow,
+    card: &gtk::EventBox,
+    key: &str,
+) -> Option<Rc<DragFloat>> {
+    let allocation = card.allocation();
+    let (width, height) = (allocation.width(), allocation.height());
+    if width < 2 || height < 2 {
+        return None;
+    }
+    let scale = card.scale_factor();
+    let picture =
+        cairo::ImageSurface::create(cairo::Format::ARgb32, width * scale, height * scale).ok()?;
+    picture.set_device_scale(f64::from(scale), f64::from(scale));
+    {
+        // The card as the overlay shows it, the video's still included
+        // (hide_native_inside has taken it by now).
+        let ctx = Context::new(&picture).ok()?;
+        // Being pressed has just restyled it, and GTK will not draw a
+        // widget waiting to be laid out: lay it out where it is.
+        let _ = card.preferred_size();
+        card.size_allocate(&allocation);
+        card.draw(&ctx);
+    }
+    let (_, left, top) = window.window()?.origin();
+    let float = gtk::Window::new(gtk::WindowType::Popup);
+    if let Some(visual) = WidgetExt::screen(&float).and_then(|screen| screen.rgba_visual()) {
+        float.set_visual(Some(&visual));
+    }
+    float.set_app_paintable(true);
+    float.set_default_size(width, height);
+    let area = gtk::DrawingArea::new();
+    area.set_size_request(width, height);
+    area.connect_draw(move |_, ctx| {
+        ctx.set_operator(Operator::Source);
+        if ctx.set_source_surface(&picture, 0.0, 0.0).is_ok() {
+            let _ = ctx.paint();
+        }
+        glib::Propagation::Stop
+    });
+    float.add(&area);
+    // The pointer is the overlay's, grabbed; the picture only shows.
+    float.connect_realize(|float| float.input_shape_combine_region(Some(&Region::create())));
+    let at = Point {
+        x: allocation.x(),
+        y: allocation.y(),
+    };
+    float.move_(left + at.x, top + at.y);
+    let lifted = Rc::new(DragFloat {
+        window: float.clone(),
+        origin: (left, top),
+        ready: Cell::new(false),
+        failed: Cell::new(false),
+        landed: Cell::new(false),
+        at: Cell::new(at),
+    });
+    // Ready when its glass is on: only then does the card leave the
+    // overlay, which takes the card's glass from there.
+    let ready: Rc<dyn Fn(bool)> = Rc::new({
+        let lifted = Rc::downgrade(&lifted);
+        let card = card.clone();
+        let window = window.clone();
+        let key = key.to_owned();
+        move |on| {
+            let Some(lifted) = lifted.upgrade() else {
+                return;
+            };
+            if lifted.landed.get() {
+                return;
+            }
+            if !on {
+                // No glass for it: the drag goes on in the overlay.
+                lifted.failed.set(true);
+                lifted.window.hide();
+                return;
+            }
+            lifted.ready.set(true);
+            LIFTED_CARD.with(|lifted| *lifted.borrow_mut() = Some(key.clone()));
+            card.set_opacity(0.0);
+            window.queue_draw();
+        }
+    });
+    let glass = crate::glass::has_glass(card);
+    float.connect_map_event({
+        let key = key.to_owned();
+        move |float, _| {
+            if glass {
+                crate::glass::glass_window(float, &key, true, ready.clone());
+            } else {
+                ready(true);
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    float.show_all();
+    Some(lifted)
+}
+
+/// Where the dragged card would be with the pointer where it is now.
+fn drag_point(
+    start: &Cell<Option<(i32, i32, f64, f64)>>,
+    card: &gtk::EventBox,
+    screens: &RefCell<Vec<ScreenRect>>,
+) -> Option<Point> {
+    let (ox, oy, pointer_start_x, pointer_start_y) = start.get()?;
+    let (pointer_x, pointer_y, _) = pointer_drag_sample()?;
+    let allocation = card.allocation();
+    Some(clamp_to_screens(
+        Point {
+            x: ox + (pointer_x - pointer_start_x) as i32,
+            y: oy + (pointer_y - pointer_start_y) as i32,
+        },
+        allocation.width(),
+        allocation.height(),
+        &screens.borrow(),
+    ))
+}
+
+fn move_float(lifted: &DragFloat, point: Point) {
+    if !lifted.ready.get() || lifted.at.replace(point) == point {
+        return;
+    }
+    lifted
+        .window
+        .move_(lifted.origin.0 + point.x, lifted.origin.1 + point.y);
+    // Out now rather than when the loop next goes idle.
+    lifted.window.display().flush();
+}
+
+/// Put the card back in the overlay, at `point`, and take its window away
+/// once the overlay has painted it there, with its glass.
+fn land_float(
+    window: &gtk::ApplicationWindow,
+    card: &gtk::EventBox,
+    lifted: &Rc<DragFloat>,
+    point: Option<Point>,
+) {
+    if let Some(point) = point {
+        move_float(lifted, point);
+    }
+    lifted.landed.set(true);
+    LIFTED_CARD.with(|lifted| lifted.borrow_mut().take());
+    card.set_opacity(1.0);
+    window.queue_draw();
+    let Some(clock) = window.frame_clock() else {
+        lifted.window.close();
+        return;
+    };
+    let gone = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
+    let handler = clock.connect_after_paint({
+        let lifted = lifted.clone();
+        let gone = gone.clone();
+        let clock = clock.clone();
+        move |_| {
+            if let Some(handler) = gone.take() {
+                clock.disconnect(handler);
+            }
+            // A couple of frames more for the overlay's glass to come back
+            // under the card before this one's goes.
+            let lifted = lifted.clone();
+            glib::timeout_add_local_once(Duration::from_millis(40), move || {
+                lifted.window.close();
+            });
+        }
+    });
+    gone.set(Some(handler));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attach_drag(
     handle: &gtk::EventBox,
@@ -15884,9 +16085,11 @@ fn attach_drag(
     let gesture_screens: Rc<RefCell<Vec<ScreenRect>>> = Rc::new(RefCell::new(Vec::new()));
     let live = Rc::new(Cell::new(None::<Point>));
     let ticking = Rc::new(Cell::new(false));
+    let float: Rc<RefCell<Option<Rc<DragFloat>>>> = Rc::default();
     let finish: Rc<dyn Fn(f64, f64)> = Rc::new({
         let start = start.clone();
         let live = live.clone();
+        let float = float.clone();
         let card = card.clone();
         let root = root.clone();
         let registry = registry.clone();
@@ -15898,11 +16101,15 @@ fn attach_drag(
         let key = key.clone();
         move |fallback_x, fallback_y| {
             OVERLAY_DRAG_FINISH.with(|slot| slot.borrow_mut().take());
-            show_native_inside(&card);
             hold_widget(&registry, &key, false);
             live.set(None);
             ungrab_pointer();
+            let lifted = float.borrow_mut().take();
             let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.replace(None) else {
+                show_native_inside(&card);
+                if let Some(lifted) = lifted {
+                    land_float(&window, &card, &lifted, None);
+                }
                 return;
             };
             let allocation = card.allocation();
@@ -15920,6 +16127,12 @@ fn attach_drag(
                 &screens,
             );
             drop(screens);
+            // A lifted card is still where the drag began: put it down now,
+            // so what it holds (the video's window) shows where it lands.
+            if lifted.is_some() {
+                slide_overlay_card(&window, &root, &card, &card_widget, origin);
+            }
+            show_native_inside(&card);
             move_overlay_card(&window, &root, &card, &card_widget, origin);
             let screens = overlay_screen_rects(&root);
             let (width, height) =
@@ -15953,6 +16166,9 @@ fn attach_drag(
             drop(data);
             restack_overlay_card(&card);
             refresh_input_shape(&window, &registry, interactive.get());
+            if let Some(lifted) = lifted {
+                land_float(&window, &card, &lifted, Some(point));
+            }
         }
     });
 
@@ -15962,6 +16178,7 @@ fn attach_drag(
     handle.connect_button_press_event({
         let start = start.clone();
         let live = live.clone();
+        let float = float.clone();
         let ticking = ticking.clone();
         let card = card.clone();
         let root = root.clone();
@@ -15994,9 +16211,31 @@ fn attach_drag(
             }));
             hold_widget(&registry, &key, true);
             grab_overlay_pointer(&window);
-            restack_overlay_card(&card);
             hide_native_inside(&card);
+            // Before the restack: putting the card back on top leaves it
+            // unallocated until the next layout, with nothing to picture.
+            let lifted = lift_card(&window, &card, &key);
+            restack_overlay_card(&card);
             OVERLAY_DRAG_FINISH.with(|slot| *slot.borrow_mut() = Some(finish.clone()));
+            if let Some(lifted) = lifted {
+                // Followed at the pointer's pace, not the overlay's frames.
+                glib::timeout_add_local(FLOAT_POLL, {
+                    let lifted = Rc::downgrade(&lifted);
+                    let start = start.clone();
+                    let card = card.clone();
+                    let gesture_screens = gesture_screens.clone();
+                    move || {
+                        let Some(lifted) = lifted.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        if let Some(point) = drag_point(&start, &card, &gesture_screens) {
+                            move_float(&lifted, point);
+                        }
+                        glib::ControlFlow::Continue
+                    }
+                });
+                *float.borrow_mut() = Some(lifted);
+            }
             if !ticking.get() {
                 ticking.set(true);
                 // Once per frame the overlay paints, at the screen's own rate:
@@ -16006,6 +16245,7 @@ fn attach_drag(
                 window.add_tick_callback({
                     let start = start.clone();
                     let live = live.clone();
+                    let float = float.clone();
                     let ticking = ticking.clone();
                     let card = card.clone();
                     let card_widget = card_widget.clone();
@@ -16038,8 +16278,13 @@ fn attach_drag(
                             &screens,
                         );
                         drop(screens);
-                        live.set(Some(point));
-                        slide_overlay_card(&window, &root, &card, &card_widget, point);
+                        // Lifted, the card stays put in the overlay and its
+                        // window is what moves.
+                        let lifted = float.borrow().as_ref().map(|lifted| lifted.failed.get());
+                        if lifted.is_none_or(|failed| failed) {
+                            live.set(Some(point));
+                            slide_overlay_card(&window, &root, &card, &card_widget, point);
+                        }
                         glib::ControlFlow::Continue
                     }
                 });
@@ -17891,6 +18136,10 @@ fn glass_card_samples(
             let item = items
                 .iter()
                 .find(|item| item.widget.upcast_ref::<gtk::Widget>() == child)?;
+            // Lifted into a window of its own, which carries its glass.
+            if LIFTED_CARD.with(|lifted| lifted.borrow().as_deref() == Some(item.key.as_str())) {
+                return None;
+            }
             let allocation = child.allocation();
             Some(crate::glass::CardSample {
                 key: item.key.clone(),

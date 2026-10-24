@@ -387,6 +387,87 @@ fn set_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool) {
 /// Give a popover glass of its own while the card it belongs to is glass.
 /// A popover lives inside the overlay window, so its glass travels with the
 /// cards' as one more card, painted last.
+/// Glass under a window of Sysi's own standing in for a card, the one being
+/// dragged: drawn by the extension inside that window, it moves with the
+/// window in the same frame. `done` hears whether the window can stand in
+/// for the card: yes at once when there is no live glass (the card wears its
+/// own frosted plate then, and the window shows it), and otherwise whether
+/// the glass went on.
+pub fn glass_window(window: &gtk::Window, key: &str, pressed: bool, done: Rc<dyn Fn(bool)>) {
+    if !glass_is_live() {
+        done(true);
+        return;
+    }
+    send_window(window.clone(), key.to_owned(), pressed, done, 6);
+}
+
+fn send_window(
+    window: gtk::Window,
+    key: String,
+    pressed: bool,
+    done: Rc<dyn Fn(bool)>,
+    tries: u32,
+) {
+    let connection = LINK.with(|link| {
+        link.borrow()
+            .as_ref()
+            .and_then(|link| link.connection.borrow().clone())
+    });
+    let xid = window
+        .window()
+        .filter(|_| window.is_mapped())
+        .and_then(|window| window.downcast::<gdkx11::X11Window>().ok())
+        .map(|window| window.xid());
+    let (Some(connection), Some(xid)) = (connection, xid) else {
+        done(false);
+        return;
+    };
+    let scale = f64::from(window.scale_factor().max(1));
+    let (width, height) = (
+        f64::from(window.allocated_width()) * scale,
+        f64::from(window.allocated_height()) * scale,
+    );
+    let message: Message = (
+        xid,
+        width,
+        height,
+        vec![(
+            key.clone(),
+            0.0,
+            0.0,
+            width,
+            height,
+            RADIUS * scale,
+            pressed,
+        )],
+    );
+    connection.call(
+        Some(BUS_NAME),
+        OBJECT_PATH,
+        INTERFACE,
+        "SetCards",
+        Some(&message.to_variant()),
+        Some(glib::VariantTy::new("(b)").expect("valid reply type")),
+        gio::DBusCallFlags::NONE,
+        1000,
+        None::<&gio::Cancellable>,
+        move |reply| {
+            let attached = reply
+                .ok()
+                .and_then(|reply| reply.get::<(bool,)>())
+                .is_some_and(|(attached,)| attached);
+            // The shell makes the window's actor a moment after it maps.
+            if attached || tries == 0 || !window.is_mapped() {
+                done(attached);
+                return;
+            }
+            glib::timeout_add_local_once(Duration::from_millis(15), move || {
+                send_window(window, key, pressed, done, tries - 1)
+            });
+        },
+    );
+}
+
 pub fn glass_popover(popover: &gtk::Popover) {
     POPOVERS.with(|list| {
         let mut list = list.borrow_mut();
