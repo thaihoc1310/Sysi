@@ -350,7 +350,7 @@ thread_local! {
     static NEXT_POPOVER: Cell<u64> = const { Cell::new(0) };
 }
 
-fn glass_is_live() -> bool {
+pub fn glass_is_live() -> bool {
     LINK.with(|link| {
         link.borrow()
             .as_ref()
@@ -402,7 +402,17 @@ pub fn glass_window(
         done(true);
         return;
     }
-    send_window(window.clone(), key.to_owned(), inset, pressed, done, 6);
+    // Named as the lifted card, so the extension shows this window only
+    // while the overlay does not show the card, switching the two in one
+    // frame.
+    send_window(
+        window.clone(),
+        format!("lift:{key}"),
+        inset,
+        pressed,
+        done,
+        6,
+    );
 }
 
 fn send_window(

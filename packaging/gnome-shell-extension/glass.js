@@ -776,6 +776,8 @@ class GlassHost {
         this._layer = new Clutter.Actor({reactive: false});
         windowActor.insert_child_at_index(this._layer, 0);
         this._cards = new Map();
+        // The keys of the cards this host shows, as of its last update.
+        this.keys = new Set();
         this._pending = null;
         this._latchTimeout = 0;
         this._damaged = false;
@@ -872,6 +874,8 @@ class GlassHost {
             else
                 card.destroy();
         }
+        this.keys = seen;
+        this._manager.hostApplied();
     }
 
     pipelines(context) {
@@ -1145,6 +1149,30 @@ export class GlassManager {
                 this._hosts.delete(xid);
                 host.destroy();
             }
+        }
+        this.hostApplied();
+    }
+
+    // A card being dragged is lifted by Sysi into a window of its own, whose
+    // glass comes as "lift:KEY". That window, glass and all, shows only while
+    // no other window shows KEY. Each host applies its update in the frame
+    // that paints its window, so the card leaves the overlay and its stand-in
+    // appears in one frame, and the other way round when it is put down: done
+    // by Sysi instead, the two land frames apart and the card shows twice or
+    // not at all for a moment.
+    hostApplied() {
+        const shown = new Set();
+        const lifted = [];
+        for (const host of this._hosts.values()) {
+            const lift = [...host.keys].find(key => key.startsWith('lift:'));
+            if (lift)
+                lifted.push([host, lift.slice('lift:'.length)]);
+            else
+                host.keys.forEach(key => shown.add(key));
+        }
+        for (const [host, key] of lifted) {
+            if (!host.windowActor.is_destroyed?.())
+                host.windowActor.opacity = shown.has(key) ? 0 : 255;
         }
     }
 

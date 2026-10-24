@@ -15968,6 +15968,9 @@ struct DragFloat {
     failed: Cell<bool>,
     /// Put down already; a late answer about its glass changes nothing.
     landed: Cell<bool>,
+    /// On live glass, where the extension shows and hides this window as the
+    /// card leaves and comes back to the overlay.
+    glassed: bool,
     at: Cell<Point>,
 }
 
@@ -16034,6 +16037,7 @@ fn lift_card(
         ready: Cell::new(false),
         failed: Cell::new(false),
         landed: Cell::new(false),
+        glassed: crate::glass::has_glass(card) && crate::glass::glass_is_live(),
         at: Cell::new(at),
     });
     // Ready when its glass is on: only then does the card leave the
@@ -16138,7 +16142,7 @@ fn land_float(
         }
     };
     // Whatever happens to the overlay's frames, it does not stay behind.
-    glib::timeout_add_local_once(Duration::from_millis(250), close.clone());
+    glib::timeout_add_local_once(Duration::from_millis(400), close.clone());
     let Some(clock) = window.frame_clock() else {
         close();
         return;
@@ -16147,13 +16151,21 @@ fn land_float(
     let handler = clock.connect_after_paint({
         let gone = gone.clone();
         let clock = clock.clone();
+        let lifted = lifted.clone();
         move |_| {
             if let Some(handler) = gone.take() {
                 clock.disconnect(handler);
             }
-            // The overlay's glass for the card follows its paint by a
-            // message to the shell; this goes a moment after.
-            glib::timeout_add_local_once(Duration::from_millis(10), close.clone());
+            // On glass the extension hides this window in the frame that
+            // shows the card back, which reaches the shell a little after
+            // this paint; closed sooner, there could be a frame with neither.
+            // Off glass it is Sysi's to hide, now that the card is painted.
+            if lifted.glassed {
+                glib::timeout_add_local_once(Duration::from_millis(120), close.clone());
+            } else {
+                lifted.window.set_opacity(0.0);
+                glib::timeout_add_local_once(Duration::from_millis(10), close.clone());
+            }
         }
     });
     gone.set(Some(handler));
