@@ -3844,8 +3844,9 @@ impl HoverTip {
         }
         self.anchor.set((x.round() as i32, y.round() as i32));
         let natural = self.window.preferred_size().1;
-        // Shrunk back too when the frame goes.
-        if had_frame != frame.is_some() {
+        // Shrunk back too when the frame goes: a window only grows by
+        // itself, and one left bigger puts the time off where it is placed.
+        if self.window.size() != (natural.width, natural.height) {
             self.window.resize(natural.width, natural.height);
         }
         self.window.move_(
