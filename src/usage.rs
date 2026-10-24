@@ -1585,49 +1585,88 @@ fn session_root(source: Source) -> Option<PathBuf> {
 }
 
 /// Claude Code on other machines, counted as Claude: one SSH host per line in
-/// `~/.config/sysi/claude-hosts`. Each host's transcripts are mirrored under
-/// the data dir and read like the local ones; a host that cannot be reached
-/// leaves its last mirror as it was.
-fn remote_claude_roots() -> Vec<PathBuf> {
+/// `~/.config/sysi/claude-hosts`. Each host counts its own transcripts with
+/// src/claude_tokens.py, sent over SSH, and answers with its days' totals;
+/// nothing of the conversations comes back. A host that cannot be reached adds
+/// nothing this time, and the ledger keeps what it reported before.
+fn remote_claude_days(offset: i64) -> Vec<TokenDays> {
+    // Where the hosts' transcripts used to be mirrored whole; counting them
+    // there instead leaves the copies with no use.
+    let _ = fs::remove_dir_all(crate::state::data_dir().join("remote"));
     let Ok(list) = fs::read_to_string(crate::state::config_dir().join("claude-hosts")) else {
         return Vec::new();
     };
     list.lines()
         .map(str::trim)
-        // A leading `-` would reach rsync as an option, and `/` or `:` would
-        // turn the mirror path or the remote spec into something else.
+        // A leading `-` would reach ssh as an option, and `/`, `:` or a space
+        // would make the host something else.
         .filter(|host| {
             !host.is_empty()
                 && !host.starts_with(['#', '-'])
                 && !host.contains(['/', ':', ' ', '\t'])
         })
-        .map(|host| {
-            let mirror = crate::state::data_dir()
-                .join("remote")
-                .join(host)
-                .join("claude");
-            if fs::create_dir_all(&mirror).is_ok() {
-                let _ = Command::new("rsync")
-                    .args([
-                        "-a",
-                        "--delete",
-                        "--timeout=30",
-                        "--include=*/",
-                        "--include=*.jsonl",
-                        "--exclude=*",
-                        "-e",
-                        "ssh -o BatchMode=yes -o ConnectTimeout=5",
-                    ])
-                    .arg(format!("{host}:.claude/projects/"))
-                    .arg(&mirror)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
-            mirror
-        })
+        .filter_map(|host| remote_claude_host(host, offset))
         .collect()
+}
+
+fn remote_claude_host(host: &str, offset: i64) -> Option<TokenDays> {
+    let mut child = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ServerAliveInterval=10",
+            "-o",
+            "ServerAliveCountMax=3",
+            "--",
+            host,
+            "python3",
+            "-",
+            &offset.to_string(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Dropped once written, so python3 sees the end of the script.
+    child
+        .stdin
+        .take()?
+        .write_all(include_bytes!("claude_tokens.py"))
+        .ok()?;
+    let output = child.wait_with_output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_remote_days(&output.stdout))
+        .flatten()
+}
+
+/// claude_tokens.py's answer: `{"days": {"DAY": [input, output, cache read,
+/// cache write]}}`.
+fn parse_remote_days(output: &[u8]) -> Option<TokenDays> {
+    let value: Value = serde_json::from_slice(output).ok()?;
+    let days = value.get("days")?.as_object()?;
+    Some(
+        days.iter()
+            .filter_map(|(day, spent)| {
+                let spent = spent.as_array()?;
+                let count = |index: usize| json_u64(spent.get(index));
+                Some((
+                    day.parse().ok()?,
+                    TokenTotals {
+                        input: count(0),
+                        output: count(1),
+                        cache_read: count(2),
+                        cache_write: count(3),
+                    },
+                ))
+            })
+            .collect(),
+    )
 }
 
 /// Deep enough for every layout in play: Codex nests a rollout under year,
@@ -1809,11 +1848,6 @@ pub fn scan_tokens() -> TokenReport {
         if let Some(root) = session_root(source) {
             session_files(&root, SESSION_DEPTH, &mut files);
         }
-        if source == Source::Claude {
-            for root in remote_claude_roots() {
-                session_files(&root, SESSION_DEPTH, &mut files);
-            }
-        }
         for path in files {
             let metadata = fs::metadata(&path).ok();
             let modified = metadata.as_ref().and_then(|data| data.modified().ok());
@@ -1842,6 +1876,14 @@ pub fn scan_tokens() -> TokenReport {
             }
             fresh.insert(path, entry);
         }
+        // Other machines' sessions are their own: nothing to key across.
+        if source == Source::Claude {
+            for remote in remote_claude_days(offset) {
+                for (day, spent) in remote {
+                    totals.entry(day).or_default().merge(spent);
+                }
+            }
+        }
         totals.retain(|_, spent| spent.total() > 0);
         days.insert(source, totals);
     }
@@ -1858,6 +1900,78 @@ pub fn scan_tokens() -> TokenReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// claude_tokens.py counts another machine's transcripts by the same rules
+    /// as scan_claude_file and scan_tokens here: same files, same totals.
+    #[test]
+    fn the_remote_counter_agrees_with_the_local_one() {
+        let root = env::temp_dir().join(format!("sysi-remote-count-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("project/sub")).unwrap();
+        let line = |id: &str, request: &str, stamp: &str, tokens: [u64; 4]| {
+            format!(
+                "{{\"timestamp\":\"{stamp}\",\"requestId\":\"{request}\",\"message\":{{\"id\":\"{id}\",\"usage\":{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_input_tokens\":{},\"cache_creation_input_tokens\":{}}}}}}}\n",
+                tokens[0], tokens[1], tokens[2], tokens[3]
+            )
+        };
+        let first = [
+            line("m1", "q1", "2026-10-22T10:00:00.000Z", [10, 5, 100, 7]),
+            // The same response again, as a streaming update repeats it.
+            line("m1", "q1", "2026-10-22T10:00:01.000Z", [10, 5, 100, 7]),
+            // Past midnight once the offset is added.
+            line("m2", "q2", "2026-10-22T23:30:00.000Z", [3, 2, 0, 0]),
+            "{\"timestamp\":\"2026-10-22T11:00:00Z\",\"usage\":{\"input_tokens\":9}}\n".to_string(),
+            format!("\"usage\" {}\n", "x".repeat(MAX_RECORD_BYTES)),
+        ]
+        .concat();
+        // A forked session's copy, one level down, with one response of its own.
+        let second = [
+            line("m1", "q1", "2026-10-22T10:00:00.000Z", [10, 5, 100, 7]),
+            line("m3", "q3", "2026-10-21T08:00:00.000Z", [1, 1, 1, 1]),
+        ]
+        .concat();
+        fs::write(root.join("project/one.jsonl"), first).unwrap();
+        fs::write(root.join("project/sub/two.jsonl"), second).unwrap();
+        let offset = 7 * 3600;
+
+        let mut files = Vec::new();
+        session_files(&root, SESSION_DEPTH, &mut files);
+        let mut local = TokenDays::new();
+        let mut seen = HashSet::new();
+        for path in &files {
+            for record in scan_claude_file(path, offset) {
+                if record.key.is_some_and(|key| seen.insert(key)) {
+                    local.entry(record.day).or_default().merge(record.totals);
+                }
+            }
+        }
+
+        let mut python = Command::new("python3")
+            .arg("-")
+            .arg(offset.to_string())
+            .arg(&root)
+            .arg(root.join("cache.json"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("python3, as the remote host runs it");
+        python
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(include_bytes!("claude_tokens.py"))
+            .unwrap();
+        let output = python.wait_with_output().unwrap();
+        let remote = parse_remote_days(&output.stdout).expect("the script's JSON");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            local.len(),
+            3,
+            "three days: the fork's, the 22nd, and past midnight"
+        );
+        assert_eq!(remote, local);
+    }
 
     fn fixture(name: &str, body: &str) -> PathBuf {
         let dir = env::temp_dir().join("sysi-token-scan-tests");

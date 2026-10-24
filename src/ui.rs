@@ -15269,6 +15269,27 @@ fn overlay_card_rect(card: &gtk::EventBox, point: Point) -> ScreenRect {
 /// backing stores, which is why the same window is sometimes butter and
 /// sometimes frames behind the pointer until another, cheaper window has
 /// just been moved (and the stores filled again).
+/// A card with a native window inside it (YOUTUBE's video): repaint the
+/// overlay at once rather than at the next frame. X moves and raises the
+/// native window the moment it is asked, and the card around it otherwise
+/// followed a frame later, so the compositor could catch the video standing
+/// apart from its card for a frame. It showed on the first drag after another
+/// card had been raised over this one, when the raise left a full repaint
+/// pending as the drag began.
+fn paint_now_if_native(window: &gtk::ApplicationWindow, card: &gtk::EventBox) {
+    if card.widget_name() != "youtube" {
+        return;
+    }
+    if let Some(toplevel) = window.window() {
+        use glib::translate::ToGlibPtr;
+        // SAFETY: a live, realized GdkWindow. Deprecated in GTK 3.22 but
+        // still the one way to paint synchronously.
+        unsafe {
+            gdk::ffi::gdk_window_process_updates(toplevel.to_glib_none().0, glib::ffi::GTRUE)
+        };
+    }
+}
+
 fn slide_overlay_card(
     window: &gtk::ApplicationWindow,
     root: &gtk::Fixed,
@@ -15292,6 +15313,7 @@ fn slide_overlay_card(
         if let Some(gdk_window) = card.window() {
             gdk_window.move_(point.x, point.y);
         }
+        paint_now_if_native(window, card);
         root.queue_draw_area(
             allocation.x() - 3,
             allocation.y() - 3,
@@ -15485,6 +15507,7 @@ fn attach_drag(
             hold_widget(&registry, &key, true);
             grab_overlay_pointer(&window);
             restack_overlay_card(&card);
+            paint_now_if_native(&window, &card);
             OVERLAY_DRAG_FINISH.with(|slot| *slot.borrow_mut() = Some(finish.clone()));
             if !ticking.get() {
                 ticking.set(true);
