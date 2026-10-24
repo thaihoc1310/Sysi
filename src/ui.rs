@@ -1491,14 +1491,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             // mpv's window is above everything Sysi paints, OCR's dim included,
             // and would take the press that starts a selection. Out of the
             // way while one is up; the sound plays on.
+            // A drag keeps it hidden too (hide_native_inside), and shows it
+            // again itself when it ends.
             let selecting = DICTATE_SHAPE.with(Cell::get);
             if let Some(window) = card.video.window() {
-                if window.is_visible() == selecting {
-                    if selecting {
-                        window.hide();
-                    } else {
-                        window.show();
-                    }
+                if selecting && window.is_visible() {
+                    window.hide();
+                } else if !selecting && !window.is_visible() && !any_gesture_held(&registry) {
+                    window.show();
                 }
             }
             if selecting {
@@ -15261,6 +15261,50 @@ fn overlay_card_rect(card: &gtk::EventBox, point: Point) -> ScreenRect {
     }
 }
 
+const HIDDEN_NATIVE_KEY: &str = "sysi-hidden-native";
+
+/// Hide the native windows inside a card for the length of a drag: YOUTUBE's
+/// video. X moves a native window the moment it is asked and the card around
+/// it is repainted a frame later, so a drag could show the video a frame
+/// apart from its card, or leave a copy of it behind. Painting the overlay
+/// synchronously after each move made the copy worse. Hidden, the video
+/// cannot stray; mpv plays on, and the windows come back where the card lands.
+fn hide_native_inside(card: &gtk::EventBox) {
+    fn collect(window: &gdk::Window, found: &mut Vec<gdk::Window>) {
+        for child in window.children() {
+            if child.has_native() {
+                // Only what shows: a handle hidden now stays hidden after.
+                if child.is_visible() {
+                    found.push(child);
+                }
+            } else {
+                collect(&child, found);
+            }
+        }
+    }
+    let Some(window) = card.window() else {
+        return;
+    };
+    let mut hidden = Vec::new();
+    collect(&window, &mut hidden);
+    if hidden.is_empty() {
+        return;
+    }
+    for native in &hidden {
+        native.hide();
+    }
+    unsafe {
+        card.set_data(HIDDEN_NATIVE_KEY, hidden);
+    }
+}
+
+fn show_native_inside(card: &gtk::EventBox) {
+    let hidden: Option<Vec<gdk::Window>> = unsafe { card.steal_data(HIDDEN_NATIVE_KEY) };
+    for native in hidden.into_iter().flatten() {
+        native.show();
+    }
+}
+
 /// Slide one overlay card without asking GtkFixed to relayout the desk.
 ///
 /// `gtk_fixed_move` queue-resizes the whole overlay. That invalidates the
@@ -15269,27 +15313,6 @@ fn overlay_card_rect(card: &gtk::EventBox, point: Point) -> ScreenRect {
 /// backing stores, which is why the same window is sometimes butter and
 /// sometimes frames behind the pointer until another, cheaper window has
 /// just been moved (and the stores filled again).
-/// A card with a native window inside it (YOUTUBE's video): repaint the
-/// overlay at once rather than at the next frame. X moves and raises the
-/// native window the moment it is asked, and the card around it otherwise
-/// followed a frame later, so the compositor could catch the video standing
-/// apart from its card for a frame. It showed on the first drag after another
-/// card had been raised over this one, when the raise left a full repaint
-/// pending as the drag began.
-fn paint_now_if_native(window: &gtk::ApplicationWindow, card: &gtk::EventBox) {
-    if card.widget_name() != "youtube" {
-        return;
-    }
-    if let Some(toplevel) = window.window() {
-        use glib::translate::ToGlibPtr;
-        // SAFETY: a live, realized GdkWindow. Deprecated in GTK 3.22 but
-        // still the one way to paint synchronously.
-        unsafe {
-            gdk::ffi::gdk_window_process_updates(toplevel.to_glib_none().0, glib::ffi::GTRUE)
-        };
-    }
-}
-
 fn slide_overlay_card(
     window: &gtk::ApplicationWindow,
     root: &gtk::Fixed,
@@ -15313,7 +15336,6 @@ fn slide_overlay_card(
         if let Some(gdk_window) = card.window() {
             gdk_window.move_(point.x, point.y);
         }
-        paint_now_if_native(window, card);
         root.queue_draw_area(
             allocation.x() - 3,
             allocation.y() - 3,
@@ -15411,6 +15433,7 @@ fn attach_drag(
         let key = key.clone();
         move |fallback_x, fallback_y| {
             OVERLAY_DRAG_FINISH.with(|slot| slot.borrow_mut().take());
+            show_native_inside(&card);
             hold_widget(&registry, &key, false);
             live.set(None);
             ungrab_pointer();
@@ -15507,7 +15530,7 @@ fn attach_drag(
             hold_widget(&registry, &key, true);
             grab_overlay_pointer(&window);
             restack_overlay_card(&card);
-            paint_now_if_native(&window, &card);
+            hide_native_inside(&card);
             OVERLAY_DRAG_FINISH.with(|slot| *slot.borrow_mut() = Some(finish.clone()));
             if !ticking.get() {
                 ticking.set(true);
