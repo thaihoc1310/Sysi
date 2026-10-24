@@ -98,6 +98,10 @@ pub struct CardSample {
     pub width: i32,
     pub height: i32,
     pub pressed: bool,
+    /// False for a card with no glass (LIGHT, DARK, ...): sent all the same,
+    /// with a negative radius, so the extension knows it is shown and can
+    /// swap it with its lifted window in one frame.
+    pub glass: bool,
 }
 
 /// What the extension is sent for one card: key, rect and radius in X11
@@ -131,7 +135,11 @@ pub fn wire_cards(samples: &[CardSample], scale: f64) -> Vec<WireCard> {
                 outline.y * scale,
                 outline.width * scale,
                 outline.height * scale,
-                outline.radius * scale,
+                if card.glass {
+                    outline.radius * scale
+                } else {
+                    -1.0
+                },
                 card.pressed,
             )
         })
@@ -199,15 +207,17 @@ pub fn start(
         gio::BusNameWatcherFlags::NONE,
         |connection, _, _| {
             with_link(|link| {
-                link.connection.replace(Some(connection));
+                link.connection.replace(Some(connection.clone()));
                 link.last.replace(None);
                 link.retries.set(0);
                 link.window.queue_draw();
-            })
+            });
+            ask_caps(&connection);
         },
         |_, _| {
             with_link(|link| {
                 link.connection.replace(None);
+                CAPS.with(|caps| caps.set(0));
                 link.last.replace(None);
                 link.waiting.replace(None);
                 set_live(&link.window, false);
@@ -234,7 +244,15 @@ pub fn start(
             xid,
             f64::from(link.window.allocated_width()) * scale,
             f64::from(link.window.allocated_height()) * scale,
-            wire_cards(&[collect(), popover_samples(&link.root)].concat(), scale),
+            wire_cards(
+                &[collect(), popover_samples(&link.root)]
+                    .concat()
+                    .into_iter()
+                    // An extension without lifts would draw them square.
+                    .filter(|card| card.glass || lifts_supported())
+                    .collect::<Vec<_>>(),
+                scale,
+            ),
         );
         if link.last.borrow().as_ref() == Some(&message) {
             return;
@@ -246,6 +264,45 @@ pub fn start(
         }
         send(&link, message);
     });
+}
+
+thread_local! {
+    /// What the extension answered to Caps: 1 for cards without glass and
+    /// lifted cards; 0 for one too old to know the call.
+    static CAPS: Cell<u32> = const { Cell::new(0) };
+}
+
+fn ask_caps(connection: &gio::DBusConnection) {
+    connection.call(
+        Some(BUS_NAME),
+        OBJECT_PATH,
+        INTERFACE,
+        "Caps",
+        None,
+        Some(glib::VariantTy::new("(u)").expect("valid reply type")),
+        gio::DBusCallFlags::NONE,
+        1000,
+        None::<&gio::Cancellable>,
+        |reply| {
+            let caps = reply
+                .ok()
+                .and_then(|reply| reply.get::<(u32,)>())
+                .map_or(0, |(caps,)| caps);
+            CAPS.with(|known| known.set(caps));
+            // Send the cards again, now with those it can take.
+            with_link(|link| {
+                link.last.replace(None);
+                link.window.queue_draw();
+            });
+        },
+    );
+}
+
+/// Whether the extension swaps a dragged card's window with the card itself,
+/// whatever the card's look: it then shows and hides that window in the
+/// frames that change the overlay.
+pub fn lifts_supported() -> bool {
+    CAPS.with(Cell::get) >= 1 && glass_is_live()
 }
 
 fn send(link: &Rc<Link>, message: Message) {
@@ -395,10 +452,11 @@ pub fn glass_window(
     window: &gtk::Window,
     key: &str,
     inset: i32,
+    glass: bool,
     pressed: bool,
     done: Rc<dyn Fn(bool)>,
 ) {
-    if !glass_is_live() {
+    if !lifts_supported() && !(glass && glass_is_live()) {
         done(true);
         return;
     }
@@ -409,6 +467,7 @@ pub fn glass_window(
         window.clone(),
         format!("lift:{key}"),
         inset,
+        glass,
         pressed,
         done,
         6,
@@ -419,6 +478,7 @@ fn send_window(
     window: gtk::Window,
     key: String,
     inset: i32,
+    glass: bool,
     pressed: bool,
     done: Rc<dyn Fn(bool)>,
     tries: u32,
@@ -453,7 +513,7 @@ fn send_window(
             inset_px,
             width - 2.0 * inset_px,
             height - 2.0 * inset_px,
-            RADIUS * scale,
+            if glass { RADIUS * scale } else { -1.0 },
             pressed,
         )],
     );
@@ -478,7 +538,7 @@ fn send_window(
                 return;
             }
             glib::timeout_add_local_once(Duration::from_millis(15), move || {
-                send_window(window, key, inset, pressed, done, tries - 1)
+                send_window(window, key, inset, glass, pressed, done, tries - 1)
             });
         },
     );
@@ -542,6 +602,7 @@ fn popover_samples(root: &gtk::Container) -> Vec<CardSample> {
                     y: y + outline.y as i32,
                     width: outline.width as i32,
                     height: outline.height as i32,
+                    glass: true,
                     pressed: false,
                 })
             })
@@ -791,6 +852,7 @@ mod tests {
             width,
             height,
             pressed: false,
+            glass: true,
         }
     }
 
@@ -810,6 +872,15 @@ mod tests {
                 ("usage".into(), 0.0, 0.0, 392.0, 152.0, 28.0, false),
             ]
         );
+    }
+
+    #[test]
+    fn a_card_without_glass_goes_with_a_negative_radius() {
+        let bare = CardSample {
+            glass: false,
+            ..card("usage", 0, 0, 100, 50)
+        };
+        assert_eq!(wire_cards(&[bare], 1.0)[0].5, -1.0);
     }
 
     #[test]

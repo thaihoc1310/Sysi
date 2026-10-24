@@ -16041,7 +16041,8 @@ fn lift_card(
         ready: Cell::new(false),
         failed: Cell::new(false),
         landed: Cell::new(false),
-        glassed: crate::glass::has_glass(card) && crate::glass::glass_is_live(),
+        glassed: crate::glass::lifts_supported()
+            || (crate::glass::has_glass(card) && crate::glass::glass_is_live()),
         at: Cell::new(at),
     });
     // Ready when its glass is on: only then does the card leave the
@@ -16072,11 +16073,14 @@ fn lift_card(
         }
     });
     let glass = crate::glass::has_glass(card);
+    // Handed to the extension when it can swap it with the card in one
+    // frame, glass or not; otherwise Sysi shows and hides it itself.
+    let handed = lifted.glassed;
     float.connect_map_event({
         let key = key.to_owned();
         move |float, _| {
-            if glass {
-                crate::glass::glass_window(float, &key, FLOAT_MARGIN, true, ready.clone());
+            if handed {
+                crate::glass::glass_window(float, &key, FLOAT_MARGIN, glass, true, ready.clone());
             } else {
                 ready(true);
             }
@@ -16377,7 +16381,11 @@ fn attach_drag(
                         if !moving.get() {
                             let (dx, dy) =
                                 (pointer_x - pointer_start_x, pointer_y - pointer_start_y);
-                            if dx.hypot(dy) < DRAG_THRESHOLD {
+                            // Raised by being taken out of its container and
+                            // put back, the card has no size until the next
+                            // layout: nothing to lift yet.
+                            let laid_out = card.allocation().width() > 1;
+                            if dx.hypot(dy) < DRAG_THRESHOLD || !laid_out {
                                 return glib::ControlFlow::Continue;
                             }
                             // A drag after all: only now is the card taken
@@ -18267,12 +18275,9 @@ fn glass_card_samples(
     };
     crate::glass::paint_order(root.upcast_ref())
         .iter()
-        .filter(|child| {
-            child.is_visible()
-                && child.is_mapped()
-                && child.widget_name() != "dictate"
-                && crate::glass::has_glass(*child)
-        })
+        // Every card, glass or not: the extension swaps a dragged card with
+        // its lifted window by whether the overlay still shows it.
+        .filter(|child| child.is_visible() && child.is_mapped() && child.widget_name() != "dictate")
         .filter_map(|child| {
             let item = items
                 .iter()
@@ -18288,6 +18293,7 @@ fn glass_card_samples(
                 y: allocation.y(),
                 width: allocation.width(),
                 height: allocation.height(),
+                glass: crate::glass::has_glass(child),
                 pressed: item.held.get(),
             })
         })

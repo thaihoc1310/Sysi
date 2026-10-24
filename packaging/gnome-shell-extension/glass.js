@@ -36,6 +36,9 @@ const IFACE_XML = `
       <arg type="a(sdddddb)" direction="in" name="cards"/>
       <arg type="b" direction="out" name="attached"/>
     </method>
+    <method name="Caps">
+      <arg type="u" direction="out" name="caps"/>
+    </method>
   </interface>
 </node>`;
 
@@ -841,8 +844,22 @@ class GlassHost {
         this._fresh = false;
         const seen = new Set();
         let below = null;
-        for (const [key, x, y, w, h, radius, pressed] of cards) {
+        for (const [key, x, y, w, h, radius, pressed, bare] of cards) {
             seen.add(key);
+            // A card coming back from being lifted, or leaving to be, is the
+            // same card moving between windows: no fading in or out, or for
+            // the length of the fade it has no glass, or glass twice over.
+            const lifted = this._manager.isLifted(key);
+            if (bare) {
+                const glass = this._cards.get(key);
+                if (glass && !glass.leaving) {
+                    if (animate && !lifted)
+                        glass.dissolve();
+                    else
+                        glass.destroy();
+                }
+                continue;
+            }
             let card = this._cards.get(key);
             if (!card || card.leaving) {
                 card?.destroy();
@@ -853,7 +870,7 @@ class GlassHost {
                         this._cards.delete(key);
                 });
                 this._layer.add_child(card);
-                if (animate)
+                if (animate && !lifted)
                     card.materialize();
             }
             card.place(x * scaleX, y * scaleY, w * scaleX, h * scaleY,
@@ -869,7 +886,7 @@ class GlassHost {
         for (const [key, card] of this._cards) {
             if (seen.has(key) || card.leaving)
                 continue;
-            if (animate)
+            if (animate && !this._manager.isLifted(key))
                 card.dissolve();
             else
                 card.destroy();
@@ -1085,8 +1102,11 @@ export class GlassManager {
                 continue;
             if (w <= 1 || h <= 1 || w > MAX_SIDE || h > MAX_SIDE)
                 continue;
+            // A negative radius: a card with no glass, sent so its window
+            // can be swapped with a lifted one (see hostApplied).
+            const bare = radius < 0;
             const clampedRadius = Math.max(0, Math.min(radius, w / 2, h / 2));
-            clean.push([key, x, y, w, h, clampedRadius, Boolean(pressed)]);
+            clean.push([key, x, y, w, h, clampedRadius, Boolean(pressed), bare]);
         }
         this._states.delete(xid);
         this._states.set(xid, {xid, width, height, cards: clean});
@@ -1098,6 +1118,21 @@ export class GlassManager {
             return false;
         host.setCards(width, height, clean);
         return true;
+    }
+
+    // What this extension understands beyond SetCards: 1, cards with no glass
+    // (a negative radius) and lifted cards (lift:KEY).
+    Caps() {
+        return 1;
+    }
+
+    // Whether a window of Sysi's shows KEY lifted out of the overlay.
+    isLifted(key) {
+        for (const host of this._hosts.values()) {
+            if (host.keys.has(`lift:${key}`))
+                return true;
+        }
+        return false;
     }
 
     _hostFor(xid) {
