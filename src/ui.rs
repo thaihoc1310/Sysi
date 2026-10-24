@@ -15940,6 +15940,10 @@ fn move_overlay_card(
 /// whole copy of what lies under it, keeps showing an old one.
 const FLOAT_MARGIN: i32 = 32;
 
+/// How far, in pixels, the pointer goes from where it pressed a card's title
+/// before the press is a drag rather than a click.
+const DRAG_THRESHOLD: f64 = 3.0;
+
 /// How often a lifted card's window follows the pointer: above any screen's
 /// refresh, so the compositor always has the latest place to show.
 const FLOAT_POLL: Duration = Duration::from_millis(3);
@@ -16192,10 +16196,14 @@ fn attach_drag(
     let live = Rc::new(Cell::new(None::<Point>));
     let ticking = Rc::new(Cell::new(false));
     let float: Rc<RefCell<Option<Rc<DragFloat>>>> = Rc::default();
+    // Set once the pointer has gone DRAG_THRESHOLD from where it pressed:
+    // before that a press is a click, and leaves the card as it is.
+    let moving = Rc::new(Cell::new(false));
     let finish: Rc<dyn Fn(f64, f64)> = Rc::new({
         let start = start.clone();
         let live = live.clone();
         let float = float.clone();
+        let moving = moving.clone();
         let card = card.clone();
         let root = root.clone();
         let registry = registry.clone();
@@ -16219,9 +16227,14 @@ fn attach_drag(
                 return;
             };
             let allocation = card.allocation();
-            let (pointer_x, pointer_y) = pointer_drag_sample()
-                .map(|(x, y, _)| (x, y))
-                .unwrap_or((pointer_start_x + fallback_x, pointer_start_y + fallback_y));
+            let (pointer_x, pointer_y) = if moving.replace(false) {
+                pointer_drag_sample()
+                    .map(|(x, y, _)| (x, y))
+                    .unwrap_or((pointer_start_x + fallback_x, pointer_start_y + fallback_y))
+            } else {
+                // A click: the card stays exactly where it was.
+                (pointer_start_x, pointer_start_y)
+            };
             let screens = gesture_screens.borrow();
             let origin = clamp_to_screens(
                 Point {
@@ -16326,31 +16339,9 @@ fn attach_drag(
             if let Some(stale) = float.borrow_mut().take() {
                 land_float(&window, &card, &stale, None);
             }
-            hide_native_inside(&card);
-            // Before the restack: putting the card back on top leaves it
-            // unallocated until the next layout, with nothing to picture.
-            let lifted = lift_card(&window, &card, &key);
+            moving.set(false);
             restack_overlay_card(&card);
             OVERLAY_DRAG_FINISH.with(|slot| *slot.borrow_mut() = Some(finish.clone()));
-            if let Some(lifted) = lifted {
-                // Followed at the pointer's pace, not the overlay's frames.
-                glib::timeout_add_local(FLOAT_POLL, {
-                    let lifted = Rc::downgrade(&lifted);
-                    let start = start.clone();
-                    let card = card.clone();
-                    let gesture_screens = gesture_screens.clone();
-                    move || {
-                        let Some(lifted) = lifted.upgrade() else {
-                            return glib::ControlFlow::Break;
-                        };
-                        if let Some(point) = drag_point(&start, &card, &gesture_screens) {
-                            move_float(&lifted, point);
-                        }
-                        glib::ControlFlow::Continue
-                    }
-                });
-                *float.borrow_mut() = Some(lifted);
-            }
             if !ticking.get() {
                 ticking.set(true);
                 // Once per frame the overlay paints, at the screen's own rate:
@@ -16361,6 +16352,8 @@ fn attach_drag(
                     let start = start.clone();
                     let live = live.clone();
                     let float = float.clone();
+                    let moving = moving.clone();
+                    let key = key.clone();
                     let ticking = ticking.clone();
                     let card = card.clone();
                     let card_widget = card_widget.clone();
@@ -16380,6 +16373,39 @@ fn attach_drag(
                             finish(0.0, 0.0);
                             ticking.set(false);
                             return glib::ControlFlow::Break;
+                        }
+                        if !moving.get() {
+                            let (dx, dy) =
+                                (pointer_x - pointer_start_x, pointer_y - pointer_start_y);
+                            if dx.hypot(dy) < DRAG_THRESHOLD {
+                                return glib::ControlFlow::Continue;
+                            }
+                            // A drag after all: only now is the card taken
+                            // up, so a click changes nothing on screen.
+                            moving.set(true);
+                            hide_native_inside(&card);
+                            if let Some(lifted) = lift_card(&window, &card, &key) {
+                                // Followed at the pointer's pace, not the
+                                // overlay's frames.
+                                glib::timeout_add_local(FLOAT_POLL, {
+                                    let lifted = Rc::downgrade(&lifted);
+                                    let start = start.clone();
+                                    let card = card.clone();
+                                    let gesture_screens = gesture_screens.clone();
+                                    move || {
+                                        let Some(lifted) = lifted.upgrade() else {
+                                            return glib::ControlFlow::Break;
+                                        };
+                                        if let Some(point) =
+                                            drag_point(&start, &card, &gesture_screens)
+                                        {
+                                            move_float(&lifted, point);
+                                        }
+                                        glib::ControlFlow::Continue
+                                    }
+                                });
+                                *float.borrow_mut() = Some(lifted);
+                            }
                         }
                         let allocation = card.allocation();
                         let screens = gesture_screens.borrow();
