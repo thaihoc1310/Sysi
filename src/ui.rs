@@ -3844,15 +3844,22 @@ impl HoverTip {
         }
         self.anchor.set((x.round() as i32, y.round() as i32));
         let natural = self.window.preferred_size().1;
+        let (width, height) = (natural.width, natural.height);
+        let at = (x.round() as i32 - width / 2, y.round() as i32 - height - 6);
+        // Moved and resized in one go: GTK moves a shown window at once but
+        // resizes it a frame later, and in between the tip, still its old
+        // size, flashed down over the bar.
+        if let Some(window) = self.window.window().filter(|_| self.window.is_visible()) {
+            if (window.width(), window.height()) != (width, height) {
+                window.move_resize(at.0, at.1, width, height);
+            }
+        }
         // Shrunk back too when the frame goes: a window only grows by
         // itself, and one left bigger puts the time off where it is placed.
-        if self.window.size() != (natural.width, natural.height) {
-            self.window.resize(natural.width, natural.height);
+        if self.window.size() != (width, height) {
+            self.window.resize(width, height);
         }
-        self.window.move_(
-            x.round() as i32 - natural.width / 2,
-            y.round() as i32 - natural.height - 6,
-        );
+        self.window.move_(at.0, at.1);
         if !self.window.is_visible() {
             self.window.show();
             // The overlay is raised as it works; this goes over it.
@@ -4080,7 +4087,9 @@ fn show_youtube_preview(card: &YoutubeCard, fetched: &async_channel::Sender<Shee
                     let _ = fetched.send_blocking((video, index, youtube::fetch_sheet(&url)));
                 });
             }
-            return None;
+            // The last frame stays up while this one loads, as YouTube's
+            // does, rather than the tip shrinking to the time and back.
+            return preview.frame.as_ref().map(|(_, surface)| surface.clone());
         };
         // The last sheet can stop short of a full grid.
         let fits = left + board.width <= sheet.width() && top + board.height <= sheet.height();
