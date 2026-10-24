@@ -23,7 +23,9 @@ const MAX_PHRASES: usize = 3;
 
 /// Oxford's senses for `query`, the same word's other parts of speech
 /// included, or nothing when Oxford has no entry that is this word.
-pub fn lookup(query: &str) -> Vec<EnDefinition> {
+/// `current` says whether the lookup is still wanted: the other entries are
+/// not fetched for one the window has moved on from.
+pub fn lookup(query: &str, current: &dyn Fn() -> bool) -> Vec<EnDefinition> {
     let url = format!(
         "{SITE}search/english/?q={}",
         translate::percent_encode(query.trim())
@@ -36,7 +38,10 @@ pub fn lookup(query: &str) -> Vec<EnDefinition> {
         return Vec::new();
     };
     let mut definitions = found.definitions;
-    if found.whole_entry {
+    // Only for the word itself: an inflection lands on the entry it belongs
+    // to ("courted" on the verb), and the headword's other entries (the noun)
+    // are another word that happens to be spelled alike.
+    if found.whole_entry && found.exact && current() {
         // At once rather than one after another; a page that cannot get a
         // thread is fetched here instead.
         let others: Vec<_> = found
@@ -76,6 +81,8 @@ struct Entry {
     /// The whole entry was the word, rather than one idiom or phrasal verb
     /// inside it; only then are the headword's other entries the word too.
     whole_entry: bool,
+    /// The headword is the query itself, not a form of it.
+    exact: bool,
     /// The same headword's other entries, by URL.
     other_entries: Vec<String>,
 }
@@ -94,7 +101,8 @@ fn read_entry(document: &Document, query: &str) -> Option<Entry> {
     if wanted.is_empty() {
         return None;
     }
-    if normalize(&headword) == wanted || is_listed_form(document, entry, &wanted, &headword) {
+    let exact = normalize(&headword) == wanted;
+    if exact || is_listed_form(document, entry, &wanted, &headword) {
         let mut definitions = Vec::new();
         collect_senses(document, entry, &headword, &pos, &mut definitions);
         let this = &document.nodes[entry].id;
@@ -103,6 +111,7 @@ fn read_entry(document: &Document, query: &str) -> Option<Entry> {
         return (!definitions.is_empty()).then_some(Entry {
             definitions,
             whole_entry: true,
+            exact,
             other_entries: others,
         });
     }
@@ -147,6 +156,7 @@ fn read_entry(document: &Document, query: &str) -> Option<Entry> {
     (!definitions.is_empty()).then_some(Entry {
         definitions,
         whole_entry: false,
+        exact: false,
         other_entries: Vec::new(),
     })
 }
@@ -725,7 +735,7 @@ mod tests {
     fn a_word_reads_its_senses_without_idioms_boxes_or_links() {
         let document = Document::parse(&entry(COURT));
         let found = read_entry(&document, "Court").unwrap();
-        assert!(found.whole_entry);
+        assert!(found.whole_entry && found.exact);
         assert_eq!(found.definitions.len(), 2);
         let first = &found.definitions[0];
         assert_eq!(first.pos, "noun · law");
@@ -776,10 +786,10 @@ mod tests {
             <ol><li class="sense"><span class="def">a young human</span></li></ol>"##,
         );
         let document = Document::parse(&child);
-        assert_eq!(
-            read_entry(&document, "children").unwrap().definitions.len(),
-            1
-        );
+        let children = read_entry(&document, "children").unwrap();
+        assert_eq!(children.definitions.len(), 1);
+        // A form of the word: the headword's other entries are not fetched.
+        assert!(!children.exact);
         assert!(read_entry(&document, "childish").is_none());
         let cat = entry(
             r##"<h1 class="headword">cat</h1><ol><li class="sense"><span class="def">a pet</span></li></ol>"##,

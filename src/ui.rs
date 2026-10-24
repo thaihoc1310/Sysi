@@ -1321,9 +1321,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     let mut preview = card.preview.borrow_mut();
                     preview.sheets.insert(index, sheet);
                     preview.arrived.push_back(index);
-                    // At most 16 held: dropped ones are fetched again if the
-                    // pointer goes back there.
-                    while preview.arrived.len() > 16 {
+                    // At most 6 held, some 12 MB: the pointer only ever
+                    // wants the ones around it, and one dropped is a small
+                    // JPEG to fetch again if it goes back there.
+                    while preview.arrived.len() > 6 {
                         if let Some(oldest) = preview.arrived.pop_front() {
                             preview.sheets.remove(&oldest);
                             preview.asked.remove(&oldest);
@@ -12858,11 +12859,10 @@ fn add_translate_section(
 
 /// One word's answer on the card, filled in a source at a time as each
 /// replies. Every source has a place of its own, in a fixed order, so what
-/// arrives late neither pushes what is already being read nor closes a section
-/// left open.
+/// arrives late never closes a section left open, and lands above what is
+/// being read without pushing it once the column is scrolled (see reveal).
 struct TranslateView {
     generation: u64,
-    headword: String,
     gloss: gtk::Box,
     pronunciations: gtk::Box,
     /// CAMBRIDGE, OXFORD, ANH–VIỆT and EXAMPLES, in that order.
@@ -12909,7 +12909,6 @@ impl TranslateView {
         };
         let view = Self {
             generation,
-            headword: headword.to_owned(),
             gloss: place(),
             pronunciations: place(),
             slots: [place(), place(), place(), place()],
@@ -12980,8 +12979,10 @@ impl TranslateView {
             speaker.connect_clicked({
                 let audio_buttons = audio_buttons.clone();
                 let audio_tx = audio_tx.clone();
-                let url = pronunciation.audio_url.clone();
-                let sources = crate::translate::audio_sources(&self.headword, &pronunciation.lang);
+                // The button's name while its clip loads.
+                let url = format!("{}#{}", pronunciation.word, pronunciation.lang);
+                let sources =
+                    crate::translate::audio_sources(&pronunciation.word, &pronunciation.lang);
                 move |button| {
                     // Disabled until the clip lands, so a slow download
                     // cannot be queued up a dozen times.
@@ -13108,6 +13109,8 @@ impl TranslateView {
     fn finish(&self, suggestions: &[String], lookup: &Rc<dyn Fn(&str)>) {
         clear_children(&self.tail);
         if suggestions.is_empty() {
+            // Kept out of a later show_all() too.
+            self.tail.set_no_show_all(true);
             self.tail.hide();
             return;
         }
@@ -13125,9 +13128,48 @@ impl TranslateView {
     }
 }
 
+/// Show a filled place. One above where the column is scrolled to would push
+/// what is being read down by its height; the scroll follows it instead.
 fn reveal(place: &gtk::Box) {
     place.set_no_show_all(false);
     place.show_all();
+    let Some(scroller) = place
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_then(|scroller| scroller.downcast::<gtk::ScrolledWindow>().ok())
+    else {
+        return;
+    };
+    let adjustment = scroller.vadjustment();
+    let (Some(content), Some(clock)) = (scroller.child(), place.frame_clock()) else {
+        return;
+    };
+    if adjustment.value() <= 0.0 {
+        return;
+    }
+    // Measured once laid out: after GTK's own layout in the same frame, so
+    // the shift and the scroll are painted together.
+    let handler = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
+    let id = clock.connect_layout({
+        let place = place.clone();
+        let handler = handler.clone();
+        move |clock| {
+            if let Some(id) = handler.take() {
+                clock.disconnect(id);
+            }
+            let Some((_, top)) = place.translate_coordinates(&content, 0, 0) else {
+                return;
+            };
+            if f64::from(top) < adjustment.value() {
+                let spacing = place
+                    .parent()
+                    .and_then(|parent| parent.downcast::<gtk::Box>().ok())
+                    .map_or(0, |parent| parent.spacing());
+                adjustment
+                    .set_value(adjustment.value() + f64::from(place.allocated_height() + spacing));
+            }
+        }
+    });
+    handler.set(Some(id));
 }
 
 /// Show a whole answer at once: one already in hand (stepping back to a word,
@@ -15948,10 +15990,16 @@ const DRAG_THRESHOLD: f64 = 3.0;
 /// refresh, so the compositor always has the latest place to show.
 const FLOAT_POLL: Duration = Duration::from_millis(3);
 
+/// How long a lifted card waits for the extension to take its window before
+/// the drag slides it in the overlay instead.
+const LIFT_DEADLINE: Duration = Duration::from_millis(150);
+
 thread_local! {
     /// The card a drag has lifted into a window of its own, by key: its glass
     /// is that window's meanwhile, not the overlay's.
     static LIFTED_CARD: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Windows of cards put down, until they close.
+    static LANDING: RefCell<Vec<std::rc::Weak<DragFloat>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A card being dragged, as a picture of it in a window of its own. The
@@ -15972,6 +16020,8 @@ struct DragFloat {
     failed: Cell<bool>,
     /// Put down already; a late answer about its glass changes nothing.
     landed: Cell<bool>,
+    /// Destroyed: GTK holds every toplevel until it is, hidden or not.
+    closed: Cell<bool>,
     /// On live glass, where the extension shows and hides this window as the
     /// card leaves and comes back to the overlay.
     glassed: bool,
@@ -15985,6 +16035,23 @@ fn lift_card(
     card: &gtk::EventBox,
     key: &str,
 ) -> Option<Rc<DragFloat>> {
+    // On glass from an extension too old to swap a lifted card in one frame,
+    // its glass would show twice over: such a card slides in the overlay.
+    if crate::glass::has_glass(card)
+        && crate::glass::glass_is_live()
+        && !crate::glass::lifts_supported()
+    {
+        return None;
+    }
+    // Any card still waiting to be closed from a drag just put down: the
+    // extension would show it again as this one leaves the overlay.
+    LANDING.with(|landing| {
+        for lifted in landing.borrow_mut().drain(..) {
+            if let Some(lifted) = lifted.upgrade() {
+                close_float(&lifted);
+            }
+        }
+    });
     let allocation = card.allocation();
     let (width, height) = (allocation.width(), allocation.height());
     if width < 2 || height < 2 {
@@ -16041,8 +16108,8 @@ fn lift_card(
         ready: Cell::new(false),
         failed: Cell::new(false),
         landed: Cell::new(false),
-        glassed: crate::glass::lifts_supported()
-            || (crate::glass::has_glass(card) && crate::glass::glass_is_live()),
+        closed: Cell::new(false),
+        glassed: crate::glass::lifts_supported(),
         at: Cell::new(at),
     });
     // Ready when its glass is on: only then does the card leave the
@@ -16056,13 +16123,14 @@ fn lift_card(
             let Some(lifted) = lifted.upgrade() else {
                 return;
             };
-            if lifted.landed.get() {
+            // Answered already (or given up on), or put down meanwhile.
+            if lifted.landed.get() || lifted.ready.get() || lifted.failed.get() {
                 return;
             }
             if !on {
                 // No glass for it: the drag goes on in the overlay.
                 lifted.failed.set(true);
-                lifted.window.hide();
+                close_float(&lifted);
                 return;
             }
             lifted.ready.set(true);
@@ -16076,6 +16144,7 @@ fn lift_card(
     // Handed to the extension when it can swap it with the card in one
     // frame, glass or not; otherwise Sysi shows and hides it itself.
     let handed = lifted.glassed;
+    let ready_by_then = ready.clone();
     float.connect_map_event({
         let key = key.to_owned();
         move |float, _| {
@@ -16087,8 +16156,20 @@ fn lift_card(
             glib::Propagation::Proceed
         }
     });
+    // A busy shell can take a second and more to answer: the card is not
+    // left to ignore the pointer that long, it slides in the overlay.
+    glib::timeout_add_local_once(LIFT_DEADLINE, move || ready_by_then(false));
     float.show_all();
     Some(lifted)
+}
+
+/// Close a lifted card's window, once.
+fn close_float(lifted: &DragFloat) {
+    if !lifted.closed.replace(true) {
+        // SAFETY: Sysi's own popup, referenced only through this DragFloat;
+        // nothing touches it after this but the flag above.
+        unsafe { lifted.window.destroy() };
+    }
 }
 
 /// Where the dragged card would be with the pointer where it is now.
@@ -16096,9 +16177,9 @@ fn drag_point(
     start: &Cell<Option<(i32, i32, f64, f64)>>,
     card: &gtk::EventBox,
     screens: &RefCell<Vec<ScreenRect>>,
+    (pointer_x, pointer_y): (f64, f64),
 ) -> Option<Point> {
     let (ox, oy, pointer_start_x, pointer_start_y) = start.get()?;
-    let (pointer_x, pointer_y, _) = pointer_drag_sample()?;
     let allocation = card.allocation();
     Some(clamp_to_screens(
         Point {
@@ -16141,13 +16222,10 @@ fn land_float(
     LIFTED_CARD.with(|lifted| lifted.borrow_mut().take());
     card.set_opacity(1.0);
     window.queue_draw();
+    LANDING.with(|landing| landing.borrow_mut().push(Rc::downgrade(lifted)));
     let close = {
         let lifted = lifted.clone();
-        move || {
-            if lifted.window.is_visible() {
-                lifted.window.close();
-            }
-        }
+        move || close_float(&lifted)
     };
     // Whatever happens to the overlay's frames, it does not stay behind.
     glib::timeout_add_local_once(Duration::from_millis(400), close.clone());
@@ -16404,8 +16482,30 @@ fn attach_drag(
                                         let Some(lifted) = lifted.upgrade() else {
                                             return glib::ControlFlow::Break;
                                         };
+                                        // Done with: put down, or sliding in
+                                        // the overlay instead.
+                                        if lifted.landed.get() || lifted.failed.get() {
+                                            return glib::ControlFlow::Break;
+                                        }
+                                        if !lifted.ready.get() {
+                                            return glib::ControlFlow::Continue;
+                                        }
+                                        let Some((x, y, held)) = pointer_drag_sample() else {
+                                            return glib::ControlFlow::Continue;
+                                        };
+                                        // Let go: put down here even when the
+                                        // overlay is not painting (hidden), so
+                                        // its frames would never say so.
+                                        if !held {
+                                            let finish = OVERLAY_DRAG_FINISH
+                                                .with(|slot| slot.borrow().clone());
+                                            if let Some(finish) = finish {
+                                                finish(0.0, 0.0);
+                                            }
+                                            return glib::ControlFlow::Break;
+                                        }
                                         if let Some(point) =
-                                            drag_point(&start, &card, &gesture_screens)
+                                            drag_point(&start, &card, &gesture_screens, (x, y))
                                         {
                                             move_float(&lifted, point);
                                         }

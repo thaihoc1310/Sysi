@@ -140,7 +140,9 @@ pub struct Pronunciation {
     /// "uk" or "us".
     pub lang: String,
     pub ipa: String,
-    pub audio_url: String,
+    /// The word the IPA is for: Cambridge's entry, which is the lemma for an
+    /// inflection ("run" for "ran"), so the speaker says what is written.
+    pub word: String,
 }
 
 /// One part-of-speech block of the Vietnamese dictionary, e.g. "tính từ" and
@@ -566,7 +568,7 @@ fn lookup_word(query: &str, request: &Request, tx: &Sender<TranslateEvent>) -> O
             if !request.is_current() {
                 return Vec::new();
             }
-            let definitions = crate::oxford::lookup(&query);
+            let definitions = crate::oxford::lookup(&query, &|| request.is_current());
             if !definitions.is_empty() {
                 send(LookupPart::Oxford(definitions.clone()));
             }
@@ -911,17 +913,23 @@ pub fn parse_cambridge(json: &Value, query: &str) -> (Vec<Pronunciation>, Vec<En
         for item in items {
             let lang = item.get("lang").and_then(Value::as_str).unwrap_or("");
             let ipa = item.get("pron").and_then(Value::as_str).unwrap_or("");
-            let url = item.get("url").and_then(Value::as_str).unwrap_or("");
-            if ipa.is_empty() || url.is_empty() {
+            // Cambridge's own clips sit behind a Cloudflare challenge; the
+            // speaker plays Oxford's or Youdao's, so only the IPA is wanted.
+            if ipa.is_empty() {
                 continue;
             }
             if pronunciations.iter().any(|kept| kept.lang == lang) {
                 continue;
             }
+            let word = if headword.trim().is_empty() {
+                query.trim()
+            } else {
+                headword.trim()
+            };
             pronunciations.push(Pronunciation {
                 lang: lang.to_owned(),
                 ipa: ipa.to_owned(),
-                audio_url: url.to_owned(),
+                word: word.to_owned(),
             });
         }
     }
@@ -1789,7 +1797,8 @@ mod tests {
         assert_eq!(pronunciations.len(), 2);
         assert_eq!(pronunciations[0].lang, "uk");
         assert_eq!(pronunciations[0].ipa, "/uk-one/");
-        assert_eq!(pronunciations[1].audio_url, "us1.mp3");
+        assert_eq!(pronunciations[1].ipa, "/us-one/");
+        assert_eq!(pronunciations[1].word, "inefficient");
         // The trailing colon is chrome from the page, and the example-only row
         // has no definition to show.
         assert_eq!(definitions.len(), 1);
