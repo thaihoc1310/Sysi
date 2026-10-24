@@ -1632,17 +1632,36 @@ fn remote_claude_host(host: &str, offset: i64) -> Option<TokenDays> {
         .spawn()
         .ok()?;
     // Dropped once written, so python3 sees the end of the script.
-    child
+    let sent = child
         .stdin
-        .take()?
-        .write_all(include_bytes!("claude_tokens.py"))
-        .ok()?;
-    let output = child.wait_with_output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| parse_remote_days(&output.stdout))
-        .flatten()
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(include_bytes!("claude_tokens.py")).is_ok());
+    let mut stdout = child.stdout.take()?;
+    let answer = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    // A host that answers the network but never finishes (a hung home
+    // directory, say) is given a minute, not the scan thread for good.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if sent => break Some(status),
+            Ok(None) if sent && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let bytes = answer.join().ok()?;
+    status
+        .filter(|status| status.success())
+        .and_then(|_| parse_remote_days(&bytes))
 }
 
 /// claude_tokens.py's answer: `{"days": {"DAY": [input, output, cache read,

@@ -446,6 +446,8 @@ impl Proxy {
 }
 
 fn serve(mut client: TcpStream, routes: &Mutex<HashMap<String, Route>>) -> io::Result<()> {
+    // A client that connects and says nothing gives up its thread.
+    client.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut reader = BufReader::new(client.try_clone()?);
     let mut request = String::new();
     reader.read_line(&mut request)?;
@@ -501,19 +503,36 @@ fn serve(mut client: TcpStream, routes: &Mutex<HashMap<String, Route>>) -> io::R
         "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         to - from + 1
     );
+    // The first piece before the header: a stream that cannot be had is then
+    // a 502 mpv reports, not a body cut short that it takes for the end.
+    let mut first = Vec::new();
+    let Ok(mut at) = fetch(&upstream, from, (from + CHUNK - 1).min(to), &mut first) else {
+        return client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+    };
     client.write_all(head.as_bytes())?;
-    let mut at = from;
+    client.write_all(&first)?;
     while at <= to {
         at = fetch(&upstream, at, (at + CHUNK - 1).min(to), &mut client)?;
     }
     Ok(())
 }
 
+/// A refusal no retry changes: the link expired or is not this address's.
+/// The card looks the video up again instead.
+fn refused(error: &ureq::Error) -> bool {
+    matches!(error, ureq::Error::Status(403 | 404 | 410, _))
+}
+
 /// The stream's length, from the `Content-Range` of its first byte.
 fn size(url: &str) -> io::Result<u64> {
-    for _ in 0..ATTEMPTS {
-        let Ok(response) = AGENT.get(url).set("Range", "bytes=0-0").call() else {
-            continue;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(125 << attempt.min(4)));
+        }
+        let response = match AGENT.get(url).set("Range", "bytes=0-0").call() {
+            Ok(response) => response,
+            Err(error) if refused(&error) => return Err(io::Error::other("googlevideo refused")),
+            Err(_) => continue,
         };
         if let Some(total) = response
             .header("Content-Range")
@@ -531,13 +550,20 @@ fn size(url: &str) -> io::Result<u64> {
 fn fetch(url: &str, from: u64, to: u64, out: &mut impl Write) -> io::Result<u64> {
     let mut at = from;
     let mut buffer = vec![0; 64 << 10];
-    for _ in 0..ATTEMPTS {
-        let Ok(response) = AGENT
+    for attempt in 0..ATTEMPTS {
+        // A breath between tries, longer each time: a blip in the network
+        // otherwise burns all of them in a few milliseconds.
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(125 << attempt.min(4)));
+        }
+        let response = match AGENT
             .get(url)
             .set("Range", &format!("bytes={at}-{to}"))
             .call()
-        else {
-            continue;
+        {
+            Ok(response) => response,
+            Err(error) if refused(&error) => return Err(io::Error::other("googlevideo refused")),
+            Err(_) => continue,
         };
         let mut body = response.into_reader();
         while let Ok(read) = body.read(&mut buffer) {
@@ -590,17 +616,19 @@ fn watch(socket: &Path, generation: u64, updates: &async_channel::Sender<(u64, U
             None
         })
     });
-    let Some(mut stream) = stream else {
+    let Some(stream) = stream else {
+        let _ = updates.send_blocking((generation, Update::Gone));
+        return;
+    };
+    let Ok(mut ask) = stream.try_clone() else {
         let _ = updates.send_blocking((generation, Update::Gone));
         return;
     };
     let mut setup: Vec<serde_json::Value> = [
-        "time-pos",
         "duration",
         "pause",
         "mute",
         "volume",
-        "demuxer-cache-time",
         "video-params/aspect",
         "loop-file",
         "eof-reached",
@@ -619,13 +647,50 @@ fn watch(socket: &Path, generation: u64, updates: &async_channel::Sender<(u64, U
         setup.push(serde_json::json!(["keybind", key, command]));
     }
     for command in setup {
-        let _ = writeln!(stream, "{}", serde_json::json!({ "command": command }));
+        let _ = writeln!(ask, "{}", serde_json::json!({ "command": command }));
     }
-    // time-pos changes every frame; a quarter second is all the bar can show.
-    let mut quarter = i64::MIN;
+    // Where it is and how far is downloaded are asked four times a second
+    // while it plays, not observed: mpv reports both on every frame and every
+    // packet, which woke this thread some fifty times a second for a bar that
+    // shows a quarter second. Paused, they are asked only after a seek.
+    const POSITION: u64 = 1;
+    const BUFFERED: u64 = 2;
+    let poll = |ask: &mut UnixStream| {
+        for (id, name) in [(POSITION, "time-pos"), (BUFFERED, "demuxer-cache-time")] {
+            let request =
+                serde_json::json!({ "command": ["get_property", name], "request_id": id });
+            let _ = writeln!(ask, "{request}");
+        }
+    };
+    let mut reader = BufReader::new(stream);
+    // Bytes, not a String: read_line drops what it read when a timeout lands
+    // inside a multi-byte character.
+    let mut line = Vec::new();
+    let mut playing = false;
+    let mut polled = std::time::Instant::now();
     let mut buffered_second = i64::MIN;
-    for line in BufReader::new(stream).lines().map_while(Result::ok) {
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+    loop {
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            // Not a whole line yet: what came stays in `line` for the next read.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+            Ok(_) => {}
+        }
+        if playing && polled.elapsed() >= Duration::from_millis(250) {
+            polled = std::time::Instant::now();
+            poll(&mut ask);
+        }
+        if line.last() != Some(&b'\n') {
+            continue;
+        }
+        let event = serde_json::from_slice::<serde_json::Value>(&line);
+        line.clear();
+        let Ok(event) = event else {
             continue;
         };
         if event["event"] == "client-message" && event["args"][0] == "sysi-menu" {
@@ -634,35 +699,17 @@ fn watch(socket: &Path, generation: u64, updates: &async_channel::Sender<(u64, U
             }
             continue;
         }
-        if event["event"] != "property-change" {
+        if event["event"] == "playback-restart" {
+            poll(&mut ask);
             continue;
         }
         let data = &event["data"];
-        let update = match event["name"].as_str() {
-            Some("time-pos") => {
-                let Some(position) = data.as_f64() else {
-                    continue;
-                };
-                if (position * 4.0) as i64 == quarter {
-                    continue;
-                }
-                quarter = (position * 4.0) as i64;
-                Update::Position(position)
-            }
-            Some("duration") => Update::Duration(data.as_f64().unwrap_or(0.0)),
-            Some("pause") => Update::Paused(data.as_bool().unwrap_or(false)),
-            Some("mute") => Update::Muted(data.as_bool().unwrap_or(false)),
-            Some("volume") => Update::Volume(data.as_f64().unwrap_or(100.0)),
-            // "inf", a count, or false.
-            Some("eof-reached") if data == true => Update::Ended,
-            Some("loop-file") => Update::Looping(data != false && data != "no" && data != 0),
-            Some("video-params/aspect") => {
-                let Some(aspect) = data.as_f64() else {
-                    continue;
-                };
-                Update::Aspect(aspect)
-            }
-            Some("demuxer-cache-time") => {
+        let update = match event["request_id"].as_u64() {
+            Some(POSITION) => match data.as_f64() {
+                Some(position) => Update::Position(position),
+                None => continue,
+            },
+            Some(BUFFERED) => {
                 let Some(ahead) = data.as_f64() else {
                     continue;
                 };
@@ -672,7 +719,31 @@ fn watch(socket: &Path, generation: u64, updates: &async_channel::Sender<(u64, U
                 buffered_second = ahead as i64;
                 Update::Buffered(ahead)
             }
-            _ => continue,
+            _ if event["event"] != "property-change" => continue,
+            _ => match event["name"].as_str() {
+                Some("duration") => Update::Duration(data.as_f64().unwrap_or(0.0)),
+                Some("pause") => {
+                    playing = data == false;
+                    // Woken to poll only while it plays; paused, the thread
+                    // sleeps until mpv has something to say.
+                    let timeout = playing.then_some(Duration::from_millis(250));
+                    let _ = reader.get_ref().set_read_timeout(timeout);
+                    poll(&mut ask);
+                    Update::Paused(!playing)
+                }
+                Some("mute") => Update::Muted(data.as_bool().unwrap_or(false)),
+                Some("volume") => Update::Volume(data.as_f64().unwrap_or(100.0)),
+                Some("eof-reached") if data == true => Update::Ended,
+                // "inf", a count, or false.
+                Some("loop-file") => Update::Looping(data != false && data != "no" && data != 0),
+                Some("video-params/aspect") => {
+                    let Some(aspect) = data.as_f64() else {
+                        continue;
+                    };
+                    Update::Aspect(aspect)
+                }
+                _ => continue,
+            },
         };
         if updates.send_blocking((generation, update)).is_err() {
             return;
@@ -686,6 +757,9 @@ pub struct Player {
     proxy: Option<Proxy>,
     generation: u64,
     updates: async_channel::Sender<(u64, Update)>,
+    /// One connection to the current mpv for the card's commands, rather
+    /// than a new one for each (a volume drag sends dozens).
+    ipc: std::cell::RefCell<Option<UnixStream>>,
 }
 
 impl Player {
@@ -695,6 +769,7 @@ impl Player {
             proxy: None,
             generation: 0,
             updates,
+            ipc: std::cell::RefCell::new(None),
         }
     }
 
@@ -703,14 +778,34 @@ impl Player {
         self.generation
     }
 
-    /// Send mpv a command. False when there is no mpv to take it.
+    /// Send mpv a command. False only when there is no mpv: one still
+    /// starting, its socket not up yet, drops the command rather than have
+    /// the card start another.
     pub fn command(&self, command: serde_json::Value) -> bool {
-        self.child.is_some()
-            && UnixStream::connect(socket(self.generation))
-                .and_then(|mut stream| {
-                    writeln!(stream, "{}", serde_json::json!({ "command": command }))
-                })
-                .is_ok()
+        if self.child.is_none() {
+            return false;
+        }
+        let line = format!("{}\n", serde_json::json!({ "command": command }));
+        let mut ipc = self.ipc.borrow_mut();
+        // Once on the open connection, once more on a fresh one.
+        for _ in 0..2 {
+            if ipc.is_none() {
+                *ipc = UnixStream::connect(socket(self.generation))
+                    .and_then(|stream| {
+                        stream.set_write_timeout(Some(Duration::from_millis(200)))?;
+                        Ok(stream)
+                    })
+                    .ok();
+            }
+            let Some(stream) = ipc.as_mut() else {
+                return true;
+            };
+            if stream.write_all(line.as_bytes()).is_ok() {
+                return true;
+            }
+            *ipc = None;
+        }
+        true
     }
 
     /// Play `streams` in the X window `xid` from `start` seconds, at the
@@ -813,6 +908,7 @@ impl Player {
         let _ = child.kill();
         let _ = std::fs::remove_file(socket(self.generation));
         self.generation += 1;
+        *self.ipc.borrow_mut() = None;
         // Reaped off the main loop.
         thread::spawn(move || child.wait());
     }

@@ -1021,6 +1021,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 // would be noted as the new link's meanwhile.
                 player.borrow_mut().stop();
                 reset_youtube_controls(&card);
+                forget_youtube_media(&card);
                 let mut data = state.borrow_mut();
                 data.settings.youtube_url = input.clone();
                 data.settings.youtube_position = 0.0;
@@ -1064,7 +1065,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     )
                 };
                 let status = match (streams, xid) {
-                    (Err(reason), _) => reason,
+                    (Err(reason), _) => {
+                        forget_youtube_media(&card);
+                        reason
+                    }
                     (Ok(_), None) => {
                         continue;
                     }
@@ -1075,7 +1079,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         {
                             Ok(()) => {
                                 // A new mpv, a new window to round.
-                                card.video_shape.set(None);
+                                card.video_shape.set(Some((0, 0, 0, false)));
                                 {
                                     let mut preview = card.preview.borrow_mut();
                                     preview.video += 1;
@@ -1112,6 +1116,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let card = youtube_card.clone();
         let player = youtube_player.clone();
         let state = state.clone();
+        let play_youtube = play_youtube.clone();
+        // On disk every half minute of playing, not only at a pause: a logout
+        // that takes Xwayland first never reaches the save on quit.
+        let saved_at = Cell::new(0i64);
+        // When a stream that failed mid-play was last looked up again.
+        let retried_at = Cell::new(0i64);
         async move {
             while let Ok((generation, update)) = youtube_updates.recv().await {
                 if generation != player.borrow().generation() {
@@ -1120,6 +1130,10 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 match update {
                     youtube::Update::Position(position) => {
                         state.borrow_mut().settings.youtube_position = position;
+                        if now_ms() - saved_at.get() > 30_000 {
+                            saved_at.set(now_ms());
+                            let _ = state.borrow().save();
+                        }
                         card.seek.set_value(position);
                         if !card.seek.dragging() {
                             show_youtube_time(&card, position);
@@ -1170,6 +1184,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                         ]));
                     }
                     youtube::Update::Paused(paused) => {
+                        card.paused.set(paused);
                         let (icon, tip) = match paused {
                             true => ("media-playback-start-symbolic", "Play"),
                             false => ("media-playback-pause-symbolic", "Pause"),
@@ -1195,6 +1210,27 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     // frame, where play does nothing, and the position saved
                     // there would reopen the card at the end.
                     youtube::Update::Ended => {
+                        // mpv reaches its "end" too when the stream fails under
+                        // it (a link expired over a long pause, the network
+                        // gone): not near the real end, that is a failure, and
+                        // the place it was is kept and the video looked up again.
+                        let length = card.seek.max();
+                        let at = state.borrow().settings.youtube_position;
+                        let live = length <= 0.0;
+                        if !live && at < length - 2.0 {
+                            youtube::forget();
+                            if now_ms() - retried_at.get() > 30_000 {
+                                retried_at.set(now_ms());
+                                play_youtube(false);
+                            } else {
+                                player.borrow_mut().stop();
+                                reset_youtube_controls(&card);
+                                *card.status.borrow_mut() =
+                                    "Playback stopped \u{2014} press play to try again".to_string();
+                                card.video.queue_draw();
+                            }
+                            continue;
+                        }
                         state.borrow_mut().settings.youtube_position = 0.0;
                         let _ = state.borrow().save();
                         let player = player.borrow();
@@ -1207,8 +1243,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     youtube::Update::Gone => {
                         player.borrow_mut().stop();
                         youtube::forget();
-                        card.video_shape.set(None);
                         reset_youtube_controls(&card);
+                        forget_youtube_media(&card);
                         *card.status.borrow_mut() =
                             "Playback stopped \u{2014} press play to try again".to_string();
                         card.video.queue_draw();
@@ -1271,6 +1307,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 if video != card.preview.borrow().video {
                     continue;
                 }
+                // Not had this time: asked for again when the pointer comes back.
+                let Some(bytes) = bytes else {
+                    card.preview.borrow_mut().asked.remove(&index);
+                    continue;
+                };
                 let loader = gdk_pixbuf::PixbufLoader::new();
                 let decoded = loader.write(&bytes).and_then(|()| loader.close());
                 let Some(sheet) = decoded.ok().and_then(|()| loader.pixbuf()) else {
@@ -1300,13 +1341,18 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let card = youtube_card.clone();
         let player = youtube_player.clone();
         let state = state.clone();
-        move |level, _| {
+        let sent_at = Cell::new(0i64);
+        move |level, done| {
             let level = level.round();
             state.borrow_mut().settings.youtube_volume = level;
             show_youtube_sound(&card, state.borrow().settings.youtube_muted);
-            player
-                .borrow()
-                .command(serde_json::json!(["set_property", "volume", level]));
+            // Ten a second while dragged is plenty to hear it follow.
+            if done || now_ms() - sent_at.get() >= 100 {
+                sent_at.set(now_ms());
+                player
+                    .borrow()
+                    .command(serde_json::json!(["set_property", "volume", level]));
+            }
         }
     });
     // YOUTUBE's own row in its menu: play the video over again at its end.
@@ -1472,22 +1518,17 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             }
         });
     }
-    glib::timeout_add_local(Duration::from_millis(120), {
+    // Polled while the card is up, and only then: mapped, not just visible,
+    // since a hidden overlay hides the card's window but leaves the widget
+    // flagged visible.
+    let youtube_tick: Rc<dyn Fn()> = {
         let card = youtube_card.clone();
         let registry = registry.clone();
         let root = root.clone();
         let pointer_left = pointer_left.clone();
         let last_pointer = Cell::new((0, 0));
         let moved_at = Cell::new(0i64);
-        move || {
-            // Mapped, not just visible: a hidden overlay hides the card's
-            // window but leaves the widget flagged visible. While the card is
-            // dragged the controls could only trail behind it.
-            if !card.card.is_mapped() {
-                card.overlay.hide();
-                card.tip.hide();
-                return glib::ControlFlow::Continue;
-            }
+        Rc::new(move || {
             // mpv's window is above everything Sysi paints, OCR's dim included,
             // and would take the press that starts a selection. Out of the
             // way while one is up; the sound plays on.
@@ -1504,40 +1545,35 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
             if selecting {
                 card.overlay.hide();
                 card.tip.hide();
-                return glib::ControlFlow::Continue;
+                return;
             }
             // The title bar comes and goes with lock mode; keep the video 16:9
             // through that as well.
             fit_youtube_card(&card);
-            let resizing = any_gesture_held(&registry) && card.resize_handle.is_visible();
-            if let Some(device) = gdk::Display::default()
-                .and_then(|display| display.default_seat())
-                .and_then(|seat| seat.pointer())
-            {
-                let (_, x, y) = device.position();
-                let near = card.chrome.is_visible()
-                    && card.card.window().is_some_and(|window| {
-                        let (_, left, top) = window.origin();
-                        let (right, bottom) = (left + window.width(), top + window.height());
-                        (right - 32..right).contains(&x) && (bottom - 32..bottom).contains(&y)
-                    });
-                let wanted = resizing || near;
-                if card.resize_handle.is_visible() != wanted {
-                    card.resize_handle.set_visible(wanted);
-                }
-            }
-            if any_gesture_held(&registry) {
-                card.overlay.hide();
-                card.tip.hide();
-                return glib::ControlFlow::Continue;
-            }
             let Some(device) = gdk::Display::default()
                 .and_then(|display| display.default_seat())
                 .and_then(|seat| seat.pointer())
             else {
-                return glib::ControlFlow::Continue;
+                return;
             };
             let (_, x, y) = device.position();
+            let held = any_gesture_held(&registry);
+            let resizing = held && card.resize_handle.is_visible();
+            let near = card.chrome.is_visible()
+                && card.card.window().is_some_and(|window| {
+                    let (_, left, top) = window.origin();
+                    let (right, bottom) = (left + window.width(), top + window.height());
+                    (right - 32..right).contains(&x) && (bottom - 32..bottom).contains(&y)
+                });
+            let wanted = resizing || near;
+            if card.resize_handle.is_visible() != wanted {
+                card.resize_handle.set_visible(wanted);
+            }
+            if held {
+                card.overlay.hide();
+                card.tip.hide();
+                return;
+            }
             let gone = match pointer_left.get() {
                 Some(left) if left == (x, y) => true,
                 Some(_) => {
@@ -1565,9 +1601,44 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 card.tip.hide();
                 card.volume_reveal.set_reveal_child(false);
             }
-            glib::ControlFlow::Continue
+        })
+    };
+    let youtube_ticking: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    let start_youtube_tick = {
+        let tick = youtube_tick.clone();
+        let ticking = youtube_ticking.clone();
+        move || {
+            if ticking.borrow().is_none() {
+                let tick = tick.clone();
+                *ticking.borrow_mut() = Some(glib::timeout_add_local(
+                    Duration::from_millis(120),
+                    move || {
+                        tick();
+                        glib::ControlFlow::Continue
+                    },
+                ));
+            }
+        }
+    };
+    youtube_card.card.connect_map({
+        let start = start_youtube_tick.clone();
+        move |_| start()
+    });
+    youtube_card.card.connect_unmap({
+        let card = youtube_card.clone();
+        let ticking = youtube_ticking.clone();
+        move |_| {
+            if let Some(source) = ticking.borrow_mut().take() {
+                source.remove();
+            }
+            // While the card is dragged the controls could only trail behind it.
+            card.overlay.hide();
+            card.tip.hide();
         }
     });
+    if youtube_card.card.is_mapped() {
+        start_youtube_tick();
+    }
     let toggle_youtube: Rc<dyn Fn()> = {
         let toggle = CardToggle {
             card: youtube_card.card.clone(),
@@ -1587,6 +1658,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let play_youtube = play_youtube.clone();
         let player = youtube_player.clone();
         let card = youtube_card.clone();
+        let state = state.clone();
         Rc::new(move || {
             // Closed, the card frees mpv and its couple of hundred MB; the
             // place to carry on from is already in the state.
@@ -1594,9 +1666,15 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 player.borrow_mut().stop();
                 reset_youtube_controls(&card);
             }
-            toggle.toggle(&|| play_youtube(false), &|data, open| {
-                data.settings.youtube_open = open
-            });
+            // Opened with nothing to play yet: the link box, ready to type in.
+            let on_open = || {
+                if state.borrow().settings.youtube_url.is_empty() {
+                    show_youtube_entry(&card, true);
+                } else {
+                    play_youtube(false);
+                }
+            };
+            toggle.toggle(&on_open, &|data, open| data.settings.youtube_open = open);
         })
     };
     youtube_card.entry.connect_activate({
@@ -2886,8 +2964,12 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     } else {
         youtube_card.chrome.set_visible(interactive.get());
         // Back where it was after a restart, but paused: a login should not
-        // start talking.
-        play_youtube(true);
+        // start talking. Nothing played yet: the link box, as on opening.
+        if state.borrow().settings.youtube_url.is_empty() {
+            show_youtube_entry(&youtube_card, true);
+        } else {
+            play_youtube(true);
+        }
     }
     // Likewise the dictionary: show_all() dropped its query panel down, but a
     // window restored from the last session was not asked for just now.
@@ -3396,6 +3478,8 @@ struct YoutubeCard {
     time: gtk::Label,
     /// Where the pointer would seek to, floated over the video.
     tip: HoverTip,
+    /// Whether mpv last said it was paused (true with no mpv).
+    paused: Rc<Cell<bool>>,
     preview: Rc<RefCell<YoutubePreview>>,
     /// What the settings menu offers and has chosen for this video.
     media: Rc<RefCell<YoutubeMedia>>,
@@ -3406,10 +3490,13 @@ struct YoutubeCard {
     /// ones too.
     video_corners: Rc<Cell<(i32, bool)>>,
     /// The X shape last given mpv's window: its size and corners in device
-    /// pixels. Cleared for each new mpv.
+    /// pixels. None with no mpv; all zero for a new one whose window is still
+    /// to turn up.
     video_shape: Rc<Cell<Option<(i32, i32, i32, bool)>>>,
     /// When the controls were last raised, in ms.
     raised_at: Rc<Cell<i64>>,
+    /// Where the controls were last moved to.
+    overlay_at: Rc<Cell<(i32, i32)>>,
     status: Rc<RefCell<String>>,
     color_mode: Rc<Cell<Foreground>>,
     resize: ResizeHandle,
@@ -3539,6 +3626,20 @@ impl MediaSlider {
                 glib::Propagation::Stop
             }
         });
+        // A drag the slider never hears end (its window hidden mid-drag, a
+        // grab taken away) would leave it "dragging": the controls pinned up
+        // and the bar deaf to playback. Gone is let go.
+        slider.area.connect_grab_broken_event({
+            let slider = slider.clone();
+            move |_, _| {
+                slider.cancel_drag();
+                glib::Propagation::Proceed
+            }
+        });
+        slider.area.connect_unmap({
+            let slider = slider.clone();
+            move |_| slider.cancel_drag()
+        });
         slider.area.connect_leave_notify_event({
             let state = slider.state.clone();
             move |area, _| {
@@ -3572,6 +3673,15 @@ impl MediaSlider {
 
     fn dragging(&self) -> bool {
         self.state.borrow().dragging
+    }
+
+    /// Drop a drag without acting on it.
+    fn cancel_drag(&self) {
+        let mut state = self.state.borrow_mut();
+        state.dragging = false;
+        state.hover = None;
+        drop(state);
+        self.area.queue_draw();
     }
 
     fn value(&self) -> f64 {
@@ -3717,21 +3827,37 @@ impl HoverTip {
     /// Centred above the root point `(x, y)`, with the frame over the time
     /// when there is one.
     fn show(&self, text: &str, x: f64, y: f64, frame: Option<&cairo::Surface>) {
-        self.label.set_text(text);
-        self.image.set_from_surface(frame);
-        self.image.set_visible(frame.is_some());
+        if self.label.text() != text {
+            self.label.set_text(text);
+        }
+        // Set only when it changes: the pointer moving within one tile keeps
+        // the same frame, and setting it again re-lays the tip for nothing.
+        let had_frame = self.image.is_visible();
+        let same = match (frame, self.image.surface()) {
+            (Some(frame), Some(shown)) => frame.to_raw_none() == shown.to_raw_none(),
+            (None, _) => !had_frame,
+            _ => false,
+        };
+        if !same {
+            self.image.set_from_surface(frame);
+            self.image.set_visible(frame.is_some());
+        }
         self.anchor.set((x.round() as i32, y.round() as i32));
         let natural = self.window.preferred_size().1;
         // Shrunk back too when the frame goes.
-        self.window.resize(natural.width, natural.height);
+        if had_frame != frame.is_some() {
+            self.window.resize(natural.width, natural.height);
+        }
         self.window.move_(
             x.round() as i32 - natural.width / 2,
             y.round() as i32 - natural.height - 6,
         );
-        self.window.show();
-        // The overlay is raised as it works; this goes over it each time.
-        if let Some(window) = self.window.window() {
-            window.raise();
+        if !self.window.is_visible() {
+            self.window.show();
+            // The overlay is raised as it works; this goes over it.
+            if let Some(window) = self.window.window() {
+                window.raise();
+            }
         }
     }
 
@@ -3752,6 +3878,9 @@ struct YoutubePreview {
     asked: HashSet<usize>,
     /// Counted per video, so a sheet of the one before is dropped.
     video: u64,
+    /// The frame last shown and which tile it was (sheet, left, top, scale):
+    /// moving along the bar within one tile reuses it.
+    frame: Option<((usize, i32, i32, i32), cairo::Surface)>,
     hover: Option<(f64, f64, f64)>,
 }
 
@@ -3835,13 +3964,17 @@ fn youtube_settings_menu(
         item.connect_activate({
             let state = state.clone();
             let play = play.clone();
+            let card = card.clone();
             move |_| {
                 if state.borrow().settings.youtube_height == choice {
                     return;
                 }
                 state.borrow_mut().settings.youtube_height = choice;
                 let _ = state.borrow().save();
-                play(false);
+                // The link that plays, at the new height, paused if it was:
+                // not whatever an open link box holds.
+                show_youtube_entry(&card, false);
+                play(card.paused.get());
             }
         });
         heights.append(&item);
@@ -3919,7 +4052,7 @@ impl Default for YoutubeMedia {
 
 /// A storyboard sheet fetched off the main loop: for which video, which
 /// sheet, its bytes.
-type SheetFetched = (u64, usize, Vec<u8>);
+type SheetFetched = (u64, usize, Option<Vec<u8>>);
 
 /// Show the time under the pointer, and the frame there once its sheet is in.
 /// A sheet not asked for yet is fetched; it calls this again when it lands.
@@ -3932,14 +4065,18 @@ fn show_youtube_preview(card: &YoutubeCard, fetched: &async_channel::Sender<Shee
     let scale = card.video.scale_factor();
     let frame = preview.board.clone().and_then(|board| {
         let (index, left, top) = board.locate(position)?;
+        let tile_key = (index, left, top, scale);
+        if let Some((key, surface)) = &preview.frame {
+            if *key == tile_key {
+                return Some(surface.clone());
+            }
+        }
         let Some(sheet) = preview.sheets.get(&index) else {
             if preview.asked.insert(index) {
                 let url = board.sheet_url(index)?.to_string();
                 let (video, fetched) = (preview.video, fetched.clone());
                 std::thread::spawn(move || {
-                    if let Some(bytes) = youtube::fetch_sheet(&url) {
-                        let _ = fetched.send_blocking((video, index, bytes));
-                    }
+                    let _ = fetched.send_blocking((video, index, youtube::fetch_sheet(&url)));
                 });
             }
             return None;
@@ -3957,7 +4094,9 @@ fn show_youtube_preview(card: &YoutubeCard, fetched: &async_channel::Sender<Shee
                 InterpType::Bilinear,
             )?,
         };
-        tile.create_surface(scale, card.video.window().as_ref())
+        let surface = tile.create_surface(scale, card.video.window().as_ref())?;
+        preview.frame = Some((tile_key, surface.clone()));
+        Some(surface)
     });
     drop(preview);
     card.tip.show(&clock(position), x, y, frame.as_ref());
@@ -4010,8 +4149,8 @@ fn round_youtube_video(card: &YoutubeCard) {
     );
     let shape = (width, height, radius * scale, corners.1);
     // Asked of X only when something changed: a new mpv clears the cache, and
-    // until its window turns up this keeps looking.
-    if card.video_shape.get() == Some(shape) {
+    // until its window turns up this keeps looking. Not at all with no mpv.
+    if card.video_shape.get().is_none_or(|last| last == shape) {
         return;
     }
     let Some((display, mpv)) = card
@@ -4178,7 +4317,8 @@ fn place_youtube_overlay(card: &YoutubeCard) {
         ));
         card.overlay.input_shape_combine_region(Some(&input));
     }
-    if card.overlay.position() != (x, top) {
+    // Its last place kept here: asking the window where it is goes to X.
+    if card.overlay_at.replace((x, top)) != (x, top) {
         card.overlay.move_(x, top);
     }
     let shown = !card.overlay.is_visible();
@@ -4255,9 +4395,32 @@ fn right_click_at_pointer(widget: &gtk::EventBox) {
     }
 }
 
+/// Forget what the card knew of the video that played: its title, its
+/// storyboard, its subtitle tracks. Done when the link changes or fails, or
+/// the title bar, the seek preview and the cog went on showing the old one.
+fn forget_youtube_media(card: &YoutubeCard) {
+    card.playing.set_text("");
+    card.playing.set_tooltip_text(None);
+    {
+        let mut preview = card.preview.borrow_mut();
+        preview.video += 1;
+        preview.board = None;
+        preview.frame = None;
+        preview.sheets.clear();
+        preview.asked.clear();
+        preview.arrived.clear();
+    }
+    *card.media.borrow_mut() = YoutubeMedia::default();
+}
+
 /// The controls with no mpv behind them: ready to play, at the start.
 fn reset_youtube_controls(card: &YoutubeCard) {
     set_button_icon(&card.play, "media-playback-start-symbolic", "Play");
+    card.paused.set(true);
+    // No mpv: no window to look for.
+    card.video_shape.set(None);
+    card.seek.cancel_drag();
+    card.volume.cancel_drag();
     card.seek.set_value(0.0);
     card.seek.set_max(0.0);
     card.seek.set_buffered(0.0);
@@ -4373,7 +4536,9 @@ fn build_youtube_window(initial_color_mode: Foreground) -> YoutubeCard {
             }
         }
     });
-    let status = Rc::new(RefCell::new(String::from("Paste a YouTube link above")));
+    let status = Rc::new(RefCell::new(String::from(
+        "Paste a link or type a search in the box above",
+    )));
     let video_corners = Rc::new(Cell::new((14, false)));
     let video = gtk::DrawingArea::new();
     video.set_hexpand(true);
@@ -4500,12 +4665,14 @@ fn build_youtube_window(initial_color_mode: Foreground) -> YoutubeCard {
         sound,
         time,
         tip: HoverTip::new(),
+        paused: Rc::new(Cell::new(true)),
         preview: Rc::new(RefCell::new(YoutubePreview::default())),
         media: Rc::new(RefCell::new(YoutubeMedia::default())),
         settings,
         settings_open: Rc::new(Cell::new(false)),
         video_corners,
         video_shape: Rc::new(Cell::new(None)),
+        overlay_at: Rc::new(Cell::new((i32::MIN, i32::MIN))),
         raised_at: Rc::new(Cell::new(0)),
         status,
         color_mode: shell.color_mode,
