@@ -4141,11 +4141,7 @@ fn fit_youtube_card(card: &YoutubeCard) {
 /// opaque, so it gets an X shape. (Shaping the video area instead leaves what
 /// it uncovers black: GTK never paints under a window of its own.)
 fn round_youtube_video(card: &YoutubeCard) {
-    let radius = if card.card.style_context().has_class("mode-glass") {
-        14
-    } else {
-        4
-    };
+    let radius = card_corner_radius(&card.card);
     let corners = (radius, !card.chrome.is_visible());
     if card.video_corners.get() != corners {
         card.video_corners.set(corners);
@@ -15633,6 +15629,19 @@ fn hide_native_inside(card: &gtk::EventBox) {
     if hidden.is_empty() {
         return;
     }
+    // What each showed stays in its place, painted by the card itself, so
+    // the video goes with the card as a still rather than as a hole.
+    let pictures: Vec<NativePicture> = hidden
+        .iter()
+        .filter_map(|native| picture_of_native(card, native))
+        .collect();
+    if !pictures.is_empty() {
+        paint_native_pictures(card);
+        unsafe {
+            card.set_data(NATIVE_PICTURES_KEY, pictures);
+        }
+        card.queue_draw();
+    }
     for native in &hidden {
         native.hide();
     }
@@ -15645,6 +15654,119 @@ fn show_native_inside(card: &gtk::EventBox) {
     let hidden: Option<Vec<gdk::Window>> = unsafe { card.steal_data(HIDDEN_NATIVE_KEY) };
     for native in hidden.into_iter().flatten() {
         native.show();
+    }
+    let pictures: Option<Vec<NativePicture>> = unsafe { card.steal_data(NATIVE_PICTURES_KEY) };
+    if pictures.is_some() {
+        card.queue_draw();
+    }
+}
+
+const NATIVE_PICTURES_KEY: &str = "sysi-native-pictures";
+const NATIVE_PAINTER_KEY: &str = "sysi-native-painter";
+
+/// The last picture of a native window hidden for a drag, where it sat in
+/// the card.
+struct NativePicture {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    surface: cairo::Surface,
+}
+
+/// Read what another program drew in `native` (mpv's frame) off the X
+/// server. Only windows with such a child: GTK's own paint again on their
+/// own, and an input-only window has no pixels to read.
+fn picture_of_native(card: &gtk::EventBox, native: &gdk::Window) -> Option<NativePicture> {
+    let (_, xid) = foreign_child(native)?;
+    let display = native.display().downcast::<gdkx11::X11Display>().ok()?;
+    // mpv's window can be gone by now; an X error GDK was not told to expect
+    // ends the whole program.
+    display.error_trap_push();
+    // Called directly: the binding takes the NULL GDK answers with for a
+    // window that has gone for a window all the same.
+    let foreign = unsafe {
+        use glib::translate::{FromGlibPtrFull, ToGlibPtr};
+        let raw =
+            gdkx11::ffi::gdk_x11_window_foreign_new_for_display(display.to_glib_none().0, xid);
+        (!raw.is_null()).then(|| gdk::Window::from_glib_full(raw.cast()))
+    };
+    let pixbuf =
+        foreign.and_then(|foreign| foreign.pixbuf(0, 0, foreign.width(), foreign.height()));
+    display.error_trap_pop_ignored();
+    let pixbuf = pixbuf?;
+    let (_, native_x, native_y) = native.origin();
+    let (_, card_x, card_y) = card.window()?.origin();
+    // A card without a window of its own is placed in its parent's.
+    let (offset_x, offset_y) = if card.has_window() {
+        (0, 0)
+    } else {
+        (card.allocation().x(), card.allocation().y())
+    };
+    let (width, height) = (native.width(), native.height());
+    let scale = card.scale_factor();
+    // Scaled once here rather than in every frame of the drag.
+    let pixbuf = pixbuf.scale_simple(
+        (width * scale).max(1),
+        (height * scale).max(1),
+        InterpType::Bilinear,
+    )?;
+    let surface = pixbuf.create_surface(scale, card.window().as_ref())?;
+    Some(NativePicture {
+        x: f64::from(native_x - card_x - offset_x),
+        y: f64::from(native_y - card_y - offset_y),
+        width: f64::from(width),
+        height: f64::from(height),
+        surface,
+    })
+}
+
+/// Paint the pictures over the card, within its rounded corners, once
+/// connected; after the card's own paint, which would cover them.
+fn paint_native_pictures(card: &gtk::EventBox) {
+    if unsafe { card.data::<bool>(NATIVE_PAINTER_KEY) }.is_some() {
+        return;
+    }
+    unsafe {
+        card.set_data(NATIVE_PAINTER_KEY, true);
+    }
+    card.connect_local("draw", true, |values| {
+        let card = values.first()?.get::<gtk::EventBox>().ok()?;
+        let ctx = values.get(1)?.get::<cairo::Context>().ok()?;
+        // SAFETY: the key is only ever set to a Vec<NativePicture>.
+        let pictures = unsafe { card.data::<Vec<NativePicture>>(NATIVE_PICTURES_KEY) };
+        if let Some(pictures) = pictures {
+            let pictures = unsafe { pictures.as_ref() };
+            let _ = ctx.save();
+            rounded_rect_path(
+                &ctx,
+                f64::from(card.allocated_width()),
+                f64::from(card.allocated_height()),
+                f64::from(card_corner_radius(&card)),
+                true,
+            );
+            ctx.clip();
+            for picture in pictures {
+                if ctx
+                    .set_source_surface(&picture.surface, picture.x, picture.y)
+                    .is_ok()
+                {
+                    ctx.rectangle(picture.x, picture.y, picture.width, picture.height);
+                    let _ = ctx.fill();
+                }
+            }
+            let _ = ctx.restore();
+        }
+        Some(false.to_value())
+    });
+}
+
+/// The rounding of a card's glass, which what is painted over it keeps to.
+fn card_corner_radius(card: &impl IsA<gtk::Widget>) -> i32 {
+    if card.style_context().has_class("mode-glass") {
+        14
+    } else {
+        4
     }
 }
 
