@@ -384,26 +384,31 @@ fn set_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool) {
     }
 }
 
-/// Give a popover glass of its own while the card it belongs to is glass.
-/// A popover lives inside the overlay window, so its glass travels with the
-/// cards' as one more card, painted last.
 /// Glass under a window of Sysi's own standing in for a card, the one being
 /// dragged: drawn by the extension inside that window, it moves with the
-/// window in the same frame. `done` hears whether the window can stand in
-/// for the card: yes at once when there is no live glass (the card wears its
-/// own frosted plate then, and the window shows it), and otherwise whether
-/// the glass went on.
-pub fn glass_window(window: &gtk::Window, key: &str, pressed: bool, done: Rc<dyn Fn(bool)>) {
+/// window in the same frame. The card sits `inset` logical pixels inside the
+/// window on every side. `done` hears whether the window can stand in for the
+/// card: yes at once when there is no live glass (the card wears its own
+/// frosted plate then, and the window shows it), and otherwise whether the
+/// glass went on.
+pub fn glass_window(
+    window: &gtk::Window,
+    key: &str,
+    inset: i32,
+    pressed: bool,
+    done: Rc<dyn Fn(bool)>,
+) {
     if !glass_is_live() {
         done(true);
         return;
     }
-    send_window(window.clone(), key.to_owned(), pressed, done, 6);
+    send_window(window.clone(), key.to_owned(), inset, pressed, done, 6);
 }
 
 fn send_window(
     window: gtk::Window,
     key: String,
+    inset: i32,
     pressed: bool,
     done: Rc<dyn Fn(bool)>,
     tries: u32,
@@ -427,16 +432,17 @@ fn send_window(
         f64::from(window.allocated_width()) * scale,
         f64::from(window.allocated_height()) * scale,
     );
+    let inset_px = f64::from(inset) * scale;
     let message: Message = (
         xid,
         width,
         height,
         vec![(
             key.clone(),
-            0.0,
-            0.0,
-            width,
-            height,
+            inset_px,
+            inset_px,
+            width - 2.0 * inset_px,
+            height - 2.0 * inset_px,
             RADIUS * scale,
             pressed,
         )],
@@ -462,12 +468,15 @@ fn send_window(
                 return;
             }
             glib::timeout_add_local_once(Duration::from_millis(15), move || {
-                send_window(window, key, pressed, done, tries - 1)
+                send_window(window, key, inset, pressed, done, tries - 1)
             });
         },
     );
 }
 
+/// Give a popover glass of its own while the card it belongs to is glass.
+/// A popover lives inside the overlay window, so its glass travels with the
+/// cards' as one more card, painted last.
 pub fn glass_popover(popover: &gtk::Popover) {
     POPOVERS.with(|list| {
         let mut list = list.borrow_mut();

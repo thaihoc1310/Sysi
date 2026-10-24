@@ -15678,23 +15678,17 @@ struct NativePicture {
 /// server. Only windows with such a child: GTK's own paint again on their
 /// own, and an input-only window has no pixels to read.
 fn picture_of_native(card: &gtk::EventBox, native: &gdk::Window) -> Option<NativePicture> {
-    let (_, xid) = foreign_child(native)?;
+    let (xdisplay, xid) = foreign_child(native)?;
     let display = native.display().downcast::<gdkx11::X11Display>().ok()?;
-    // mpv's window can be gone by now; an X error GDK was not told to expect
-    // ends the whole program.
+    // Read straight off the X server: wrapped as a GDK window, mpv's would
+    // join GDK's own tree, and GDK reshapes native windows of its own to clip
+    // them, which can leave mpv's showing nothing. mpv's window can be gone
+    // by now as well; an X error GDK was not told to expect ends the whole
+    // program.
     display.error_trap_push();
-    // Called directly: the binding takes the NULL GDK answers with for a
-    // window that has gone for a window all the same.
-    let foreign = unsafe {
-        use glib::translate::{FromGlibPtrFull, ToGlibPtr};
-        let raw =
-            gdkx11::ffi::gdk_x11_window_foreign_new_for_display(display.to_glib_none().0, xid);
-        (!raw.is_null()).then(|| gdk::Window::from_glib_full(raw.cast()))
-    };
-    let pixbuf =
-        foreign.and_then(|foreign| foreign.pixbuf(0, 0, foreign.width(), foreign.height()));
+    let frame = unsafe { read_window_pixels(xdisplay, xid) };
     display.error_trap_pop_ignored();
-    let pixbuf = pixbuf?;
+    let frame = frame?;
     let (_, native_x, native_y) = native.origin();
     let (_, card_x, card_y) = card.window()?.origin();
     // A card without a window of its own is placed in its parent's.
@@ -15706,12 +15700,24 @@ fn picture_of_native(card: &gtk::EventBox, native: &gdk::Window) -> Option<Nativ
     let (width, height) = (native.width(), native.height());
     let scale = card.scale_factor();
     // Scaled once here rather than in every frame of the drag.
-    let pixbuf = pixbuf.scale_simple(
+    let surface = cairo::ImageSurface::create(
+        cairo::Format::Rgb24,
         (width * scale).max(1),
         (height * scale).max(1),
-        InterpType::Bilinear,
-    )?;
-    let surface = pixbuf.create_surface(scale, card.window().as_ref())?;
+    )
+    .ok()?;
+    {
+        let ctx = Context::new(&surface).ok()?;
+        ctx.scale(
+            f64::from(width * scale) / f64::from(frame.width().max(1)),
+            f64::from(height * scale) / f64::from(frame.height().max(1)),
+        );
+        ctx.set_source_surface(&frame, 0.0, 0.0).ok()?;
+        ctx.source().set_filter(cairo::Filter::Good);
+        ctx.paint().ok()?;
+    }
+    surface.set_device_scale(f64::from(scale), f64::from(scale));
+    let surface: cairo::Surface = (*surface).clone();
     Some(NativePicture {
         x: f64::from(native_x - card_x - offset_x),
         y: f64::from(native_y - card_y - offset_y),
@@ -15719,6 +15725,69 @@ fn picture_of_native(card: &gtk::EventBox, native: &gdk::Window) -> Option<Nativ
         height: f64::from(height),
         surface,
     })
+}
+
+/// The pixels of a 24-bit window, as XGetImage hands them over, in a cairo
+/// surface. None for anything else (another depth, another byte order).
+///
+/// # Safety
+/// `display` must be the open connection `window` was found on.
+unsafe fn read_window_pixels(
+    display: *mut x11::xlib::Display,
+    window: x11::xlib::Window,
+) -> Option<cairo::ImageSurface> {
+    let mut attributes: x11::xlib::XWindowAttributes = std::mem::zeroed();
+    if x11::xlib::XGetWindowAttributes(display, window, &mut attributes) == 0
+        || attributes.map_state != x11::xlib::IsViewable
+    {
+        return None;
+    }
+    let (width, height) = (attributes.width, attributes.height);
+    if width < 1 || height < 1 {
+        return None;
+    }
+    let image = x11::xlib::XGetImage(
+        display,
+        window,
+        0,
+        0,
+        width as u32,
+        height as u32,
+        x11::xlib::XAllPlanes(),
+        x11::xlib::ZPixmap,
+    );
+    if image.is_null() {
+        return None;
+    }
+    let read = {
+        let image = &*image;
+        // 0x00RRGGBB in a native-endian word: cairo's RGB24 exactly.
+        let fits = image.bits_per_pixel == 32
+            && image.red_mask == 0xff0000
+            && image.green_mask == 0xff00
+            && image.blue_mask == 0xff
+            && image.byte_order == x11::xlib::LSBFirst
+            && cfg!(target_endian = "little");
+        fits.then(|| {
+            let mut surface =
+                cairo::ImageSurface::create(cairo::Format::Rgb24, width, height).ok()?;
+            let stride = surface.stride() as usize;
+            let row = image.bytes_per_line as usize;
+            let bytes = (width as usize) * 4;
+            {
+                let mut data = surface.data().ok()?;
+                for y in 0..height as usize {
+                    let source =
+                        std::slice::from_raw_parts((image.data as *const u8).add(y * row), bytes);
+                    data[y * stride..y * stride + bytes].copy_from_slice(source);
+                }
+            }
+            Some(surface)
+        })
+        .flatten()
+    };
+    x11::xlib::XDestroyImage(image);
+    read
 }
 
 /// Paint the pictures over the card, within its rounded corners, once
@@ -15864,6 +15933,13 @@ fn move_overlay_card(
     root.move_(card, point.x, point.y);
 }
 
+/// Room around a lifted card in its window for what the glass draws past
+/// the card's edge (its shadow, the light its rim bends): the extension's
+/// MARGIN. Inside the window, the compositor repaints it all as the window
+/// moves; outside, it is left behind as a trail, and the glass, short of a
+/// whole copy of what lies under it, keeps showing an old one.
+const FLOAT_MARGIN: i32 = 32;
+
 /// How often a lifted card's window follows the pointer: above any screen's
 /// refresh, so the compositor always has the latest place to show.
 const FLOAT_POLL: Duration = Duration::from_millis(3);
@@ -15927,13 +16003,20 @@ fn lift_card(
         float.set_visual(Some(&visual));
     }
     float.set_app_paintable(true);
-    float.set_default_size(width, height);
+    // Unseen until the card leaves the overlay: both at once would show the
+    // card twice over.
+    float.set_opacity(0.0);
+    float.set_default_size(width + 2 * FLOAT_MARGIN, height + 2 * FLOAT_MARGIN);
     let area = gtk::DrawingArea::new();
-    area.set_size_request(width, height);
+    area.set_size_request(width + 2 * FLOAT_MARGIN, height + 2 * FLOAT_MARGIN);
     area.connect_draw(move |_, ctx| {
+        ctx.set_operator(Operator::Clear);
+        let _ = ctx.paint();
         ctx.set_operator(Operator::Source);
-        if ctx.set_source_surface(&picture, 0.0, 0.0).is_ok() {
-            let _ = ctx.paint();
+        let margin = f64::from(FLOAT_MARGIN);
+        if ctx.set_source_surface(&picture, margin, margin).is_ok() {
+            ctx.rectangle(margin, margin, f64::from(width), f64::from(height));
+            let _ = ctx.fill();
         }
         glib::Propagation::Stop
     });
@@ -15944,7 +16027,7 @@ fn lift_card(
         x: allocation.x(),
         y: allocation.y(),
     };
-    float.move_(left + at.x, top + at.y);
+    float.move_(left + at.x - FLOAT_MARGIN, top + at.y - FLOAT_MARGIN);
     let lifted = Rc::new(DragFloat {
         window: float.clone(),
         origin: (left, top),
@@ -15975,6 +16058,7 @@ fn lift_card(
             }
             lifted.ready.set(true);
             LIFTED_CARD.with(|lifted| *lifted.borrow_mut() = Some(key.clone()));
+            lifted.window.set_opacity(1.0);
             card.set_opacity(0.0);
             window.queue_draw();
         }
@@ -15984,7 +16068,7 @@ fn lift_card(
         let key = key.to_owned();
         move |float, _| {
             if glass {
-                crate::glass::glass_window(float, &key, true, ready.clone());
+                crate::glass::glass_window(float, &key, FLOAT_MARGIN, true, ready.clone());
             } else {
                 ready(true);
             }
@@ -16019,47 +16103,57 @@ fn move_float(lifted: &DragFloat, point: Point) {
     if !lifted.ready.get() || lifted.at.replace(point) == point {
         return;
     }
-    lifted
-        .window
-        .move_(lifted.origin.0 + point.x, lifted.origin.1 + point.y);
+    lifted.window.move_(
+        lifted.origin.0 + point.x - FLOAT_MARGIN,
+        lifted.origin.1 + point.y - FLOAT_MARGIN,
+    );
     // Out now rather than when the loop next goes idle.
     lifted.window.display().flush();
 }
 
 /// Put the card back in the overlay, at `point`, and take its window away
-/// once the overlay has painted it there, with its glass.
+/// as soon as the overlay has painted the card there: the two together, for
+/// longer than a frame or so, show it twice over.
 fn land_float(
     window: &gtk::ApplicationWindow,
     card: &gtk::EventBox,
     lifted: &Rc<DragFloat>,
     point: Option<Point>,
 ) {
+    if lifted.landed.replace(true) {
+        return;
+    }
     if let Some(point) = point {
         move_float(lifted, point);
     }
-    lifted.landed.set(true);
     LIFTED_CARD.with(|lifted| lifted.borrow_mut().take());
     card.set_opacity(1.0);
     window.queue_draw();
+    let close = {
+        let lifted = lifted.clone();
+        move || {
+            if lifted.window.is_visible() {
+                lifted.window.close();
+            }
+        }
+    };
+    // Whatever happens to the overlay's frames, it does not stay behind.
+    glib::timeout_add_local_once(Duration::from_millis(250), close.clone());
     let Some(clock) = window.frame_clock() else {
-        lifted.window.close();
+        close();
         return;
     };
     let gone = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
     let handler = clock.connect_after_paint({
-        let lifted = lifted.clone();
         let gone = gone.clone();
         let clock = clock.clone();
         move |_| {
             if let Some(handler) = gone.take() {
                 clock.disconnect(handler);
             }
-            // A couple of frames more for the overlay's glass to come back
-            // under the card before this one's goes.
-            let lifted = lifted.clone();
-            glib::timeout_add_local_once(Duration::from_millis(40), move || {
-                lifted.window.close();
-            });
+            // The overlay's glass for the card follows its paint by a
+            // message to the shell; this goes a moment after.
+            glib::timeout_add_local_once(Duration::from_millis(10), close.clone());
         }
     });
     gone.set(Some(handler));
@@ -16193,6 +16287,11 @@ fn attach_drag(
             if !interactive.get() || card_locked(&key) || event.button() != 1 {
                 return glib::Propagation::Proceed;
             }
+            // A quick second click comes as a press and then a double-press
+            // for the same button: one drag, not two.
+            if event.event_type() != gdk::EventType::ButtonPress {
+                return glib::Propagation::Stop;
+            }
             let allocation = card.allocation();
             let (local_x, local_y) = event.position();
             if local_x >= f64::from(allocation.width() - RESIZE_HIT_SIZE)
@@ -16211,6 +16310,10 @@ fn attach_drag(
             }));
             hold_widget(&registry, &key, true);
             grab_overlay_pointer(&window);
+            // A drag whose release never came still has its window up.
+            if let Some(stale) = float.borrow_mut().take() {
+                land_float(&window, &card, &stale, None);
+            }
             hide_native_inside(&card);
             // Before the restack: putting the card back on top leaves it
             // unallocated until the next layout, with nothing to picture.

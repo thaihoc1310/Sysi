@@ -1689,11 +1689,17 @@ window.youtube-overlay.mode-glass {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
 }
 
-/* What plays, beside the title while the link box is folded away. */
+/* What plays, beside the title while the link box is folded away: in the
+   title's ink, which the theme's own label colour is not on every card. */
 .youtube-playing {
+  color: #222222;
   font-size: 11px;
   margin-left: 4px;
   opacity: 0.72;
+}
+
+.mode-dark .youtube-playing {
+  color: #f2f2f2;
 }
 
 .youtube-button {
