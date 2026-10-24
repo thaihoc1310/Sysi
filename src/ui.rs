@@ -12062,11 +12062,27 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
         let stack = history_stack.clone();
         let alive = alive.clone();
         async move {
+            // The answer being filled in, while its sources reply.
+            let mut view: Option<TranslateView> = None;
             while let Ok(event) = rx.recv().await {
                 if !alive.get() {
                     break;
                 }
                 match event {
+                    translate::TranslateEvent::Part {
+                        generation: at,
+                        query,
+                        part,
+                    } if at == lookup_generation.load(Ordering::Relaxed) => {
+                        if view.as_ref().is_none_or(|view| view.generation != at) {
+                            scroller.vadjustment().set_value(0.0);
+                            view = Some(TranslateView::begin(&results, at, &query, &audio_buttons));
+                        }
+                        if let Some(view) = &view {
+                            view.show_part(&part, &fit_height, &audio_buttons, &tx);
+                        }
+                        fit_height();
+                    }
                     translate::TranslateEvent::Suggestions {
                         generation: at,
                         items,
@@ -12094,15 +12110,29 @@ fn spawn_translate_window(ctx: &TranslateContext, id: u64, near_pointer: bool) {
                                 cache.retain(|query, _| stack.contains(query));
                             }
                         }
-                        scroller.vadjustment().set_value(0.0);
-                        render_translate_result(
-                            &results,
-                            &fit_height,
-                            &result,
-                            &audio_buttons,
-                            &tx,
-                            &lookup,
-                        );
+                        // Filled in already, part by part: only the note and the
+                        // guesses are left. Otherwise (a sentence, an error, a
+                        // word no source knew) it is shown whole.
+                        match (
+                            &result.kind,
+                            view.take().filter(|view| view.generation == at),
+                        ) {
+                            (translate::ResultKind::Content(content), Some(shown)) => {
+                                shown.finish(&content.suggestions, &lookup);
+                                fit_height();
+                            }
+                            _ => {
+                                scroller.vadjustment().set_value(0.0);
+                                render_translate_result(
+                                    &results,
+                                    &fit_height,
+                                    &result,
+                                    &audio_buttons,
+                                    &tx,
+                                    &lookup,
+                                );
+                            }
+                        }
                     }
                     translate::TranslateEvent::AudioReady { url, path } => {
                         // Only play for a button that is still on screen: a clip
@@ -12830,8 +12860,282 @@ fn add_translate_section(
     });
 }
 
-/// Replace the answer column wholesale. Rebuilding rather than patching keeps
-/// the render a pure function of the result, the way the note list works.
+/// One word's answer on the card, filled in a source at a time as each
+/// replies. Every source has a place of its own, in a fixed order, so what
+/// arrives late neither pushes what is already being read nor closes a section
+/// left open.
+struct TranslateView {
+    generation: u64,
+    headword: String,
+    gloss: gtk::Box,
+    pronunciations: gtk::Box,
+    /// CAMBRIDGE, OXFORD, ANH–VIỆT and EXAMPLES, in that order.
+    slots: [gtk::Box; 4],
+    /// "Looking it up…" while sources are out, then the suggestions.
+    tail: gtk::Box,
+    sections: Rc<RefCell<Vec<TranslateSection>>>,
+    open: Rc<Cell<Option<usize>>>,
+}
+
+const SLOT_CAMBRIDGE: usize = 0;
+const SLOT_OXFORD: usize = 1;
+const SLOT_VIETNAMESE: usize = 2;
+const SLOT_EXAMPLES: usize = 3;
+
+impl TranslateView {
+    /// Clear the column for `headword`, with every place empty and a note that
+    /// the rest is on its way.
+    fn begin(
+        results: &gtk::Box,
+        generation: u64,
+        headword: &str,
+        audio_buttons: &Rc<RefCell<HashMap<String, gtk::Button>>>,
+    ) -> Self {
+        clear_children(results);
+        // The buttons in the column just went away; anything still downloading
+        // for them has nothing left to re-enable.
+        audio_buttons.borrow_mut().clear();
+        results.pack_start(
+            &translate_line(
+                &format!("<b>{}</b>", crate::translate::escape_markup(headword)),
+                "translate-headword",
+            ),
+            false,
+            false,
+            0,
+        );
+        // Empty places stay out of the layout, spacing and all, until filled.
+        let place = || {
+            let place = gtk::Box::new(gtk::Orientation::Vertical, results.spacing());
+            place.set_no_show_all(true);
+            results.pack_start(&place, false, false, 0);
+            place
+        };
+        let view = Self {
+            generation,
+            headword: headword.to_owned(),
+            gloss: place(),
+            pronunciations: place(),
+            slots: [place(), place(), place(), place()],
+            tail: place(),
+            sections: Rc::new(RefCell::new(Vec::new())),
+            open: Rc::new(Cell::new(None)),
+        };
+        view.tail.pack_start(
+            &translate_line("Looking it up\u{2026}", "translate-status"),
+            false,
+            false,
+            0,
+        );
+        reveal(&view.tail);
+        results.show_all();
+        view
+    }
+
+    fn show_gloss(&self, translation: &crate::translate::SentenceResult) {
+        use crate::translate::escape_markup;
+        clear_children(&self.gloss);
+        let heading = if translation.detected.as_deref() == Some("vi") {
+            "GOOGLE · ENGLISH"
+        } else {
+            "GOOGLE · VIETNAMESE"
+        };
+        self.gloss
+            .pack_start(&translate_line(heading, "translate-pos"), false, false, 0);
+        self.gloss.pack_start(
+            &translate_line(&escape_markup(&translation.translation), "translate-gloss"),
+            false,
+            false,
+            0,
+        );
+        reveal(&self.gloss);
+    }
+
+    fn show_pronunciations(
+        &self,
+        pronunciations: &[crate::translate::Pronunciation],
+        audio_buttons: &Rc<RefCell<HashMap<String, gtk::Button>>>,
+        audio_tx: &async_channel::Sender<crate::translate::TranslateEvent>,
+    ) {
+        use crate::translate::escape_markup;
+        clear_children(&self.pronunciations);
+        if pronunciations.is_empty() {
+            return;
+        }
+        let row = translate_row(12);
+        for pronunciation in pronunciations {
+            let cell = translate_row(2);
+            cell.pack_start(
+                &translate_inline(
+                    &format!(
+                        "<b>{}</b> {}",
+                        escape_markup(&pronunciation.lang.to_uppercase()),
+                        escape_markup(&pronunciation.ipa)
+                    ),
+                    "translate-ipa",
+                ),
+                false,
+                false,
+                0,
+            );
+            let speaker = small_button("\u{25b6}");
+            speaker.style_context().add_class("translate-speaker");
+            speaker.set_tooltip_text(Some("Play pronunciation"));
+            speaker.connect_clicked({
+                let audio_buttons = audio_buttons.clone();
+                let audio_tx = audio_tx.clone();
+                let url = pronunciation.audio_url.clone();
+                let sources = crate::translate::audio_sources(&self.headword, &pronunciation.lang);
+                move |button| {
+                    // Disabled until the clip lands, so a slow download
+                    // cannot be queued up a dozen times.
+                    button.set_sensitive(false);
+                    audio_buttons
+                        .borrow_mut()
+                        .insert(url.clone(), button.clone());
+                    crate::translate::spawn_audio(url.clone(), sources.clone(), audio_tx.clone());
+                }
+            });
+            cell.pack_start(&speaker, false, false, 0);
+            row.pack_start(&cell, false, false, 0);
+        }
+        self.pronunciations.pack_start(&row, false, false, 0);
+        reveal(&self.pronunciations);
+    }
+
+    fn show_section(
+        &self,
+        slot: usize,
+        label: &str,
+        count: usize,
+        fit_height: &Rc<dyn Fn()>,
+        build: TranslateSectionBuilder,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let place = &self.slots[slot];
+        clear_children(place);
+        add_translate_section(
+            place,
+            &self.sections,
+            &self.open,
+            fit_height,
+            label,
+            count,
+            build,
+        );
+        reveal(place);
+    }
+
+    fn show_english(
+        &self,
+        slot: usize,
+        label: &str,
+        definitions: &[crate::translate::EnDefinition],
+        fit_height: &Rc<dyn Fn()>,
+    ) {
+        let definitions = definitions.to_vec();
+        self.show_section(
+            slot,
+            label,
+            definitions.len(),
+            fit_height,
+            Rc::new({
+                let fit_height = fit_height.clone();
+                move |content| {
+                    build_cambridge_section(content, definitions.clone(), fit_height.clone())
+                }
+            }),
+        );
+    }
+
+    fn show_vietnamese(
+        &self,
+        entries: &[crate::translate::ViEntry],
+        examples: &[crate::translate::BilingualExample],
+        fit_height: &Rc<dyn Fn()>,
+    ) {
+        let entries = entries.to_vec();
+        let count = entries
+            .iter()
+            .map(|entry| entry.meanings.len() + entry.phrases.len())
+            .sum();
+        self.show_section(
+            SLOT_VIETNAMESE,
+            "ANH–VIỆT",
+            count,
+            fit_height,
+            Rc::new({
+                let fit_height = fit_height.clone();
+                move |content| build_vi_section(content, entries.clone(), fit_height.clone())
+            }),
+        );
+        let examples = examples.to_vec();
+        self.show_section(
+            SLOT_EXAMPLES,
+            "EXAMPLES",
+            examples.len(),
+            fit_height,
+            Rc::new({
+                let fit_height = fit_height.clone();
+                move |content| build_examples_section(content, examples.clone(), fit_height.clone())
+            }),
+        );
+    }
+
+    fn show_part(
+        &self,
+        part: &crate::translate::LookupPart,
+        fit_height: &Rc<dyn Fn()>,
+        audio_buttons: &Rc<RefCell<HashMap<String, gtk::Button>>>,
+        audio_tx: &async_channel::Sender<crate::translate::TranslateEvent>,
+    ) {
+        use crate::translate::LookupPart;
+        match part {
+            LookupPart::Translation(translation) => self.show_gloss(translation),
+            LookupPart::Cambridge(pronunciations, definitions) => {
+                self.show_pronunciations(pronunciations, audio_buttons, audio_tx);
+                self.show_english(SLOT_CAMBRIDGE, "CAMBRIDGE", definitions, fit_height);
+            }
+            LookupPart::Oxford(definitions) => {
+                self.show_english(SLOT_OXFORD, "OXFORD", definitions, fit_height)
+            }
+            LookupPart::Vietnamese(entries, examples) => {
+                self.show_vietnamese(entries, examples, fit_height)
+            }
+        }
+    }
+
+    /// Every source is in: the note goes, and the guesses come when nothing
+    /// was found.
+    fn finish(&self, suggestions: &[String], lookup: &Rc<dyn Fn(&str)>) {
+        clear_children(&self.tail);
+        if suggestions.is_empty() {
+            self.tail.hide();
+            return;
+        }
+        self.tail.pack_start(
+            &translate_line("DID YOU MEAN", "translate-pos"),
+            false,
+            false,
+            0,
+        );
+        for suggestion in suggestions {
+            self.tail
+                .pack_start(&translate_word_button(suggestion, lookup), false, false, 0);
+        }
+        reveal(&self.tail);
+    }
+}
+
+fn reveal(place: &gtk::Box) {
+    place.set_no_show_all(false);
+    place.show_all();
+}
+
+/// Show a whole answer at once: one already in hand (stepping back to a word,
+/// a sentence's translation) or an error.
 fn render_translate_result(
     results: &gtk::Box,
     fit_height: &Rc<dyn Fn()>,
@@ -12840,161 +13144,27 @@ fn render_translate_result(
     audio_tx: &async_channel::Sender<crate::translate::TranslateEvent>,
     lookup: &Rc<dyn Fn(&str)>,
 ) {
-    use crate::translate::{escape_markup, ResultKind};
-
-    clear_children(results);
-    // The buttons in the column just went away; anything still downloading for
-    // them has nothing left to re-enable.
-    audio_buttons.borrow_mut().clear();
+    use crate::translate::{escape_markup, LookupPart, ResultKind};
 
     match &result.kind {
         ResultKind::Content(word) => {
-            results.pack_start(
-                &translate_line(
-                    &format!("<b>{}</b>", escape_markup(&word.headword)),
-                    "translate-headword",
-                ),
-                false,
-                false,
-                0,
-            );
+            let view = TranslateView::begin(results, 0, &word.headword, audio_buttons);
+            let mut parts = vec![
+                LookupPart::Cambridge(word.pronunciations.clone(), word.en_definitions.clone()),
+                LookupPart::Oxford(word.oxford.clone()),
+                LookupPart::Vietnamese(word.vi_entries.clone(), word.examples.clone()),
+            ];
             if let Some(translation) = &word.translation {
-                let heading = if translation.detected.as_deref() == Some("vi") {
-                    "GOOGLE · ENGLISH"
-                } else {
-                    "GOOGLE · VIETNAMESE"
-                };
-                results.pack_start(&translate_line(heading, "translate-pos"), false, false, 0);
-                results.pack_start(
-                    &translate_line(&escape_markup(&translation.translation), "translate-gloss"),
-                    false,
-                    false,
-                    0,
-                );
+                parts.push(LookupPart::Translation(translation.clone()));
             }
-
-            if !word.pronunciations.is_empty() {
-                let row = translate_row(12);
-                for pronunciation in &word.pronunciations {
-                    let cell = translate_row(2);
-                    cell.pack_start(
-                        &translate_inline(
-                            &format!(
-                                "<b>{}</b> {}",
-                                escape_markup(&pronunciation.lang.to_uppercase()),
-                                escape_markup(&pronunciation.ipa)
-                            ),
-                            "translate-ipa",
-                        ),
-                        false,
-                        false,
-                        0,
-                    );
-                    let speaker = small_button("\u{25b6}");
-                    speaker.style_context().add_class("translate-speaker");
-                    speaker.set_tooltip_text(Some("Play pronunciation"));
-                    speaker.connect_clicked({
-                        let audio_buttons = audio_buttons.clone();
-                        let audio_tx = audio_tx.clone();
-                        let url = pronunciation.audio_url.clone();
-                        let sources =
-                            crate::translate::audio_sources(&word.headword, &pronunciation.lang);
-                        move |button| {
-                            // Disabled until the clip lands, so a slow download
-                            // cannot be queued up a dozen times.
-                            button.set_sensitive(false);
-                            audio_buttons
-                                .borrow_mut()
-                                .insert(url.clone(), button.clone());
-                            crate::translate::spawn_audio(
-                                url.clone(),
-                                sources.clone(),
-                                audio_tx.clone(),
-                            );
-                        }
-                    });
-                    cell.pack_start(&speaker, false, false, 0);
-                    row.pack_start(&cell, false, false, 0);
-                }
-                results.pack_start(&row, false, false, 0);
+            for part in &parts {
+                view.show_part(part, fit_height, audio_buttons, audio_tx);
             }
-
-            let sections: Rc<RefCell<Vec<TranslateSection>>> = Rc::new(RefCell::new(Vec::new()));
-            let open = Rc::new(Cell::new(None));
-            if !word.en_definitions.is_empty() {
-                let definitions = word.en_definitions.clone();
-                let count = definitions.len();
-                add_translate_section(
-                    results,
-                    &sections,
-                    &open,
-                    fit_height,
-                    "CAMBRIDGE",
-                    count,
-                    Rc::new({
-                        let fit_height = fit_height.clone();
-                        move |content| {
-                            build_cambridge_section(
-                                content,
-                                definitions.clone(),
-                                fit_height.clone(),
-                            )
-                        }
-                    }),
-                );
-            }
-            if !word.vi_entries.is_empty() {
-                let entries = word.vi_entries.clone();
-                let count = entries
-                    .iter()
-                    .map(|entry| entry.meanings.len() + entry.phrases.len())
-                    .sum();
-                add_translate_section(
-                    results,
-                    &sections,
-                    &open,
-                    fit_height,
-                    "ANH–VIỆT",
-                    count,
-                    Rc::new({
-                        let fit_height = fit_height.clone();
-                        move |content| {
-                            build_vi_section(content, entries.clone(), fit_height.clone())
-                        }
-                    }),
-                );
-            }
-            if !word.examples.is_empty() {
-                let examples = word.examples.clone();
-                let count = examples.len();
-                add_translate_section(
-                    results,
-                    &sections,
-                    &open,
-                    fit_height,
-                    "EXAMPLES",
-                    count,
-                    Rc::new({
-                        let fit_height = fit_height.clone();
-                        move |content| {
-                            build_examples_section(content, examples.clone(), fit_height.clone())
-                        }
-                    }),
-                );
-            }
-            if !word.suggestions.is_empty() {
-                results.pack_start(
-                    &translate_line("DID YOU MEAN", "translate-pos"),
-                    false,
-                    false,
-                    0,
-                );
-                for suggestion in &word.suggestions {
-                    results.pack_start(&translate_word_button(suggestion, lookup), false, false, 0);
-                }
-            }
+            view.finish(&word.suggestions, lookup);
         }
         ResultKind::Error(message) => {
+            clear_children(results);
+            audio_buttons.borrow_mut().clear();
             results.pack_start(
                 &translate_line(&escape_markup(message), "translate-status"),
                 false,
@@ -13009,10 +13179,9 @@ fn render_translate_result(
                 false,
                 0,
             );
+            results.show_all();
         }
     }
-    // Freshly built widgets start hidden; without this the card renders empty.
-    results.show_all();
     fit_height();
 }
 

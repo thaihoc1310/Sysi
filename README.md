@@ -78,6 +78,8 @@ The `TOKENS` tab talks to nothing. It reads `~/.codex/sessions`, `~/.claude/proj
 
 Claude Code on other machines counts as Claude too: put one SSH host per line in `~/.config/sysi/claude-hosts`. Each scan sends the host a small Python script over SSH (key login only, five-second connect timeout; the host needs `python3`) that counts its `~/.claude/projects` transcripts by the same rules and answers with each day's totals, about a kilobyte; none of the conversations leaves the host. The script caches each transcript's records on the host (`~/.cache/sysi-claude-tokens.json`), so only the one being written is read again. A host that cannot be reached adds nothing that scan, and the ledger keeps what it reported before.
 
+`DICT` looks a word up in Google Translate, Cambridge (through `dictionary-api.eliaschen.dev`), the Oxford Learner's Dictionary and tracau's English–Vietnamese at once, and shows each one's part as soon as it answers, in a fixed place, so a slow source holds back only itself. Oxford has no free API, so Sysi reads its pages: the search sends an inflection to its root, a phrasal verb to its page and an idiom to the entry that holds it, and the answer is kept only when the entry is that word, lists it as one of its forms or spellings, or holds an idiom saying it. The speaker plays Oxford's recording of the word, or Youdao's when Oxford has no page for it; Cambridge's clips sit behind a Cloudflare challenge.
+
 ## Build
 
 Ubuntu 24.04 and 26.04 build dependencies:

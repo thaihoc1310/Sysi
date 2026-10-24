@@ -16,7 +16,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::Duration,
@@ -75,6 +75,14 @@ pub enum TranslateEvent {
         generation: u64,
         items: Vec<String>,
     },
+    /// One source's share of a word lookup, sent the moment it is in so the
+    /// card can show it without waiting for the slowest. `Lookup` follows
+    /// with the whole answer once every source has replied.
+    Part {
+        generation: u64,
+        query: String,
+        part: LookupPart,
+    },
     Lookup {
         generation: u64,
         result: LookupResult,
@@ -86,6 +94,13 @@ pub enum TranslateEvent {
     AudioFailed {
         url: String,
     },
+}
+
+pub enum LookupPart {
+    Translation(SentenceResult),
+    Cambridge(Vec<Pronunciation>, Vec<EnDefinition>),
+    Oxford(Vec<EnDefinition>),
+    Vietnamese(Vec<ViEntry>, Vec<BilingualExample>),
 }
 
 pub struct LookupResult {
@@ -115,6 +130,7 @@ pub struct ContentResult {
     pub pronunciations: Vec<Pronunciation>,
     pub vi_entries: Vec<ViEntry>,
     pub en_definitions: Vec<EnDefinition>,
+    pub oxford: Vec<EnDefinition>,
     pub examples: Vec<BilingualExample>,
     pub suggestions: Vec<String>,
 }
@@ -188,7 +204,7 @@ pub fn spawn_lookup(query: String, request: Request, tx: Sender<TranslateEvent>)
         let query = query.clone();
         move || {
             let kind = if should_probe_dictionary(&query) {
-                lookup_word(&query, &request)
+                lookup_word(&query, &request, &tx)
             } else {
                 translate_sentence(&query, &request)
             };
@@ -376,56 +392,52 @@ fn spawn_named<F: FnOnce() + Send + 'static>(name: &str, work: F) -> bool {
         .is_ok()
 }
 
-/// One in-flight GET. Described by its URL rather than by a closure, so that a
-/// request which could not get a thread can still be run in series at join
-/// time instead of being dropped on the floor.
-enum Fetch {
-    Running(thread::JoinHandle<Result<String, String>>),
-    Deferred(String, Request),
+/// Work on a thread of its own, or, when the process has none to give, run in
+/// series when joined: dropped on the floor, it would leave the window waiting
+/// for a reply that never comes.
+enum Task<T> {
+    Running(thread::JoinHandle<Option<T>>),
+    Deferred(Option<Box<dyn FnOnce() -> T + Send>>),
 }
 
-fn spawn_fetch(name: &str, url: String, request: Request) -> Fetch {
-    let work = {
-        let url = url.clone();
-        let request = request.clone();
-        move || {
-            if !request.is_current() {
-                return Err("superseded".to_owned());
-            }
-            http_get(&url)
-        }
-    };
-    match thread::Builder::new().name(name.to_owned()).spawn(work) {
-        Ok(handle) => Fetch::Running(handle),
-        Err(_) => Fetch::Deferred(url, request),
+fn spawn_task<T: Send + 'static>(name: &str, work: impl FnOnce() -> T + Send + 'static) -> Task<T> {
+    // Held where both sides can reach it: a thread that fails to start has
+    // already taken the closure it was given.
+    let work: Box<dyn FnOnce() -> T + Send> = Box::new(work);
+    let slot = Arc::new(Mutex::new(Some(work)));
+    let taken = slot.clone();
+    let started = thread::Builder::new().name(name.to_owned()).spawn(move || {
+        let work = taken.lock().ok().and_then(|mut slot| slot.take());
+        work.map(|work| work())
+    });
+    match started {
+        Ok(handle) => Task::Running(handle),
+        Err(_) => Task::Deferred(slot.lock().ok().and_then(|mut slot| slot.take())),
     }
 }
 
-impl Fetch {
-    fn join(self) -> Fetched {
-        let body = match self {
-            Fetch::Running(handle) => match handle.join() {
-                Ok(body) => body,
-                // The worker died mid-request; treat it as unreachable rather
-                // than as "the word does not exist".
-                Err(_) => return Fetched::Unreachable,
-            },
-            Fetch::Deferred(url, request) => {
-                if !request.is_current() {
-                    return Fetched::Unreachable;
-                }
-                http_get(&url)
-            }
-        };
-        match body {
-            Ok(body) => match serde_json::from_str::<Value>(&body) {
-                Ok(json) => Fetched::Json(json),
-                // http_get turns a non-2xx status into an empty body, so an
-                // unparseable reply here really is "reached, nothing to say".
-                Err(_) => Fetched::Empty,
-            },
-            Err(_) => Fetched::Unreachable,
+impl<T> Task<T> {
+    /// None when the worker died mid-way.
+    fn join(self) -> Option<T> {
+        match self {
+            Task::Running(handle) => handle.join().ok().flatten(),
+            Task::Deferred(work) => work.map(|work| work()),
         }
+    }
+}
+
+fn fetch_json(url: &str, request: &Request) -> Fetched {
+    if !request.is_current() {
+        return Fetched::Unreachable;
+    }
+    match http_get(url) {
+        Ok(body) => match serde_json::from_str::<Value>(&body) {
+            Ok(json) => Fetched::Json(json),
+            // http_get turns a non-2xx status into an empty body, so an
+            // unparseable reply here really is "reached, nothing to say".
+            Err(_) => Fetched::Empty,
+        },
+        Err(_) => Fetched::Unreachable,
     }
 }
 
@@ -443,6 +455,7 @@ fn translate_sentence(query: &str, request: &Request) -> Option<ResultKind> {
                 pronunciations: Vec::new(),
                 vi_entries: Vec::new(),
                 en_definitions: Vec::new(),
+                oxford: Vec::new(),
                 examples: Vec::new(),
                 suggestions: Vec::new(),
             })),
@@ -479,60 +492,113 @@ fn sentence_from_google(
     }
 }
 
-fn lookup_word(query: &str, request: &Request) -> Option<ResultKind> {
+fn lookup_word(query: &str, request: &Request, tx: &Sender<TranslateEvent>) -> Option<ResultKind> {
     if !request.is_current() {
         return None;
     }
-    // The two dictionaries are independent, so they run at once and the slower
-    // one sets the wait. The gloss runs here on the calling thread, which would
-    // otherwise just block waiting for them.
-    let cambridge = spawn_fetch(
-        "sysi-cambridge",
-        format!(
-            "https://dictionary-api.eliaschen.dev/api/dictionary/en/{}",
-            cambridge_slug(query)
-        ),
-        request.clone(),
-    );
-    let tracau = spawn_fetch(
-        "sysi-tracau",
-        format!(
-            "https://api.tracau.vn/WBBcwnwQpV89/s/{}/en",
-            percent_encode(query)
-        ),
-        request.clone(),
-    );
+    // Each source shows its part the moment it is in, so the slowest of them
+    // holds back only itself. They run at once; the gloss runs here on the
+    // calling thread, which would otherwise just wait for them.
+    let send: Arc<dyn Fn(LookupPart) + Send + Sync> = {
+        let (tx, request, query) = (tx.clone(), request.clone(), query.to_owned());
+        Arc::new(move |part| {
+            if request.is_current() {
+                let _ = tx.send_blocking(TranslateEvent::Part {
+                    generation: request.generation,
+                    query: query.clone(),
+                    part,
+                });
+            }
+        })
+    };
+    let cambridge = spawn_task("sysi-cambridge", {
+        let (query, request, send) = (query.to_owned(), request.clone(), send.clone());
+        move || {
+            let fetched = fetch_json(
+                &format!(
+                    "https://dictionary-api.eliaschen.dev/api/dictionary/en/{}",
+                    cambridge_slug(&query)
+                ),
+                &request,
+            );
+            let (pronunciations, definitions) = match &fetched {
+                Fetched::Json(json) => parse_cambridge(json, &query),
+                _ => (Vec::new(), Vec::new()),
+            };
+            if !pronunciations.is_empty() || !definitions.is_empty() {
+                send(LookupPart::Cambridge(
+                    pronunciations.clone(),
+                    definitions.clone(),
+                ));
+            }
+            // A 404 is "no such word", not a failure to reach it, so it must
+            // not count towards the offline check below.
+            (
+                !matches!(fetched, Fetched::Unreachable),
+                pronunciations,
+                definitions,
+            )
+        }
+    });
+    let tracau = spawn_task("sysi-tracau", {
+        let (query, request, send) = (query.to_owned(), request.clone(), send.clone());
+        move || {
+            let fetched = fetch_json(
+                &format!(
+                    "https://api.tracau.vn/WBBcwnwQpV89/s/{}/en",
+                    percent_encode(&query)
+                ),
+                &request,
+            );
+            let (entries, examples) = match &fetched {
+                Fetched::Json(json) => parse_tracau(json, &query),
+                _ => (Vec::new(), Vec::new()),
+            };
+            if !entries.is_empty() || !examples.is_empty() {
+                send(LookupPart::Vietnamese(entries.clone(), examples.clone()));
+            }
+            (!matches!(fetched, Fetched::Unreachable), entries, examples)
+        }
+    });
+    let oxford = spawn_task("sysi-oxford", {
+        let (query, request, send) = (query.to_owned(), request.clone(), send.clone());
+        move || {
+            if !request.is_current() {
+                return Vec::new();
+            }
+            let definitions = crate::oxford::lookup(&query);
+            if !definitions.is_empty() {
+                send(LookupPart::Oxford(definitions.clone()));
+            }
+            definitions
+        }
+    });
     let translation = sentence_from_google(query, google_translate(query, "vi"));
+    if let Ok(translation) = &translation {
+        send(LookupPart::Translation(translation.clone()));
+    }
 
-    let cambridge = cambridge.join();
-    let tracau = tracau.join();
+    let (cambridge_reached, pronunciations, en_definitions) =
+        cambridge.join().unwrap_or((false, Vec::new(), Vec::new()));
+    let (tracau_reached, vi_entries, examples) =
+        tracau.join().unwrap_or((false, Vec::new(), Vec::new()));
+    let oxford = oxford.join().unwrap_or_default();
     if !request.is_current() {
         return None;
     }
 
-    // A 404 from Cambridge is "no such word", not a failure to reach it, so it
-    // must not count towards the offline check below.
-    let reached = !matches!(cambridge, Fetched::Unreachable)
-        || !matches!(tracau, Fetched::Unreachable)
-        || translation.is_ok();
+    let reached = cambridge_reached || tracau_reached || translation.is_ok() || !oxford.is_empty();
     if !reached {
         return Some(ResultKind::Error(
             "Could not reach the dictionary services".into(),
         ));
     }
 
-    let (pronunciations, en_definitions) = match &cambridge {
-        Fetched::Json(json) => parse_cambridge(json, query),
-        _ => (Vec::new(), Vec::new()),
-    };
-    let (vi_entries, examples) = match &tracau {
-        Fetched::Json(json) => parse_tracau(json, query),
-        _ => (Vec::new(), Vec::new()),
-    };
-
-    let has_dictionary =
-        !en_definitions.is_empty() || !vi_entries.is_empty() || !examples.is_empty();
-    // "Did you mean" is a fifth request, and by now the user may well have
+    let has_dictionary = !en_definitions.is_empty()
+        || !oxford.is_empty()
+        || !vi_entries.is_empty()
+        || !examples.is_empty();
+    // "Did you mean" is one more request, and by now the user may well have
     // typed the word they meant themselves.
     let suggestions =
         if !has_dictionary && !is_sentence(query) && query.is_ascii() && request.is_current() {
@@ -552,6 +618,7 @@ fn lookup_word(query: &str, request: &Request) -> Option<ResultKind> {
         pronunciations,
         vi_entries,
         en_definitions,
+        oxford,
         examples,
         suggestions,
     })))
@@ -1110,7 +1177,7 @@ fn last_phrase_meaning(entries: &mut Vec<ViEntry>) -> &mut ViMeaning {
     phrase.meanings.last_mut().expect("just pushed when empty")
 }
 
-fn normalize_match_text(input: &str) -> String {
+pub(crate) fn normalize_match_text(input: &str) -> String {
     let mut normalized = String::new();
     for character in input.chars().flat_map(char::to_lowercase) {
         if character.is_alphanumeric() || matches!(character, '\'' | '\u{2019}') {
@@ -1316,7 +1383,7 @@ fn agent() -> ureq::Agent {
         .clone()
 }
 
-fn http_get(url: &str) -> Result<String, String> {
+pub(crate) fn http_get(url: &str) -> Result<String, String> {
     match agent().get(url).call() {
         Ok(response) => response
             .into_string()
