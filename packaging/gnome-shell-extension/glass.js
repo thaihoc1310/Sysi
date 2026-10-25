@@ -815,7 +815,14 @@ class GlassHost {
     // way (wait for it).
     setCards(width, height, cards) {
         this._pending = {width, height, cards};
-        if (this._fresh || this._damaged) {
+        // A card leaving for its lifted window, or coming back from it, has
+        // to change in the frame that paints it gone or back, or it shows
+        // twice or not at all. Sysi sends such an update before that paint
+        // and waits for this reply to make it, so the damage already seen
+        // this frame is some other paint: wait for the next one.
+        const swap = [...this._manager.liftedKeys()].some(key =>
+            this.keys.has(key) !== cards.some(card => card[0] === key));
+        if (this._fresh || (this._damaged && !swap)) {
             this._applyPending();
             return;
         }
@@ -1124,6 +1131,18 @@ export class GlassManager {
     // (a negative radius) and lifted cards (lift:KEY).
     Caps() {
         return 1;
+    }
+
+    // The keys of the cards lifted into windows of their own.
+    liftedKeys() {
+        const keys = new Set();
+        for (const host of this._hosts.values()) {
+            for (const key of host.keys) {
+                if (key.startsWith('lift:'))
+                    keys.add(key.slice('lift:'.length));
+            }
+        }
+        return keys;
     }
 
     // Whether a window of Sysi's shows KEY lifted out of the overlay.

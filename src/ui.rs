@@ -16137,10 +16137,16 @@ fn lift_card(
             LIFTED_CARD.with(|lifted| *lifted.borrow_mut() = Some(key.clone()));
             // Told before the overlay paints the card gone, so the
             // extension swaps the two in the frame that does.
-            crate::glass::send_cards_now();
-            lifted.window.set_opacity(1.0);
-            card.set_opacity(0.0);
-            window.queue_draw();
+            let (lifted, card, window) = (lifted.clone(), card.clone(), window.clone());
+            crate::glass::send_cards_now(move || {
+                // Put down meanwhile: land_float has the card already.
+                if lifted.landed.get() {
+                    return;
+                }
+                lifted.window.set_opacity(1.0);
+                card.set_opacity(0.0);
+                window.queue_draw();
+            });
         }
     });
     let glass = crate::glass::has_glass(card);
@@ -16223,10 +16229,6 @@ fn land_float(
         move_float(lifted, point);
     }
     LIFTED_CARD.with(|lifted| lifted.borrow_mut().take());
-    // As at the lift: the extension is told before the card is painted back.
-    crate::glass::send_cards_now();
-    card.set_opacity(1.0);
-    window.queue_draw();
     LANDING.with(|landing| landing.borrow_mut().push(Rc::downgrade(lifted)));
     let close = {
         let lifted = lifted.clone();
@@ -16234,32 +16236,41 @@ fn land_float(
     };
     // Whatever happens to the overlay's frames, it does not stay behind.
     glib::timeout_add_local_once(Duration::from_millis(400), close.clone());
-    let Some(clock) = window.frame_clock() else {
-        close();
-        return;
-    };
-    let gone = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
-    let handler = clock.connect_after_paint({
-        let gone = gone.clone();
-        let clock = clock.clone();
-        let lifted = lifted.clone();
-        move |_| {
-            if let Some(handler) = gone.take() {
-                clock.disconnect(handler);
-            }
-            // On glass the extension hides this window in the frame that
-            // shows the card back, which reaches the shell a little after
-            // this paint; closed sooner, there could be a frame with neither.
-            // Off glass it is Sysi's to hide, now that the card is painted.
-            if lifted.glassed {
-                glib::timeout_add_local_once(Duration::from_millis(120), close.clone());
-            } else {
-                lifted.window.set_opacity(0.0);
-                glib::timeout_add_local_once(Duration::from_millis(10), close.clone());
-            }
+    // As at the lift: the extension is told before the card is painted back,
+    // and the window goes only after that paint.
+    crate::glass::send_cards_now({
+        let (card, window, lifted) = (card.clone(), window.clone(), lifted.clone());
+        move || {
+            card.set_opacity(1.0);
+            window.queue_draw();
+            let Some(clock) = window.frame_clock() else {
+                close();
+                return;
+            };
+            let gone = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
+            let handler = clock.connect_after_paint({
+                let gone = gone.clone();
+                let clock = clock.clone();
+                move |_| {
+                    if let Some(handler) = gone.take() {
+                        clock.disconnect(handler);
+                    }
+                    // On glass the extension hides this window in the frame
+                    // that shows the card back, which reaches the shell a
+                    // little after this paint; closed sooner, there could be
+                    // a frame with neither. Off glass it is Sysi's to hide,
+                    // now that the card is painted.
+                    if lifted.glassed {
+                        glib::timeout_add_local_once(Duration::from_millis(120), close.clone());
+                    } else {
+                        lifted.window.set_opacity(0.0);
+                        glib::timeout_add_local_once(Duration::from_millis(10), close.clone());
+                    }
+                }
+            });
+            gone.set(Some(handler));
         }
     });
-    gone.set(Some(handler));
 }
 
 #[allow(clippy::too_many_arguments)]

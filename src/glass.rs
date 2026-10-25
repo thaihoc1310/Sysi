@@ -273,25 +273,53 @@ fn current_message(link: &Link) -> Option<Message> {
 }
 
 /// Send the cards now, before the overlay paints the change they describe,
-/// rather than after as each frame does: a card leaving for its lifted window
-/// or coming back from it. The extension holds an update until the frame
-/// that paints the overlay next, so sent first it lands in that very frame;
-/// sent after, it can miss it and wait for another, and for that while the
-/// card shows twice or not at all. Not held behind a call already on the bus
-/// for the same reason.
-pub fn send_cards_now() {
-    with_link(|link| {
-        let Some(message) = current_message(link) else {
-            return;
-        };
-        if link.last.borrow().as_ref() == Some(&message) {
-            return;
+/// and run `then` (which paints it) once the extension has them, or after
+/// SWAP_WAIT if it is slow to say so: a card leaving for its lifted window or
+/// coming back from it. The extension applies such an update in the first
+/// frame that paints the overlay after it arrives, which is then this one;
+/// sent after the paint, as every frame's update is, it could miss that
+/// frame, and meanwhile the card would show twice or not at all. Not held
+/// behind a call already on the bus, for the same reason.
+pub fn send_cards_now(then: impl FnOnce() + 'static) {
+    let then: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(Some(Box::new(then))));
+    let run = {
+        let then = then.clone();
+        move || {
+            let then = then.borrow_mut().take();
+            if let Some(then) = then {
+                then();
+            }
         }
+    };
+    let sent = LINK.with(|link| link.borrow().clone()).and_then(|link| {
+        let message = current_message(&link)?;
+        let connection = link.connection.borrow().clone()?;
         link.last.replace(Some(message.clone()));
         link.waiting.replace(None);
-        send(link, message);
+        Some((connection, message))
     });
+    let Some((connection, message)) = sent else {
+        run();
+        return;
+    };
+    glib::timeout_add_local_once(SWAP_WAIT, run.clone());
+    connection.call(
+        Some(BUS_NAME),
+        OBJECT_PATH,
+        INTERFACE,
+        "SetCards",
+        Some(&message.to_variant()),
+        Some(glib::VariantTy::new("(b)").expect("valid reply type")),
+        gio::DBusCallFlags::NONE,
+        1000,
+        None::<&gio::Cancellable>,
+        move |_| run(),
+    );
 }
+
+/// How long a swap waits for the extension to take its cards before it is
+/// painted all the same.
+const SWAP_WAIT: Duration = Duration::from_millis(60);
 
 thread_local! {
     /// What the extension answered to Caps: 1 for cards without glass and
