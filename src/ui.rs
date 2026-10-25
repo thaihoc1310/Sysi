@@ -16135,6 +16135,9 @@ fn lift_card(
             }
             lifted.ready.set(true);
             LIFTED_CARD.with(|lifted| *lifted.borrow_mut() = Some(key.clone()));
+            // Told before the overlay paints the card gone, so the
+            // extension swaps the two in the frame that does.
+            crate::glass::send_cards_now();
             lifted.window.set_opacity(1.0);
             card.set_opacity(0.0);
             window.queue_draw();
@@ -16220,6 +16223,8 @@ fn land_float(
         move_float(lifted, point);
     }
     LIFTED_CARD.with(|lifted| lifted.borrow_mut().take());
+    // As at the lift: the extension is told before the card is painted back.
+    crate::glass::send_cards_now();
     card.set_opacity(1.0);
     window.queue_draw();
     LANDING.with(|landing| landing.borrow_mut().push(Rc::downgrade(lifted)));

@@ -164,6 +164,8 @@ struct Link {
     /// Retries since the extension last took the cards.
     retries: Cell<u32>,
     retry_pending: Cell<bool>,
+    /// The overlay's cards, in paint order.
+    collect: Box<dyn Fn() -> Vec<CardSample>>,
 }
 
 /// How often a refusal is asked again before Sysi keeps its own plates.
@@ -199,6 +201,7 @@ pub fn start(
         waiting: RefCell::new(None),
         retries: Cell::new(0),
         retry_pending: Cell::new(false),
+        collect: Box::new(collect),
     });
     LINK.with(|slot| *slot.borrow_mut() = Some(link.clone()));
     gio::bus_watch_name(
@@ -228,32 +231,9 @@ pub fn start(
         return;
     };
     clock.connect_after_paint(move |_| {
-        if link.connection.borrow().is_none() {
-            return;
-        }
-        let Some(xid) = link
-            .window
-            .window()
-            .and_then(|window| window.downcast::<gdkx11::X11Window>().ok())
-            .map(|window| window.xid())
-        else {
+        let Some(message) = current_message(&link) else {
             return;
         };
-        let scale = f64::from(link.window.scale_factor().max(1));
-        let message = (
-            xid,
-            f64::from(link.window.allocated_width()) * scale,
-            f64::from(link.window.allocated_height()) * scale,
-            wire_cards(
-                &[collect(), popover_samples(&link.root)]
-                    .concat()
-                    .into_iter()
-                    // An extension without lifts would draw them square.
-                    .filter(|card| card.glass || lifts_supported())
-                    .collect::<Vec<_>>(),
-                scale,
-            ),
-        );
         if link.last.borrow().as_ref() == Some(&message) {
             return;
         }
@@ -263,6 +243,53 @@ pub fn start(
             return;
         }
         send(&link, message);
+    });
+}
+
+/// The cards as they are now, ready to send; None with no extension or
+/// window to send them for.
+fn current_message(link: &Link) -> Option<Message> {
+    link.connection.borrow().as_ref()?;
+    let xid = link
+        .window
+        .window()
+        .and_then(|window| window.downcast::<gdkx11::X11Window>().ok())
+        .map(|window| window.xid())?;
+    let scale = f64::from(link.window.scale_factor().max(1));
+    Some((
+        xid,
+        f64::from(link.window.allocated_width()) * scale,
+        f64::from(link.window.allocated_height()) * scale,
+        wire_cards(
+            &[(link.collect)(), popover_samples(&link.root)]
+                .concat()
+                .into_iter()
+                // An extension without lifts would draw them square.
+                .filter(|card| card.glass || lifts_supported())
+                .collect::<Vec<_>>(),
+            scale,
+        ),
+    ))
+}
+
+/// Send the cards now, before the overlay paints the change they describe,
+/// rather than after as each frame does: a card leaving for its lifted window
+/// or coming back from it. The extension holds an update until the frame
+/// that paints the overlay next, so sent first it lands in that very frame;
+/// sent after, it can miss it and wait for another, and for that while the
+/// card shows twice or not at all. Not held behind a call already on the bus
+/// for the same reason.
+pub fn send_cards_now() {
+    with_link(|link| {
+        let Some(message) = current_message(link) else {
+            return;
+        };
+        if link.last.borrow().as_ref() == Some(&message) {
+            return;
+        }
+        link.last.replace(Some(message.clone()));
+        link.waiting.replace(None);
+        send(link, message);
     });
 }
 
