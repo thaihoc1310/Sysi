@@ -98,10 +98,6 @@ pub struct CardSample {
     pub width: i32,
     pub height: i32,
     pub pressed: bool,
-    /// False for a card with no glass (LIGHT, DARK, ...): sent all the same,
-    /// with a negative radius, so the extension knows it is shown and can
-    /// swap it with its lifted window in one frame.
-    pub glass: bool,
 }
 
 /// What the extension is sent for one card: key, rect and radius in X11
@@ -135,11 +131,7 @@ pub fn wire_cards(samples: &[CardSample], scale: f64) -> Vec<WireCard> {
                 outline.y * scale,
                 outline.width * scale,
                 outline.height * scale,
-                if card.glass {
-                    outline.radius * scale
-                } else {
-                    -1.0
-                },
+                outline.radius * scale,
                 card.pressed,
             )
         })
@@ -231,12 +223,6 @@ pub fn start(
         return;
     };
     clock.connect_after_paint(move |_| {
-        // A swap is under way: its update goes out on its own, and one sent
-        // from here as well would start the extension's wait for the paint
-        // early (see swap_cards).
-        if SWAPPING.with(Cell::get) > 0 {
-            return;
-        }
         let Some(message) = current_message(&link) else {
             return;
         };
@@ -267,148 +253,16 @@ fn current_message(link: &Link) -> Option<Message> {
         f64::from(link.window.allocated_width()) * scale,
         f64::from(link.window.allocated_height()) * scale,
         wire_cards(
-            &[(link.collect)(), popover_samples(&link.root)]
-                .concat()
-                .into_iter()
-                // An extension without lifts would draw them square.
-                .filter(|card| card.glass || lifts_supported())
-                .collect::<Vec<_>>(),
+            &[(link.collect)(), popover_samples(&link.root)].concat(),
             scale,
         ),
     ))
 }
 
-/// Send the cards now, before the overlay paints the change they describe,
-/// and run `then` (which paints it) once the extension has them, or after
-/// SWAP_WAIT if it is slow to say so: a card leaving for its lifted window or
-/// coming back from it. The extension applies such an update in the first
-/// frame that paints the overlay after it arrives, which is then this one;
-/// sent after the paint, as every frame's update is, it could miss that
-/// frame, and meanwhile the card would show twice or not at all. Not held
-/// behind a call already on the bus, for the same reason.
-fn send_cards_now(then: impl FnOnce() + 'static) {
-    let then: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(Some(Box::new(then))));
-    let run = {
-        let then = then.clone();
-        move || {
-            let then = then.borrow_mut().take();
-            if let Some(then) = then {
-                then();
-            }
-        }
-    };
-    let sent = LINK.with(|link| link.borrow().clone()).and_then(|link| {
-        let message = current_message(&link)?;
-        let connection = link.connection.borrow().clone()?;
-        link.last.replace(Some(message.clone()));
-        link.waiting.replace(None);
-        Some((connection, message))
-    });
-    let Some((connection, message)) = sent else {
-        run();
-        return;
-    };
-    glib::timeout_add_local_once(SWAP_WAIT, run.clone());
-    connection.call(
-        Some(BUS_NAME),
-        OBJECT_PATH,
-        INTERFACE,
-        "SetCards",
-        Some(&message.to_variant()),
-        Some(glib::VariantTy::new("(b)").expect("valid reply type")),
-        gio::DBusCallFlags::NONE,
-        1000,
-        None::<&gio::Cancellable>,
-        move |_| run(),
-    );
-}
-
-/// How long a swap waits for the extension to take its cards before it is
-/// painted all the same.
-const SWAP_WAIT: Duration = Duration::from_millis(60);
-
-/// The longest wait for the overlay's next frame, should its clock stall.
-const FRAME_WAIT: Duration = Duration::from_millis(100);
-
-/// Run `then` once a frame of `window` has run after this call: GTK does not
-/// start a frame until the shell has drawn the last one it painted, so by
-/// then every paint sent before is on screen, not still on its way.
-pub fn after_next_frame(window: &gtk::Window, then: impl FnOnce() + 'static) {
-    let then: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(Some(Box::new(then))));
-    let run = {
-        let then = then.clone();
-        move || {
-            let then = then.borrow_mut().take();
-            if let Some(then) = then {
-                then();
-            }
-        }
-    };
-    let Some(clock) = window.frame_clock() else {
-        run();
-        return;
-    };
-    glib::timeout_add_local_once(FRAME_WAIT, run.clone());
-    // Called from inside a frame, that frame's own end does not count.
-    let asked_at = clock.frame_counter();
-    let handler = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
-    let id = clock.connect_after_paint({
-        let handler = handler.clone();
-        move |clock| {
-            if clock.frame_counter() <= asked_at {
-                clock.request_phase(gdk::FrameClockPhase::AFTER_PAINT);
-                return;
-            }
-            if let Some(id) = handler.take() {
-                clock.disconnect(id);
-            }
-            run();
-        }
-    });
-    handler.set(Some(id));
-    clock.request_phase(gdk::FrameClockPhase::AFTER_PAINT);
-}
-
-/// Move a card between the overlay and its lifted window: `change` makes
-/// the change (the card's opacity, its place), and the extension shows or
-/// hides the lifted window in the frame that paints it. The extension waits
-/// for the first paint of the overlay after it has the update, so no other
-/// paint may come between: the overlay is frozen while the update goes out,
-/// until a frame after the freeze has run (every paint before it is then on
-/// screen), and thawed once the extension has it, with the change, into one
-/// paint.
-pub fn swap_cards(window: &gtk::Window, change: impl FnOnce() + 'static) {
-    let connected = LINK.with(|link| {
-        link.borrow()
-            .as_ref()
-            .is_some_and(|link| link.connection.borrow().is_some())
-    });
-    let surface = window.window();
-    let (true, Some(surface)) = (connected, surface) else {
-        change();
-        return;
-    };
-    surface.freeze_updates();
-    SWAPPING.with(|swapping| swapping.set(swapping.get() + 1));
-    after_next_frame(window, move || {
-        send_cards_now(move || {
-            change();
-            surface.thaw_updates();
-            SWAPPING.with(|swapping| swapping.set(swapping.get().saturating_sub(1)));
-        });
-    });
-}
-
 thread_local! {
-    /// Swaps under way. The extension gives a swap's paint 50 ms from the
-    /// first update that asks for it; an update from the frame clock in the
-    /// meantime would start that wait before the swap's own.
-    static SWAPPING: Cell<u32> = const { Cell::new(0) };
-}
-
-thread_local! {
-    /// What the extension answered to Caps: 1 for cards without glass and
-    /// lifted cards; 0 for one too old to know the call.
+    /// What the extension answered to Caps: 2 when it shows a lifted card's
+    /// glass in its window only while the overlay does not show the card;
+    /// less from an older one.
     static CAPS: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -438,11 +292,11 @@ fn ask_caps(connection: &gio::DBusConnection) {
     );
 }
 
-/// Whether the extension swaps a dragged card's window with the card itself,
-/// whatever the card's look: it then shows and hides that window in the
-/// frames that change the overlay.
+/// Whether a glass card can be lifted into a window of its own: the
+/// extension then hands the card's glass between the overlay and that window
+/// in one go. An older one would show both at once.
 pub fn lifts_supported() -> bool {
-    CAPS.with(Cell::get) >= 1 && glass_is_live()
+    CAPS.with(Cell::get) >= 2 && glass_is_live()
 }
 
 fn send(link: &Rc<Link>, message: Message) {
@@ -584,30 +438,21 @@ fn set_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool) {
 /// Glass under a window of Sysi's own standing in for a card, the one being
 /// dragged: drawn by the extension inside that window, it moves with the
 /// window in the same frame. The card sits `inset` logical pixels inside the
-/// window on every side. `done` hears whether the window can stand in for the
-/// card: yes at once when there is no live glass (the card wears its own
-/// frosted plate then, and the window shows it), and otherwise whether the
-/// glass went on.
+/// window on every side. `done` hears whether it went on.
 pub fn glass_window(
     window: &gtk::Window,
     key: &str,
     inset: i32,
-    glass: bool,
     pressed: bool,
     done: Rc<dyn Fn(bool)>,
 ) {
-    if !lifts_supported() && !(glass && glass_is_live()) {
-        done(true);
-        return;
-    }
-    // Named as the lifted card, so the extension shows this window only
-    // while the overlay does not show the card, switching the two in one
-    // frame.
+    // Named as the lifted card: the extension shows this glass only while
+    // the overlay does not show the card's, and hands the one to the other in
+    // a single step. Two glasses on one card would show it darker.
     send_window(
         window.clone(),
         format!("lift:{key}"),
         inset,
-        glass,
         pressed,
         done,
         6,
@@ -618,7 +463,6 @@ fn send_window(
     window: gtk::Window,
     key: String,
     inset: i32,
-    glass: bool,
     pressed: bool,
     done: Rc<dyn Fn(bool)>,
     tries: u32,
@@ -653,7 +497,7 @@ fn send_window(
             inset_px,
             width - 2.0 * inset_px,
             height - 2.0 * inset_px,
-            if glass { RADIUS * scale } else { -1.0 },
+            RADIUS * scale,
             pressed,
         )],
     );
@@ -678,7 +522,7 @@ fn send_window(
                 return;
             }
             glib::timeout_add_local_once(Duration::from_millis(15), move || {
-                send_window(window, key, inset, glass, pressed, done, tries - 1)
+                send_window(window, key, inset, pressed, done, tries - 1)
             });
         },
     );
@@ -742,7 +586,6 @@ fn popover_samples(root: &gtk::Container) -> Vec<CardSample> {
                     y: y + outline.y as i32,
                     width: outline.width as i32,
                     height: outline.height as i32,
-                    glass: true,
                     pressed: false,
                 })
             })
@@ -992,7 +835,6 @@ mod tests {
             width,
             height,
             pressed: false,
-            glass: true,
         }
     }
 
@@ -1012,15 +854,6 @@ mod tests {
                 ("usage".into(), 0.0, 0.0, 392.0, 152.0, 28.0, false),
             ]
         );
-    }
-
-    #[test]
-    fn a_card_without_glass_goes_with_a_negative_radius() {
-        let bare = CardSample {
-            glass: false,
-            ..card("usage", 0, 0, 100, 50)
-        };
-        assert_eq!(wire_cards(&[bare], 1.0)[0].5, -1.0);
     }
 
     #[test]

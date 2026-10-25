@@ -15990,9 +15990,18 @@ const DRAG_THRESHOLD: f64 = 3.0;
 /// refresh, so the compositor always has the latest place to show.
 const FLOAT_POLL: Duration = Duration::from_millis(3);
 
+/// How long a put-down card's window stays over the card after the overlay
+/// has painted it back: long enough for that paint to reach the screen, with
+/// room to spare, since the two showing at once cannot be seen.
+const LANDING_HOLD: Duration = Duration::from_millis(100);
+
+/// How long a lifted card's window has, after it first paints, to reach the
+/// screen before the card under it leaves the overlay.
+const LIFT_SHOW: Duration = Duration::from_millis(50);
+
 /// How long a lifted card waits for the extension to take its window before
 /// the drag slides it in the overlay instead.
-const LIFT_DEADLINE: Duration = Duration::from_millis(150);
+const LIFT_DEADLINE: Duration = Duration::from_millis(400);
 
 thread_local! {
     /// The card a drag has lifted into a window of its own, by key: its glass
@@ -16022,9 +16031,6 @@ struct DragFloat {
     landed: Cell<bool>,
     /// Destroyed: GTK holds every toplevel until it is, hidden or not.
     closed: Cell<bool>,
-    /// On live glass, where the extension shows and hides this window as the
-    /// card leaves and comes back to the overlay.
-    glassed: bool,
     at: Cell<Point>,
 }
 
@@ -16035,16 +16041,15 @@ fn lift_card(
     card: &gtk::EventBox,
     key: &str,
 ) -> Option<Rc<DragFloat>> {
-    // On glass from an extension too old to swap a lifted card in one frame,
-    // its glass would show twice over: such a card slides in the overlay.
-    if crate::glass::has_glass(card)
-        && crate::glass::glass_is_live()
-        && !crate::glass::lifts_supported()
-    {
+    // On glass, the extension draws the card's glass in its window too, and
+    // must be one that hands it over from the overlay in a single step; an
+    // older one would show both at once, and such a card slides in the
+    // overlay instead.
+    let glass = crate::glass::has_glass(card) && crate::glass::glass_is_live();
+    if glass && !crate::glass::lifts_supported() {
         return None;
     }
-    // Any card still waiting to be closed from a drag just put down: the
-    // extension would show it again as this one leaves the overlay.
+    // Any card's window still waiting to close from a drag just put down.
     LANDING.with(|landing| {
         for lifted in landing.borrow_mut().drain(..) {
             if let Some(lifted) = lifted.upgrade() {
@@ -16077,9 +16082,6 @@ fn lift_card(
         float.set_visual(Some(&visual));
     }
     float.set_app_paintable(true);
-    // Unseen until the card leaves the overlay: both at once would show the
-    // card twice over.
-    float.set_opacity(0.0);
     float.set_default_size(width + 2 * FLOAT_MARGIN, height + 2 * FLOAT_MARGIN);
     let area = gtk::DrawingArea::new();
     area.set_size_request(width + 2 * FLOAT_MARGIN, height + 2 * FLOAT_MARGIN);
@@ -16092,7 +16094,8 @@ fn lift_card(
             ctx.rectangle(margin, margin, f64::from(width), f64::from(height));
             let _ = ctx.fill();
         }
-        glib::Propagation::Stop
+        // On to the handler that notes the first paint (below).
+        glib::Propagation::Proceed
     });
     float.add(&area);
     // The pointer is the overlay's, grabbed; the picture only shows.
@@ -16101,6 +16104,12 @@ fn lift_card(
         x: allocation.x(),
         y: allocation.y(),
     };
+    // Shown at once, over the card it pictures, so exactly that nothing
+    // changes on screen: the card leaves the overlay under it only after.
+    // The window and the overlay reach the shell by separate ways (X and
+    // Xwayland's surfaces) that keep no step with each other, so the one
+    // to be seen goes first and the other second: the two at once cannot
+    // be told apart, and never is there a frame with neither.
     float.move_(left + at.x - FLOAT_MARGIN, top + at.y - FLOAT_MARGIN);
     let lifted = Rc::new(DragFloat {
         window: float.clone(),
@@ -16109,15 +16118,13 @@ fn lift_card(
         failed: Cell::new(false),
         landed: Cell::new(false),
         closed: Cell::new(false),
-        glassed: crate::glass::lifts_supported(),
         at: Cell::new(at),
     });
-    // Ready when its glass is on: only then does the card leave the
-    // overlay, which takes the card's glass from there.
+    // Ready when it is up (and on glass, its glass): the card then leaves
+    // the overlay, and the window follows the pointer.
     let ready: Rc<dyn Fn(bool)> = Rc::new({
         let lifted = Rc::downgrade(&lifted);
         let card = card.clone();
-        let window = window.clone();
         let key = key.to_owned();
         move |on| {
             let Some(lifted) = lifted.upgrade() else {
@@ -16134,35 +16141,49 @@ fn lift_card(
                 return;
             }
             lifted.ready.set(true);
+            // The card's glass goes with it: the overlay stops counting it,
+            // and the extension hands the glass to the window in one step.
             LIFTED_CARD.with(|lifted| *lifted.borrow_mut() = Some(key.clone()));
-            // Told before the overlay paints the card gone, so the
-            // extension swaps the two in the frame that does.
-            let (lifted, card, window) = (lifted.clone(), card.clone(), window.clone());
-            crate::glass::swap_cards(window.clone().upcast_ref(), move || {
-                // Put down meanwhile: land_float has the card already.
-                if lifted.landed.get() {
-                    return;
-                }
-                lifted.window.set_opacity(1.0);
-                // Only the card is painted again: a paint of the whole
-                // overlay, three screens of it, can take long enough that
-                // the extension stops waiting for it.
-                card.set_opacity(0.0);
-            });
+            // Only the card is painted again, not the whole overlay.
+            card.set_opacity(0.0);
         }
     });
-    let glass = crate::glass::has_glass(card);
-    // Handed to the extension when it can swap it with the card in one
-    // frame, glass or not; otherwise Sysi shows and hides it itself.
-    let handed = lifted.glassed;
     let ready_by_then = ready.clone();
+    // Mapped is not yet on screen: the window's pixels reach the shell by
+    // Xwayland, after X says it is up. The card leaves the overlay only once
+    // the window has painted and LIFT_SHOW has passed since, with its glass
+    // on when it has glass.
+    let waiting = Rc::new(Cell::new(if glass { 2u8 } else { 1 }));
+    let one_done: Rc<dyn Fn(bool)> = Rc::new({
+        let waiting = waiting.clone();
+        move |on| {
+            if !on {
+                ready(false);
+                return;
+            }
+            waiting.set(waiting.get().saturating_sub(1));
+            if waiting.get() == 0 {
+                ready(true);
+            }
+        }
+    });
     float.connect_map_event({
         let key = key.to_owned();
+        let one_done = one_done.clone();
         move |float, _| {
-            if handed {
-                crate::glass::glass_window(float, &key, FLOAT_MARGIN, glass, true, ready.clone());
-            } else {
-                ready(true);
+            if glass {
+                crate::glass::glass_window(float, &key, FLOAT_MARGIN, true, one_done.clone());
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    area.connect_draw({
+        let one_done = one_done.clone();
+        let shown = Cell::new(false);
+        move |_, _| {
+            if !shown.replace(true) {
+                let one_done = one_done.clone();
+                glib::timeout_add_local_once(LIFT_SHOW, move || one_done(true));
             }
             glib::Propagation::Proceed
         }
@@ -16231,83 +16252,34 @@ fn land_float(
         move_float(lifted, point);
     }
     LANDING.with(|landing| landing.borrow_mut().push(Rc::downgrade(lifted)));
+    // The card first, in the overlay under its window, which covers it
+    // exactly; its glass goes back to the overlay with it, in one step. The
+    // window goes only once that paint is surely on screen: the other way
+    // round, for a frame there could be neither (see lift_card).
+    LIFTED_CARD.with(|lifted| lifted.borrow_mut().take());
+    card.set_opacity(1.0);
     let close = {
         let lifted = lifted.clone();
         move || close_float(&lifted)
     };
     // Whatever happens to the overlay's frames, it does not stay behind.
-    glib::timeout_add_local_once(Duration::from_millis(400), close.clone());
-    // As at the lift: the extension is told before the card is painted back,
-    // and the window goes only after that paint.
-    let swap: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(Some(Box::new({
-        let (card, window, lifted) = (card.clone(), window.clone(), lifted.clone());
-        move || {
-            // Until now the overlay still counted the card as lifted, so its
-            // frames did not announce it back early.
-            LIFTED_CARD.with(|lifted| lifted.borrow_mut().take());
-            crate::glass::swap_cards(window.clone().upcast_ref(), move || {
-                // Only the card again, as at the lift.
-                card.set_opacity(1.0);
-                let Some(clock) = window.frame_clock() else {
-                    close();
-                    return;
-                };
-                let gone = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
-                let handler = clock.connect_after_paint({
-                    let gone = gone.clone();
-                    let clock = clock.clone();
-                    move |_| {
-                        if let Some(handler) = gone.take() {
-                            clock.disconnect(handler);
-                        }
-                        // On glass the extension hides this window in the
-                        // frame that shows the card back, which reaches the
-                        // shell a little after this paint; closed sooner,
-                        // there could be a frame with neither. Off glass it
-                        // is Sysi's to hide, now that the card is painted.
-                        if lifted.glassed {
-                            glib::timeout_add_local_once(Duration::from_millis(120), close.clone());
-                        } else {
-                            lifted.window.set_opacity(0.0);
-                            glib::timeout_add_local_once(Duration::from_millis(10), close.clone());
-                        }
-                    }
-                });
-                gone.set(Some(handler));
-            });
-        }
-    })
-        as Box<dyn FnOnce()>)));
-    let start = {
-        let swap = swap.clone();
-        move || {
-            let swap = swap.borrow_mut().take();
-            if let Some(swap) = swap {
-                swap();
-            }
-        }
-    };
-    // Putting the card down has just moved it in the overlay, which lays the
-    // overlay out again and paints all of it, three screens' worth. That
-    // paint goes first, while the card is still clear under its window, so
-    // the swap's own paint is only the card's and reaches the shell in time.
+    glib::timeout_add_local_once(LANDING_HOLD * 4, close.clone());
     let Some(clock) = window.frame_clock() else {
-        start();
+        close();
         return;
     };
-    glib::timeout_add_local_once(Duration::from_millis(60), start.clone());
-    let moved = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
+    let painted = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
     let handler = clock.connect_after_paint({
-        let moved = moved.clone();
+        let painted = painted.clone();
         let clock = clock.clone();
         move |_| {
-            if let Some(handler) = moved.take() {
+            if let Some(handler) = painted.take() {
                 clock.disconnect(handler);
             }
-            start();
+            glib::timeout_add_local_once(LANDING_HOLD, close.clone());
         }
     });
-    moved.set(Some(handler));
+    painted.set(Some(handler));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18428,9 +18400,12 @@ fn glass_card_samples(
     };
     crate::glass::paint_order(root.upcast_ref())
         .iter()
-        // Every card, glass or not: the extension swaps a dragged card with
-        // its lifted window by whether the overlay still shows it.
-        .filter(|child| child.is_visible() && child.is_mapped() && child.widget_name() != "dictate")
+        .filter(|child| {
+            child.is_visible()
+                && child.is_mapped()
+                && child.widget_name() != "dictate"
+                && crate::glass::has_glass(*child)
+        })
         .filter_map(|child| {
             let item = items
                 .iter()
@@ -18446,7 +18421,6 @@ fn glass_card_samples(
                 y: allocation.y(),
                 width: allocation.width(),
                 height: allocation.height(),
-                glass: crate::glass::has_glass(child),
                 pressed: item.held.get(),
             })
         })

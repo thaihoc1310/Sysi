@@ -423,6 +423,10 @@ class SysiGlassEffect extends Clutter.Effect {
     }
 
     _paint(node, paintContext, actor) {
+        // A lifted card's glass, handed back to the overlay this very frame
+        // (see GlassHost.hideGlassNow).
+        if (this._card.suppressed?.())
+            return;
         const framebuffer = paintContext.get_framebuffer();
         // pick_color paints the stage into a 1x1 buffer; glass there is not
         // worth a set of textures.
@@ -502,6 +506,7 @@ class SysiGlassEffect extends Clutter.Effect {
         glass.add_texture_rectangle(
             new Clutter.ActorBox({x1: 0, y1: 0, x2: actor.width, y2: actor.height}),
             0, 0, 1, 1);
+        this._card.drew?.();
     }
 
     // A monitor's framebuffer is painted every frame, so its copies are kept,
@@ -765,6 +770,29 @@ const GlassCard = GObject.registerClass({
         this._host.repaintSoon(this);
     }
 
+    // A card's first glass is drawn only once Clutter has laid it out, which
+    // for one made in the middle of a frame is the frame after. What waits on
+    // it (a lifted window giving its glass back) waits for that.
+    whenDrawn(then) {
+        if (this._drawn)
+            then();
+        else
+            this._onFirstDraw = then;
+    }
+
+    drew() {
+        if (this._drawn)
+            return;
+        this._drawn = true;
+        const then = this._onFirstDraw;
+        this._onFirstDraw = null;
+        then?.();
+    }
+
+    suppressed() {
+        return this._host.suppressed;
+    }
+
     fail(error) {
         this._host.fail(error);
     }
@@ -781,6 +809,10 @@ class GlassHost {
         this._cards = new Map();
         // The keys of the cards this host shows, as of its last update.
         this.keys = new Set();
+        // Set for the frame in which a lifted window's glass is handed back.
+        this.suppressed = false;
+        this._hideTimeout = 0;
+        this._hideToken = 0;
         this._pending = null;
         this._latchTimeout = 0;
         this._damaged = false;
@@ -815,14 +847,7 @@ class GlassHost {
     // way (wait for it).
     setCards(width, height, cards) {
         this._pending = {width, height, cards};
-        // A card leaving for its lifted window, or coming back from it, has
-        // to change in the frame that paints it gone or back, or it shows
-        // twice or not at all. Sysi sends such an update before that paint
-        // and waits for this reply to make it, so the damage already seen
-        // this frame is some other paint: wait for the next one.
-        const swap = [...this._manager.liftedKeys()].some(key =>
-            this.keys.has(key) !== cards.some(card => card[0] === key));
-        if (this._fresh || (this._damaged && !swap)) {
+        if (this._fresh || this._damaged) {
             this._applyPending();
             return;
         }
@@ -851,22 +876,12 @@ class GlassHost {
         this._fresh = false;
         const seen = new Set();
         let below = null;
-        for (const [key, x, y, w, h, radius, pressed, bare] of cards) {
+        for (const [key, x, y, w, h, radius, pressed] of cards) {
             seen.add(key);
             // A card coming back from being lifted, or leaving to be, is the
             // same card moving between windows: no fading in or out, or for
             // the length of the fade it has no glass, or glass twice over.
             const lifted = this._manager.isLifted(key);
-            if (bare) {
-                const glass = this._cards.get(key);
-                if (glass && !glass.leaving) {
-                    if (animate && !lifted)
-                        glass.dissolve();
-                    else
-                        glass.destroy();
-                }
-                continue;
-            }
             let card = this._cards.get(key);
             if (!card || card.leaving) {
                 card?.destroy();
@@ -907,6 +922,64 @@ class GlassHost {
         return this._pipelines;
     }
 
+    cardFor(key) {
+        return this._cards.get(key) ?? null;
+    }
+
+    // The glass layer only: the window's own pixels are Sysi's to show.
+    // Faded out rather than hidden, so it stays laid out and draws in the
+    // very frame it is shown again.
+    showGlass() {
+        this._clearHide();
+        this._hideToken++;
+        this.suppressed = false;
+        this._layer.opacity = 255;
+    }
+
+    _clearHide() {
+        if (this._hideTimeout) {
+            GLib.source_remove(this._hideTimeout);
+            this._hideTimeout = 0;
+        }
+    }
+
+    // Off now, from inside the paint of the glass taking over (the overlay
+    // is below, and painted first): this frame's paint of this glass skips
+    // itself, and the layer fades out after it.
+    hideGlassNow() {
+        this._clearHide();
+        if (this._layer.opacity === 0 || this.suppressed)
+            return;
+        this.suppressed = true;
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._layer.opacity = 0;
+            this.suppressed = false;
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    // Off once `card` has drawn its glass, or a moment later should it not.
+    hideGlassAfter(card) {
+        if (!card) {
+            this.hideGlassNow();
+            return;
+        }
+        // Shown again meanwhile (lifted anew): this hand-back is stale.
+        const token = ++this._hideToken;
+        card.whenDrawn(() => {
+            if (token === this._hideToken)
+                this.hideGlassNow();
+        });
+        if (token !== this._hideToken || this._layer.opacity === 0 || this.suppressed)
+            return;
+        this._hideTimeout ||= GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+            this._hideTimeout = 0;
+            if (token === this._hideToken)
+                this.hideGlassNow();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     repaintSoon(card) {
         this._repaint.add(card);
         if (this._repaintId)
@@ -927,6 +1000,7 @@ class GlassHost {
     }
 
     destroy() {
+        this._clearHide();
         if (this._latchTimeout)
             GLib.source_remove(this._latchTimeout);
         this._latchTimeout = 0;
@@ -1109,11 +1183,8 @@ export class GlassManager {
                 continue;
             if (w <= 1 || h <= 1 || w > MAX_SIDE || h > MAX_SIDE)
                 continue;
-            // A negative radius: a card with no glass, sent so its window
-            // can be swapped with a lifted one (see hostApplied).
-            const bare = radius < 0;
             const clampedRadius = Math.max(0, Math.min(radius, w / 2, h / 2));
-            clean.push([key, x, y, w, h, clampedRadius, Boolean(pressed), bare]);
+            clean.push([key, x, y, w, h, clampedRadius, Boolean(pressed)]);
         }
         this._states.delete(xid);
         this._states.set(xid, {xid, width, height, cards: clean});
@@ -1127,22 +1198,10 @@ export class GlassManager {
         return true;
     }
 
-    // What this extension understands beyond SetCards: 1, cards with no glass
-    // (a negative radius) and lifted cards (lift:KEY).
+    // What this extension understands beyond SetCards: 2, lifted cards
+    // (lift:KEY) whose glass it hands over from the overlay in one step.
     Caps() {
-        return 1;
-    }
-
-    // The keys of the cards lifted into windows of their own.
-    liftedKeys() {
-        const keys = new Set();
-        for (const host of this._hosts.values()) {
-            for (const key of host.keys) {
-                if (key.startsWith('lift:'))
-                    keys.add(key.slice('lift:'.length));
-            }
-        }
-        return keys;
+        return 2;
     }
 
     // Whether a window of Sysi's shows KEY lifted out of the overlay.
@@ -1208,12 +1267,12 @@ export class GlassManager {
     }
 
     // A card being dragged is lifted by Sysi into a window of its own, whose
-    // glass comes as "lift:KEY". That window, glass and all, shows only while
-    // no other window shows KEY. Each host applies its update in the frame
-    // that paints its window, so the card leaves the overlay and its stand-in
-    // appears in one frame, and the other way round when it is put down: done
-    // by Sysi instead, the two land frames apart and the card shows twice or
-    // not at all for a moment.
+    // glass comes as "lift:KEY". That glass shows only while no other window
+    // shows KEY: each host applies its update in the frame that paints its
+    // window, and the glass goes from the overlay to the lifted window, or
+    // back, in the same step, never on both and never on neither. Sysi
+    // shows and hides the lifted window itself, the one to be seen first,
+    // so the two showing at once for a moment cannot be told apart.
     hostApplied() {
         const shown = new Set();
         const lifted = [];
@@ -1225,8 +1284,19 @@ export class GlassManager {
                 host.keys.forEach(key => shown.add(key));
         }
         for (const [host, key] of lifted) {
-            if (!host.windowActor.is_destroyed?.())
-                host.windowActor.opacity = shown.has(key) ? 0 : 255;
+            if (!shown.has(key)) {
+                host.showGlass();
+                continue;
+            }
+            // Back in the overlay: this glass goes once the overlay's has
+            // been drawn, in the same frame, so the card is never without.
+            let card = null;
+            for (const other of this._hosts.values()) {
+                const candidate = other.cardFor(key);
+                if (candidate && !candidate.leaving)
+                    card = candidate;
+            }
+            host.hideGlassAfter(card);
         }
     }
 
