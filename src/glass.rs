@@ -280,7 +280,7 @@ fn current_message(link: &Link) -> Option<Message> {
 /// sent after the paint, as every frame's update is, it could miss that
 /// frame, and meanwhile the card would show twice or not at all. Not held
 /// behind a call already on the bus, for the same reason.
-pub fn send_cards_now(then: impl FnOnce() + 'static) {
+fn send_cards_now(then: impl FnOnce() + 'static) {
     let then: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(Some(Box::new(then))));
     let run = {
         let then = then.clone();
