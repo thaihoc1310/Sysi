@@ -16144,8 +16144,10 @@ fn lift_card(
                     return;
                 }
                 lifted.window.set_opacity(1.0);
+                // Only the card is painted again: a paint of the whole
+                // overlay, three screens of it, can take long enough that
+                // the extension stops waiting for it.
                 card.set_opacity(0.0);
-                window.queue_draw();
             });
         }
     });
@@ -16228,7 +16230,6 @@ fn land_float(
     if let Some(point) = point {
         move_float(lifted, point);
     }
-    LIFTED_CARD.with(|lifted| lifted.borrow_mut().take());
     LANDING.with(|landing| landing.borrow_mut().push(Rc::downgrade(lifted)));
     let close = {
         let lifted = lifted.clone();
@@ -16238,39 +16239,75 @@ fn land_float(
     glib::timeout_add_local_once(Duration::from_millis(400), close.clone());
     // As at the lift: the extension is told before the card is painted back,
     // and the window goes only after that paint.
-    crate::glass::swap_cards(window.upcast_ref(), {
+    let swap: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(Some(Box::new({
         let (card, window, lifted) = (card.clone(), window.clone(), lifted.clone());
         move || {
-            card.set_opacity(1.0);
-            window.queue_draw();
-            let Some(clock) = window.frame_clock() else {
-                close();
-                return;
-            };
-            let gone = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
-            let handler = clock.connect_after_paint({
-                let gone = gone.clone();
-                let clock = clock.clone();
-                move |_| {
-                    if let Some(handler) = gone.take() {
-                        clock.disconnect(handler);
+            // Until now the overlay still counted the card as lifted, so its
+            // frames did not announce it back early.
+            LIFTED_CARD.with(|lifted| lifted.borrow_mut().take());
+            crate::glass::swap_cards(window.clone().upcast_ref(), move || {
+                // Only the card again, as at the lift.
+                card.set_opacity(1.0);
+                let Some(clock) = window.frame_clock() else {
+                    close();
+                    return;
+                };
+                let gone = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
+                let handler = clock.connect_after_paint({
+                    let gone = gone.clone();
+                    let clock = clock.clone();
+                    move |_| {
+                        if let Some(handler) = gone.take() {
+                            clock.disconnect(handler);
+                        }
+                        // On glass the extension hides this window in the
+                        // frame that shows the card back, which reaches the
+                        // shell a little after this paint; closed sooner,
+                        // there could be a frame with neither. Off glass it
+                        // is Sysi's to hide, now that the card is painted.
+                        if lifted.glassed {
+                            glib::timeout_add_local_once(Duration::from_millis(120), close.clone());
+                        } else {
+                            lifted.window.set_opacity(0.0);
+                            glib::timeout_add_local_once(Duration::from_millis(10), close.clone());
+                        }
                     }
-                    // On glass the extension hides this window in the frame
-                    // that shows the card back, which reaches the shell a
-                    // little after this paint; closed sooner, there could be
-                    // a frame with neither. Off glass it is Sysi's to hide,
-                    // now that the card is painted.
-                    if lifted.glassed {
-                        glib::timeout_add_local_once(Duration::from_millis(120), close.clone());
-                    } else {
-                        lifted.window.set_opacity(0.0);
-                        glib::timeout_add_local_once(Duration::from_millis(10), close.clone());
-                    }
-                }
+                });
+                gone.set(Some(handler));
             });
-            gone.set(Some(handler));
+        }
+    })
+        as Box<dyn FnOnce()>)));
+    let start = {
+        let swap = swap.clone();
+        move || {
+            let swap = swap.borrow_mut().take();
+            if let Some(swap) = swap {
+                swap();
+            }
+        }
+    };
+    // Putting the card down has just moved it in the overlay, which lays the
+    // overlay out again and paints all of it, three screens' worth. That
+    // paint goes first, while the card is still clear under its window, so
+    // the swap's own paint is only the card's and reaches the shell in time.
+    let Some(clock) = window.frame_clock() else {
+        start();
+        return;
+    };
+    glib::timeout_add_local_once(Duration::from_millis(60), start.clone());
+    let moved = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
+    let handler = clock.connect_after_paint({
+        let moved = moved.clone();
+        let clock = clock.clone();
+        move |_| {
+            if let Some(handler) = moved.take() {
+                clock.disconnect(handler);
+            }
+            start();
         }
     });
+    moved.set(Some(handler));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16317,24 +16354,10 @@ fn attach_drag(
             live.set(None);
             ungrab_pointer();
             let lifted = float.borrow_mut().take();
-            // Putting the card down moves it in the overlay while it is still
-            // clear; painted on its own, that paint would be the one the
-            // extension takes as the card coming back. Frozen until
-            // land_float has frozen it too, the move goes into its paint.
-            let frozen = lifted
-                .as_ref()
-                .filter(|lifted| lifted.glassed)
-                .and_then(|_| window.window());
-            if let Some(surface) = &frozen {
-                surface.freeze_updates();
-            }
             let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.replace(None) else {
                 show_native_inside(&card);
                 if let Some(lifted) = lifted {
                     land_float(&window, &card, &lifted, None);
-                }
-                if let Some(surface) = frozen {
-                    surface.thaw_updates();
                 }
                 return;
             };
@@ -16399,9 +16422,6 @@ fn attach_drag(
             refresh_input_shape(&window, &registry, interactive.get());
             if let Some(lifted) = lifted {
                 land_float(&window, &card, &lifted, Some(point));
-            }
-            if let Some(surface) = frozen {
-                surface.thaw_updates();
             }
         }
     });

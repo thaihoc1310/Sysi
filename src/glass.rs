@@ -231,6 +231,12 @@ pub fn start(
         return;
     };
     clock.connect_after_paint(move |_| {
+        // A swap is under way: its update goes out on its own, and one sent
+        // from here as well would start the extension's wait for the paint
+        // early (see swap_cards).
+        if SWAPPING.with(Cell::get) > 0 {
+            return;
+        }
         let Some(message) = current_message(&link) else {
             return;
         };
@@ -344,12 +350,21 @@ pub fn swap_cards(window: &gtk::Window, change: impl FnOnce() + 'static) {
         return;
     };
     surface.freeze_updates();
+    SWAPPING.with(|swapping| swapping.set(swapping.get() + 1));
     glib::timeout_add_local_once(SWAP_SETTLE, move || {
         send_cards_now(move || {
             change();
             surface.thaw_updates();
+            SWAPPING.with(|swapping| swapping.set(swapping.get().saturating_sub(1)));
         });
     });
+}
+
+thread_local! {
+    /// Swaps under way. The extension gives a swap's paint 50 ms from the
+    /// first update that asks for it; an update from the frame clock in the
+    /// meantime would start that wait before the swap's own.
+    static SWAPPING: Cell<u32> = const { Cell::new(0) };
 }
 
 thread_local! {
