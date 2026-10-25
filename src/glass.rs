@@ -327,17 +327,57 @@ fn send_cards_now(then: impl FnOnce() + 'static) {
 /// painted all the same.
 const SWAP_WAIT: Duration = Duration::from_millis(60);
 
-/// How long a frozen overlay waits for its paints already on their way to
-/// reach the shell before the swap is sent.
-const SWAP_SETTLE: Duration = Duration::from_millis(8);
+/// The longest wait for the overlay's next frame, should its clock stall.
+const FRAME_WAIT: Duration = Duration::from_millis(100);
+
+/// Run `then` once a frame of `window` has run after this call: GTK does not
+/// start a frame until the shell has drawn the last one it painted, so by
+/// then every paint sent before is on screen, not still on its way.
+pub fn after_next_frame(window: &gtk::Window, then: impl FnOnce() + 'static) {
+    let then: Rc<RefCell<Option<Box<dyn FnOnce()>>>> =
+        Rc::new(RefCell::new(Some(Box::new(then))));
+    let run = {
+        let then = then.clone();
+        move || {
+            let then = then.borrow_mut().take();
+            if let Some(then) = then {
+                then();
+            }
+        }
+    };
+    let Some(clock) = window.frame_clock() else {
+        run();
+        return;
+    };
+    glib::timeout_add_local_once(FRAME_WAIT, run.clone());
+    // Called from inside a frame, that frame's own end does not count.
+    let asked_at = clock.frame_counter();
+    let handler = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
+    let id = clock.connect_after_paint({
+        let handler = handler.clone();
+        move |clock| {
+            if clock.frame_counter() <= asked_at {
+                clock.request_phase(gdk::FrameClockPhase::AFTER_PAINT);
+                return;
+            }
+            if let Some(id) = handler.take() {
+                clock.disconnect(id);
+            }
+            run();
+        }
+    });
+    handler.set(Some(id));
+    clock.request_phase(gdk::FrameClockPhase::AFTER_PAINT);
+}
 
 /// Move a card between the overlay and its lifted window: `change` makes
 /// the change (the card's opacity, its place), and the extension shows or
 /// hides the lifted window in the frame that paints it. The extension waits
 /// for the first paint of the overlay after it has the update, so no other
 /// paint may come between: the overlay is frozen while the update goes out,
-/// long enough first for paints already sent to land, and thawed once the
-/// extension has it, with the change, into one paint.
+/// until a frame after the freeze has run (every paint before it is then on
+/// screen), and thawed once the extension has it, with the change, into one
+/// paint.
 pub fn swap_cards(window: &gtk::Window, change: impl FnOnce() + 'static) {
     let connected = LINK.with(|link| {
         link.borrow()
@@ -351,7 +391,7 @@ pub fn swap_cards(window: &gtk::Window, change: impl FnOnce() + 'static) {
     };
     surface.freeze_updates();
     SWAPPING.with(|swapping| swapping.set(swapping.get() + 1));
-    glib::timeout_add_local_once(SWAP_SETTLE, move || {
+    after_next_frame(window, move || {
         send_cards_now(move || {
             change();
             surface.thaw_updates();
