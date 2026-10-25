@@ -334,8 +334,7 @@ const FRAME_WAIT: Duration = Duration::from_millis(100);
 /// start a frame until the shell has drawn the last one it painted, so by
 /// then every paint sent before is on screen, not still on its way.
 pub fn after_next_frame(window: &gtk::Window, then: impl FnOnce() + 'static) {
-    let then: Rc<RefCell<Option<Box<dyn FnOnce()>>>> =
-        Rc::new(RefCell::new(Some(Box::new(then))));
+    let then: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(Some(Box::new(then))));
     let run = {
         let then = then.clone();
         move || {
