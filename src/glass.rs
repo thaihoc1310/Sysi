@@ -321,6 +321,37 @@ pub fn send_cards_now(then: impl FnOnce() + 'static) {
 /// painted all the same.
 const SWAP_WAIT: Duration = Duration::from_millis(60);
 
+/// How long a frozen overlay waits for its paints already on their way to
+/// reach the shell before the swap is sent.
+const SWAP_SETTLE: Duration = Duration::from_millis(8);
+
+/// Move a card between the overlay and its lifted window: `change` makes
+/// the change (the card's opacity, its place), and the extension shows or
+/// hides the lifted window in the frame that paints it. The extension waits
+/// for the first paint of the overlay after it has the update, so no other
+/// paint may come between: the overlay is frozen while the update goes out,
+/// long enough first for paints already sent to land, and thawed once the
+/// extension has it, with the change, into one paint.
+pub fn swap_cards(window: &gtk::Window, change: impl FnOnce() + 'static) {
+    let connected = LINK.with(|link| {
+        link.borrow()
+            .as_ref()
+            .is_some_and(|link| link.connection.borrow().is_some())
+    });
+    let surface = window.window();
+    let (true, Some(surface)) = (connected, surface) else {
+        change();
+        return;
+    };
+    surface.freeze_updates();
+    glib::timeout_add_local_once(SWAP_SETTLE, move || {
+        send_cards_now(move || {
+            change();
+            surface.thaw_updates();
+        });
+    });
+}
+
 thread_local! {
     /// What the extension answered to Caps: 1 for cards without glass and
     /// lifted cards; 0 for one too old to know the call.

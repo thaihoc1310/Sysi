@@ -16138,7 +16138,7 @@ fn lift_card(
             // Told before the overlay paints the card gone, so the
             // extension swaps the two in the frame that does.
             let (lifted, card, window) = (lifted.clone(), card.clone(), window.clone());
-            crate::glass::send_cards_now(move || {
+            crate::glass::swap_cards(window.clone().upcast_ref(), move || {
                 // Put down meanwhile: land_float has the card already.
                 if lifted.landed.get() {
                     return;
@@ -16238,7 +16238,7 @@ fn land_float(
     glib::timeout_add_local_once(Duration::from_millis(400), close.clone());
     // As at the lift: the extension is told before the card is painted back,
     // and the window goes only after that paint.
-    crate::glass::send_cards_now({
+    crate::glass::swap_cards(window.upcast_ref(), {
         let (card, window, lifted) = (card.clone(), window.clone(), lifted.clone());
         move || {
             card.set_opacity(1.0);
@@ -16317,10 +16317,24 @@ fn attach_drag(
             live.set(None);
             ungrab_pointer();
             let lifted = float.borrow_mut().take();
+            // Putting the card down moves it in the overlay while it is still
+            // clear; painted on its own, that paint would be the one the
+            // extension takes as the card coming back. Frozen until
+            // land_float has frozen it too, the move goes into its paint.
+            let frozen = lifted
+                .as_ref()
+                .filter(|lifted| lifted.glassed)
+                .and_then(|_| window.window());
+            if let Some(surface) = &frozen {
+                surface.freeze_updates();
+            }
             let Some((ox, oy, pointer_start_x, pointer_start_y)) = start.replace(None) else {
                 show_native_inside(&card);
                 if let Some(lifted) = lifted {
                     land_float(&window, &card, &lifted, None);
+                }
+                if let Some(surface) = frozen {
+                    surface.thaw_updates();
                 }
                 return;
             };
@@ -16385,6 +16399,9 @@ fn attach_drag(
             refresh_input_shape(&window, &registry, interactive.get());
             if let Some(lifted) = lifted {
                 land_float(&window, &card, &lifted, Some(point));
+            }
+            if let Some(surface) = frozen {
+                surface.thaw_updates();
             }
         }
     });
