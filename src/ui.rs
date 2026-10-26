@@ -13581,6 +13581,24 @@ fn raise_owned_windows(widget: &impl IsA<gtk::Widget>) {
 fn raise_card_windows(card: &gtk::EventBox) {
     mark_card_raised(card);
     raise_widget_windows(card);
+    // mpv's window is the X server's to stack, above everything the overlay
+    // paints: under another card, YOUTUBE's title bar went beneath it while
+    // the picture still showed through. It stays on top of every card.
+    if card.widget_name() != "youtube" {
+        let youtube = card
+            .parent()
+            .and_then(|parent| parent.downcast::<gtk::Container>().ok())
+            .and_then(|parent| {
+                parent
+                    .children()
+                    .into_iter()
+                    .find(|child| child.widget_name() == "youtube" && child.is_visible())
+            });
+        if let Some(youtube) = youtube {
+            mark_card_raised(&youtube);
+            raise_widget_windows(&youtube);
+        }
+    }
     if let Some(parent) = card.parent() {
         parent.queue_draw();
     }

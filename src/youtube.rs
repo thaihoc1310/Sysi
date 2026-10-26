@@ -864,6 +864,11 @@ impl Player {
             .args(audio.map(|audio| format!("--audio-file={audio}")))
             .args([
                 "--ytdl=no",
+                // Sized to the card from the start. Left at mpv's 320x200
+                // until the first frame, Vulkan rebuilt its swapchain every
+                // frame of a slow seek, and NVIDIA's driver leaked a file per
+                // rebuild: past 1024 mpv hung on a black card.
+                "--force-window=immediate",
                 "--hwdec=auto-safe",
                 "--keep-open=yes",
                 "--no-terminal",
