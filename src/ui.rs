@@ -516,6 +516,23 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     root.set_hexpand(true);
     root.set_vexpand(true);
     root.style_context().add_class("overlay-root");
+    // GTK paints the Fixed's children in the order they were put, whatever
+    // their windows' stacking. YOUTUBE is never put back (see
+    // restack_overlay_card), so a card raised after it painted over its
+    // title bar while mpv's window stayed above both: it is painted after
+    // the cards, under the selection layer, as it is stacked.
+    root.connect_draw(|root, cr| {
+        let mut children = root.children();
+        children.sort_by_key(|child| match child.widget_name().as_str() {
+            "youtube" => 1,
+            "dictate" => 2,
+            _ => 0,
+        });
+        for child in &children {
+            root.propagate_draw(child, cr);
+        }
+        glib::Propagation::Stop
+    });
     window.add(&root);
     window.connect_draw(|_, ctx| {
         let _ = ctx.save();
