@@ -16039,9 +16039,9 @@ struct DragFloat {
     window: gtk::Window,
     /// The overlay's top left on the screen.
     origin: (i32, i32),
-    /// Set once its glass is on (or it needs none). Until then the card is
-    /// still shown in the overlay and the picture does not move, so the two
-    /// never show apart.
+    /// Set once it is on screen, with its glass on when it has glass. Until
+    /// then the card still shows in the overlay, and slides there under the
+    /// window as the window follows the pointer.
     ready: Cell<bool>,
     /// Its glass would not go on: the drag slides the card in the overlay.
     failed: Cell<bool>,
@@ -16243,7 +16243,7 @@ fn drag_point(
 }
 
 fn move_float(lifted: &DragFloat, point: Point) {
-    if !lifted.ready.get() || lifted.at.replace(point) == point {
+    if lifted.closed.get() || lifted.at.replace(point) == point {
         return;
     }
     lifted.window.move_(
@@ -16530,16 +16530,15 @@ fn attach_drag(
                                         if lifted.landed.get() || lifted.failed.get() {
                                             return glib::ControlFlow::Break;
                                         }
-                                        if !lifted.ready.get() {
-                                            return glib::ControlFlow::Continue;
-                                        }
                                         let Some((x, y, held)) = pointer_drag_sample() else {
                                             return glib::ControlFlow::Continue;
                                         };
                                         // Let go: put down here even when the
                                         // overlay is not painting (hidden), so
-                                        // its frames would never say so.
-                                        if !held {
+                                        // its frames would never say so. Not
+                                        // ready, the overlay's drag still has
+                                        // the card and sees the release itself.
+                                        if !held && lifted.ready.get() {
                                             let finish = OVERLAY_DRAG_FINISH
                                                 .with(|slot| slot.borrow().clone());
                                             if let Some(finish) = finish {
@@ -16571,9 +16570,14 @@ fn attach_drag(
                         );
                         drop(screens);
                         // Lifted, the card stays put in the overlay and its
-                        // window is what moves.
-                        let lifted = float.borrow().as_ref().map(|lifted| lifted.failed.get());
-                        if lifted.is_none_or(|failed| failed) {
+                        // window is what moves. Until the window is up, the
+                        // card slides in the overlay with the window over it,
+                        // rather than standing still that long.
+                        let sliding = float
+                            .borrow()
+                            .as_ref()
+                            .is_none_or(|lifted| lifted.failed.get() || !lifted.ready.get());
+                        if sliding {
                             live.set(Some(point));
                             slide_overlay_card(&window, &root, &card, &card_widget, point);
                         }
