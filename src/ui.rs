@@ -4477,6 +4477,13 @@ fn build_youtube_window(initial_color_mode: Foreground) -> YoutubeCard {
     let shell = utility_shell(initial_color_mode, "YOUTUBE", "Hide YouTube", "Play");
     // Known by name where it must not be re-parented (restack_overlay_card).
     shell.card.set_widget_name("youtube");
+    // On top of every card from the moment it shows, not only from the next
+    // raise (raise_card_windows): cards built after it start out above it.
+    // Once the frame is over, when the overlay has mapped the rest too.
+    shell.card.connect_map(|card| {
+        let card = card.clone();
+        glib::idle_add_local_once(move || raise_card_windows(&card));
+    });
     // Enter in the link box and the play button cover what reload did.
     shell.refresh.set_no_show_all(true);
     shell.refresh.hide();
