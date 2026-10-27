@@ -511,6 +511,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     window.move_(0, 0);
 
     install_css(&screen);
+    // GNOME stops a caret blinking after 10s without typing, which on a note
+    // left open on the desk read as a caret that had frozen. Keep it going.
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_cursor_blink_timeout(i32::MAX);
+    }
 
     let root = gtk::Fixed::new();
     root.set_hexpand(true);
@@ -581,6 +586,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
     unsafe {
         window.set_data("sysi-raise-gesture", raise);
     }
+    install_ctrl_wheel_font(&window, &root, &registry, &state);
     let interactive = Rc::new(Cell::new(true));
     publish_panel_state(true, &state.borrow());
     // Context menus are attached while their windows are built, well before the
@@ -2926,9 +2932,24 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let translate_close_search = translate_close_search.clone();
         let dictate_cancel = dictate.cancel.clone();
         let voice_cancel = voice.cancel.clone();
-        move |_, event| {
+        let state = state.clone();
+        move |window, event| {
             if event.keyval() == gdk::keys::constants::Escape && voice_cancel() {
                 return glib::Propagation::Stop;
+            }
+            // Ctrl+= / Ctrl+- resize the text of the card the keyboard is in.
+            if event.state().contains(gdk::ModifierType::CONTROL_MASK) {
+                use gdk::keys::constants as key;
+                let delta = match event.keyval() {
+                    key::plus | key::equal | key::KP_Add => 1,
+                    key::minus | key::underscore | key::KP_Subtract => -1,
+                    _ => 0,
+                };
+                let cards = keyboard_cards(&registry);
+                if let Some(index) = card_with_focus(window, &cards).filter(|_| delta != 0) {
+                    step_card_font_of(&state, &registry, &cards[index], delta);
+                    return glib::Propagation::Stop;
+                }
             }
             if event.keyval() == gdk::keys::constants::Escape && dictate_cancel() {
                 return glib::Propagation::Stop;
@@ -13742,19 +13763,95 @@ fn keyboard_cards(registry: &Rc<RefCell<Vec<RegisteredWidget>>>) -> Vec<gtk::Eve
     cards
 }
 
-/// The card holding the keyboard, else the one raised last.
-fn current_card(window: &gtk::ApplicationWindow, cards: &[gtk::EventBox]) -> Option<usize> {
-    let focus = window.focused_widget();
+/// The card holding the keyboard.
+fn card_with_focus(window: &impl IsA<gtk::Window>, cards: &[gtk::EventBox]) -> Option<usize> {
+    let focus = window.focused_widget()?;
     cards
         .iter()
-        .position(|card| {
-            focus.as_ref().is_some_and(|focus| {
-                focus == card.upcast_ref::<gtk::Widget>() || focus.is_ancestor(card)
-            })
-        })
-        .or_else(|| {
-            (0..cards.len()).max_by_key(|&index| card_raise_stamp(cards[index].upcast_ref()))
-        })
+        .position(|card| focus == *card.upcast_ref::<gtk::Widget>() || focus.is_ancestor(card))
+}
+
+/// Step one card's text size, as the − / + in its menu do.
+fn step_card_font(
+    state: &Rc<RefCell<AppState>>,
+    widget: &gtk::EventBox,
+    key: &str,
+    delta: i32,
+) -> i32 {
+    state.borrow_mut().change_font_size(Some(key), delta);
+    let size = state.borrow().font_size(key);
+    apply_widget_font(widget, size);
+    let _ = state.borrow().save();
+    size
+}
+
+fn step_card_font_of(
+    state: &Rc<RefCell<AppState>>,
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+    card: &gtk::EventBox,
+    delta: i32,
+) -> bool {
+    let key = registry
+        .borrow()
+        .iter()
+        .find(|item| &item.widget == card)
+        .map(|item| item.key.clone());
+    if let Some(key) = &key {
+        step_card_font(state, card, key, delta);
+    }
+    key.is_some()
+}
+
+/// Ctrl+wheel over a card resizes its text. Caught before GTK routes the
+/// wheel, because whatever scrolls under the pointer would take it first.
+fn install_ctrl_wheel_font(
+    window: &gtk::ApplicationWindow,
+    root: &gtk::Fixed,
+    registry: &Rc<RefCell<Vec<RegisteredWidget>>>,
+    state: &Rc<RefCell<AppState>>,
+) {
+    let window = window.clone();
+    let root = root.clone();
+    let registry = registry.clone();
+    let state = state.clone();
+    // A touchpad sends fractions of a step; one size per whole step.
+    let pending = Cell::new(0.0_f64);
+    gdk::Event::set_handler(Some(move |event: &mut gdk::Event| {
+        let overlay = window.window();
+        let wheel = event
+            .downcast_ref::<gdk::EventScroll>()
+            .filter(|scroll| scroll.state().contains(gdk::ModifierType::CONTROL_MASK))
+            .filter(|_| overlay.is_some() && event.window().map(|w| w.toplevel()) == overlay);
+        if let (Some(scroll), Some(overlay)) = (wheel, overlay) {
+            let dy = match scroll.direction() {
+                gdk::ScrollDirection::Up => -1.0,
+                gdk::ScrollDirection::Down => 1.0,
+                gdk::ScrollDirection::Smooth => scroll.delta().1,
+                _ => 0.0,
+            };
+            let (_, origin_x, origin_y) = overlay.origin();
+            let (x, y) = scroll.root();
+            if let Some(card) =
+                overlay_card_at(&root, x - f64::from(origin_x), y - f64::from(origin_y))
+            {
+                let total = pending.get() + dy;
+                let steps = total.trunc();
+                pending.set(total - steps);
+                // Wheel up, like a page zooming in, makes the text larger.
+                if steps == 0.0 || step_card_font_of(&state, &registry, &card, -steps as i32) {
+                    return;
+                }
+            }
+        }
+        gtk::main_do_event(event);
+    }));
+}
+
+/// The card holding the keyboard, else the one raised last.
+fn current_card(window: &gtk::ApplicationWindow, cards: &[gtk::EventBox]) -> Option<usize> {
+    card_with_focus(window, cards).or_else(|| {
+        (0..cards.len()).max_by_key(|&index| card_raise_stamp(cards[index].upcast_ref()))
+    })
 }
 
 /// Raise `card` and give it the keyboard: a note's editor, else the first
@@ -14372,11 +14469,7 @@ fn attach_color_mode_menu(
             let key = key.clone();
             let font_value = font_value.clone();
             move |_| {
-                state.borrow_mut().change_font_size(Some(&key), delta);
-                let size = state.borrow().font_size(&key);
-                apply_widget_font(&widget, size);
-                font_value.set_text(&size.to_string());
-                let _ = state.borrow().save();
+                font_value.set_text(&step_card_font(&state, &widget, &key, delta).to_string());
             }
         });
         font_row.pack_start(&button, false, false, 0);

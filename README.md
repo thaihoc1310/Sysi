@@ -66,6 +66,7 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 - `Super+Shift+F` — take the keyboard into Sysi, on the card you were last in (unlocks like a new note).
 - `Super+Shift+J` / `Super+Shift+K` — move the keyboard to the next / previous card, left to right across the desk.
 - `Super+Shift+W` — close the card the keyboard is in (same as its `−` / close button).
+- `Ctrl` + mouse wheel over a card, or `Ctrl+=` / `Ctrl+-` in the card the keyboard is in — make that card's text larger / smaller (same as the `−` / `+` in its right-click menu).
 - `Ctrl+Shift+V` — paste into a note exactly as copied, skipping the Markdown clean-up and the copied colours.
 - `Ctrl+F` — find text in the focused note. Use `Enter` / `Shift+Enter` (or
   `F3` / `Shift+F3`) to move between matches and `Escape` to close the panel.
