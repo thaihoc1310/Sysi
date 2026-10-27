@@ -13863,7 +13863,8 @@ fn draw_card_flash(cr: &Context) {
             return;
         }
         // One blink: up and back down.
-        let alpha = (t / duration * std::f64::consts::PI).sin();
+        // Faint: a cue, not an alarm.
+        let alpha = 0.5 * (t / duration * std::f64::consts::PI).sin();
         let a = card.allocation();
         rounded_rectangle(
             cr,
