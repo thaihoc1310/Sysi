@@ -531,6 +531,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         for child in &children {
             root.propagate_draw(child, cr);
         }
+        draw_card_flash(cr);
         glib::Propagation::Stop
     });
     window.add(&root);
@@ -13770,7 +13771,9 @@ fn focus_card(
     // Left on, the next time Sysi is shown it would take the keyboard from
     // whatever app the user is in.
     window.set_focus_on_map(false);
+    flash_card(card);
     if let Some(editor) = editor {
+        caret_into_view(editor);
         editor.grab_focus();
         return;
     }
@@ -13781,6 +13784,99 @@ fn focus_card(
         card.set_can_focus(true);
         card.grab_focus();
     }
+}
+
+/// Typing goes where the caret is, and a caret left at the end of a long
+/// note scrolled the note away from the part on screen. Put it at the start
+/// of the first whole line in view, unless it is in view already.
+fn caret_into_view(editor: &gtk::TextView) {
+    let Some((buffer, insert)) = editor
+        .buffer()
+        .and_then(|buffer| Some((buffer.clone(), buffer.get_insert()?)))
+    else {
+        return;
+    };
+    let visible = editor.visible_rect();
+    let caret = editor.iter_location(&buffer.iter_at_mark(&insert));
+    if caret.y() >= visible.y() && caret.y() + caret.height() <= visible.y() + visible.height() {
+        return;
+    }
+    // Not iter_at_location: it gives nothing for a point in the left margin.
+    let (mut iter, _) = editor.line_at_y(visible.y());
+    while editor.iter_location(&iter).y() < visible.y() && editor.forward_display_line(&mut iter) {}
+    buffer.place_cursor(&iter);
+}
+
+/// How long a card stepped to blinks.
+const CARD_FLASH: Duration = Duration::from_millis(1500);
+
+thread_local! {
+    /// The card the keyboard was last sent to, and when.
+    static FLASHED_CARD: RefCell<Option<(gtk::EventBox, Instant)>> = const { RefCell::new(None) };
+}
+
+/// Blink a ring around `card` so the eye finds where the keyboard went.
+fn flash_card(card: &gtk::EventBox) {
+    let Some(root) = card.parent() else {
+        return;
+    };
+    let started = Instant::now();
+    FLASHED_CARD.with(|flash| *flash.borrow_mut() = Some((card.clone(), started)));
+    let card = card.clone();
+    // Only the ring's strips are redrawn: the whole card would repaint every
+    // editor and list in it sixty times a second.
+    root.add_tick_callback(move |root, _| {
+        let a = card.allocation();
+        for (x, y, width, height) in [
+            (a.x(), a.y(), a.width(), 6),
+            (a.x(), a.y() + a.height() - 6, a.width(), 6),
+            (a.x(), a.y(), 6, a.height()),
+            (a.x() + a.width() - 6, a.y(), 6, a.height()),
+        ] {
+            root.queue_draw_area(x, y, width, height);
+        }
+        // A newer flash takes over the redraws; a finished one draws once
+        // more to wipe its ring.
+        let current = FLASHED_CARD.with(|flash| {
+            flash
+                .borrow()
+                .as_ref()
+                .is_some_and(|(_, at)| *at == started)
+        });
+        if current && started.elapsed() < CARD_FLASH {
+            glib::ControlFlow::Continue
+        } else {
+            glib::ControlFlow::Break
+        }
+    });
+}
+
+fn draw_card_flash(cr: &Context) {
+    FLASHED_CARD.with(|flash| {
+        let flash = flash.borrow();
+        let Some((card, started)) = flash.as_ref() else {
+            return;
+        };
+        let t = started.elapsed().as_secs_f64();
+        let duration = CARD_FLASH.as_secs_f64();
+        if t >= duration || !card.is_visible() {
+            return;
+        }
+        // Three beats, fading out.
+        let alpha = (1.0 - t / duration) * (0.5 + 0.5 * (t * std::f64::consts::TAU * 2.0).cos());
+        let a = card.allocation();
+        rounded_rectangle(
+            cr,
+            f64::from(a.x()) + 1.5,
+            f64::from(a.y()) + 1.5,
+            f64::from(a.width()) - 3.0,
+            f64::from(a.height()) - 3.0,
+            crate::glass::RADIUS,
+        );
+        cr.set_line_width(3.0);
+        cr.set_source_rgba(0.30, 0.64, 1.0, alpha);
+        let _ = cr.stroke();
+    });
 }
 
 /// The header's hide or close button, the one a click on `−` would press.
