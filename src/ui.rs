@@ -2854,6 +2854,38 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     }
                     "toggle-usage" => toggle_usage(),
                     "toggle-sessions" => toggle_sessions(),
+                    "focus-card" | "focus-next-card" | "focus-prev-card" => {
+                        // Taking the keyboard into a read-only note would
+                        // leave nothing to type into; unlock like a new note.
+                        if !interactive.get() {
+                            lock.clicked();
+                        }
+                        let cards = keyboard_cards(&registry);
+                        if let Some(current) = current_card(&window, &cards) {
+                            let step = match action.name.as_str() {
+                                "focus-next-card" => 1,
+                                "focus-prev-card" => cards.len() - 1,
+                                _ => 0,
+                            };
+                            let card = &cards[(current + step) % cards.len()];
+                            let editor = registry
+                                .borrow()
+                                .iter()
+                                .find(|item| &item.widget == card)
+                                .and_then(|item| item.editor.clone());
+                            focus_card(&window, card, editor.as_ref());
+                        }
+                    }
+                    // Only the card the keyboard is in: from another app the
+                    // press would close a card the user is not looking at.
+                    "close-card" if window.is_active() => {
+                        let cards = keyboard_cards(&registry);
+                        if let Some(button) = current_card(&window, &cards)
+                            .and_then(|index| close_button(cards[index].upcast_ref()))
+                        {
+                            button.clicked();
+                        }
+                    }
                     "toggle-youtube" => toggle_youtube(),
                     "toggle-translate" => {
                         // The entry is edit chrome, so a translate window
@@ -13277,7 +13309,10 @@ struct PanelAction {
 /// Actions that do nothing on the desk, so a hidden Sysi stays hidden for
 /// them: quitting, and SYSTEM, which lives in the top bar.
 fn leaves_the_desk_alone(action: &str) -> bool {
-    action == "quit" || action == "toggle-system" || action.starts_with("system")
+    action == "quit"
+        || action == "close-card"
+        || action == "toggle-system"
+        || action.starts_with("system")
 }
 
 fn take_panel_actions() -> Vec<PanelAction> {
@@ -13689,6 +13724,78 @@ fn keep_overlay_layers_on_top(fixed: &gtk::Fixed) {
 
 fn raise_card(card: &gtk::EventBox) {
     restack_overlay_card(card);
+}
+
+/// The cards Super+Shift+J/K step through, left to right across the desk.
+fn keyboard_cards(registry: &Rc<RefCell<Vec<RegisteredWidget>>>) -> Vec<gtk::EventBox> {
+    let mut cards: Vec<gtk::EventBox> = registry
+        .borrow()
+        .iter()
+        .filter(|item| item.key != "picker" && item.key != "voice" && item.widget.is_visible())
+        .map(|item| item.widget.clone())
+        .collect();
+    cards.sort_by_key(|card| {
+        let allocation = card.allocation();
+        (allocation.x(), allocation.y())
+    });
+    cards
+}
+
+/// The card holding the keyboard, else the one raised last.
+fn current_card(window: &gtk::ApplicationWindow, cards: &[gtk::EventBox]) -> Option<usize> {
+    let focus = window.focused_widget();
+    cards
+        .iter()
+        .position(|card| {
+            focus.as_ref().is_some_and(|focus| {
+                focus == card.upcast_ref::<gtk::Widget>() || focus.is_ancestor(card)
+            })
+        })
+        .or_else(|| {
+            (0..cards.len()).max_by_key(|&index| card_raise_stamp(cards[index].upcast_ref()))
+        })
+}
+
+/// Raise `card` and give it the keyboard: a note's editor, else the first
+/// field in it, else the card itself so the next step knows where it is.
+fn focus_card(
+    window: &gtk::ApplicationWindow,
+    card: &gtk::EventBox,
+    editor: Option<&gtk::TextView>,
+) {
+    raise_card(card);
+    window.set_accept_focus(true);
+    request_compositor_focus();
+    focus_overlay_for_typing(window);
+    // Left on, the next time Sysi is shown it would take the keyboard from
+    // whatever app the user is in.
+    window.set_focus_on_map(false);
+    if let Some(editor) = editor {
+        editor.grab_focus();
+        return;
+    }
+    let inside = window
+        .focused_widget()
+        .is_some_and(|focus| focus == *card.upcast_ref::<gtk::Widget>() || focus.is_ancestor(card));
+    if !inside && !card.child_focus(gtk::DirectionType::TabForward) {
+        card.set_can_focus(true);
+        card.grab_focus();
+    }
+}
+
+/// The header's hide or close button, the one a click on `−` would press.
+fn close_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+    if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+        let style = button.style_context();
+        if style.has_class("note-hide") || style.has_class("note-close") {
+            return Some(button.clone());
+        }
+    }
+    widget
+        .downcast_ref::<gtk::Container>()?
+        .children()
+        .iter()
+        .find_map(close_button)
 }
 
 fn repaint_card_on_scroll(scroller: &gtk::ScrolledWindow, card: &gtk::EventBox) {

@@ -241,6 +241,10 @@ export default class SysiPanelExtension extends Extension {
             this._grabKey('<Super><Shift>d', 'new-dictionary'),
             this._grabKey('<Super><Shift>u', 'toggle-usage'),
             this._grabKey('<Super><Shift>r', 'toggle-sessions'),
+            this._grabKey('<Super><Shift>f', 'focus-card'),
+            this._grabKey('<Super><Shift>j', 'focus-next-card'),
+            this._grabKey('<Super><Shift>k', 'focus-prev-card'),
+            this._grabKey('<Super><Shift>w', 'close-card'),
         ].filter(Boolean);
         this._syncOcrEscape();
         this._syncVoiceState();
@@ -552,7 +556,8 @@ export default class SysiPanelExtension extends Extension {
         const notes = action === 'toggle-notes' || action === 'toggle-history';
         const ocr = action === 'ocr' || action === 'dictate';
         const voice = action === 'voice';
-        const typing = action === 'new-note' || action === 'new-dictionary';
+        const typing = action === 'new-note' || action === 'new-dictionary' ||
+            action.startsWith('focus-');
         const cancelOcr = action === 'cancel-ocr';
         const anchor = button && !voice
             ? this._anchorOf(button)

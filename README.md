@@ -63,6 +63,9 @@ Sysi is a lightweight, native Ubuntu desktop overlay built with Rust and GTK 3. 
 - `Super+Shift+M` — start or stop voice dictation (same as the panel `voice` button). `Escape` cancels recording.
 - `Super+Shift+U` — open or close USAGE.
 - `Super+Shift+R` — open or close SESSIONS.
+- `Super+Shift+F` — take the keyboard into Sysi, on the card you were last in (unlocks like a new note).
+- `Super+Shift+J` / `Super+Shift+K` — move the keyboard to the next / previous card, left to right across the desk.
+- `Super+Shift+W` — close the card the keyboard is in (same as its `−` / close button).
 - `Ctrl+Shift+V` — paste into a note exactly as copied, skipping the Markdown clean-up and the copied colours.
 - `Ctrl+F` — find text in the focused note. Use `Enter` / `Shift+Enter` (or
   `F3` / `Shift+F3`) to move between matches and `Escape` to close the panel.
@@ -116,4 +119,4 @@ Sysi is an X11 overlay: always-on-top placement, sticky multi-monitor coverage, 
 
 Ubuntu 26.04 (GNOME 50) ships no Xorg session at all — `/usr/share/xsessions` is gone — so this is the path every 26.04 desktop takes.
 
-Xwayland cannot grab a key while a Wayland window is focused, and an Xwayland client cannot take the keyboard from a native Wayland app either. The panel extension therefore grabs `Super+Shift+L`, `Super+Shift+O`, `Super+Shift+A`, `Super+Shift+M`, `Super+Shift+H`, `Super+Shift+N`, `Super+Shift+D`, `Super+Shift+U` and `Super+Shift+R` inside the compositor and activates the overlay before Notes or OCR starts. If the extension is off, Sysi falls back to GNOME custom shortcuts (`sysi --panel-action toggle-notes` / `sysi --panel-action ocr` / `sysi --panel-action voice`). Notes opened that way may leave the caret outside the search field; OCR still starts, but on Wayland it cannot photograph native windows without the extension. Without the extension `Super+Shift+O`, `Super+Shift+H`, `Super+Shift+N`, `Super+Shift+D` and `Super+Shift+U` still work through the X11 backend whenever the overlay has focus.
+Xwayland cannot grab a key while a Wayland window is focused, and an Xwayland client cannot take the keyboard from a native Wayland app either. The panel extension therefore grabs `Super+Shift+L`, `Super+Shift+O`, `Super+Shift+A`, `Super+Shift+M`, `Super+Shift+H`, `Super+Shift+N`, `Super+Shift+D`, `Super+Shift+U`, `Super+Shift+R`, `Super+Shift+F`, `Super+Shift+J`, `Super+Shift+K` and `Super+Shift+W` inside the compositor and activates the overlay before Notes or OCR starts. If the extension is off, Sysi falls back to GNOME custom shortcuts (`sysi --panel-action toggle-notes` / `sysi --panel-action ocr` / `sysi --panel-action voice`). Notes opened that way may leave the caret outside the search field; OCR still starts, but on Wayland it cannot photograph native windows without the extension. Without the extension `Super+Shift+O`, `Super+Shift+H`, `Super+Shift+N`, `Super+Shift+D` and `Super+Shift+U` still work through the X11 backend whenever the overlay has focus.
