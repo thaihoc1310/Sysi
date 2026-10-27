@@ -13808,7 +13808,7 @@ fn caret_into_view(editor: &gtk::TextView) {
 }
 
 /// How long a card stepped to blinks.
-const CARD_FLASH: Duration = Duration::from_millis(1000);
+const CARD_FLASH: Duration = Duration::from_millis(600);
 
 thread_local! {
     /// The card the keyboard was last sent to, and when.
@@ -13862,8 +13862,8 @@ fn draw_card_flash(cr: &Context) {
         if t >= duration || !card.is_visible() {
             return;
         }
-        // Two beats, fading out.
-        let alpha = (1.0 - t / duration) * (0.5 + 0.5 * (t * std::f64::consts::TAU * 2.0).cos());
+        // One blink: up and back down.
+        let alpha = (t / duration * std::f64::consts::PI).sin();
         let a = card.allocation();
         rounded_rectangle(
             cr,
