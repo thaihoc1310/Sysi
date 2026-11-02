@@ -74,6 +74,7 @@ fn build_tasks_window(initial_color_mode: Foreground) -> TasksCard {
 
     let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     tab_bar.style_context().add_class("usage-tabs");
+    tab_bar.style_context().add_class("task-tabs");
 
     let entry = gtk::Entry::new();
     entry.set_placeholder_text(Some("+ việc mới: gọi khách mai 3h chiều #work !1"));
@@ -96,6 +97,7 @@ fn build_tasks_window(initial_color_mode: Foreground) -> TasksCard {
     undo.style_context().add_class("task-undo");
     undo.set_no_show_all(true);
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    footer.style_context().add_class("task-footer");
     footer.pack_start(&status, true, true, 0);
     footer.pack_end(&undo, false, false, 0);
 
@@ -752,6 +754,14 @@ fn set_due(task: &mut Task, due: Option<tasks::Due>) {
     }
 }
 
+/// "30s nữa" rings thirty seconds from now, not on the minute it is due.
+fn ring_in(task: &mut Task, seconds: Option<i64>) {
+    if let Some(seconds) = seconds {
+        task.remind_at = Some(now_ms() + seconds * 1000);
+        task.reminded = false;
+    }
+}
+
 fn add_from_entry(tasks: &Tasks) {
     let text = tasks.card.entry.text().to_string();
     let now = tasks::now_local();
@@ -778,6 +788,7 @@ fn add_from_entry(tasks: &Tasks) {
             ..Task::default()
         };
         set_due(&mut task, draft.due);
+        ring_in(&mut task, draft.ring_in);
         state.tasks.push(task);
     }
     tasks.card.entry.set_text("");
@@ -855,6 +866,7 @@ fn start_edit(tasks: &Tasks, id: u64, row: &gtk::EventBox, line: &gtk::Box) {
                             .map(|name| tasks::resolve_list(name, &existing))
                             .unwrap_or_default();
                         set_due(task, draft.due);
+                        ring_in(task, draft.ring_in);
                     });
                 }
             }

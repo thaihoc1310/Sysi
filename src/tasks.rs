@@ -34,6 +34,9 @@ pub struct Draft {
     pub list: Option<String>,
     pub priority: u8,
     pub due: Option<Due>,
+    /// Asked for as "in so long": when to ring, in seconds from now, to the
+    /// second rather than the minute the due date is kept in.
+    pub ring_in: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +230,9 @@ fn date_at(reader: &Reader, at: usize, now: Now) -> Option<(DateSpec, usize, Opt
             return Some((tomorrow, 1, None));
         }
     }
+    if let Some((day, taken)) = period_at(reader, at, now) {
+        return Some((DateSpec::Day(day), taken, None));
+    }
     if let Some((weekday, taken)) = weekday_at(reader, at) {
         let after = at + taken;
         let next_week = (reader.is(after, &["tuần", "tuan"]) && reader.is(after + 1, &["sau"]))
@@ -244,6 +250,97 @@ fn date_at(reader: &Reader, at: usize, now: Now) -> Option<(DateSpec, usize, Opt
         return Some((spec, 2, None));
     }
     calendar_date(key, now).map(|day| (DateSpec::Day(day), 1, None))
+}
+
+const WEEK: &[&str] = &["tuần", "tuan"];
+const MONTH: &[&str] = &["tháng", "thang"];
+const THIS: &[&str] = &["này", "nay"];
+const NEXT: &[&str] = &["sau"];
+const END: &[&str] = &["cuối", "cuoi"];
+
+/// A stretch of time named as a deadline: "tuần này" is due by Friday,
+/// "cuối tuần" on Saturday, "tháng này" on the month's last day, "tháng
+/// sau" on the first of the next. Returns the day and the tokens taken.
+fn period_at(reader: &Reader, at: usize, now: Now) -> Option<(i64, usize)> {
+    let weekday = weekday_from_days(now.day);
+    let monday = now.day - weekday;
+    // The working week ends on Friday; once that is gone, on Sunday.
+    let friday = if weekday <= 4 { monday + 4 } else { monday + 6 };
+    let saturday = if weekday <= 5 { monday + 5 } else { now.day };
+    let (year, month, _) = civil_from_days(now.day);
+    let first_of = |months_on: i64| {
+        let index = year * 12 + (month - 1) + months_on;
+        days_from_civil(index.div_euclid(12), index.rem_euclid(12) + 1, 1)
+    };
+    let is = |offset: usize, words: &[&str]| reader.is(at + offset, words);
+    // "<head> tuần/tháng [này|sau]": how far the trailing word takes it.
+    let unit = |offset: usize| -> (bool, usize) {
+        if is(offset, NEXT) {
+            (true, 1)
+        } else if is(offset, THIS) {
+            (false, 1)
+        } else {
+            (false, 0)
+        }
+    };
+    if is(0, WEEK) && is(1, THIS) {
+        return Some((friday, 2));
+    }
+    if is(0, MONTH) && is(1, THIS) {
+        return Some((first_of(1)? - 1, 2));
+    }
+    if is(0, MONTH) && is(1, NEXT) {
+        return Some((first_of(1)?, 2));
+    }
+    if is(0, &["trong"]) || is(0, END) {
+        let end = is(0, END);
+        if is(1, WEEK) {
+            let (next, extra) = unit(2);
+            let day = match (end, next) {
+                (false, false) => friday,
+                (false, true) => monday + 7 + 4,
+                (true, false) => saturday,
+                (true, true) => monday + 7 + 5,
+            };
+            return Some((day, 2 + extra));
+        }
+        if is(1, MONTH) {
+            let (next, extra) = unit(2);
+            return Some((first_of(if next { 2 } else { 1 })? - 1, 2 + extra));
+        }
+        if end && is(1, &["năm", "nam"]) {
+            let extra = usize::from(is(2, THIS));
+            return Some((days_from_civil(year, 12, 31)?, 2 + extra));
+        }
+    }
+    if is(0, &["đầu", "dau"]) && is(1, MONTH) && is(2, NEXT) {
+        return Some((first_of(1)?, 3));
+    }
+    let english = |first: &str, second: &str| {
+        reader.key(at) == Some(first) && reader.key(at + 1) == Some(second)
+    };
+    if english("this", "week") {
+        return Some((friday, 2));
+    }
+    if english("this", "weekend") {
+        return Some((saturday, 2));
+    }
+    if reader.key(at) == Some("weekend") {
+        return Some((saturday, 1));
+    }
+    if english("this", "month") {
+        return Some((first_of(1)? - 1, 2));
+    }
+    if english("next", "month") {
+        return Some((first_of(1)?, 2));
+    }
+    if reader.key(at) == Some("end")
+        && reader.key(at + 1) == Some("of")
+        && reader.key(at + 2) == Some("month")
+    {
+        return Some((first_of(1)? - 1, 3));
+    }
+    None
 }
 
 /// A weekday at `at` (Monday is 0) and how many tokens it takes.
@@ -408,17 +505,18 @@ fn place_hour(hour: u16, part: Option<Daypart>) -> u16 {
 }
 
 enum Span {
-    Minutes(i64),
+    Seconds(i64),
     Days(i64),
 }
 
 /// "30p nữa", "2 tiếng nữa", "in 30m", "in 3 days".
 fn span_at(reader: &Reader, at: usize) -> Option<(Span, usize)> {
     fn unit(word: &str) -> Option<i64> {
-        // Minutes per unit; whole days are negative so they stay dates.
+        // Seconds per unit; whole days are negative so they stay dates.
         Some(match word {
-            "p" | "ph" | "phút" | "phut" | "m" | "min" | "mins" | "minute" | "minutes" => 1,
-            "h" | "giờ" | "gio" | "tiếng" | "tieng" | "hr" | "hrs" | "hour" | "hours" => 60,
+            "s" | "giây" | "giay" | "sec" | "secs" | "second" | "seconds" => 1,
+            "p" | "ph" | "phút" | "phut" | "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "h" | "giờ" | "gio" | "tiếng" | "tieng" | "hr" | "hrs" | "hour" | "hours" => 3600,
             "ngày" | "ngay" | "d" | "day" | "days" => -1,
             "tuần" | "tuan" | "w" | "week" | "weeks" => -7,
             _ => return None,
@@ -441,7 +539,7 @@ fn span_at(reader: &Reader, at: usize) -> Option<(Span, usize)> {
         if per < 0 {
             Span::Days(number * -per)
         } else {
-            Span::Minutes(number * per)
+            Span::Seconds(number * per)
         }
     };
     const LATER: &[&str] = &["nữa", "nua"];
@@ -493,8 +591,9 @@ pub fn parse(text: &str, now: Now) -> Draft {
             .flatten()
         {
             match span {
-                Span::Minutes(minutes) => {
-                    let total = i64::from(now.minute) + minutes;
+                Span::Seconds(seconds) => {
+                    draft.ring_in = Some(seconds);
+                    let total = i64::from(now.minute) + seconds / 60;
                     date = Some(DateSpec::Day(now.day + total.div_euclid(1440)));
                     time = Some((
                         (total.rem_euclid(1440) / 60) as u16,
@@ -556,12 +655,37 @@ pub fn parse(text: &str, now: Now) -> Draft {
         }),
     };
     draft.due = day.map(|day| Due { day, minute });
+    // "nhắc tôi …" / "remind me to …" asks for the reminder; the task is
+    // what follows, or a plain reminder when nothing does.
+    let free: Vec<usize> = (0..tokens.len()).filter(|at| !tokens[*at].used).collect();
+    let asked = free.first().is_some_and(|at| {
+        matches!(tokens[*at].key.as_str(), "nhắc" | "nhac" | "remind")
+            && free.get(1).is_some_and(|next| {
+                matches!(
+                    tokens[*next].key.as_str(),
+                    "tôi" | "toi" | "mình" | "minh" | "me" | "em" | "anh"
+                )
+            })
+    });
+    if asked {
+        for at in &free[..2] {
+            tokens[*at].used = true;
+        }
+        if let Some(to) = free.get(2) {
+            if matches!(tokens[*to].key.as_str(), "to" | "là" | "la" | "về" | "ve") {
+                tokens[*to].used = true;
+            }
+        }
+    }
     draft.title = tokens
         .iter()
         .filter(|token| !token.used)
         .map(|token| token.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
+    if asked && draft.title.is_empty() && draft.due.is_some() {
+        draft.title = "Nhắc nhở".to_owned();
+    }
     draft
 }
 
@@ -965,6 +1089,57 @@ mod tests {
     }
 
     #[test]
+    fn stretches_of_time_are_deadlines() {
+        let today = now().day; // Wednesday 28/10/2026
+        assert_eq!(due("xong báo cáo tuần này"), Some((today + 2, None)));
+        assert_eq!(due("xong báo cáo trong tuần"), Some((today + 2, None)));
+        assert_eq!(due("xong bao cao trong tuan"), Some((today + 2, None)));
+        assert_eq!(due("xong trong tuần sau"), Some((today + 9, None)));
+        assert_eq!(due("dọn nhà cuối tuần"), Some((today + 3, None)));
+        assert_eq!(due("dọn nhà cuối tuần sau"), Some((today + 10, None)));
+        assert_eq!(due("đóng tiền tháng này"), Some((day(2026, 10, 31), None)));
+        assert_eq!(
+            due("đóng tiền trong tháng"),
+            Some((day(2026, 10, 31), None))
+        );
+        assert_eq!(due("đóng tiền cuối tháng"), Some((day(2026, 10, 31), None)));
+        assert_eq!(
+            due("đóng tiền cuối tháng sau"),
+            Some((day(2026, 11, 30), None))
+        );
+        assert_eq!(due("gia hạn tháng sau"), Some((day(2026, 11, 1), None)));
+        assert_eq!(due("gia hạn đầu tháng sau"), Some((day(2026, 11, 1), None)));
+        assert_eq!(due("tổng kết cuối năm"), Some((day(2026, 12, 31), None)));
+        assert_eq!(due("ship this week"), Some((today + 2, None)));
+        assert_eq!(due("hike this weekend"), Some((today + 3, None)));
+        assert_eq!(due("pay end of month"), Some((day(2026, 10, 31), None)));
+        assert_eq!(due("renew next month"), Some((day(2026, 11, 1), None)));
+        assert_eq!(title("xong báo cáo trong tuần"), "xong báo cáo");
+        // With a time too.
+        assert_eq!(due("họp cuối tuần 9h sáng"), Some((today + 3, at(9, 0))));
+        // A plain "trong" stays a word.
+        assert_eq!(due("ngồi trong phòng"), None);
+        // Past Friday, "this week" is Sunday.
+        let saturday = Now {
+            day: today + 3,
+            minute: 600,
+        };
+        assert_eq!(
+            parse("xong tuần này", saturday).due.map(|due| due.day),
+            Some(today + 4)
+        );
+        // December rolls into January.
+        let december = Now {
+            day: day(2026, 12, 10),
+            minute: 600,
+        };
+        assert_eq!(
+            parse("gia hạn tháng sau", december).due.map(|due| due.day),
+            Some(day(2027, 1, 1))
+        );
+    }
+
+    #[test]
     fn calendar_dates() {
         assert_eq!(due("nộp thuế 15/11"), Some((day(2026, 11, 15), None)));
         assert_eq!(due("nộp thuế 15/11/2027"), Some((day(2027, 11, 15), None)));
@@ -1014,6 +1189,38 @@ mod tests {
         assert_eq!(due("renew in 3 days"), Some((today + 3, None)));
         assert_eq!(due("ngủ 15 tiếng nữa"), Some((today + 1, at(1, 0))));
         assert_eq!(title("uống nước 30p nữa"), "uống nước");
+    }
+
+    #[test]
+    fn remind_me_in_seconds() {
+        let draft = parse("nhắc tôi 30s nữa", now());
+        assert_eq!(draft.title, "Nhắc nhở");
+        assert_eq!(draft.ring_in, Some(30));
+        assert_eq!(
+            draft.due,
+            Some(Due {
+                day: now().day,
+                minute: at(10, 0)
+            })
+        );
+        let draft = parse("nhac toi goi me 90 giây nữa", now());
+        assert_eq!(draft.title, "goi me");
+        assert_eq!(draft.ring_in, Some(90));
+        assert_eq!(
+            draft.due,
+            Some(Due {
+                day: now().day,
+                minute: at(10, 1)
+            })
+        );
+        let draft = parse("remind me to stretch in 45s", now());
+        assert_eq!(draft.title, "stretch");
+        assert_eq!(draft.ring_in, Some(45));
+        assert_eq!(parse("uống nước 30p nữa", now()).ring_in, Some(1800));
+        // A date or clock time rings on its minute.
+        assert_eq!(parse("gọi 15h", now()).ring_in, None);
+        // "nhắc" alone is just a word.
+        assert_eq!(parse("nhắc việc", now()).title, "nhắc việc");
     }
 
     #[test]

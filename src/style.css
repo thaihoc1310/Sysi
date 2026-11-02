@@ -1867,3 +1867,17 @@ tooltip * {
 .task-undo {
   margin: 2px 6px 4px 0;
 }
+
+/* Air under the title bar and above the rounded bottom: USAGE has its
+   "updated" line below the status, TASKS ends on the status. */
+.task-tabs {
+  margin-top: 4px;
+}
+
+.task-footer {
+  margin-bottom: 4px;
+}
+
+.mode-glass .task-footer {
+  margin-bottom: 9px;
+}
