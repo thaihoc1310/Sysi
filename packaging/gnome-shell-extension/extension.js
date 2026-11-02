@@ -97,6 +97,7 @@ export default class SysiPanelExtension extends Extension {
         this._notesMenu = this._buildMenuButton('notes', [['new', 'new-note'], ['list', 'toggle-notes']]);
         // USAGE (the quota cards) and SESSIONS (the agents running now), each a window of its own.
         this._agentMenu = this._buildMenuButton('agent', [['usage', 'toggle-usage'], ['sessions', 'toggle-sessions']]);
+        this._addAction('tasks', 'toggle-tasks');
         this._addAction('dict', 'toggle-translate');
         this._addAction('ocr', 'ocr');
         this._voiceButton = this._addAction('voice', 'voice');
@@ -241,6 +242,7 @@ export default class SysiPanelExtension extends Extension {
             this._grabKey('<Super><Shift>d', 'new-dictionary'),
             this._grabKey('<Super><Shift>u', 'toggle-usage'),
             this._grabKey('<Super><Shift>r', 'toggle-sessions'),
+            this._grabKey('<Super><Shift>t', 'toggle-tasks'),
             this._grabKey('<Super><Shift>f', 'focus-card'),
             this._grabKey('<Super><Shift>j', 'focus-next-card'),
             this._grabKey('<Super><Shift>k', 'focus-prev-card'),

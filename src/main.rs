@@ -7,6 +7,7 @@ mod rich_paste;
 mod sessions;
 mod state;
 mod system;
+mod tasks;
 mod translate;
 mod ui;
 mod usage;

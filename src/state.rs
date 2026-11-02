@@ -136,6 +136,14 @@ pub struct Settings {
     #[serde(default)]
     pub sessions_open: bool,
     #[serde(default)]
+    pub tasks_open: bool,
+    /// The list TASKS shows; empty for all of them.
+    #[serde(default)]
+    pub tasks_tab: String,
+    /// The last daily round-up sent: the local day and which of the two.
+    #[serde(default)]
+    pub tasks_digest_sent: Option<(i64, u8)>,
+    #[serde(default)]
     pub youtube_open: bool,
     /// The link or search last played in YOUTUBE, played again when it opens.
     #[serde(default)]
@@ -180,6 +188,9 @@ impl Default for Settings {
             translate_open: false,
             usage_open: false,
             sessions_open: false,
+            tasks_open: false,
+            tasks_tab: String::new(),
+            tasks_digest_sent: None,
             youtube_open: false,
             youtube_url: String::new(),
             youtube_position: 0.0,
@@ -489,6 +500,52 @@ pub struct AppState {
     /// keeps every card while the rest stay editable.
     #[serde(default)]
     pub locked_cards: BTreeSet<String>,
+    #[serde(default)]
+    pub tasks: Vec<Task>,
+    #[serde(default = "default_next_id")]
+    pub next_task_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    Todo,
+    Doing,
+    Done,
+}
+
+/// One task in TASKS. Its due date is kept as the local wall clock (a day
+/// number and a minute of the day): "Friday 15:00" stays that.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Task {
+    pub id: u64,
+    pub title: String,
+    /// The list it is filed in; empty for none.
+    #[serde(default)]
+    pub list: String,
+    #[serde(default)]
+    pub status: TaskStatus,
+    /// 1 is the most urgent, 0 none.
+    #[serde(default)]
+    pub priority: u8,
+    #[serde(default)]
+    pub due_day: Option<i64>,
+    #[serde(default)]
+    pub due_minute: Option<u16>,
+    /// When it rings, in ms; only a task with a time has one.
+    #[serde(default)]
+    pub remind_at: Option<i64>,
+    #[serde(default)]
+    pub reminded: bool,
+    /// Its notification while one is up, so a button pressed on it after a
+    /// restart still finds the task.
+    #[serde(default)]
+    pub notify_id: Option<u32>,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub completed_at: Option<i64>,
 }
 
 impl Default for AppState {
@@ -510,6 +567,8 @@ impl Default for AppState {
             next_dictionary_id: 1,
             next_image_id: 1,
             locked_cards: BTreeSet::new(),
+            tasks: Vec::new(),
+            next_task_id: 1,
         }
     }
 }
@@ -747,7 +806,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_tag, AppState, ColorMode, HighlightColor, Note, NoteInk};
+    use super::{clean_tag, AppState, ColorMode, HighlightColor, Note, NoteInk, Task, TaskStatus};
 
     #[test]
     fn tags_are_counted_from_the_notes_and_toggle_on_and_off() {
@@ -903,6 +962,19 @@ mod tests {
         let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
             .expect("state without a translate flag should remain readable");
         assert!(!state.settings.translate_open);
+    }
+
+    #[test]
+    fn old_state_has_no_tasks_and_a_closed_tasks_card() {
+        let state: AppState = serde_json::from_str(r#"{"settings":{"system":true}}"#)
+            .expect("state without tasks should remain readable");
+        assert!(state.tasks.is_empty());
+        assert_eq!(state.next_task_id, 1);
+        assert!(!state.settings.tasks_open);
+        assert_eq!(state.settings.tasks_digest_sent, None);
+        let task: Task = serde_json::from_str(r#"{"id":3,"title":"x"}"#).expect("bare task");
+        assert_eq!(task.status, TaskStatus::Todo);
+        assert_eq!(task.due_day, None);
     }
 
     #[test]

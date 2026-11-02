@@ -28,6 +28,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+mod tasks_card;
+
 /// How much disk the pronunciation clips may keep between them. Roughly a
 /// couple of thousand words, and nothing that is dropped costs more than one
 /// re-download.
@@ -932,6 +934,20 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let toggle_sessions = toggle_sessions.clone();
         move |_| toggle_sessions()
     });
+
+    // TASKS, beside SESSIONS.
+    let tasks_handle = tasks_card::install_tasks(
+        &root,
+        &window,
+        &state,
+        &registry,
+        &interactive,
+        &widget_picker.card,
+        Point {
+            x: primary_screen.x + 28 + USAGE_WIDTH + 16 + SESSIONS_WIDTH + 16,
+            y: primary_screen.y + 460,
+        },
+    );
 
     // YOUTUBE, mpv playing a link inside a card of its own.
     let youtube_color_mode = saved_color_mode(&state.borrow(), "youtube");
@@ -2785,6 +2801,8 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let notes_opened_at = notes_opened_at.clone();
         let toggle_usage = toggle_usage.clone();
         let toggle_sessions = toggle_sessions.clone();
+        let toggle_tasks = tasks_handle.toggle.clone();
+        let tasks_widget = tasks_handle.tasks.card.card.clone();
         let toggle_youtube = toggle_youtube.clone();
         let toggle_translate = toggle_translate.clone();
         let translate_spawn = translate_spawn.clone();
@@ -2861,6 +2879,14 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                     }
                     "toggle-usage" => toggle_usage(),
                     "toggle-sessions" => toggle_sessions(),
+                    "toggle-tasks" => {
+                        // The quick-add field is edit chrome: opened while
+                        // locked there would be nothing to type into.
+                        if !tasks_widget.is_visible() && !interactive.get() {
+                            lock.clicked();
+                        }
+                        toggle_tasks();
+                    }
                     "focus-card" | "focus-next-card" | "focus-prev-card" => {
                         // Taking the keyboard into a read-only note would
                         // leave nothing to type into; unlock like a new note.
@@ -2929,6 +2955,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         let registry = registry.clone();
         let notes_card = notes.card.clone();
         let handle_notes_keys = handle_notes_keys.clone();
+        let tasks_keys = tasks_handle.keys.clone();
         let translate_close_search = translate_close_search.clone();
         let dictate_cancel = dictate.cancel.clone();
         let voice_cancel = voice.cancel.clone();
@@ -2952,6 +2979,11 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
                 }
             }
             if event.keyval() == gdk::keys::constants::Escape && dictate_cancel() {
+                return glib::Propagation::Stop;
+            }
+            // Before the Notes palette, which takes Up/Down/Enter/Escape
+            // whenever it is open, wherever the keyboard is.
+            if tasks_keys(event) == glib::Propagation::Stop {
                 return glib::Propagation::Stop;
             }
             if notes_card.is_visible() {
@@ -3031,6 +3063,7 @@ pub fn build(app: &gtk::Application, state: Rc<RefCell<AppState>>) {
         sessions_card.chrome.set_visible(interactive.get());
         scan_sessions(false);
     }
+    tasks_handle.tasks.restore();
     if !state.borrow().settings.youtube_open {
         youtube_card.card.hide();
     } else {
@@ -18659,6 +18692,7 @@ fn receives_input_when_locked(key: &str) -> bool {
         || key == "notes"
         || key == "usage"
         || key == "sessions"
+        || key == "tasks"
         || key == "youtube"
         || key == "voice"
 }
@@ -20009,6 +20043,7 @@ mod tests {
         assert!(receives_input_when_locked("notes"));
         assert!(receives_input_when_locked("usage"));
         assert!(receives_input_when_locked("sessions"));
+        assert!(receives_input_when_locked("tasks"));
         assert!(!receives_input_when_locked("system"));
         assert!(!receives_input_when_locked("translate"));
     }

@@ -1785,3 +1785,85 @@ tooltip * {
   opacity: 0;
 }
 
+
+/* TASKS: a quick-add field over the rows, which read like USAGE's. */
+.task-quick {
+  padding: 3px 7px 2px;
+}
+
+.mode-glass .task-quick {
+  padding: 3px 12px 2px;
+}
+
+.history-search.task-entry {
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  min-height: 20px;
+}
+
+.task-preview {
+  color: alpha(currentColor, 0.62);
+  font-size: 10px;
+  text-shadow: none;
+}
+
+.task-row .task-line {
+  margin: 2px 4px;
+}
+
+.task-mark {
+  font-size: 13px;
+  min-width: 14px;
+  text-shadow: none;
+}
+
+.task-title {
+  font-size: 12px;
+  text-shadow: none;
+}
+
+.task-done {
+  color: alpha(currentColor, 0.5);
+}
+
+.task-list,
+.task-due {
+  color: alpha(currentColor, 0.58);
+  font-size: 10px;
+  text-shadow: none;
+}
+
+.task-due.task-today {
+  color: #d9a21b;
+  font-weight: 700;
+}
+
+.task-due.task-overdue {
+  color: #e0524a;
+  font-weight: 700;
+}
+
+.task-priority-1,
+.task-priority-2,
+.task-priority-3 {
+  font-size: 10px;
+  font-weight: 800;
+  text-shadow: none;
+}
+
+.task-priority-1 {
+  color: #e0524a;
+}
+
+.task-priority-2 {
+  color: #d9a21b;
+}
+
+.task-priority-3 {
+  color: #4da3ff;
+}
+
+.task-undo {
+  margin: 2px 6px 4px 0;
+}
