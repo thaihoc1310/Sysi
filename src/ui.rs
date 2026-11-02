@@ -14208,6 +14208,7 @@ fn show_card_chrome(item: &RegisteredWidget, interactive: bool) {
     let shown = interactive && !card_locked(&item.key);
     if let Some(edit_only) = &item.edit_only {
         if edit_only.is_visible() != shown {
+            keep_bottom_edge(&item.widget);
             edit_only.set_visible(shown);
         }
     }
@@ -14218,6 +14219,69 @@ fn show_card_chrome(item: &RegisteredWidget, interactive: bool) {
             editor.set_editable(shown);
         }
     }
+}
+
+/// How close to a screen's bottom a card counts as sitting on it.
+const BOTTOM_SNAP: i32 = 8;
+
+/// The title bar coming or going changes a card's height, and GtkFixed keeps
+/// its top where it was. A card set down on the bottom of the screen then
+/// rose off it on locking. Keep that bottom edge where it is instead, once
+/// the card has its new height.
+fn keep_bottom_edge(card: &gtk::EventBox) {
+    let Some(fixed) = card
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk::Fixed>().ok())
+    else {
+        return;
+    };
+    let before = card.allocation();
+    if !card.is_visible() || before.height() <= 1 {
+        return;
+    }
+    let bottom = before.y() + before.height();
+    let screens = overlay_screen_rects(&fixed);
+    let on_bottom = host_screen(
+        Point {
+            x: before.x(),
+            y: before.y(),
+        },
+        before.width(),
+        before.height(),
+        &screens,
+    )
+    .is_some_and(|screen| (screen.y + screen.height - bottom).abs() <= BOTTOM_SNAP);
+    if !on_bottom {
+        return;
+    }
+    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+    let id = card.connect_size_allocate({
+        let handler = handler.clone();
+        move |card, area| {
+            if area.height() == before.height() {
+                return;
+            }
+            if let Some(id) = handler.borrow_mut().take() {
+                card.disconnect(id);
+            }
+            // Not from inside the allocation that is still running.
+            let card = card.clone();
+            let fixed = fixed.clone();
+            let (x, y) = (area.x(), bottom - area.height());
+            glib::idle_add_local_once(move || fixed.move_(&card, x, y));
+        }
+    });
+    *handler.borrow_mut() = Some(id);
+    // A height that never changed must not leave this waiting for some
+    // later resize, such as the user dragging an edge.
+    glib::timeout_add_local_once(Duration::from_secs(1), {
+        let card = card.clone();
+        move || {
+            if let Some(id) = handler.borrow_mut().take() {
+                card.disconnect(id);
+            }
+        }
+    });
 }
 
 fn set_edit_chrome_visibility(registry: &Rc<RefCell<Vec<RegisteredWidget>>>, visible: bool) {
