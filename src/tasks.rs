@@ -542,20 +542,23 @@ fn span_at(reader: &Reader, at: usize) -> Option<(Span, usize)> {
             Span::Seconds(number * per)
         }
     };
+    const PREFIX: &[&str] = &["sau", "trong", "in", "after"];
     const LATER: &[&str] = &["nữa", "nua"];
-    let english = reader.is(at, &["in"]);
-    let start = at + usize::from(english);
+    let has_prefix = reader.is(at, PREFIX);
+    let start = at + usize::from(has_prefix);
     let (number, per) = amount(reader.key(start)?)?;
-    let (per, taken) = match per {
+    let (per, amount_taken) = match per {
         Some(per) => (per, 1),
         None => (unit(reader.key(start + 1)?)?, 2),
     };
-    if english {
-        return Some((span(number, per), 1 + taken));
+    let after = start + amount_taken;
+    let has_later = reader.is(after, LATER);
+    let is_seconds = per == 1;
+    if !has_prefix && !has_later && !is_seconds {
+        return None;
     }
-    reader
-        .is(start + taken, LATER)
-        .then(|| (span(number, per), taken + 1))
+    let total_taken = usize::from(has_prefix) + amount_taken + usize::from(has_later);
+    Some((span(number, per), total_taken))
 }
 
 /// Read a quick-add line: the title, and whatever list, priority and due
@@ -655,26 +658,80 @@ pub fn parse(text: &str, now: Now) -> Draft {
         }),
     };
     draft.due = day.map(|day| Due { day, minute });
-    // "nhắc tôi …" / "remind me to …" asks for the reminder; the task is
-    // what follows, or a plain reminder when nothing does.
+    // Asking phrases like "nhắc tôi …", "gọi tôi …", "báo tôi …" ask for a
+    // reminder. The task is what follows, or a default reminder when nothing does.
     let free: Vec<usize> = (0..tokens.len()).filter(|at| !tokens[*at].used).collect();
-    let asked = free.first().is_some_and(|at| {
-        matches!(tokens[*at].key.as_str(), "nhắc" | "nhac" | "remind")
-            && free.get(1).is_some_and(|next| {
-                matches!(
-                    tokens[*next].key.as_str(),
-                    "tôi" | "toi" | "mình" | "minh" | "me" | "em" | "anh"
-                )
-            })
-    });
-    if asked {
-        for at in &free[..2] {
-            tokens[*at].used = true;
-        }
-        if let Some(to) = free.get(2) {
-            if matches!(tokens[*to].key.as_str(), "to" | "là" | "la" | "về" | "ve") {
-                tokens[*to].used = true;
+    let mut default_title: Option<&'static str> = None;
+    if let Some(&first) = free.first() {
+        let key1 = tokens[first].key.as_str();
+        const PRONOUNS: &[&str] = &[
+            "tôi", "toi", "mình", "minh", "em", "anh", "bạn", "ban", "me", "us",
+        ];
+        let next_is_pronoun = free
+            .get(1)
+            .is_some_and(|&next| PRONOUNS.contains(&tokens[next].key.as_str()));
+
+        if matches!(key1, "nhắc" | "nhac" | "remind") {
+            if next_is_pronoun {
+                tokens[first].used = true;
+                tokens[free[1]].used = true;
+                if let Some(&to) = free.get(2) {
+                    if matches!(tokens[to].key.as_str(), "to" | "là" | "la" | "về" | "ve") {
+                        tokens[to].used = true;
+                    }
+                }
+            } else if free
+                .get(1)
+                .is_some_and(|&next| matches!(tokens[next].key.as_str(), "nhở" | "nho"))
+            {
+                tokens[first].used = true;
+                tokens[free[1]].used = true;
+            } else if tokens.iter().any(|t| t.used) {
+                // Bare "nhắc" when a date/time/span was found (e.g. "nhắc 30s", "nhắc sau 30s")
+                tokens[first].used = true;
             }
+            default_title = Some("Nhắc nhở");
+        } else if matches!(key1, "gọi" | "goi" | "call") {
+            if next_is_pronoun {
+                tokens[first].used = true;
+                tokens[free[1]].used = true;
+                if let Some(&third) = free.get(2) {
+                    if matches!(tokens[third].key.as_str(), "dậy" | "day" | "up") {
+                        tokens[third].used = true;
+                        default_title = Some("Gọi dậy");
+                    } else {
+                        default_title = Some("Gọi tôi");
+                    }
+                } else {
+                    default_title = Some("Gọi tôi");
+                }
+            } else if free.len() == 1 && tokens.iter().any(|t| t.used) {
+                // Bare "gọi" with no target: "gọi sau 30s", "gọi 30s nữa"
+                tokens[first].used = true;
+                default_title = Some("Gọi tôi");
+            }
+        } else if matches!(key1, "báo" | "bao" | "alert") {
+            if next_is_pronoun {
+                tokens[first].used = true;
+                tokens[free[1]].used = true;
+                default_title = Some("Báo nhắc");
+            } else if free
+                .get(1)
+                .is_some_and(|&next| matches!(tokens[next].key.as_str(), "thức" | "thuc"))
+            {
+                tokens[first].used = true;
+                tokens[free[1]].used = true;
+                default_title = Some("Báo thức");
+            }
+        } else if matches!(key1, "hẹn" | "hen")
+            && (free
+                .get(1)
+                .is_some_and(|&next| matches!(tokens[next].key.as_str(), "giờ" | "gio"))
+                || next_is_pronoun)
+        {
+            tokens[first].used = true;
+            tokens[free[1]].used = true;
+            default_title = Some("Hẹn giờ");
         }
     }
     draft.title = tokens
@@ -683,8 +740,12 @@ pub fn parse(text: &str, now: Now) -> Draft {
         .map(|token| token.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    if asked && draft.title.is_empty() && draft.due.is_some() {
-        draft.title = "Nhắc nhở".to_owned();
+    if draft.title.is_empty() {
+        if let Some(title) = default_title {
+            draft.title = title.to_owned();
+        } else if draft.ring_in.is_some() {
+            draft.title = "Nhắc nhở".to_owned();
+        }
     }
     draft
 }
@@ -759,11 +820,22 @@ pub fn due_label(due: Due, now: Now) -> String {
 pub fn preview(draft: &Draft, now: Now) -> String {
     let mut parts = Vec::new();
     if let Some(due) = draft.due {
-        let when = due_label(due, now);
-        parts.push(match due.day - now.day {
-            0 if due.minute.is_some() => format!("hôm nay {when}"),
-            _ => when,
-        });
+        let when = if let Some(seconds) = draft.ring_in.filter(|s| *s < 3600) {
+            if seconds < 60 {
+                format!("{seconds}s nữa")
+            } else if seconds % 60 == 0 {
+                format!("{}p nữa", seconds / 60)
+            } else {
+                format!("{seconds}s nữa")
+            }
+        } else {
+            let when = due_label(due, now);
+            match due.day - now.day {
+                0 if due.minute.is_some() => format!("hôm nay {when}"),
+                _ => when,
+            }
+        };
+        parts.push(when);
     }
     if let Some(list) = &draft.list {
         parts.push(format!("#{list}"));
@@ -1200,9 +1272,58 @@ mod tests {
             draft.due,
             Some(Due {
                 day: now().day,
-                minute: at(10, 0)
+                minute: at(10, 0),
             })
         );
+        let draft = parse("gọi tôi sau 30s", now());
+        assert_eq!(draft.title, "Gọi tôi");
+        assert_eq!(draft.ring_in, Some(30));
+        assert_eq!(preview(&draft, now()), "→ 30s nữa");
+
+        let draft = parse("gọi sau 30s", now());
+        assert_eq!(draft.title, "Gọi tôi");
+        assert_eq!(draft.ring_in, Some(30));
+
+        let draft = parse("sau 30s", now());
+        assert_eq!(draft.title, "Nhắc nhở");
+        assert_eq!(draft.ring_in, Some(30));
+
+        let draft = parse("trong 30s", now());
+        assert_eq!(draft.title, "Nhắc nhở");
+        assert_eq!(draft.ring_in, Some(30));
+
+        let draft = parse("30s", now());
+        assert_eq!(draft.title, "Nhắc nhở");
+        assert_eq!(draft.ring_in, Some(30));
+
+        let draft = parse("sau 30 giây nữa", now());
+        assert_eq!(draft.title, "Nhắc nhở");
+        assert_eq!(draft.ring_in, Some(30));
+
+        let draft = parse("gọi tôi dậy sau 30p", now());
+        assert_eq!(draft.title, "Gọi dậy");
+        assert_eq!(draft.ring_in, Some(1800));
+
+        let draft = parse("gọi tôi đi học sau 15p", now());
+        assert_eq!(draft.title, "đi học");
+        assert_eq!(draft.ring_in, Some(900));
+
+        let draft = parse("gọi khách sau 30s", now());
+        assert_eq!(draft.title, "gọi khách");
+        assert_eq!(draft.ring_in, Some(30));
+
+        let draft = parse("báo tôi sau 5 phút", now());
+        assert_eq!(draft.title, "Báo nhắc");
+        assert_eq!(draft.ring_in, Some(300));
+
+        let draft = parse("báo thức sau 30p", now());
+        assert_eq!(draft.title, "Báo thức");
+        assert_eq!(draft.ring_in, Some(1800));
+
+        let draft = parse("hẹn giờ sau 10p", now());
+        assert_eq!(draft.title, "Hẹn giờ");
+        assert_eq!(draft.ring_in, Some(600));
+
         let draft = parse("nhac toi goi me 90 giây nữa", now());
         assert_eq!(draft.title, "goi me");
         assert_eq!(draft.ring_in, Some(90));
@@ -1210,7 +1331,7 @@ mod tests {
             draft.due,
             Some(Due {
                 day: now().day,
-                minute: at(10, 1)
+                minute: at(10, 1),
             })
         );
         let draft = parse("remind me to stretch in 45s", now());
@@ -1219,7 +1340,7 @@ mod tests {
         assert_eq!(parse("uống nước 30p nữa", now()).ring_in, Some(1800));
         // A date or clock time rings on its minute.
         assert_eq!(parse("gọi 15h", now()).ring_in, None);
-        // "nhắc" alone is just a word.
+        // "nhắc" alone is just a word when no time is given.
         assert_eq!(parse("nhắc việc", now()).title, "nhắc việc");
     }
 
