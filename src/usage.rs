@@ -1584,16 +1584,22 @@ fn session_root(source: Source) -> Option<PathBuf> {
     }
 }
 
-/// Claude Code on other machines, counted as Claude: one SSH host per line in
-/// `~/.config/sysi/claude-hosts`. Each host counts its own transcripts with
-/// src/claude_tokens.py, sent over SSH, and answers with its days' totals;
-/// nothing of the conversations comes back. A host that cannot be reached adds
-/// nothing this time, and the ledger keeps what it reported before.
-fn remote_claude_days(offset: i64) -> Vec<TokenDays> {
+/// Claude Code and Codex on other machines, counted as their own: one SSH
+/// host per line in `~/.config/sysi/claude-hosts` or `codex-hosts`. Each host
+/// counts its own logs with src/claude_tokens.py or src/codex_tokens.py, sent
+/// over SSH, and answers with its days' totals; nothing of the conversations
+/// comes back. A host that cannot be reached adds nothing this time, and the
+/// ledger keeps what it reported before.
+fn remote_days(source: Source, offset: i64) -> Vec<TokenDays> {
+    let (hosts, script): (&str, &'static [u8]) = match source {
+        Source::Claude => ("claude-hosts", include_bytes!("claude_tokens.py")),
+        Source::Codex => ("codex-hosts", include_bytes!("codex_tokens.py")),
+        Source::Omp => return Vec::new(),
+    };
     // Where the hosts' transcripts used to be mirrored whole; counting them
     // there instead leaves the copies with no use.
     let _ = fs::remove_dir_all(crate::state::data_dir().join("remote"));
-    let Ok(list) = fs::read_to_string(crate::state::config_dir().join("claude-hosts")) else {
+    let Ok(list) = fs::read_to_string(crate::state::config_dir().join(hosts)) else {
         return Vec::new();
     };
     list.lines()
@@ -1605,11 +1611,11 @@ fn remote_claude_days(offset: i64) -> Vec<TokenDays> {
                 && !host.starts_with(['#', '-'])
                 && !host.contains(['/', ':', ' ', '\t'])
         })
-        .filter_map(|host| remote_claude_host(host, offset))
+        .filter_map(|host| remote_host(host, script, offset))
         .collect()
 }
 
-fn remote_claude_host(host: &str, offset: i64) -> Option<TokenDays> {
+fn remote_host(host: &str, script: &'static [u8], offset: i64) -> Option<TokenDays> {
     let mut child = Command::new("ssh")
         .args([
             "-o",
@@ -1635,7 +1641,7 @@ fn remote_claude_host(host: &str, offset: i64) -> Option<TokenDays> {
     let sent = child
         .stdin
         .take()
-        .is_some_and(|mut stdin| stdin.write_all(include_bytes!("claude_tokens.py")).is_ok());
+        .is_some_and(|mut stdin| stdin.write_all(script).is_ok());
     let mut stdout = child.stdout.take()?;
     let answer = std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -1664,7 +1670,7 @@ fn remote_claude_host(host: &str, offset: i64) -> Option<TokenDays> {
         .and_then(|_| parse_remote_days(&bytes))
 }
 
-/// claude_tokens.py's answer: `{"days": {"DAY": [input, output, cache read,
+/// The counting scripts' answer: `{"days": {"DAY": [input, output, cache read,
 /// cache write]}}`.
 fn parse_remote_days(output: &[u8]) -> Option<TokenDays> {
     let value: Value = serde_json::from_slice(output).ok()?;
@@ -1896,11 +1902,9 @@ pub fn scan_tokens() -> TokenReport {
             fresh.insert(path, entry);
         }
         // Other machines' sessions are their own: nothing to key across.
-        if source == Source::Claude {
-            for remote in remote_claude_days(offset) {
-                for (day, spent) in remote {
-                    totals.entry(day).or_default().merge(spent);
-                }
+        for remote in remote_days(source, offset) {
+            for (day, spent) in remote {
+                totals.entry(day).or_default().merge(spent);
             }
         }
         totals.retain(|_, spent| spent.total() > 0);
@@ -1988,6 +1992,72 @@ mod tests {
             local.len(),
             3,
             "three days: the fork's, the 22nd, and past midnight"
+        );
+        assert_eq!(remote, local);
+    }
+
+    /// codex_tokens.py counts another machine's rollouts as scan_codex_file
+    /// does: the growth of the running total, a fork's inherited jump skipped.
+    #[test]
+    fn the_remote_codex_counter_agrees_with_the_local_one() {
+        let root = env::temp_dir().join(format!("sysi-remote-codex-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("2026/10/22")).unwrap();
+        let line = |stamp: &str, tokens: [u64; 4]| {
+            format!(
+                "{{\"timestamp\":\"{stamp}\",\"payload\":{{\"info\":{{\"model_context_window\":1000,\"total_token_usage\":{{\"input_tokens\":{},\"output_tokens\":{},\"cached_input_tokens\":{},\"cache_write_input_tokens\":{}}}}}}}}}\n",
+                tokens[0], tokens[1], tokens[2], tokens[3]
+            )
+        };
+        let first = [
+            line("2026-10-22T10:00:00.000Z", [100, 10, 40, 0]),
+            line("2026-10-22T10:05:00.000Z", [300, 30, 140, 0]),
+            // Past midnight once the offset is added.
+            line("2026-10-22T23:30:00.000Z", [400, 50, 150, 5]),
+        ]
+        .concat();
+        // A fork starts at its parent's total: more than a turn could spend.
+        let fork = [
+            line("2026-10-21T08:00:00.000Z", [5000, 400, 3000, 0]),
+            line("2026-10-21T08:01:00.000Z", [5100, 420, 3050, 0]),
+        ]
+        .concat();
+        fs::write(root.join("2026/10/22/one.jsonl"), first).unwrap();
+        fs::write(root.join("2026/10/22/fork.jsonl"), fork).unwrap();
+        let offset = 7 * 3600;
+
+        let mut files = Vec::new();
+        session_files(&root, SESSION_DEPTH, &mut files);
+        let mut local = TokenDays::new();
+        for path in &files {
+            for record in scan_codex_file(path, offset) {
+                local.entry(record.day).or_default().merge(record.totals);
+            }
+        }
+
+        let mut python = Command::new("python3")
+            .arg("-")
+            .arg(offset.to_string())
+            .arg(&root)
+            .arg(root.join("cache.json"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("python3, as the remote host runs it");
+        python
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(include_bytes!("codex_tokens.py"))
+            .unwrap();
+        let output = python.wait_with_output().unwrap();
+        let remote = parse_remote_days(&output.stdout).expect("the script's JSON");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            local.len(),
+            3,
+            "the fork's day, the 22nd, and past midnight"
         );
         assert_eq!(remote, local);
     }
