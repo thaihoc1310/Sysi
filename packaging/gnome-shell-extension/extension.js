@@ -300,10 +300,19 @@ export default class SysiPanelExtension extends Extension {
         } catch (error) {
             logError(error, 'Sysi could not save the input source setting');
         }
-        if (this._imeRevertLabel)
-            this._imeRevertLabel.text = on ? 'auto en · on' : 'auto en · off';
+        this._showImeRevert(on);
         if (this._inputSources)
             this._scheduleImeRevert();
+    }
+
+    // Bright while on, faint like the voice models not in use while off.
+    _showImeRevert(on) {
+        if (!this._imeRevertItem)
+            return;
+        if (on)
+            this._imeRevertItem.remove_style_class_name('sysi-voice-option');
+        else
+            this._imeRevertItem.add_style_class_name('sysi-voice-option');
     }
 
     _clearImeRevert() {
@@ -465,11 +474,11 @@ export default class SysiPanelExtension extends Extension {
         row.add_child(new St.Widget({x_expand: true}));
         this._settingsMenu.addMenuItem(row);
         // Back to the first input source a minute after switching away.
-        const imeRevert = new PopupMenu.PopupMenuItem('');
-        this._imeRevertLabel = imeRevert.label;
+        const imeRevert = new PopupMenu.PopupMenuItem('auto en');
+        this._imeRevertItem = imeRevert;
         imeRevert.label.x_align = Clutter.ActorAlign.CENTER;
         imeRevert.label.x_expand = true;
-        imeRevert.label.text = this._imeRevertOn() ? 'auto en · on' : 'auto en · off';
+        this._showImeRevert(this._imeRevertOn());
         // Stays open, like the colour mode row, to show what it now is.
         imeRevert.activate = () => this._setImeRevert(!this._imeRevertOn());
         this._settingsMenu.addMenuItem(imeRevert);
