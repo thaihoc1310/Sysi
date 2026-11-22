@@ -4915,7 +4915,7 @@ impl UsageTab {
     const ALL: [Self; 4] = [
         Self::Source(UsageSource::Codex),
         Self::Source(UsageSource::Claude),
-        Self::Source(UsageSource::Omp),
+        Self::Source(UsageSource::Agy),
         Self::Tokens,
     ];
 
@@ -6946,7 +6946,7 @@ fn start_usage_updates(card: UsageCard, initial_tab: UsageTab) -> UsageControlle
             let tx = tx.clone();
             // One independent, bounded task per source: a slow CLI cannot block another tab.
             std::thread::spawn(move || {
-                let result = usage::fetch(which, manual);
+                let result = usage::fetch(which);
                 let _ = tx.send_blocking((which, result));
             });
         }) as Rc<dyn Fn(bool)>
@@ -21754,7 +21754,7 @@ mod usage_ui_tests {
         host.close();
         let card = build_usage_window(Foreground::Light);
         let snapshot = usage::Snapshot {
-            source: UsageSource::Omp,
+            source: UsageSource::Agy,
             account: Some("user@example.com".into()),
             fetched_at_ms: usage_now_ms(),
             windows: (0..20)
@@ -21770,7 +21770,7 @@ mod usage_ui_tests {
         };
         render_usage_card(
             &card,
-            UsageTab::Source(UsageSource::Omp),
+            UsageTab::Source(UsageSource::Agy),
             Some(&snapshot),
             None,
         );
@@ -21778,7 +21778,7 @@ mod usage_ui_tests {
         assert_eq!(card.status.text(), "user@example.com");
         render_usage_card(
             &card,
-            UsageTab::Source(UsageSource::Omp),
+            UsageTab::Source(UsageSource::Agy),
             Some(&usage::Snapshot {
                 account: None,
                 ..snapshot.clone()
@@ -21802,7 +21802,7 @@ mod usage_ui_tests {
         assert!(card.refresh.is_sensitive());
         render_usage_card(
             &card,
-            UsageTab::Source(UsageSource::Omp),
+            UsageTab::Source(UsageSource::Agy),
             None,
             Some("Sign in again"),
         );

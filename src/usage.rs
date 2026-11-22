@@ -28,15 +28,20 @@ use std::{
 const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Source {
     Codex,
     Claude,
+    /// Counted in the token tab only: its quota tab gave way to AGY's.
     Omp,
+    /// Antigravity's CLI: a quota tab, but no session logs to count tokens from.
+    Agy,
 }
 
 impl Source {
+    /// The sources the token tab counts, in the order it draws them.
     pub const ALL: [Self; 3] = [Self::Codex, Self::Claude, Self::Omp];
 
     pub fn label(self) -> &'static str {
@@ -44,6 +49,7 @@ impl Source {
             Self::Codex => "CODEX",
             Self::Claude => "CLAUDE",
             Self::Omp => "OMP",
+            Self::Agy => "AGY",
         }
     }
 
@@ -52,13 +58,15 @@ impl Source {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Omp => "omp",
+            Self::Agy => "agy",
         }
     }
 
     pub fn from_key(value: &str) -> Self {
         match value {
             "claude" => Self::Claude,
-            "omp" => Self::Omp,
+            // A settings file from when the third tab was OMP's.
+            "agy" | "omp" => Self::Agy,
             _ => Self::Codex,
         }
     }
@@ -66,9 +74,9 @@ impl Source {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Window {
-    /// The headings this row sits under, outermost first: an OMP row is under
-    /// its provider, its account and its model. Empty for a source with one
-    /// account and one model.
+    /// The headings this row sits under, outermost first: an AGY row is under
+    /// its model family, a Claude row under its account when there are two.
+    /// Empty for a source with one account and one model.
     pub group: Vec<String>,
     pub label: String,
     pub used_percent: Option<f64>,
@@ -176,13 +184,12 @@ fn retry_after(value: Option<&str>, now: i64) -> Duration {
     Duration::from_millis(reset.saturating_sub(now).max(0) as u64)
 }
 
-/// `force` marks a refresh the user asked for: OMP answers from a cache, so
-/// without clearing it the card shows the same numbers with the same age.
-pub fn fetch(source: Source, force: bool) -> Result<Snapshot, FetchError> {
+pub fn fetch(source: Source) -> Result<Snapshot, FetchError> {
     match source {
         Source::Codex => fetch_codex().map_err(Into::into),
         Source::Claude => fetch_claude(),
-        Source::Omp => fetch_omp(force).map_err(Into::into),
+        Source::Agy => fetch_agy().map_err(Into::into),
+        Source::Omp => Err("OMP has no quota tab".to_owned().into()),
     }
 }
 
@@ -962,7 +969,7 @@ fn fetch_claude_api() -> Result<Snapshot, FetchError> {
 /// in one request instead of booting a CLI; whichever answered last is asked
 /// first after that, and a failure falls straight through to the other, so the
 /// pair keeps swapping instead of hammering the side that is currently blocked.
-fn fetch_claude() -> Result<Snapshot, FetchError> {
+fn fetch_claude_account() -> Result<Snapshot, FetchError> {
     static PREFER_CLI: AtomicBool = AtomicBool::new(false);
     let cli_first = PREFER_CLI.load(Ordering::Relaxed);
     let attempt = |cli: bool| {
@@ -991,219 +998,199 @@ fn fetch_claude() -> Result<Snapshot, FetchError> {
     }
 }
 
-fn amount_percent(amount: &Value) -> Option<(f64, f64)> {
-    let object = amount.as_object()?;
-    let mut used_fraction = finite_number(object.get("usedFraction")).or_else(|| {
-        let used = finite_number(object.get("used"))?;
-        if let Some(limit) = finite_number(object.get("limit")).filter(|limit| *limit > 0.0) {
-            return Some(used / limit);
-        }
-        (object.get("unit").and_then(Value::as_str) == Some("percent")).then_some(used / 100.0)
-    });
-    used_fraction = used_fraction.or_else(|| {
-        let remaining = finite_number(object.get("remaining"))?;
-        let limit = finite_number(object.get("limit"))?;
-        (limit > 0.0).then_some(1.0 - remaining / limit)
-    });
-    let remaining_fraction = finite_number(object.get("remainingFraction"))
-        .or_else(|| used_fraction.map(|fraction| 1.0 - fraction));
-    used_fraction = used_fraction.or_else(|| remaining_fraction.map(|fraction| 1.0 - fraction));
-    let used = used_fraction?.max(0.0) * 100.0;
-    let remaining = remaining_fraction
-        .or_else(|| used_fraction.map(|fraction| 1.0 - fraction))?
-        .clamp(0.0, 1.0)
-        * 100.0;
-    Some((used, remaining))
+/// The second Claude account, signed in with a `claude setup-token` token that
+/// the `claude2` wrapper also reads. Sysi finds it at
+/// `~/.config/sysi/claude2.token`; without it the tab shows one account.
+fn claude2_token() -> Option<String> {
+    let token = fs::read_to_string(crate::state::config_dir().join("claude2.token")).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_owned())
 }
 
-fn parse_omp_report(
-    report: &Value,
-    windows: &mut Vec<Window>,
-    accounts: &mut Vec<String>,
-    fetched: &mut i64,
-) {
-    let Some(object) = report.as_object() else {
-        return;
-    };
-    let provider = object
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("provider");
-    if let Some(timestamp) = finite_number(object.get("fetchedAt")) {
-        let timestamp = normalize_reset(Some(&Value::from(timestamp))).unwrap_or(0);
-        if timestamp > 0 {
-            *fetched = if *fetched == 0 {
-                timestamp
-            } else {
-                (*fetched).min(timestamp)
-            };
-        }
-    }
-    if let Some(email) = object
-        .get("metadata")
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("email"))
-        .and_then(Value::as_str)
+/// The account's quota as the Messages API states it on every reply:
+/// `anthropic-ratelimit-unified-5h-utilization: 0.42` (a fraction) and
+/// `anthropic-ratelimit-unified-5h-reset: 1795356000` (unix seconds).
+fn claude_header_windows(header: impl Fn(&str) -> Option<String>) -> Vec<Window> {
+    [
+        ("5h", "Session", 5 * 60 * 60 * 1000),
+        ("7d", "Weekly", 7 * 24 * 60 * 60 * 1000),
+    ]
+    .into_iter()
+    .filter_map(|(key, label, duration_ms)| {
+        let used = header(&format!("anthropic-ratelimit-unified-{key}-utilization"))?
+            .trim()
+            .parse::<f64>()
+            .ok()?;
+        let reset = header(&format!("anthropic-ratelimit-unified-{key}-reset"))
+            .and_then(|reset| reset.trim().parse::<i64>().ok())
+            .filter(|reset| *reset > 0)
+            .map(|reset| reset.saturating_mul(1000));
+        window_from_percent(label, Some(used * 100.0), reset, Some(duration_ms))
+    })
+    .collect()
+}
+
+/// A setup token may only run inference: the usage endpoint answers it 403 and
+/// `/usage` prints no quota for it. Every reply carries the account's quota in
+/// its headers though, so a one-token Haiku reply reads it, at the cost of a
+/// few dozen tokens against that quota. It does open a five-hour window when
+/// none is running.
+fn fetch_claude2(token: &str) -> Result<Vec<Window>, FetchError> {
+    let agent = ureq::builder()
+        .timeout_connect(HTTP_TIMEOUT)
+        .timeout(HTTP_TIMEOUT)
+        .redirects(0)
+        .user_agent("sysi-usage")
+        .build();
+    let body = json!({
+        "model": "claude-haiku-4-5",
+        "max_tokens": 1,
+        // An OAuth token is only served to Claude Code.
+        "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let response = match agent
+        .post(CLAUDE_MESSAGES_URL)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("anthropic-version", "2023-06-01")
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
     {
-        if !email.trim().is_empty() && !accounts.iter().any(|existing| existing == email) {
-            accounts.push(email.to_owned());
+        Ok(response) => response,
+        // Over the limit: the refusal still says by how much.
+        Err(ureq::Error::Status(429, response)) => response,
+        Err(ureq::Error::Status(401, _)) => {
+            return Err("claude2 token was revoked or has expired".to_owned().into())
         }
-    }
-    let limits = object.get("limits").and_then(Value::as_array);
-    if limits.is_none_or(|limits| limits.is_empty()) {
-        let account = object
-            .get("metadata")
-            .and_then(|metadata| metadata.get("email"))
-            .and_then(Value::as_str)
-            .unwrap_or("account unspecified");
-        windows.push(Window {
-            group: vec![provider.to_owned(), account.to_owned()],
-            label: "No quota reported".to_owned(),
-            used_percent: None,
-            remaining_percent: None,
-            reset_at_ms: None,
-            duration_ms: None,
-        });
-        return;
-    }
-    // Antigravity lists a quota shared by several model families once per
-    // family (Claude and GPT draw on one "3p" pool): one row is the pool.
-    let mut shared_groups: Vec<&str> = Vec::new();
-    for limit in limits.unwrap() {
-        let Some(limit_object) = limit.as_object() else {
-            continue;
-        };
-        let scope = limit_object.get("scope");
-        if let Some(group) = scope
-            .filter(|scope| scope.get("shared").and_then(Value::as_bool) == Some(true))
-            .and_then(|scope| scope.get("sharedGroup"))
-            .and_then(Value::as_str)
-        {
-            if shared_groups.contains(&group) {
-                continue;
-            }
-            shared_groups.push(group);
+        Err(ureq::Error::Status(code, response)) => {
+            return Err(FetchError {
+                message: format!("claude2 usage request failed (HTTP {code})"),
+                retry_after: retry_after(response.header("Retry-After"), now_ms()),
+            })
         }
-        let percent = limit_object.get("amount").and_then(amount_percent);
-        let window = limit_object.get("window").and_then(Value::as_object);
-        let reset = window.and_then(|window| {
-            normalize_reset(window.get("resetsAt").or_else(|| window.get("resets_at")))
-        });
-        let duration = window
-            .and_then(|window| finite_number(window.get("durationMs")))
-            .map(|value| value.clamp(0.0, i64::MAX as f64) as i64);
-        let label = limit_object
-            .get("label")
-            .and_then(Value::as_str)
-            .unwrap_or("Usage");
-        // One quota is often limited over two windows, a 5 hour and a weekly,
-        // under the same label: say which window this row is.
-        let span = window
-            .and_then(|window| window.get("label").or_else(|| window.get("id")))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|span| {
-                !span.is_empty() && !label.to_lowercase().contains(&span.to_lowercase())
-            });
-        let account = limit_object
-            .get("scope")
-            .and_then(|scope| scope.get("accountId"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                object
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("email"))
-                    .and_then(Value::as_str)
-            });
-        let mut group = vec![
-            provider.to_owned(),
-            account.unwrap_or("account unspecified").to_owned(),
-        ];
-        // A row per window under its model; a label that names its own
-        // window is the row itself.
-        let label = match span {
-            Some(span) => {
-                group.push(label.to_owned());
-                span.to_owned()
-            }
-            None => label.to_owned(),
-        };
-        windows.push(Window {
-            group,
-            label,
-            used_percent: percent.map(|(used, _)| used),
-            remaining_percent: percent.map(|(_, remaining)| remaining),
-            reset_at_ms: reset,
-            duration_ms: duration,
-        });
-    }
-}
-
-/// Rows of one heading together, so each provider, account and model is
-/// shown once, in an order that holds from one refresh to the next: OMP lists
-/// its reports and limits in whatever order they finished. Headings go by
-/// name, and windows shortest first, 5 hour before weekly.
-fn gather_groups(windows: &mut [Window]) {
-    windows.sort_by_cached_key(|window| {
-        (
-            window
-                .group
-                .iter()
-                .map(|heading| heading.to_lowercase())
-                .collect::<Vec<_>>(),
-            window.duration_ms.is_none(),
-            window.duration_ms,
-        )
-    });
-}
-
-fn invalidate_omp_cache() {
-    let Ok(mut child) = Command::new(resolve_executable("omp"))
-        .args(["usage", "invalidate"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
+        Err(error) => return Err(format!("claude2 usage request failed: {error}").into()),
     };
-    let deadline = Instant::now() + CLI_TIMEOUT;
-    while Instant::now() < deadline {
-        // A failure here is not worth surfacing: the report still renders,
-        // just from the cache the refresh meant to skip.
-        if !matches!(child.try_wait(), Ok(None)) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
+    let windows = claude_header_windows(|name| response.header(name).map(str::to_owned));
+    if windows.is_empty() {
+        return Err("claude2 reply carried no usage headers".to_owned().into());
     }
-    terminate_child(&mut child);
+    Ok(windows)
 }
 
-fn fetch_omp(force: bool) -> Result<Snapshot, String> {
-    if force {
-        invalidate_omp_cache();
+/// While the main account sits out a cooldown it was given, and what it said.
+/// A failing account no longer fails the tab when the other one answers, so
+/// the card keeps polling; this keeps that polling off the main account until
+/// its Retry-After has passed.
+static CLAUDE_HOLD: Mutex<Option<(i64, String)>> = Mutex::new(None);
+
+fn fetch_claude_held() -> Result<Snapshot, FetchError> {
+    let now = now_ms();
+    let mut hold = CLAUDE_HOLD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((until, message)) = hold.as_ref().filter(|(until, _)| *until > now) {
+        return Err(FetchError {
+            message: message.clone(),
+            retry_after: Duration::from_millis(until.saturating_sub(now) as u64),
+        });
     }
-    let output = run_cli("OMP", "omp", &["usage", "--json"], CLI_TIMEOUT)?;
-    let value: Value = serde_json::from_slice(&output)
-        .map_err(|_| "OMP returned invalid usage JSON".to_owned())?;
-    let reports = value
-        .get("reports")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "OMP JSON has no reports array".to_owned())?;
+    let result = fetch_claude_account();
+    *hold = match &result {
+        Err(error) if !error.retry_after.is_zero() => Some((
+            now.saturating_add(error.retry_after.as_millis().min(i64::MAX as u128) as i64),
+            error.message.clone(),
+        )),
+        _ => None,
+    };
+    result
+}
+
+/// Both accounts, each under a heading named for the command that runs it. One
+/// that fails becomes a row saying why, so the other still shows; only when
+/// both fail does the tab fail, and back off.
+fn fetch_claude() -> Result<Snapshot, FetchError> {
+    let Some(token) = claude2_token() else {
+        return fetch_claude_account();
+    };
+    let main = fetch_claude_held().map(|snapshot| snapshot.windows);
+    let second = fetch_claude2(&token);
+    let (main, second) = match (main, second) {
+        (Err(main), Err(second)) => {
+            return Err(FetchError {
+                message: main.message,
+                retry_after: main.retry_after.min(second.retry_after),
+            })
+        }
+        pair => pair,
+    };
     let mut windows = Vec::new();
-    let mut accounts = Vec::new();
-    let mut fetched = 0;
-    for report in reports {
-        parse_omp_report(report, &mut windows, &mut accounts, &mut fetched);
-    }
-    gather_groups(&mut windows);
-    if windows.is_empty() {
-        return Err("OMP has no reported quota windows".to_owned());
+    for (name, result) in [("claude", main), ("claude2", second)] {
+        let rows = result.unwrap_or_else(|error| {
+            vec![Window {
+                group: Vec::new(),
+                label: error.message,
+                used_percent: None,
+                remaining_percent: None,
+                reset_at_ms: None,
+                duration_ms: None,
+            }]
+        });
+        windows.extend(rows.into_iter().map(|mut window| {
+            window.group = vec![name.to_owned()];
+            window
+        }));
     }
     Ok(Snapshot {
-        source: Source::Omp,
-        account: (!accounts.is_empty()).then(|| accounts.join(", ")),
-        fetched_at_ms: if fetched > 0 { fetched } else { now_ms() },
+        source: Source::Claude,
+        account: None,
+        fetched_at_ms: now_ms(),
+        windows,
+    })
+}
+
+/// `agy -p /usage` answers from the account's quota without starting a turn,
+/// one tab-separated line per window:
+/// `Gemini Models\tFive Hour Limit Remaining\t80%\t2026-11-22T17:11:22Z`.
+/// A window nobody has drawn on yet resets at the epoch: no reset is due.
+fn parse_agy_usage(report: &str) -> Vec<Window> {
+    report
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.trim().split('\t').map(str::trim).collect();
+            let &[family, label, remaining, reset] = fields.as_slice() else {
+                return None;
+            };
+            let remaining = remaining.strip_suffix('%')?.trim().parse::<f64>().ok()?;
+            // `Gemini 4 Argon Weekly Limit` names its own family.
+            let label = label.strip_prefix(family).unwrap_or(label).trim();
+            let label = label
+                .trim_end_matches(" Remaining")
+                .trim_end_matches(" Limit");
+            let (label, duration_ms) = match label {
+                "Weekly" => ("Weekly", Some(7 * 24 * 60 * 60 * 1000)),
+                "Five Hour" => ("5h", Some(5 * 60 * 60 * 1000)),
+                other => (other, None),
+            };
+            let reset = parse_iso_reset(Some(&Value::from(reset))).filter(|reset| *reset > 0);
+            let mut window =
+                window_from_percent(label, Some(100.0 - remaining), reset, duration_ms)?;
+            window.group = vec![family.to_owned()];
+            Some(window)
+        })
+        .collect()
+}
+
+fn fetch_agy() -> Result<Snapshot, String> {
+    let output = run_cli("AGY", "agy", &["-p", "/usage"], CLI_TIMEOUT)?;
+    let windows = parse_agy_usage(&String::from_utf8_lossy(&output));
+    if windows.is_empty() {
+        return Err("AGY reported no quota windows".to_owned());
+    }
+    Ok(Snapshot {
+        source: Source::Agy,
+        account: None,
+        fetched_at_ms: now_ms(),
         windows,
     })
 }
@@ -1562,6 +1549,7 @@ fn scan_session_file(source: Source, path: &Path, offset: i64) -> Vec<TokenRecor
         Source::Claude => scan_claude_file(path, offset),
         Source::Codex => scan_codex_file(path, offset),
         Source::Omp => scan_omp_file(path, offset),
+        Source::Agy => Vec::new(),
     }
 }
 
@@ -1581,6 +1569,7 @@ fn session_root(source: Source) -> Option<PathBuf> {
             .map(|dir| PathBuf::from(dir).join("sessions"))
             .or_else(|| under_home(".codex/sessions")),
         Source::Omp => under_home(".omp/agent/sessions"),
+        Source::Agy => None,
     }
 }
 
@@ -1594,7 +1583,7 @@ fn remote_days(source: Source, offset: i64) -> Vec<TokenDays> {
     let (hosts, script): (&str, &'static [u8]) = match source {
         Source::Claude => ("claude-hosts", include_bytes!("claude_tokens.py")),
         Source::Codex => ("codex-hosts", include_bytes!("codex_tokens.py")),
-        Source::Omp => return Vec::new(),
+        Source::Omp | Source::Agy => return Vec::new(),
     };
     // Where the hosts' transcripts used to be mirrored whole; counting them
     // there instead leaves the copies with no use.
@@ -2389,53 +2378,6 @@ mod tests {
     }
 
     #[test]
-    fn omp_accounts_remain_distinct_and_all_rows_survive() {
-        let limits: Vec<_> = (0..20)
-            .map(|i| {
-                json!({
-                    "label": "Weekly", "scope": {"accountId": format!("account-{i}")},
-                    "amount": {"usedFraction": 0.25}
-                })
-            })
-            .collect();
-        let mut windows = Vec::new();
-        parse_omp_report(
-            &json!({"provider": "codex", "limits": limits}),
-            &mut windows,
-            &mut Vec::new(),
-            &mut 0,
-        );
-        assert_eq!(windows.len(), 20);
-        assert_ne!(windows[0].group, windows[1].group);
-        assert_eq!(windows[19].group, ["codex", "account-19"]);
-        assert_eq!(windows[19].label, "Weekly");
-    }
-
-    #[test]
-    fn omp_age_uses_oldest_report_and_retains_overage() {
-        let mut windows = Vec::new();
-        let mut accounts = Vec::new();
-        let mut fetched = 0;
-        for timestamp in [1_800_000_000_000i64, 1_700_000_000_000] {
-            parse_omp_report(
-                &json!({"provider": "test", "fetchedAt": timestamp, "limits": []}),
-                &mut windows,
-                &mut accounts,
-                &mut fetched,
-            );
-        }
-        assert_eq!(fetched, 1_700_000_000_000);
-        assert_eq!(
-            amount_percent(&json!({"usedFraction": 1.2})),
-            Some((120.0, 0.0))
-        );
-        assert_eq!(
-            amount_percent(&json!({"used": 25, "limit": 50, "unit": "percent"})),
-            Some((50.0, 50.0))
-        );
-    }
-
-    #[test]
     fn codex_windows_use_remaining_percent_and_server_resets() {
         let value = serde_json::json!({
             "result": {"rateLimits": {
@@ -2602,141 +2544,48 @@ mod tests {
     }
 
     #[test]
-    fn omp_prefers_remaining_fraction_and_keeps_provider_labels() {
-        let value = serde_json::json!({
-            "reports": [{"provider": "anthropic", "fetchedAt": 1_700_000_000_000i64, "limits": [{
-                "label": "5 Hour limit",
-                "amount": {"usedFraction": 0.34, "remainingFraction": 0.66, "unit": "percent"},
-                "window": {"resetsAt": 1_800_000_000_000i64}
-            }]}]
-        });
-        let snapshot = {
-            let reports = value.get("reports").and_then(Value::as_array).unwrap();
-            let mut windows = Vec::new();
-            let mut accounts = Vec::new();
-            let mut fetched = 0;
-            for report in reports {
-                parse_omp_report(report, &mut windows, &mut accounts, &mut fetched);
-            }
-            (windows, fetched)
-        };
-        assert_eq!(snapshot.0[0].group, ["anthropic", "account unspecified"]);
-        assert_eq!(snapshot.0[0].label, "5 Hour limit");
-        assert_eq!(snapshot.0[0].remaining_percent, Some(66.0));
-        assert_eq!(snapshot.1, 1_700_000_000_000);
-    }
-
-    #[test]
-    fn omp_rows_sit_under_provider_account_and_model_with_a_shared_pool_once() {
-        let limit = |label: &str, family: &str, window: &str, shared: bool| {
-            json!({
-                "id": format!("google-antigravity:{family}:default:{window}"),
-                "label": label,
-                "scope": {"provider": "google-antigravity", "windowId": window,
-                          "shared": shared, "sharedGroup": format!("3p-{window}:{window}")},
-                "window": {"id": window, "label": if window == "5h" { "5 Hour" } else { "Weekly" }},
-                "amount": {"usedFraction": 0.0, "remainingFraction": 1.0}
-            })
-        };
-        let report = json!({
-            "provider": "google-antigravity",
-            "metadata": {"email": "a@example.com"},
-            "limits": [
-                limit("Gemini", "google", "weekly", false),
-                limit("Gemini", "google", "5h", false),
-                limit("Claude & GPT (shared)", "anthropic", "weekly", true),
-                limit("Claude & GPT (shared)", "openai", "weekly", true),
-                limit("Claude & GPT (shared)", "anthropic", "5h", true),
-                limit("Claude & GPT (shared)", "openai", "5h", true),
-            ]
-        });
-        let mut windows = Vec::new();
-        parse_omp_report(&report, &mut windows, &mut Vec::new(), &mut 0);
-        let rows: Vec<String> = windows
+    fn agy_rows_sit_under_their_model_family() {
+        let report = "Gemini Models\tWeekly Limit Remaining\t80%\t2026-11-29T12:11:22Z\n\
+                      Gemini Models\tFive Hour Limit Remaining\t100%\t2026-11-22T17:11:22Z\n\
+                      Claude and GPT models\tWeekly Limit Remaining\t100%\t1970-01-01T00:00:00Z\n\
+                      Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t5%\t2026-11-29T12:11:22Z\n\
+                      Remaining credits\t0\n";
+        let windows = parse_agy_usage(report);
+        let rows: Vec<_> = windows
             .iter()
-            .map(|window| format!("{} / {}", window.group.join(" / "), window.label))
+            .map(|w| (w.group.join("/"), w.label.as_str(), w.remaining_percent))
             .collect();
         assert_eq!(
             rows,
             [
-                "google-antigravity / a@example.com / Gemini / Weekly",
-                "google-antigravity / a@example.com / Gemini / 5 Hour",
-                "google-antigravity / a@example.com / Claude & GPT (shared) / Weekly",
-                "google-antigravity / a@example.com / Claude & GPT (shared) / 5 Hour",
+                ("Gemini Models".into(), "Weekly", Some(80.0)),
+                ("Gemini Models".into(), "5h", Some(100.0)),
+                ("Claude and GPT models".into(), "Weekly", Some(100.0)),
+                ("Gemini 4 Argon".into(), "Weekly", Some(5.0)),
             ]
         );
-        // A label that already names its window is not told twice.
-        let mut windows = Vec::new();
-        parse_omp_report(
-            &json!({"provider": "anthropic", "limits": [{
-                "label": "5 Hour limit", "window": {"label": "5 hour"},
-                "amount": {"usedFraction": 0.5}
-            }]}),
-            &mut windows,
-            &mut Vec::new(),
-            &mut 0,
-        );
-        assert_eq!(windows[0].group, ["anthropic", "account unspecified"]);
-        assert_eq!(windows[0].label, "5 Hour limit");
-    }
-
-    #[test]
-    fn omp_rows_keep_one_order_whatever_order_omp_lists_them_in() {
-        let row = |group: &[&str], label: &str, duration_ms: Option<i64>| Window {
-            group: group.iter().map(|part| part.to_string()).collect(),
-            label: label.to_owned(),
-            used_percent: None,
-            remaining_percent: None,
-            reset_at_ms: None,
-            duration_ms,
-        };
-        let week = Some(604_800_000);
-        let five = Some(18_000_000);
-        let mut windows = vec![
-            row(&["p", "b@x", "Gemini"], "Weekly", week),
-            row(&["q", "a@x", "Model"], "Usage", None),
-            row(&["p", "a@x", "Gemini"], "Weekly", week),
-            row(&["p", "b@x", "Claude & GPT (shared)"], "5 Hour", five),
-            row(&["p", "b@x", "Gemini"], "5 Hour", five),
-            row(&["p", "a@x", "Gemini"], "5 Hour", five),
-            row(&["p", "b@x", "Claude & GPT (shared)"], "Weekly", week),
-        ];
-        let mut shuffled = windows.clone();
-        shuffled.reverse();
-        gather_groups(&mut windows);
-        gather_groups(&mut shuffled);
-        assert_eq!(windows, shuffled);
-        let rows: Vec<String> = windows
-            .iter()
-            .map(|window| format!("{}/{}", window.group.join("/"), window.label))
-            .collect();
+        assert_eq!(windows[0].reset_at_ms, Some(1_795_954_282_000));
         assert_eq!(
-            rows,
-            [
-                "p/a@x/Gemini/5 Hour",
-                "p/a@x/Gemini/Weekly",
-                "p/b@x/Claude & GPT (shared)/5 Hour",
-                "p/b@x/Claude & GPT (shared)/Weekly",
-                "p/b@x/Gemini/5 Hour",
-                "p/b@x/Gemini/Weekly",
-                "q/a@x/Model/Usage",
-            ]
+            windows[2].reset_at_ms, None,
+            "the epoch means no reset is due"
         );
     }
 
     #[test]
-    fn omp_does_not_turn_an_undivided_cost_into_a_percentage() {
-        let value = serde_json::json!({
-            "provider": "anthropic",
-            "limits": [{
-                "label": "Cost",
-                "amount": {"used": 3.0, "unit": "usd"}
-            }]
-        });
-        let mut windows = Vec::new();
-        let mut accounts = Vec::new();
-        let mut fetched = 0;
-        parse_omp_report(&value, &mut windows, &mut accounts, &mut fetched);
-        assert_eq!(windows[0].remaining_percent, None);
+    fn claude2_quota_is_read_off_the_reply_headers() {
+        let headers = HashMap::from([
+            ("anthropic-ratelimit-unified-5h-utilization", "0.0"),
+            ("anthropic-ratelimit-unified-5h-reset", "1795356000"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.73"),
+            ("anthropic-ratelimit-unified-7d-reset", "1795590000"),
+        ]);
+        let windows = claude_header_windows(|name| headers.get(name).map(|v| v.to_string()));
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "Session");
+        assert_eq!(windows[0].remaining_percent, Some(100.0));
+        assert_eq!(windows[0].reset_at_ms, Some(1_795_356_000_000));
+        assert_eq!(windows[1].label, "Weekly");
+        assert!((windows[1].used_percent.unwrap() - 73.0).abs() < 1e-9);
+        assert!(claude_header_windows(|_| None).is_empty());
     }
 }
